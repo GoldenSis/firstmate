@@ -6,3 +6,6 @@ data/
 .DS_Store
 .env
 config/crew-harness
+
+# runtime logs
+run/**/*.log
