@@ -69,7 +69,9 @@ json.dump(d,open(p,'w'),indent=2); print('wrote',p)
 PY
 # stash the key where the service unit will source it (root-only)
 umask 077; printf 'ANTHROPIC_API_KEY=%s\n' "$KEY" > /opt/bots/amaury-driver.env
-echo "MCP configured; key staged 0600"
+# the wrapper does `cd "$HOME/BrainShared"` but the brain is at /opt/brain here → symlink it
+[ -e /root/BrainShared ] || ln -sfn /opt/brain /root/BrainShared
+echo "MCP configured; key staged 0600; /root/BrainShared -> $(readlink -f /root/BrainShared)"
 REMOTE_B
 [ $? -eq 0 ] || die "Phase B failed"
 
@@ -113,19 +115,21 @@ if [ "$AUTH_OK" = 1 ]; then
 set -e; SVC="$1"
 cat > /etc/systemd/system/$SVC.service <<UNIT
 [Unit]
-Description=Amaury job-search driver (daily, autonomous)
+Description=Amaury job-search driver (autonomous, every ~2h daytime)
 After=network-online.target
 [Service]
 Type=oneshot
+TimeoutStartSec=600
+Environment=HOME=/root
 EnvironmentFile=/opt/bots/amaury-driver.env
 WorkingDirectory=/opt/brain
 ExecStart=/usr/bin/env bash /opt/brain/tools/amaury-watch.sh
 UNIT
 cat > /etc/systemd/system/$SVC.timer <<TIMER
 [Unit]
-Description=Run the Amaury driver daily
+Description=Run the Amaury driver every ~2h during daytime (UTC)
 [Timer]
-OnCalendar=*-*-* 06:20:00 UTC
+OnCalendar=*-*-* 05,07,09,11,13,15,17,19:00:00 UTC
 Persistent=true
 [Install]
 WantedBy=timers.target
@@ -133,6 +137,12 @@ TIMER
 systemctl daemon-reload
 systemctl enable --now $SVC.timer
 systemctl list-timers $SVC.timer --no-pager | tail -2
+echo "--- VERIFY: run one real cycle now ---"
+systemctl start $SVC.service || echo "(start returned nonzero — check log)"
+echo "--- health stamp (primary-ok) ---"
+ls -la /opt/brain/ops/amaury-driver.primary-ok 2>&1 || echo "NO STAMP — driver did not complete a healthy run"
+echo "--- run log tail ---"
+tail -12 /tmp/amaury-watch.log 2>/dev/null || echo "(no /tmp/amaury-watch.log)"
 REMOTE_E
   # single authoritative runner: retire the Mac launchd job
   if launchctl list 2>/dev/null | grep -q com.goldensis.amaury-watch; then
