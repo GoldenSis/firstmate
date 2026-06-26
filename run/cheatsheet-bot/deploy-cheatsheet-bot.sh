@@ -21,8 +21,12 @@ echo "== Cheat-sheet bot deploy -> $VPS_HOST =="
 # --- 1. ship only the runtime files (never .env / .venv / .run) ---
 # REMOTE_DIR is a fixed local constant; client-side expansion is intended.
 # shellcheck disable=SC2029
-tar -C "$SRC" -czf - bot.py cheatsheet.py triage.py requirements.txt content \
+tar -C "$SRC" -czf - bot.py cheatsheet.py triage.py panic_command.py requirements.txt content \
   | ssh "$VPS_HOST" "mkdir -p $REMOTE_DIR && tar -C $REMOTE_DIR -xzf -"
+
+# --- 1b. ship the /panic kill-switch executor (from the vault, not the bot dir) ---
+scp -q "$HOME/BrainShared/tools/panic.sh" "$VPS_HOST:/opt/bots/panic.sh"
+ssh "$VPS_HOST" "chmod +x /opt/bots/panic.sh"
 
 # --- 2. remote setup: venv, env file, systemd unit, verify it stays up ---
 # Creds must expand client-side to be passed into the remote shell. Intended.
@@ -45,10 +49,13 @@ HF="${HF_TOKEN:-$(get HF_TOKEN)}"   # optional — enables /triage; preserved ac
 [ -d "$VENV" ] || python3 -m venv "$VENV"
 "$VENV/bin/pip" install -q --upgrade pip >/dev/null
 "$VENV/bin/pip" install -q -r "$DIR/requirements.txt" >/dev/null
-"$VENV/bin/python" -c "import ast; ast.parse(open('$DIR/bot.py').read()); ast.parse(open('$DIR/triage.py').read())"
+"$VENV/bin/python" -c "import ast; ast.parse(open('$DIR/bot.py').read()); ast.parse(open('$DIR/triage.py').read()); ast.parse(open('$DIR/panic_command.py').read())"
 
 umask 077
-{ echo "TELEGRAM_BOT_TOKEN=$TOKEN"; echo "OWNER_ID=$OWNER"; [ -n "$HF" ] && echo "HF_TOKEN=$HF"; } > "$ENVF"
+# /panic kill switch — VPS-only, LOCAL systemctl, UNARMED (no PANIC_ARM = dry-run).
+# Arming is a deliberate later step: add PANIC_ARM=1 here after a live rehearsal.
+{ echo "TELEGRAM_BOT_TOKEN=$TOKEN"; echo "OWNER_ID=$OWNER"; [ -n "$HF" ] && echo "HF_TOKEN=$HF"; \
+  echo "PANIC_SCRIPT=/opt/bots/panic.sh"; echo "PANIC_SCOPE=vps"; echo "PANIC_VPS_LOCAL=1"; } > "$ENVF"
 
 cat > "$UNIT" <<UNITEOF
 [Unit]
