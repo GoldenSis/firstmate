@@ -84,6 +84,13 @@ FM_SUPERVISOR_TARGET=firstmate:0   # supervisor tmux target (override; auto-disc
 FM_INJECT_SKIP=heartbeat           # |-prefixes force-self-handled bypassing classification; empty disables
 FM_CAPTAIN_RE='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'   # status regex that escalates daemon signal/stale/scan output
 FM_STALE_ESCALATE_SECS=240         # idle seconds before a stale pane escalates as a possible wedge
+# deterministic auto-nudge (bin/fm-autonudge.sh); cheap first rung below the LLM recovery ladder
+FM_AUTONUDGE=1                      # 1 tries one bounded auto-nudge on a stale wake before escalating; 0 restores marker-only behavior
+FM_AUTONUDGE_MAX=2                  # pokes per wedge before the helper exits 10 to signal escalation
+FM_AUTONUDGE_COOLDOWN=120           # seconds between pokes
+FM_AUTONUDGE_TTL=900               # seconds after which an untouched poke ledger self-expires so the budget starts fresh
+FM_AUTONUDGE_TEXT=                  # override the generic task-agnostic steering line (one line)
+FM_AUTONUDGE_DIALOG_RE=            # regex (case-insensitive, matched against the pane tail) for a confirm/permission/trust dialog to defer instead of nudge
 FM_ESCALATE_BATCH_SECS=90          # buffer window for batched escalation digests; 0 = flush immediately
 FM_MAX_DEFER_SECS=300              # max buffered escalation age before retry plus wedge alarm; 0 disables
 FM_INJECT_FAIL_SLEEP=30            # seconds to back off when the supervisor pane is unavailable

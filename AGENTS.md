@@ -88,6 +88,7 @@ state/               volatile runtime signals; gitignored
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
   .hash-* .count-* .stale-* .seen-* .last-* .heartbeat-streak   watcher internals; never touch
   .last-watcher-beat watcher liveness beacon, touched every poll; fm-guard.sh reads it
+  .autonudge-*   per-window auto-nudge poke ledgers written by fm-autonudge.sh; never touch
   .subsuper-* .supervise-daemon.*   sub-supervisor internals; never touch
 .no-mistakes/        local validation state and evidence; gitignored
 ```
@@ -446,8 +447,8 @@ On wake, in order of cheapness:
 
 1. Read the reason line and drain queued wake records with `bin/fm-wake-drain.sh`.
 2. `signal:` read the listed status files first; a wake lists every signal that landed within the coalescing grace window (e.g. a status write plus the same turn's turn-end marker), and each is ~30 tokens and usually sufficient.
-3. `stale:` the crewmate stopped without reporting; peek the pane (`bin/fm-peek.sh <window>`) to diagnose.
-   If the pane is waiting, looping, confused, or unresponsive, load `stuck-crewmate-recovery`.
+3. `stale:` the crewmate stopped without reporting; load `wedge-autonudge` and try the bounded deterministic auto-nudge before spending a turn on the ladder.
+   Only when that poke is exhausted, or the pane is visibly looping, confused, or asking a question, peek (`bin/fm-peek.sh <window>`) and load `stuck-crewmate-recovery`.
 4. `check:` a per-task poll fired (usually a merge); act on it.
 5. `heartbeat:` review the whole fleet: skim each window's status file, peek panes that look off, check PR-ready tasks for merge, reconcile data/backlog.md, then re-arm the watcher.
    A heartbeat with no captain-relevant change is internal; do not report that the fleet is unchanged.
@@ -504,7 +505,8 @@ Inline facts that must survive without a loaded skill:
 
 ### Stuck-crewmate recovery
 
-On `stale`, looping, repeated confusion, an answered-by-brief question, an unresponsive pane, or a failed steer, load `stuck-crewmate-recovery`.
+On a plain `stale` wake, first load `wedge-autonudge` and run the cheap bounded auto-nudge (`bin/fm-autonudge.sh`); a quiet pane usually just needs one poke, and that costs no firstmate turn.
+Only escalate when that poke is exhausted (exit 10) or the pane is visibly looping, confused, asking a question, unresponsive, or a steer fails: then load `stuck-crewmate-recovery`.
 That playbook escalates from peek, to one-line steer, to harness-specific interrupt, to relaunch with a progress note, to `failed` with evidence.
 
 ## 9. Escalation and captain etiquette
@@ -602,5 +604,6 @@ It performs only fast-forward self-updates of firstmate and registered secondmat
 These skills are not captain-invocable; they are conditional operating references you must load at the trigger points below.
 
 - `harness-adapters` - load before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.
-- `stuck-crewmate-recovery` - load after a stale wake, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer.
+- `wedge-autonudge` - load on a plain stale wake, before the recovery ladder, to try the cheap bounded deterministic auto-nudge (`bin/fm-autonudge.sh`) that pokes a quiet pane without spending a turn.
+- `stuck-crewmate-recovery` - load after the auto-nudge is exhausted, or on a looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer.
 - `secondmate-provisioning` - load before creating, seeding, validating, recovering, handing backlog to, or retiring a secondmate home, and before editing `data/secondmates.md`.

@@ -7,6 +7,7 @@ user-invocable: false
 # stuck-crewmate-recovery
 
 Use this playbook when a direct report is stale, looping, repeatedly confused, asking a question its brief already answers, unresponsive, or when a steer failed to land.
+On a plain stale wake, try the cheaper `wedge-autonudge` rung first; escalate here only once that bounded auto-nudge is exhausted or the pane is visibly wrong-direction (looping, confused, or asking a question).
 
 Load `harness-adapters` before sending an interrupt, exit command, resume command, or harness-specific skill invocation.
 The target window's harness is recorded as `harness=` in `state/<id>.meta`.

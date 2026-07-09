@@ -132,11 +132,14 @@ Classify each wake this way:
   -> self-handle. Captain-relevant verb -> escalate.
 - `check` -> always escalate. Check scripts print only when firstmate should wake.
 - `stale` with a terminal status -> escalate. Non-terminal stale is transient:
-  record a marker and self-handle. If the pane is still idle past
-  `FM_STALE_ESCALATE_SECS` (default 240s), housekeeping escalates it as a
-  possible wedge. This bounds wedge-detection latency to the threshold plus a
-  tick: a delay, never a loss. Healthy crewmates are autonomous and do not wait
-  on firstmate mid-task.
+  record a marker, try one bounded deterministic auto-nudge
+  (`bin/fm-autonudge.sh`, gated by `FM_AUTONUDGE`, default on), and self-handle.
+  The auto-nudge pokes a quiet pane in bash without spending an escalation; if it
+  cannot land (busy, cooldown, dialog, or budget spent) the marker just ages as
+  before. If the pane is still idle past `FM_STALE_ESCALATE_SECS` (default 240s),
+  housekeeping escalates it as a possible wedge. This bounds wedge-detection
+  latency to the threshold plus a tick: a delay, never a loss. Healthy crewmates
+  are autonomous and do not wait on firstmate mid-task.
 - `heartbeat` -> self-handle. The daemon runs its own cheap bash fleet scan
   every `FM_HEARTBEAT_SCAN_SECS` (default 300s) as the catch-all for a
   captain-relevant status line the per-wake classifier might miss.
