@@ -65,6 +65,14 @@
 #                                   kinds.
 #          FM_STALE_ESCALATE_SECS   idle seconds before a stale pane escalates
 #                                   as a possible wedge (default 240)
+#          FM_AUTONUDGE             1 (default) tries one bounded deterministic
+#                                   auto-nudge (bin/fm-autonudge.sh) on a
+#                                   transient stale wake, before the persistence
+#                                   recheck escalates to the LLM recovery ladder;
+#                                   0 disables and restores the prior
+#                                   record-marker-only behavior. Poke budget and
+#                                   cadence are the FM_AUTONUDGE_* knobs on
+#                                   bin/fm-autonudge.sh.
 #          FM_ESCALATE_BATCH_SECS   buffer window for batched escalation
 #                                   digests; 0 = flush immediately (default 90)
 #          FM_HEARTBEAT_SCAN_SECS   cadence for the catch-all status scan
@@ -366,6 +374,31 @@ stale_marker_remove() {  # <window> <state>
   local win=$1 state=$2 key
   key=$(_stale_key "$(window_to_task "$win")")
   rm -f "$state/.subsuper-stale-$key"
+  # The auto-nudge poke budget lives exactly as long as the wedge: whenever the
+  # stale marker clears (crewmate resumed, or the wedge was escalated to the LLM
+  # recovery ladder), reset the ledger so a later, unrelated quiet spell on this
+  # window starts from a fresh budget. Best-effort; fm-autonudge's own TTL is the
+  # backstop if this reset is ever missed.
+  [ "${FM_AUTONUDGE:-1}" != 0 ] && "$FM_DAEMON_DIR/fm-autonudge.sh" --reset "$win" >/dev/null 2>&1 || true
+}
+
+# attempt_autonudge: the cheap first rung below stuck-crewmate-recovery. On a
+# transient (non-terminal) stale wake, try one bounded deterministic poke of the
+# quiet pane before the persistence recheck spends an escalation on it. Never
+# fails the daemon: any non-zero exit (not-idle, cooldown, exhausted, error) just
+# means "no cheap poke happened", and the existing stale-persistence path takes
+# over unchanged. Gated by FM_AUTONUDGE (default on).
+attempt_autonudge() {  # <window> <state>
+  local win=$1 rc
+  [ "${FM_AUTONUDGE:-1}" != 0 ] || return 0
+  "$FM_DAEMON_DIR/fm-autonudge.sh" "$win" >/dev/null 2>&1
+  rc=$?
+  case "$rc" in
+    0)  log "auto-nudge: poked quiet crewmate $win (deterministic, no turn)" ;;
+    10) log "auto-nudge: budget spent for $win; persistence recheck will escalate" ;;
+    *)  : ;;  # 3 = not idle / cooldown, 1 = error: nothing to log, marker still ages
+  esac
+  return 0
 }
 
 # Record the seen-status marker for a captain-relevant status line so the
@@ -530,7 +563,7 @@ housekeeping() {  # <state>
       rm -f "$marker"; continue
     fi
     if pane_is_busy "$win"; then
-      rm -f "$marker"   # crewmate resumed: benign
+      stale_marker_remove "$win" "$state"   # crewmate resumed: benign; clears nudge ledger too
     else
       escalate_add "$state" "stale persisted ${age}s (possible wedge): $win"
       stale_marker_remove "$win" "$state"
@@ -685,7 +718,14 @@ handle_wake() {  # <reason> <state>
   else
     # Transient (non-terminal) stale: record/refresh the marker so housekeeping
     # can age it; the persistence recheck, not this wake, escalates a wedge.
-    [ "$kind" = "stale" ] && stale_marker_record "$arg" "$state"
+    # Before deferring to that recheck, try one bounded deterministic auto-nudge
+    # — most quiet panes just need a poke, and doing it here costs no firstmate
+    # turn. If the poke does not land (busy, cooldown, budget spent), the marker
+    # still ages exactly as before and the recheck escalates.
+    if [ "$kind" = "stale" ]; then
+      stale_marker_record "$arg" "$state"
+      attempt_autonudge "$arg" "$state"
+    fi
     log "self-handle: $reason -> $distilled"
   fi
 }
