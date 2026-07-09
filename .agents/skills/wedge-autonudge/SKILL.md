@@ -60,11 +60,21 @@ bin/fm-autonudge.sh --reset <window>
 - `FM_AUTONUDGE_TEXT` — override the generic steering line. Keep it
   task-agnostic and one line: it is sent to any wedged crewmate without knowing
   its brief.
+- `FM_AUTONUDGE_DIALOG_RE` — regex (matched case-insensitively against the pane
+  tail) for a pane awaiting a human choice. A match suppresses the nudge and
+  defers to the ladder. The default is deliberately broad; widen it if a harness
+  shows a confirm prompt it does not yet catch.
 
 ## Safety
 
 The helper never nudges a busy or pending-input pane (it reuses the same
-detectors as `fm-send.sh` and the away-mode daemon), the nudge is a single
-generic goal-anchored line that invents no task detail, and pokes are strictly
-budgeted — it cannot machine-gun a pane or loop. See the header of
-`bin/fm-autonudge.sh` for the full contract.
+detectors as `fm-send.sh` and the away-mode daemon), and it never types into a
+harness confirm/permission/trust dialog: a pane awaiting a human choice usually
+shows no busy footer and no composer text, so the busy/pending checks miss it,
+but its tail is matched against a broad, configurable regex
+(`FM_AUTONUDGE_DIALOG_RE`) and any match defers to the ladder instead of
+answering the dialog. Over-suppressing is acceptable — it just falls back to the
+existing stale-persistence escalation — while a false negative that answers a
+dialog is not. The nudge is a single generic goal-anchored line that invents no
+task detail, and pokes are strictly budgeted — it cannot machine-gun a pane or
+loop. See the header of `bin/fm-autonudge.sh` for the full contract.

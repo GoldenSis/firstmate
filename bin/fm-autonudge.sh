@@ -12,7 +12,12 @@
 # Safety contract (why this is safe to run without LLM judgment):
 #   1. It NEVER nudges a busy or pending-input pane. It reuses the same busy /
 #      composer detectors as fm-send.sh and the away-mode daemon
-#      (bin/fm-tmux-lib.sh), so a working crewmate is left alone.
+#      (bin/fm-tmux-lib.sh), so a working crewmate is left alone. It ALSO never
+#      types into a harness confirm/permission/trust dialog: such a pane awaits a
+#      human choice with no busy footer and no composer text, so the busy/pending
+#      checks miss it. The pane tail is matched against FM_AUTONUDGE_DIALOG_RE (a
+#      broad, configurable regex) and any match defers to the LLM ladder instead
+#      of nudging. Over-suppressing is acceptable; answering a dialog is not.
 #   2. The nudge is a single generic, goal-anchored line — it never invents task
 #      detail, never restates a plan, and asks for a one-line blocker if stuck.
 #   3. Pokes are budgeted per window (FM_AUTONUDGE_MAX, default 2) with a
@@ -55,6 +60,10 @@ TTL=${FM_AUTONUDGE_TTL:-900}
 # One generic, goal-anchored line. Deliberately task-agnostic: it must be safe
 # to send to any wedged crewmate without knowing its brief.
 NUDGE_TEXT=${FM_AUTONUDGE_TEXT:-"Supervisor status check: if your last step finished, continue toward the goal in your brief. If you are blocked or waiting on input, reply with the single blocker on one line. Do not restate the plan."}
+# Broad, over-inclusive regex for a pane awaiting a human choice (harness
+# confirm / permission / trust dialog). A match defers to the LLM recovery
+# ladder rather than typing the steer line into the dialog.
+DIALOG_RE=${FM_AUTONUDGE_DIALOG_RE:-'Do you want to (proceed|trust|allow|continue)|Yes, (and|proceed)|❯ *[0-9]+\.|\[y/n\]|\(y/n\)|Allow this|permission to (run|use|edit)|trust the (files|authors|folder|workspace)|awaiting (your )?(approval|confirmation)'}
 
 usage() { echo "usage: fm-autonudge.sh <window> | --reset <window>" >&2; exit 1; }
 
@@ -101,6 +110,16 @@ fi
 if fm_pane_input_pending "$TARGET"; then
   echo "not-idle: $WINDOW has pending composer input" >&2
   exit 3
+fi
+# A pane waiting on a human confirm/permission/trust dialog shows no busy footer
+# and no composer text, so the checks above miss it. Match the tail against the
+# broad dialog regex and defer to the LLM ladder rather than answering it.
+if [ -n "$DIALOG_RE" ]; then
+  pane_tail=$(tmux capture-pane -p -t "$TARGET" -S -20 2>/dev/null || true)
+  if [ -n "$pane_tail" ] && printf '%s\n' "$pane_tail" | grep -qiE "$DIALOG_RE"; then
+    echo "not-idle: $WINDOW shows a confirm/permission dialog" >&2
+    exit 3
+  fi
 fi
 
 # Read ledger: "<count> <last_epoch>".

@@ -16,6 +16,7 @@
 #   5. A failed steer surfaces as exit 1.
 #   6. The cooldown blocks a too-soon second poke (exit 3).
 #   7. The TTL backstop forgives an old ledger even without an explicit reset.
+#   8. A pane showing a confirm/permission dialog is never nudged (exit 3).
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -43,8 +44,18 @@ printf '%s\t%s\n' "\$1" "\$2" >> "$dir/sent.log"
 [ "\${STUB_SEND_FAIL:-0}" = 1 ] && exit 1 || exit 0
 SEND
   printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/fm-guard.sh"
+  # tmux stub: only 'capture-pane' matters here (resolve() takes the sess:win
+  # branch and never calls tmux). It echoes the controllable STUB_PANE var so a
+  # test can drive the dialog guard; empty (the default) means no dialog.
+  cat > "$bin/tmux" <<'TMUX'
+#!/usr/bin/env bash
+case "$1" in
+  capture-pane) printf '%s\n' "${STUB_PANE:-}" ;;
+  *) exit 0 ;;
+esac
+TMUX
   cp "$NUDGE_SRC" "$bin/fm-autonudge.sh"
-  chmod +x "$bin"/*.sh
+  chmod +x "$bin"/*.sh "$bin/tmux"
   printf '%s\n' "$bin"
 }
 
@@ -55,8 +66,8 @@ run_nudge() {
   local env=()
   while [ "$1" != "--" ]; do env+=("$1"); shift; done
   shift
-  env FM_STATE_OVERRIDE="$dir/state" FM_AUTONUDGE_COOLDOWN=0 "${env[@]+"${env[@]}"}" \
-    "$dir/bin/fm-autonudge.sh" "$@"
+  env PATH="$dir/bin:$PATH" FM_STATE_OVERRIDE="$dir/state" FM_AUTONUDGE_COOLDOWN=0 \
+    "${env[@]+"${env[@]}"}" "$dir/bin/fm-autonudge.sh" "$@"
 }
 
 sent_count() { [ -f "$1/sent.log" ] && wc -l < "$1/sent.log" | tr -d ' ' || echo 0; }
@@ -120,7 +131,18 @@ test_ttl_backstop_forgives_old_ledger() {
   pass "fm-autonudge: the TTL backstop forgives an old ledger without an explicit reset"
 }
 
+test_confirm_dialog_is_never_nudged() {
+  local dir; dir="$TMP_ROOT/dialog"; make_sandbox "$dir" >/dev/null
+  run_nudge "$dir" STUB_PANE="Do you want to proceed?
+❯ 1. Yes
+  2. No" -- "sess:win"
+  expect_code 3 $? "a confirm dialog must not be nudged"
+  [ "$(sent_count "$dir")" = 0 ] || fail "a confirm dialog must receive no steer, got $(sent_count "$dir")"
+  pass "fm-autonudge: a confirm/permission dialog is never nudged (exit 3)"
+}
+
 test_idle_pane_is_nudged_once
+test_confirm_dialog_is_never_nudged
 test_budget_is_bounded
 test_reset_clears_budget
 test_busy_and_pending_are_never_nudged
