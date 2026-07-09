@@ -236,6 +236,12 @@ $RULE1
 6. If a decision belongs to a human (product choices, destructive actions, ask-user findings),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
 
+# Engineering standards
+Apply these to the work itself, not just to passing the gate:
+- Bug fixes start by reproducing the bug end-to-end, as close to how an end user hits it as possible, before you touch a fix - so you fix the real cause, not a symptom. The repro becomes the regression test.
+- Prefer quality, simplicity, robustness, and long-term maintainability over the cheapest change. Do not optimize for minimal effort.
+- If you spot an unrelated broken thing along the way - a lint error, a flaky or failing test, an obviously wrong UI - fix it too, but in its own separate commit, never mixed into your task's commit, so it can be reviewed and rolled back independently.
+
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
 If this task produced durable project-intrinsic knowledge, record it in \`AGENTS.md\` as part of your change.
