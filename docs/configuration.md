@@ -37,6 +37,15 @@ When it is unset, the repo root is the home; when it is set, scripts still run f
 When `FM_HOME` is unset, it also behaves as the old whole-root override.
 `FM_STATE_OVERRIDE`, `FM_DATA_OVERRIDE`, `FM_PROJECTS_OVERRIDE`, and `FM_CONFIG_OVERRIDE` override individual operational directories for tests and specialized harness setup.
 
+## Native state source (experimental, default off)
+
+By default firstmate detects crewmate state by scraping tmux panes.
+Setting `FM_STATE_SOURCE=herdr` swaps the detection predicates in [`bin/fm-tmux-lib.sh`](../bin/fm-tmux-lib.sh) (`fm_pane_is_busy`, the composer/ready classification behind `fm_pane_input_pending`, and the new `fm_pane_needs_human` blocked signal) for herdr's native, push-based agent state via [`bin/fm-herdr-lib.sh`](../bin/fm-herdr-lib.sh).
+With the flag unset - the default - the herdr lib is never sourced and every predicate takes its original tmux path byte-for-byte, so nothing changes.
+A pane herdr is not tracking (status `unknown`) degrades to the tmux busy-scrape via `FM_HERDR_UNKNOWN_FALLBACK`.
+Submit stays on the tmux path regardless, because herdr does not reliably submit an agent TUI (its bundled Enter is swallowed by the composer); the event-driven watcher loop and the submit rewrite are deferred follow-ups.
+Enabling the flag requires a per-harness `herdr integration install`, which mutates that harness's global config, so it is opt-in only and never automatic.
+
 ## Harness support
 
 claude, codex, opencode, and pi are all empirically verified; new harnesses get verified through a supervised trial task before joining the set.
@@ -76,6 +85,10 @@ FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT=20   # seconds allowed for bootstrap's best-effo
 FM_FLEET_PRUNE=1        # set to 0 to skip pruning local branches whose upstream is gone
 FM_BUSY_REGEX='esc (to )?interrupt|Working\.\.\.'   # busy-pane signatures, shared by watcher and tmux helper
 FM_COMPOSER_IDLE_RE=    # optional empty-composer regex, applied after dim-ghost and border stripping
+# native state source (bin/fm-herdr-lib.sh); default off = tmux scrape
+FM_STATE_SOURCE=        # set to `herdr` to draw detection predicates from herdr's native socket state; unset means the tmux path unchanged
+FM_HERDR_UNKNOWN_FALLBACK=   # command run as `<cmd> <target>` when herdr reports `unknown`; defaults to the internal tmux busy-scrape adapter
+HERDR_BIN=herdr         # herdr binary name/path used by the herdr state source
 FM_SEND_RETRIES=3       # fm-send Enter-retry attempts after typing the line once
 FM_SEND_SLEEP=0.4       # seconds between fm-send submit checks
 FM_SEND_SETTLE=1        # seconds fm-send waits after a successful text submit; 0 disables

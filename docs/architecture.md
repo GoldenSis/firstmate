@@ -25,6 +25,12 @@ Both firstmate (via the `wedge-autonudge` skill) and the away-mode daemon (gated
 Its injection path shares `bin/fm-tmux-lib.sh` with `fm-send.sh`, so dim-ghost-aware and border-aware composer detection plus verified submit retry stay consistent; stalled escalation delivery raises `state/.subsuper-inject-wedged` after `FM_MAX_DEFER_SECS` instead of silently deferring forever.
 `fm-send.sh` adds its own `FM_SEND_SETTLE` pause after successful text sends so immediate peeks catch the receiving turn starting; the sub-supervisor uses only the shared submit core and does not pay that pause.
 
+State detection defaults to scraping tmux panes, but an experimental, default-off seam can draw it from herdr's native, push-based agent state instead.
+With `FM_STATE_SOURCE=herdr`, the detection predicates in `bin/fm-tmux-lib.sh` (`fm_pane_is_busy`, the composer/ready classification, and a new `fm_pane_needs_human` blocked signal) resolve through `bin/fm-herdr-lib.sh` rather than the pane scrape; an untracked pane degrades to the tmux scrape via `FM_HERDR_UNKNOWN_FALLBACK`.
+With the flag unset the herdr lib is never sourced and behavior is byte-for-byte the tmux path.
+Submit deliberately stays on tmux (herdr does not reliably submit an agent TUI), and the event-driven watcher loop plus the submit rewrite are deferred follow-ups.
+The flag and its variables are documented in [configuration.md](configuration.md).
+
 ## Worktrees, not branches in your checkout
 
 Crewmates never intentionally touch your project clone; [treehouse](https://github.com/kunchenguid/treehouse) pools clean worktrees so parallel tasks on one repo cannot collide.

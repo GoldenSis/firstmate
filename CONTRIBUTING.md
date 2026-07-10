@@ -75,6 +75,8 @@ tests/fm-secondmate-sync.test.sh          # local-HEAD secondmate sync, no-fetch
 tests/fm-secondmate-lifecycle-e2e.test.sh # persistent secondmate routing, seeding, backlog handoff, spawn, recovery, teardown, and FM_HOME flow tests
 tests/fm-secondmate-safety.test.sh        # secondmate home safety, idle charter, handoff validation, and teardown boundary tests
 tests/fm-teardown.test.sh                 # fm-teardown.sh safety and reminder checks: local-only fork-remote allow, truly-unpushed refuse, merged-to-main allow, no-mistakes regression, tasks-axi reminder, --force override
+tests/fm-state-source.test.sh             # FM_STATE_SOURCE=herdr detection seam: default-off byte-identical (herdr never invoked), on-routing for busy/needs-human/readiness, unknown fallback, and missing-binary fallback
+tests/test-herdr-lib.sh                   # live herdr-lib validation of every native state primitive; needs a running herdr server, so it is not named *.test.sh and is not run by CI
 [ "$(readlink CLAUDE.md)" = "AGENTS.md" ]
 [ "$(readlink .claude/skills)" = "../.agents/skills" ]
 FM_HEARTBEAT=2 FM_POLL=1 bin/fm-watch-arm.sh  # watcher re-arm smoke test (prints arm status, then "heartbeat")
