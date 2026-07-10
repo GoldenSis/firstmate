@@ -66,3 +66,12 @@ before=$(git -C "$PROJ" rev-parse --short "$DEFAULT")
 git -C "$PROJ" merge --ff-only "$BRANCH" >/dev/null
 after=$(git -C "$PROJ" rev-parse --short "$DEFAULT")
 echo "merged $BRANCH into local $DEFAULT ($before -> $after) in $PROJ"
+
+# Durable approval record (agent-registry gap #4). This is the one spot the local-only merge
+# physically happens, so log it here - it captures the yolo=on auto-approval that otherwise
+# leaves no trace. Never let a logging failure block or unwind a completed merge.
+YOLO=$(grep '^yolo=' "$META" | cut -d= -f2- || true)
+[ "$YOLO" = on ] && ACTOR=yolo || ACTOR=captain
+"$FM_ROOT/bin/fm-approval-log.sh" record \
+  --actor "$ACTOR" --action local-merge --project "$PROJ" --ref "$ID" \
+  --detail "$BRANCH -> $DEFAULT ($before..$after)" >/dev/null 2>&1 || true
