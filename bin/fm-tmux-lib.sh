@@ -31,6 +31,18 @@
 # dim-ghost and structural border stripping. FM_BUSY_REGEX overrides the busy
 # footer set (mirrors fm-watch.sh / the daemon).
 #
+# State source (FM_STATE_SOURCE, default unset = tmux): when set to `herdr`, the
+# DETECTION predicates below (fm_pane_is_busy, fm_pane_input_pending, and the new
+# fm_pane_needs_human) draw agent state from herdr's native socket API
+# (bin/fm-herdr-lib.sh) instead of scraping tmux. With the flag unset the herdr
+# lib is never even sourced and every predicate takes its original tmux path
+# verbatim, so default behavior is byte-for-byte identical. A pane herdr is not
+# tracking (status `unknown`) transparently degrades to the tmux scrape via
+# FM_HERDR_UNKNOWN_FALLBACK. SUBMIT is deliberately NOT wired to herdr: the
+# swallowed-Enter reality of agent TUIs keeps fm_tmux_composer_state / submit on
+# tmux (see bin/fm-herdr-lib.sh header). The seam is intentionally thin — the
+# event-driven watcher loop and the submit rewrite are separate follow-ups.
+#
 # All functions are `set -u` and `set -e` safe (guarded tmux calls, explicit
 # returns) so they can be sourced into either context.
 
@@ -147,20 +159,90 @@ fm_tmux_composer_state() {  # <target> -> empty|pending|unknown
   printf 'pending'; return 0
 }
 
-# fm_pane_input_pending: 0 (pending) if the cursor line holds real unsubmitted
-# text, 1 otherwise. An unreadable pane is treated as NOT pending (fail-safe:
-# the same bias the old daemon used — an unknown pane defers nothing here).
-fm_pane_input_pending() {  # <target>
-  [ "$(fm_tmux_composer_state "$1")" = pending ]
+# ---- herdr state-source seam (default OFF) --------------------------------
+# These helpers are inert unless FM_STATE_SOURCE=herdr. They let the detection
+# predicates below draw native agent state from bin/fm-herdr-lib.sh while keeping
+# the tmux path byte-for-byte identical when the flag is unset.
+
+# _fm_herdr_lib_loaded: source bin/fm-herdr-lib.sh once, from next to this file.
+# Returns 1 (so callers fall back to tmux) if herdr is unusable — binary or lib
+# missing. Sourcing is lazy: it only happens under the flag (see _fm_herdr_state).
+_fm_herdr_lib_loaded() {
+  command -v "${HERDR_BIN:-herdr}" >/dev/null 2>&1 || return 1
+  command -v fm_herdr_agent_status >/dev/null 2>&1 && return 0
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 1
+  [ -r "$d/fm-herdr-lib.sh" ] || return 1
+  # shellcheck source=bin/fm-herdr-lib.sh
+  . "$d/fm-herdr-lib.sh"
 }
 
-# fm_pane_is_busy: 0 if the pane's last few non-blank lines show a busy footer
-# (an agent mid-turn). Scans a 40-line tail like fm-watch.sh.
-fm_pane_is_busy() {  # <target>
+# _fm_tmux_status_word: a herdr-style status word derived purely from the tmux
+# busy scrape — `working` if the pane shows a busy footer, else `idle`. Wired as
+# the default FM_HERDR_UNKNOWN_FALLBACK so a pane herdr does not yet track (the
+# startup/attach window, or a non-integrated harness) degrades to tmux. Calls the
+# RAW tmux impl, never the dispatching predicate, so it cannot recurse.
+_fm_tmux_status_word() {  # <target>
+  if _fm_tmux_pane_is_busy_impl "$1"; then printf 'working'; else printf 'idle'; fi
+}
+
+# _fm_herdr_state: the resolved herdr status for <target> (idle|working|blocked|
+# done) with the tmux fallback wired in, or an EMPTY string when the herdr source
+# is off or unusable — in which case the caller uses its tmux path unchanged.
+# The leading guard is what guarantees the default path is untouched: with
+# FM_STATE_SOURCE unset this returns '' before herdr is ever probed or sourced.
+_fm_herdr_state() {  # <target>
+  [ "${FM_STATE_SOURCE:-}" = herdr ] || { printf ''; return 0; }
+  _fm_herdr_lib_loaded || { printf ''; return 0; }
+  FM_HERDR_UNKNOWN_FALLBACK="${FM_HERDR_UNKNOWN_FALLBACK:-_fm_tmux_status_word}" \
+    fm_herdr_agent_status "$1"
+}
+
+# _fm_tmux_pane_is_busy_impl: the original tmux busy detector (unchanged body).
+# fm_pane_is_busy dispatches to this when the herdr source is off; the fallback
+# adapter above also calls it directly.
+_fm_tmux_pane_is_busy_impl() {  # <target>
   local win=$1 tail40
   tail40=$(tmux capture-pane -p -t "$win" -S -40 2>/dev/null) || return 1
   printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -6 \
     | grep -qiE "${FM_BUSY_REGEX:-$FM_TMUX_BUSY_REGEX_DEFAULT}"
+}
+# ---------------------------------------------------------------------------
+
+# fm_pane_input_pending: 0 (pending) if it is NOT safe to inject — the cursor line
+# holds real unsubmitted text, 1 otherwise. An unreadable pane is treated as NOT
+# pending (fail-safe: the same bias the old daemon used — an unknown pane defers
+# nothing here).
+# Under FM_STATE_SOURCE=herdr: a `working` or `blocked` agent is definitively
+# not-injectable, so it reports pending directly; an `idle`/`done` agent is
+# quiescent but herdr cannot see human-typed text, so the tmux composer check
+# still decides that case; an untracked pane ('') takes the tmux path unchanged.
+fm_pane_input_pending() {  # <target>
+  case "$(_fm_herdr_state "$1")" in
+    working|blocked) return 0 ;;
+    idle|done)       if [ "$(fm_tmux_composer_state "$1")" = pending ]; then return 0; else return 1; fi ;;
+  esac
+  [ "$(fm_tmux_composer_state "$1")" = pending ]
+}
+
+# fm_pane_needs_human: 0 iff the agent is parked on an in-turn approval prompt
+# (herdr `blocked`) — the native needs-decision signal. This is a herdr-only
+# capability: with the state source off (or herdr not tracking the pane) it
+# returns 1 (false), because the tmux scrape has no reliable equivalent.
+fm_pane_needs_human() {  # <target>
+  [ "$(_fm_herdr_state "$1")" = blocked ]
+}
+
+# fm_pane_is_busy: 0 if the agent is mid-turn. Under FM_STATE_SOURCE=herdr this is
+# herdr's native `working`; otherwise it scans a 40-line tail for a busy footer
+# like fm-watch.sh. With the flag unset, _fm_herdr_state returns '' and this is
+# byte-for-byte the original tmux detector.
+fm_pane_is_busy() {  # <target>
+  case "$(_fm_herdr_state "$1")" in
+    working)           return 0 ;;
+    idle|done|blocked) return 1 ;;
+  esac
+  _fm_tmux_pane_is_busy_impl "$1"
 }
 
 # fm_tmux_submit_core: type <text> into <target> ONCE, then submit with Enter,

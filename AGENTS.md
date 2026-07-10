@@ -463,6 +463,11 @@ A secondmate may be sitting on its own watcher with no visible pane changes, so 
 `fm-watch.sh` therefore skips stale-pane wakes for windows whose meta records `kind=secondmate`.
 This exception is narrow: ordinary crewmates still trip stale detection when their pane stops changing without a busy signature.
 
+**Native state source (experimental, default off).** `FM_STATE_SOURCE=herdr` swaps the tmux-scraping detection primitives in `bin/fm-tmux-lib.sh` (`fm_pane_is_busy`, the composer/ready classification, and the new `fm_pane_needs_human` blocked signal) for herdr's native, push-based agent state via `bin/fm-herdr-lib.sh`; an untracked pane degrades to the tmux scrape through `FM_HERDR_UNKNOWN_FALLBACK`.
+With the flag unset - the default - detection is byte-for-byte the tmux behavior and herdr is never consulted.
+Submit stays on tmux regardless (herdr does not reliably submit an agent TUI), and this seam does not yet rewrite the watcher poll loop; those are deferred follow-ups.
+Enabling it requires a per-harness `herdr integration install`, which mutates that harness's global config - so it is opt-in only, never automatic.
+
 **Watcher liveness is guarded, not just disciplined.**
 Arming the watcher is the last action of every wake-handling turn - but the protocol no longer relies on remembering that.
 While running, `fm-watch.sh` touches `state/.last-watcher-beat` every poll cycle.
