@@ -412,6 +412,21 @@ if [ "$KIND" != secondmate ]; then
   case "$HARNESS" in
     claude*)
       mkdir -p "$WT/.claude"
+      # Pre-accept Claude Code's one-time per-folder trust gate for this fresh
+      # worktree, so an autonomous crewmate never hangs on the "trust this
+      # folder" dialog. Trust is global in ~/.claude.json and is NOT covered by
+      # --dangerously-skip-permissions or the local settings written below.
+      # Atomic merge (temp + rename) preserves every existing key.
+      python3 - "$WT" <<'PYTRUST' 2>/dev/null || true
+import json,os,sys,tempfile
+wt=sys.argv[1]; p=os.path.expanduser("~/.claude.json")
+try: d=json.load(open(p))
+except Exception: d={}
+d.setdefault("projects",{}).setdefault(wt,{})["hasTrustDialogAccepted"]=True
+fd,tmp=tempfile.mkstemp(dir=os.path.dirname(p))
+with os.fdopen(fd,"w") as f: json.dump(d,f)
+os.replace(tmp,p)
+PYTRUST
       cat > "$WT/.claude/settings.local.json" <<EOF
 {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch '$TURNEND'"}]}]}}
 EOF
