@@ -135,9 +135,9 @@ launch_template() {
     opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode --prompt "$(cat __BRIEF__)"' ;;
     pi)
       if [ "$kind" = secondmate ]; then
-        printf '%s' 'pi --model ollama/huihui_ai/qwen2.5-abliterate:14b "$(cat __BRIEF__)"'
+        printf '%s' 'pi --model openrouter/deepseek/deepseek-v3.2 "$(cat __BRIEF__)"'
       else
-        printf '%s' 'pi --model ollama/huihui_ai/qwen2.5-abliterate:14b -e __PIEXT__ "$(cat __BRIEF__)"'
+        printf '%s' 'pi --model openrouter/deepseek/deepseek-v3.2 -e __PIEXT__ "$(cat __BRIEF__)"'
       fi
       ;;
     *) return 1 ;;
