@@ -24,10 +24,11 @@
 #   - teardown removes meta and the registry route only after removing the home
 set -u
 
-# shellcheck source=tests/secondmate-helpers.sh
+# shellcheck source=tests/secondmate-helpers.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/secondmate-helpers.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-secondmate-lifecycle)
+export FM_BACKEND=tmux
 
 HOME_DIR="$TMP_ROOT/main home"
 SUB="$TMP_ROOT/design-home"
@@ -140,12 +141,22 @@ phase_send() {
     FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
     "$ROOT/bin/fm-send.sh" fm-design 'route this work' >/dev/null 2>&1 \
     || fail "fm-send failed for a bare firstmate window with home metadata"
-  assert_grep 'send-keys -t firstmate:fm-design -l route this work' "$LOG" "send did not use the window recorded in this home's meta"
+  # design is a kind=secondmate target, so the request is prefixed with the
+  # from-firstmate marker (bin/fm-marker-lib.sh): the send targets the meta window
+  # AND carries the marker label, and the original payload still follows it.
+  assert_grep 'send-keys -t firstmate:fm-design -l [fm-from-firstmate]' "$LOG" "send did not use the window recorded in this home's meta, or did not mark the secondmate request"
+  assert_grep 'route this work' "$LOG" "the original request text did not survive the marker"
   assert_no_grep 'send-keys -t other-session:fm-design' "$LOG" "send targeted a foreign same-named window"
-  pass "send: a bare fm-<id> routes to the window recorded in this home's meta"
+  pass "send: a bare fm-<id> secondmate routes to the meta window with the from-firstmate marker"
 }
 
 phase_handoff() {
+  # The move is delegated to `tasks-axi mv`; skip cleanly when it is absent (the
+  # downstream recovery and teardown phases do not depend on this phase).
+  if ! command -v tasks-axi >/dev/null 2>&1; then
+    echo "skip: tasks-axi not found (backlog handoff delegates to it)"
+    return 0
+  fi
   cat > "$HOME_DIR/data/backlog.md" <<'EOF'
 ## In flight
 - [ ] live-task - active work (repo: alpha, since 2026-06-20)
@@ -198,10 +209,13 @@ phase_recovery() {
 }
 
 phase_teardown() {
+  local teardown_out
   : > "$LOG"
-  PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
-    "$ROOT/bin/fm-teardown.sh" design >/dev/null 2>&1 \
+  teardown_out=$(PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
+    "$ROOT/bin/fm-teardown.sh" design 2>&1) \
     || fail "teardown failed for the empty secondmate home"
+  printf '%s\n' "$teardown_out" | grep -F 'Backlog:' >/dev/null \
+    && fail "secondmate teardown emitted a main-backlog completion reminder"
   assert_absent "$SUB" "teardown did not remove the retired secondmate home"
   assert_absent "$HOME_DIR/state/design.meta" "teardown did not clear the parent meta"
   assert_no_grep '- design ' "$HOME_DIR/data/secondmates.md" "teardown did not remove the registry route"
