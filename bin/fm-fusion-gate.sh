@@ -106,6 +106,9 @@ reject_unsafe_patch_argument() {
 
 validate_test_patch() {
   local project=$1 patch=$2 rows path count=0 error=
+  if grep -Eq '^(rename|copy) (from|to) ' "$patch"; then
+    die "gate patch must not rename or copy files: only tests/ edits are allowed"
+  fi
   rows=$(mktemp "${TMPDIR:-/tmp}/fm-fusion-paths.XXXXXX")
   if ! git -C "$project" apply --numstat "$patch" > "$rows" 2>/dev/null; then
     rm -f "$rows"

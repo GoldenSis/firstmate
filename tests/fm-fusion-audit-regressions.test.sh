@@ -102,5 +102,45 @@ EOF
   pass "fusion gate seals and verifies through the sha256sum fallback"
 }
 
+test_rename_into_tests_is_rejected() {
+  local root home repo val_wt synth_wt patch base out rc
+  root=$(fm_test_tmproot fm-fusion-rename)
+  home="$root/home"
+  repo="$root/project"
+  val_wt="$root/validator"
+  synth_wt="$root/synthesis"
+  patch="$root/gate.patch"
+  mkdir -p "$home/data" "$home/state" "$repo/bin" "$repo/tests"
+  printf '#!/usr/bin/env bash\necho production\n' > "$repo/bin/feature.sh"
+  chmod +x "$repo/bin/feature.sh"
+  : > "$repo/tests/.keep"
+  git -C "$repo" init -q
+  git -C "$repo" add -A
+  git -C "$repo" commit -qm base
+  base=$(git -C "$repo" rev-parse HEAD)
+  git -C "$repo" worktree add -q --detach "$val_wt" "$base"
+  git -C "$repo" worktree add -q --detach "$synth_wt" "$base"
+  fm_write_meta "$home/state/synth.meta" \
+    "worktree=$synth_wt" "project=$repo" "harness=codex" "model=explicit-synth" \
+    "kind=scout" "mode=scout" "base=$base"
+  fm_write_meta "$home/state/validator.meta" \
+    "worktree=$val_wt" "project=$repo" "harness=claude" "model=explicit-validator" \
+    "kind=scout" "mode=scout" "base=$base"
+  # A rename of a production file into tests/ shows numstat only for the
+  # destination path, so the tests-only check must reject the rename metadata.
+  git -C "$val_wt" mv bin/feature.sh tests/moved.sh
+  git -C "$val_wt" commit -qm move
+  git -C "$val_wt" format-patch -1 --stdout > "$patch"
+  git -C "$val_wt" reset -q --hard "$base"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$GATE" seal synth validator --patch "$patch" -- bash tests/moved.sh 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "seal must reject a rename of a production file into tests/ (out: $out)"
+  assert_contains "$out" "rename or copy" "seal must name the rename/copy restriction (out: $out)"
+  assert_absent "$home/data/synth/fusion-gate/v1" "no package may be sealed from a rename patch"
+  pass "fusion gate refuses a rename of a production file into tests/"
+}
+
 test_sha256sum_fallback_seals_and_verifies
+test_rename_into_tests_is_rejected
 test_ordinary_scout_spacing_is_byte_compatible
