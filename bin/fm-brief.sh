@@ -6,10 +6,13 @@
 # description, acceptance criteria, and context, and may adjust other sections
 # when the task genuinely deviates (e.g. working an existing external PR instead
 # of shipping a new one).
-# Usage: fm-brief.sh <task-id> <repo-name> [--scout] [--herdr-lab]
+# Usage: fm-brief.sh <task-id> <repo-name> [--scout] [--fusion-synthesis] [--herdr-lab]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
+#   --fusion-synthesis is a scout-only variant for model fusion. It writes the
+#   mandatory synthesis-report contract and a private promotion marker at
+#   data/<task-id>/fusion-synthesis. The model-fusion skill owns orchestration.
 #   --secondmate writes a persistent secondmate charter. The project list
 #   is cloned into the secondmate home, while the natural-language scope
 #   tells the main firstmate when to route work there; routine churn stays in its own home;
@@ -73,11 +76,13 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 KIND=ship
 HERDR_LAB=0
 NO_PROJECTS=0
+FUSION_SYNTHESIS=0
 POS=()
 for a in "$@"; do
   case "$a" in
     --scout) KIND=scout ;;
     --secondmate) KIND=secondmate ;;
+    --fusion-synthesis) FUSION_SYNTHESIS=1 ;;
     --herdr-lab) HERDR_LAB=1 ;;
     --no-projects) NO_PROJECTS=1 ;;
     *) POS+=("$a") ;;
@@ -92,6 +97,11 @@ fi
 
 if [ "$NO_PROJECTS" -eq 1 ] && [ "$KIND" != secondmate ]; then
   echo "error: --no-projects applies only to --secondmate charters" >&2
+  exit 1
+fi
+
+if [ "$FUSION_SYNTHESIS" -eq 1 ] && [ "$KIND" != scout ]; then
+  echo "error: --fusion-synthesis requires --scout" >&2
   exit 1
 fi
 
@@ -222,11 +232,34 @@ EOF
 fi
 
 if [ "$KIND" = scout ]; then
+FUSION_SECTION=""
+if [ "$FUSION_SYNTHESIS" -eq 1 ]; then
+FUSION_SECTION=$(cat <<'EOF'
+# Model-fusion synthesis contract
+Read only the completed opinion reports and digests named in the task.
+The report must cite every input and contain these exact sections:
+
+## Consensus
+
+State the shared conclusions, or `None` with a reason.
+
+## Divergence
+
+Classify every item as `complementary` or `contradictory`, or write `None` with a reason.
+
+## Discarded ideas
+
+Give the explicit reason for every discarded idea, or write `None` with a reason.
+EOF
+)
+fi
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
 # Task
 {TASK}
+
+$FUSION_SECTION
 
 $HERDR_SECTION
 
@@ -265,6 +298,9 @@ Before reporting done, read and follow \`$FM_ROOT/.agents/skills/decision-hold-l
 When the report is complete, append \`done: {one-line conclusion}\` to the status file and stop.
 If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
 EOF
+if [ "$FUSION_SYNTHESIS" -eq 1 ]; then
+  : > "$DATA/$ID/fusion-synthesis"
+fi
 echo "scaffolded: $BRIEF (scout; replace {TASK})"
 exit 0
 fi

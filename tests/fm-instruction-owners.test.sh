@@ -221,7 +221,26 @@ test_compressed_agents_retains_authority_and_supervision_safety() {
   pass "compressed AGENTS.md retains authority, supervision, AFK, and X safety"
 }
 
+test_model_fusion_instruction_ownership() {
+  local fusion="$ROOT/.agents/skills/model-fusion/SKILL.md" count
+  # One semantic owner: an internal, non-user-invocable model-fusion skill.
+  assert_present "$fusion" "model-fusion skill is missing (semantic owner not created)"
+  assert_grep "name: model-fusion" "$fusion" "model-fusion skill metadata has the wrong name"
+  assert_grep "user-invocable: false" "$fusion" "model-fusion skill must not be user-invocable"
+  assert_grep "  internal: true" "$fusion" "model-fusion skill must be internal"
+  # Exactly one AGENTS.md load trigger, no duplicated lifecycle inline.
+  count=$(grep -Fc -- "- \`model-fusion\` -" "$AGENTS")
+  [ "$count" -eq 1 ] || fail "model-fusion must have exactly one AGENTS.md trigger entry, found $count"
+  # One mechanical owner: the deterministic gate helper.
+  assert_grep "fm-fusion-gate.sh" "$fusion" "model-fusion skill does not point at its mechanical owner bin/fm-fusion-gate.sh"
+  # No weakening of the no-stacked-reviews boundary.
+  assert_grep 'Never hold work outside no-mistakes for a manual clean verdict, stack serial manual reviews' "$AGENTS" \
+    "AGENTS.md weakened the no-stacked-reviews boundary alongside the fusion overlay"
+  pass "model-fusion has one precise trigger, one semantic owner, and one mechanical owner"
+}
+
 test_new_skill_metadata_and_triggers
+test_model_fusion_instruction_ownership
 test_diagnostic_owner_covers_causal_procedure
 test_project_management_owner_covers_guarded_operations
 test_generic_effort_fallback_respects_precedence
