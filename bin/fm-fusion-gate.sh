@@ -51,6 +51,35 @@ canonical_dir() {
   (cd "$1" && pwd -P)
 }
 
+sha256_tool() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s\n' shasum
+  elif command -v sha256sum >/dev/null 2>&1; then
+    printf '%s\n' sha256sum
+  else
+    die "shasum or sha256sum is required for fusion gate digests"
+  fi
+}
+
+sha256_files() {
+  local tool=$1
+  shift
+  case "$tool" in
+    shasum) shasum -a 256 "$@" ;;
+    sha256sum) sha256sum "$@" ;;
+    *) die "unsupported SHA-256 tool: $tool" ;;
+  esac
+}
+
+sha256_check() {
+  local tool=$1 manifest=$2
+  case "$tool" in
+    shasum) shasum -a 256 -c "$manifest" ;;
+    sha256sum) sha256sum -c "$manifest" ;;
+    *) die "unsupported SHA-256 tool: $tool" ;;
+  esac
+}
+
 task_meta() {
   local id=$1 file="$STATE/$1.meta"
   [ -f "$file" ] || die "no meta for task $id at $file"
@@ -126,13 +155,14 @@ manifest_value() {
 
 verify_package() {
   local id=$1 pkg="$DATA/$1/fusion-gate/v1" manifest synth_meta
-  local recorded_project current_project synth_worktree recorded_base current_base file
+  local recorded_project current_project synth_worktree recorded_base current_base file digest_tool
   [ -d "$pkg" ] || die "no sealed fusion gate for $id"
   for file in gate.patch argv manifest red-output.log seal.sha256; do
     [ -f "$pkg/$file" ] && [ ! -L "$pkg/$file" ] || die "sealed package has a missing or unsafe $file"
     [ ! -w "$pkg/$file" ] || die "sealed package file is writable: $file"
   done
-  (cd "$pkg" && shasum -a 256 -c seal.sha256 >/dev/null 2>&1) \
+  digest_tool=$(sha256_tool)
+  (cd "$pkg" && sha256_check "$digest_tool" seal.sha256 >/dev/null 2>&1) \
     || die "sealed fusion gate digest verification failed"
   manifest="$pkg/manifest"
   [ "$(manifest_value "$manifest" synthesis)" = "$id" ] || die "sealed synthesis identity mismatch"
@@ -183,7 +213,7 @@ seal_gate() {
   validate_test_patch "$val_project" "$patch"
   git -C "$val_wt" apply --check "$patch" >/dev/null 2>&1 || die "gate patch does not apply to the validator base"
 
-  local parent="$DATA/$synthesis/fusion-gate" pkg output argv_tmp rc stage
+  local parent="$DATA/$synthesis/fusion-gate" pkg output argv_tmp rc stage digest_tool
   pkg="$parent/v1"
   mkdir -p "$parent"
   output=$(mktemp "${TMPDIR:-/tmp}/fm-fusion-red.XXXXXX")
@@ -231,9 +261,10 @@ seal_gate() {
     echo "validator_model=$(meta_value "$val_meta" model)"
     echo "red_exit=$rc"
   } > "$stage/manifest"
+  digest_tool=$(sha256_tool)
   (
     cd "$stage"
-    shasum -a 256 gate.patch argv manifest red-output.log > seal.sha256
+    sha256_files "$digest_tool" gate.patch argv manifest red-output.log > seal.sha256
   )
   chmod 0444 "$stage"/*
   mv "$stage" "$pkg"

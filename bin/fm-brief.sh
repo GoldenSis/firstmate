@@ -252,6 +252,7 @@ Classify every item as `complementary` or `contradictory`, or write `None` with 
 Give the explicit reason for every discarded idea, or write `None` with a reason.
 EOF
 )
+FUSION_SECTION+=$'\n\n'
 fi
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -259,9 +260,7 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 # Task
 {TASK}
 
-$FUSION_SECTION
-
-$HERDR_SECTION
+$FUSION_SECTION$HERDR_SECTION
 
 # Setup
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
