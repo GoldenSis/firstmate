@@ -339,6 +339,58 @@ test_scout_and_secondmate_scaffold() {
   pass "fm-brief: scout and secondmate code paths still scaffold well-formed briefs"
 }
 
+# The --fusion-synthesis variant (data/fusion-synthesis-v6/report.md) is a
+# scout-only scaffold that writes the mandatory synthesis contract and the
+# private promotion marker data/<id>/fusion-synthesis.
+test_fusion_synthesis_scout_scaffold_and_marker() {
+  local home id brief status
+  home="$TMP_ROOT/fusion-synth-home"
+  mkdir -p "$home/data"
+  id="brief-fusion-synth-f1"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" alpha --scout --fusion-synthesis >/dev/null 2>&1; status=$?
+  expect_code 0 "$status" "scout --fusion-synthesis brief should exit 0"
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "fusion-synthesis brief was not scaffolded"
+  assert_present "$home/data/$id/fusion-synthesis" \
+    "fusion-synthesis scaffold did not create the data/<id>/fusion-synthesis promotion marker"
+  assert_grep "SCOUT task" "$brief" "fusion-synthesis brief must remain a scout task"
+  assert_grep "## Consensus" "$brief" "fusion-synthesis brief missing the mandatory Consensus section"
+  assert_grep "## Divergence" "$brief" "fusion-synthesis brief missing the mandatory Divergence section"
+  assert_grep "## Discarded ideas" "$brief" "fusion-synthesis brief missing the mandatory Discarded ideas section"
+  assert_grep "complementary" "$brief" "fusion-synthesis brief must require complementary divergence classification"
+  assert_grep "contradictory" "$brief" "fusion-synthesis brief must require contradictory divergence classification"
+  assert_grep "None" "$brief" "fusion-synthesis brief must require an explicit None for an empty category"
+  pass "fm-brief.sh: --fusion-synthesis scaffolds the synthesis contract and marker"
+}
+
+test_fusion_synthesis_is_scout_only() {
+  local home status
+  home="$TMP_ROOT/fusion-synth-guard-home"
+  mkdir -p "$home/data"
+  # Default (ship) mode must reject the scout-only variant and write nothing.
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" fs-ship alpha --fusion-synthesis >/dev/null 2>&1; status=$?
+  expect_code 1 "$status" "--fusion-synthesis on a ship brief must be rejected"
+  assert_absent "$home/data/fs-ship/brief.md" "rejected ship --fusion-synthesis still wrote a brief"
+  assert_absent "$home/data/fs-ship/fusion-synthesis" "rejected ship --fusion-synthesis still wrote a marker"
+  # --secondmate must also reject it.
+  FM_HOME="$home" FM_SECONDMATE_CHARTER='ops' \
+    "$ROOT/bin/fm-brief.sh" fs-mate --secondmate alpha --fusion-synthesis >/dev/null 2>&1; status=$?
+  expect_code 1 "$status" "--fusion-synthesis on a secondmate charter must be rejected"
+  assert_absent "$home/data/fs-mate/brief.md" "rejected secondmate --fusion-synthesis still wrote a brief"
+  pass "fm-brief.sh: --fusion-synthesis is scout-only and guards ship/secondmate misuse"
+}
+
+test_ordinary_scout_writes_no_fusion_marker() {
+  local home
+  home="$TMP_ROOT/fusion-synth-control-home"
+  mkdir -p "$home/data"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" plain-scout alpha --scout >/dev/null 2>&1
+  assert_present "$home/data/plain-scout/brief.md" "ordinary scout brief was not scaffolded"
+  assert_absent "$home/data/plain-scout/fusion-synthesis" \
+    "an ordinary scout brief must not create the fusion-synthesis marker"
+  pass "fm-brief.sh: an ordinary scout brief writes no fusion marker"
+}
+
 test_script_parses
 test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
@@ -353,3 +405,6 @@ test_secondmate_no_projects_charter
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
+test_ordinary_scout_writes_no_fusion_marker
+test_fusion_synthesis_scout_scaffold_and_marker
+test_fusion_synthesis_is_scout_only

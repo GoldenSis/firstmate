@@ -118,6 +118,9 @@ The helper's header owns the exact signal detection, relocated-home limitation, 
 
 Ship tasks change projects and ship by project mode (`no-mistakes`, `direct-PR`, or `local-only`); scout tasks investigate, plan, reproduce bugs, or audit, then leave a report at `data/<id>/report.md` and never push.
 
+Model fusion composes ordinary scouts for independent explicit-model opinions, structured synthesis, and a validator-authored pre-builder gate before normal promotion.
+The [`model-fusion` skill](../.agents/skills/model-fusion/SKILL.md) owns the semantic overlay, while `bin/fm-fusion-gate.sh` owns only deterministic gate mechanics and never becomes a delivery reviewer.
+
 ## Dispatch profiles
 
 Crewmate and scout dispatch can stay on the static crewmate harness resolved by `config/crew-harness`, or it can use local dispatch profiles in `config/crew-dispatch.json`.
