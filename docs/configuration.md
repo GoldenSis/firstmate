@@ -10,8 +10,9 @@ The shared orchestrator behavior lives in [`AGENTS.md`](../AGENTS.md) - edit it 
 
 This section is the single owner of the top-level operational-home layout; producer script headers and their help own exact child-file fields and mutation contracts.
 The tracked code root contains the shared instruction, skill, documentation, workflow, and `bin/` surfaces, while each effective `FM_HOME` contains private operational directories.
-`data/` holds durable private fleet records such as the project and secondmate registries, captain preferences, optional shared captain preferences, learnings, backlog, briefs, scout reports, and model-fusion synthesis markers and sealed gates.
+`data/` holds durable private fleet records such as the project and secondmate registries, captain preferences, optional shared captain preferences, learnings, backlog, briefs, scout reports, question-first prototype manifests, and model-fusion synthesis markers and sealed gates.
 `bin/fm-brief.sh` writes the `data/<id>/fusion-synthesis` promotion marker, and `bin/fm-fusion-gate.sh` owns the exact `data/<id>/fusion-gate/` sealed-package mechanics.
+`bin/fm-brief.sh --scout --prototype` registers the `data/<id>/prototype.json` manifest through `bin/fm-prototype.sh`, whose header owns the exact `fm-prototype.v1` schema, safe-envelope values, worktree binding, evidence headings, and promotion checks.
 `state/` holds volatile runtime records such as task metadata, append-only status events, endpoint signals, watcher and wake-queue coordination, away-mode state, and generated X-mode artifacts.
 `config/` holds local gitignored operating choices, and `projects/` holds the local project clones that Firstmate reads but changes only through the guarded exceptions in `AGENTS.md`.
 
