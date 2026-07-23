@@ -6,10 +6,16 @@
 # description, acceptance criteria, and context, and may adjust other sections
 # when the task genuinely deviates (e.g. working an existing external PR instead
 # of shipping a new one).
-# Usage: fm-brief.sh <task-id> <repo-name> [--scout] [--fusion-synthesis] [--herdr-lab]
+# Usage: fm-brief.sh <task-id> <repo-name> [--scout] [--prototype <ui|logic-state> --question <question>] [--fusion-synthesis] [--herdr-lab]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
+#   --prototype <ui|logic-state> is a scout-only question-first prototype variant.
+#   It requires --question with one explicit uncertainty, registers the immutable
+#   safe envelope in data/<task-id>/prototype.json through fm-prototype.sh, and
+#   adds the prototype-lifecycle skill trigger to the brief. Prototype registration
+#   cannot be combined with fusion synthesis. fm-prototype.sh's help owns the
+#   manifest schema, evidence headings, binding, completion, and promotion checks.
 #   --fusion-synthesis is a scout-only variant for model fusion. It writes the
 #   mandatory synthesis-report contract and a private promotion marker at
 #   data/<task-id>/fusion-synthesis. The model-fusion skill owns orchestration.
@@ -77,16 +83,29 @@ KIND=ship
 HERDR_LAB=0
 NO_PROJECTS=0
 FUSION_SYNTHESIS=0
+PROTOTYPE_CLASS=
+PROTOTYPE_QUESTION=
 POS=()
-for a in "$@"; do
-  case "$a" in
+while [ "$#" -gt 0 ]; do
+  case "$1" in
     --scout) KIND=scout ;;
     --secondmate) KIND=secondmate ;;
     --fusion-synthesis) FUSION_SYNTHESIS=1 ;;
     --herdr-lab) HERDR_LAB=1 ;;
     --no-projects) NO_PROJECTS=1 ;;
-    *) POS+=("$a") ;;
+    --prototype)
+      [ "$#" -ge 2 ] || { echo "error: --prototype requires ui or logic-state" >&2; exit 1; }
+      PROTOTYPE_CLASS=$2
+      shift
+      ;;
+    --question)
+      [ "$#" -ge 2 ] || { echo "error: --question requires one explicit uncertainty" >&2; exit 1; }
+      PROTOTYPE_QUESTION=$2
+      shift
+      ;;
+    *) POS+=("$1") ;;
   esac
+  shift
 done
 ID=${POS[0]}
 
@@ -102,6 +121,26 @@ fi
 
 if [ "$FUSION_SYNTHESIS" -eq 1 ] && [ "$KIND" != scout ]; then
   echo "error: --fusion-synthesis requires --scout" >&2
+  exit 1
+fi
+
+if [ -n "$PROTOTYPE_CLASS" ] && [ "$KIND" != scout ]; then
+  echo "error: --prototype requires --scout" >&2
+  exit 1
+fi
+
+if [ -n "$PROTOTYPE_CLASS" ] && [ -z "$PROTOTYPE_QUESTION" ]; then
+  echo "error: --prototype requires --question with one explicit uncertainty" >&2
+  exit 1
+fi
+
+if [ -z "$PROTOTYPE_CLASS" ] && [ -n "$PROTOTYPE_QUESTION" ]; then
+  echo "error: --question applies only with --prototype" >&2
+  exit 1
+fi
+
+if [ -n "$PROTOTYPE_CLASS" ] && [ "$FUSION_SYNTHESIS" -eq 1 ]; then
+  echo "error: --prototype cannot be combined with --fusion-synthesis" >&2
   exit 1
 fi
 
@@ -254,13 +293,29 @@ EOF
 )
 FUSION_SECTION+=$'\n\n'
 fi
+PROTOTYPE_SECTION=""
+PROTOTYPE_DOD=""
+if [ -n "$PROTOTYPE_CLASS" ]; then
+  FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" \
+    "$FM_ROOT/bin/fm-prototype.sh" register "$ID" "$PROTOTYPE_CLASS" "$PROTOTYPE_QUESTION" >/dev/null
+PROTOTYPE_SECTION=$(cat <<EOF
+# Question-first prototype
+This scout is a registered \`$PROTOTYPE_CLASS\` prototype for one uncertainty: $PROTOTYPE_QUESTION
+Before any experiment work, read and follow \`$FM_ROOT/.agents/skills/prototype-lifecycle/SKILL.md\`.
+The prototype lifecycle has no sensitive exception flag and must stop before live sensitive systems.
+\`$FM_ROOT/bin/fm-prototype.sh --help\` owns the exact evidence and lifecycle commands.
+EOF
+)
+PROTOTYPE_SECTION+=$'\n\n'
+PROTOTYPE_DOD="Before the shared decision inventory, pass the registered prototype evidence gate described by \`$FM_ROOT/bin/fm-prototype.sh --help\`."
+fi
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
 # Task
 {TASK}
 
-$FUSION_SECTION$HERDR_SECTION
+$FUSION_SECTION$PROTOTYPE_SECTION$HERDR_SECTION
 
 # Setup
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
@@ -293,6 +348,7 @@ The report is the only thing that survives, so anything worth keeping must be in
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
 The report must stand alone: what you did, what you found, the evidence (commands run, output, file:line references), and what you recommend.
+$PROTOTYPE_DOD
 Before reporting done, read and follow \`$FM_ROOT/.agents/skills/decision-hold-lifecycle/SKILL.md\` and pass its shared completion gate for the report and any visual review.
 When the report is complete, append \`done: {one-line conclusion}\` to the status file and stop.
 If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.

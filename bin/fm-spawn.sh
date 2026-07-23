@@ -53,6 +53,12 @@
 #   --scout records kind=scout in the task's meta (report deliverable, scratch worktree;
 #   see AGENTS.md task lifecycle); --secondmate records kind=secondmate and launches in a
 #   provisioned firstmate home; the default is kind=ship.
+#   When data/<task-id>/prototype.json exists, spawn requires kind=scout, validates
+#   the registered question-first lifecycle before creating a runtime endpoint,
+#   then binds its baseline after every backend converges on the isolated worktree
+#   and after any worktree-local tool hook is installed, but before the harness
+#   launches. The shared placement makes prototype enforcement identical for
+#   every harness and runtime backend.
 #   Before a secondmate launch, the home is locally fast-forwarded to the primary
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the resolved task path is a real
@@ -647,6 +653,15 @@ else
   BRIEF="$DATA/$ID/brief.md"
 fi
 [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
+PROTOTYPE_MANIFEST="$DATA/$ID/prototype.json"
+if [ -e "$PROTOTYPE_MANIFEST" ] || [ -L "$PROTOTYPE_MANIFEST" ]; then
+  [ "$KIND" = scout ] || {
+    echo "error: registered prototype $ID must spawn with --scout" >&2
+    exit 1
+  }
+  FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" \
+    "$FM_ROOT/bin/fm-prototype.sh" check "$ID" >/dev/null
+fi
 
 # PROJ_ABS can still carry a symlinked path component (e.g. macOS's /tmp ->
 # /private/tmp) when it came from the ship/scout branch's logical `pwd` above.
@@ -973,6 +988,11 @@ EOF
       exclude_path '.fm-grok-turnend'
       ;;
   esac
+fi
+
+if [ -e "$PROTOTYPE_MANIFEST" ] || [ -L "$PROTOTYPE_MANIFEST" ]; then
+  FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" \
+    "$FM_ROOT/bin/fm-prototype.sh" bind "$ID" "$WT" >/dev/null
 fi
 
 # Per-project delivery mode + yolo flag (bin/fm-project-mode.sh; the project-management skill and AGENTS.md task lifecycle).
