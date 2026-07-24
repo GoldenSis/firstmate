@@ -57,6 +57,9 @@ HERDR_LAB_SESSION=$("$HERDR_LAB_HELPER" name fm-autodetect-smoke-concurrency-h3)
   fail "could not generate an isolated Herdr lab session name"
 }
 export HERDR_SESSION="$HERDR_LAB_SESSION"
+# shellcheck source=tests/herdr-test-safety.sh
+. "$ROOT/tests/herdr-test-safety.sh"
+herdr_lab_environment_ready "$HERDR_LAB_SESSION" || { echo "skip: no running default Herdr session (the isolated lab has no fleet-state tripwire to record)"; rm -rf "$TMP_ROOT"; exit 0; }
 ID="autodetectsmoke1"
 WT=
 cleanup_all() {

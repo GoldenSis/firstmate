@@ -29,6 +29,8 @@
 # declared scratch and the report at data/<task-id>/report.md is the work
 # product. Teardown proceeds only once the report exists and the shared
 # unresolved-decision completion gate verifies its captain-held inventory.
+# A scout marked by data/<task-id>/prototype.json must also pass the prototype
+# evidence and digest verification owned by fm-prototype.sh before teardown.
 # Before destructive cleanup, teardown validates task check artifacts and any
 # matching quarantine entries as ordinary single-link files on the state
 # device. It refuses and preserves task state when that proof fails; otherwise
@@ -1055,6 +1057,14 @@ if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
     echo "REFUSED: scout task $ID has not passed the unresolved-decision completion gate." >&2
     echo "Inventory its report and any visual review through bin/fm-decision-hold.sh before teardown." >&2
     exit 1
+  fi
+  if [ -e "$DATA/$ID/prototype.json" ] || [ -L "$DATA/$ID/prototype.json" ]; then
+    if ! FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" \
+        "$SCRIPT_DIR/fm-prototype.sh" verify "$ID" >/dev/null; then
+      echo "REFUSED: prototype scout $ID has not passed its durable evidence gate." >&2
+      echo "Complete and verify the question-first prototype evidence before teardown." >&2
+      exit 1
+    fi
   fi
 fi
 

@@ -27,6 +27,7 @@ command -v python3 >/dev/null 2>&1 || { echo "skip: python3 not found (required 
 
 SESSION="fm-lab-eventwait-smoke-$$"
 export HERDR_SESSION="$SESSION"
+herdr_lab_environment_ready "$SESSION" || { echo "skip: no running default Herdr session (the isolated lab has no fleet-state tripwire to record)"; exit 0; }
 SCRATCH=
 cleanup_all() {
   [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"

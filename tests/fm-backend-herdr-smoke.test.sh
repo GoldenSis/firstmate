@@ -29,6 +29,7 @@ command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the her
 
 SESSION="fm-lab-backend-smoke-$$"
 export HERDR_SESSION="$SESSION"
+herdr_lab_environment_ready "$SESSION" || { echo "skip: no running default Herdr session (the isolated lab has no fleet-state tripwire to record)"; exit 0; }
 SM_SCRATCH=
 cleanup_all() {
   [ -n "$SM_SCRATCH" ] && rm -rf "$SM_SCRATCH"
