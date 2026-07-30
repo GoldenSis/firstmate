@@ -133,6 +133,13 @@ An entry is removed when the relay acknowledges it, including a `duplicate:` ans
 An entry is also removed when the rejection is permanent (`invalid:`, `blocked:`, `pow:`), because replaying it could never succeed and would loop forever.
 A provisioning-shaped refusal (`auth-required:`, `restricted:`) is kept, since it can clear once the channel or membership exists.
 The cache is capped at 100 entries, dropping oldest first, because a newer bearings projection supersedes an older one anyway.
+A `.json.tmp` left by a kill between the cache write and its rename is swept once it is a minute old, so an interrupted run leaks neither an invisible file nor an unbounded pile of them.
+
+`auth-required:` is a special case of "it can clear", and it can clear inside the same run.
+The wait for a NIP-42 challenge has to be bounded, because an open relay never sends one and "no challenge yet" is indistinguishable from "no challenge ever" until a deadline passes.
+So a relay that challenges late gets published to before the handshake finishes, and refuses everything for it.
+The client answers that challenge when it lands and then re-offers exactly the events the unauthenticated window refused, which is what stops the same race being lost run after run with nothing published.
+The honest worst case remains: if the challenge arrives after both windows, the run ends unauthenticated, the events stay cached, and the next run races it again.
 
 ## Verification evidence
 

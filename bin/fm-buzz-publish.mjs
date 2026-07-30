@@ -22,7 +22,15 @@
 // line or in the process environment. Fields: privateKey, content, relay,
 // channelId, channelName, timeoutMs, replayDir, maxCache.
 
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, renameSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+  renameSync,
+} from "node:fs";
 import path from "node:path";
 import {
   buildBearingsEvent,
@@ -32,6 +40,7 @@ import {
   withRelay,
   DELIVERED,
   PERMANENT,
+  RETRYABLE,
 } from "./fm-buzz-lib.mjs";
 
 function log(message) {
@@ -59,10 +68,43 @@ function cacheEntries(replayDir) {
     .sort((a, b) => (a.createdAt - b.createdAt) || a.id.localeCompare(b.id));
 }
 
+// A `.json.tmp` is the half of cacheEvent's atomic write that a kill between the
+// write and the rename leaves behind. It matches neither the drain's `.json`
+// filter nor the cap's accounting, so without this it is never published, never
+// counted, and never removed - one signed projection leaked per interrupted run,
+// forever. Age-gated so a concurrent run's in-flight write is not deleted out
+// from under it; an incomplete entry is dropped rather than repaired, because
+// only a completed rename means the bytes are whole enough to send.
+const ORPHAN_TMP_AGE_MS = 60000;
+
+function sweepOrphanTemporaries(replayDir, now) {
+  let names;
+  try {
+    names = readdirSync(replayDir);
+  } catch {
+    return 0;
+  }
+  let swept = 0;
+  for (const name of names) {
+    if (!name.endsWith(".json.tmp")) continue;
+    const file = path.join(replayDir, name);
+    try {
+      if (now - statSync(file).mtimeMs < ORPHAN_TMP_AGE_MS) continue;
+      unlinkSync(file);
+      swept += 1;
+    } catch {
+      // Vanished under us, or never ours to remove.
+    }
+  }
+  if (swept > 0) log(`swept ${swept} interrupted cache write(s)`);
+  return swept;
+}
+
 // Keep the cache bounded. An unbounded queue after a long relay outage would grow
 // without limit and replay ancient fleet state; oldest-first is the right thing to
 // drop because a newer bearings projection supersedes an older one anyway.
 function pruneCache(replayDir, maxCache) {
+  sweepOrphanTemporaries(replayDir, Date.now());
   const entries = cacheEntries(replayDir);
   const excess = entries.length - maxCache;
   if (excess <= 0) return 0;
@@ -118,9 +160,12 @@ async function main() {
   log(`signed event ${event.id} (${Buffer.byteLength(content, "utf8")} bytes) for channel ${channelId}`);
 
   const pending = cacheEntries(replayDir);
-  let delivered = 0;
-  let kept = 0;
-  let discarded = 0;
+  // Final verdict per cache entry rather than running counters, because an entry
+  // can be attempted twice: a pass that ran before a late NIP-42 handshake
+  // completed is superseded by the one that ran after it, and incrementing
+  // counters would report the same event as both retained and delivered.
+  const outcome = new Map();
+  const authRefused = new Set();
 
   await withRelay(relay, privateKey, timeoutMs, async (api) => {
     // A challenged relay that refuses or never answers the response will refuse
@@ -132,78 +177,122 @@ async function main() {
     // Idempotent channel provisioning. The relay answers `duplicate: channel
     // already exists` on every run after the first; a failure here is not fatal
     // because the channel may already exist and only the message matters.
-    try {
-      const create = buildChannelCreateEvent(
-        channelId,
-        channelName,
-        "Firstmate bearings projections (read-only publisher)",
-        privateKey,
-      );
-      const response = await api.publish(create);
-      if (!response.accepted && !String(response.message).startsWith("duplicate:")) {
-        log(`channel provisioning refused: ${response.message}`);
-      }
-    } catch (error) {
-      log(`channel provisioning failed: ${error.message}`);
-    }
-
-    for (const entry of pending) {
-      let raw;
+    // Returns true when the refusal was `auth-required:`, which is a statement
+    // about the handshake rather than about the channel.
+    const provisionChannel = async () => {
       try {
-        raw = readFileSync(entry.file, "utf8");
-      } catch {
-        continue; // pruned or removed concurrently
-      }
-      let parsed;
-      try {
-        parsed = JSON.parse(raw)[1];
-      } catch {
-        // A corrupt cache entry can never be delivered; drop it rather than
-        // retrying it on every future run.
-        log(`dropping unparseable cache entry ${entry.name}`);
-        try {
-          unlinkSync(entry.file);
-        } catch { /* already gone */ }
-        discarded += 1;
-        continue;
-      }
-      // The relay verdict and the cache eviction are settled separately on
-      // purpose. Evicting inside the publish try meant a failed unlink AFTER a
-      // successful delivery was caught as "delivery unresolved" and counted as
-      // retained - reporting a landed event as lost and turning a local
-      // filesystem hiccup into a non-zero exit. The event's fate is decided by
-      // the relay; a leftover file is only a redundant replay, which the relay's
-      // id dedupe absorbs.
-      let verdict;
-      try {
-        const response = await api.publish(parsed, raw);
-        verdict = classifyOkResponse(response.accepted, response.message);
-        if (verdict === PERMANENT) log(`permanently rejected ${entry.id}: ${response.message}`);
-        if (verdict !== DELIVERED && verdict !== PERMANENT) {
-          log(`retryable rejection for ${entry.id}: ${response.message}`);
+        const create = buildChannelCreateEvent(
+          channelId,
+          channelName,
+          "Firstmate bearings projections (read-only publisher)",
+          privateKey,
+        );
+        const response = await api.publish(create);
+        const message = String(response.message);
+        if (!response.accepted && !message.startsWith("duplicate:")) {
+          log(`channel provisioning refused: ${message}`);
+          return message.startsWith("auth-required:");
         }
       } catch (error) {
-        // Includes the genuinely-unknown case: sent, socket closed, no OK. The
-        // entry stays cached and the relay's id dedupe makes the replay a no-op
-        // if it did in fact land.
-        log(`delivery unresolved for ${entry.id}: ${error.message}`);
-        kept += 1;
-        continue;
+        log(`channel provisioning failed: ${error.message}`);
       }
+      return false;
+    };
 
-      if (verdict === DELIVERED) delivered += 1;
-      else if (verdict === PERMANENT) discarded += 1;
-      else {
-        kept += 1;
-        continue;
+    // Offer `entries` to the relay, recording each one's verdict. Returns true if
+    // anything was refused for want of authentication.
+    const drain = async (entries) => {
+      let authBlocked = false;
+      for (const entry of entries) {
+        let raw;
+        try {
+          raw = readFileSync(entry.file, "utf8");
+        } catch {
+          outcome.delete(entry.id);
+          continue; // pruned or removed concurrently
+        }
+        let parsed;
+        try {
+          parsed = JSON.parse(raw)[1];
+        } catch {
+          // A corrupt cache entry can never be delivered; drop it rather than
+          // retrying it on every future run.
+          log(`dropping unparseable cache entry ${entry.name}`);
+          try {
+            unlinkSync(entry.file);
+          } catch { /* already gone */ }
+          outcome.set(entry.id, PERMANENT);
+          continue;
+        }
+        // The relay verdict and the cache eviction are settled separately on
+        // purpose. Evicting inside the publish try meant a failed unlink AFTER a
+        // successful delivery was caught as "delivery unresolved" and counted as
+        // retained - reporting a landed event as lost and turning a local
+        // filesystem hiccup into a non-zero exit. The event's fate is decided by
+        // the relay; a leftover file is only a redundant replay, which the relay's
+        // id dedupe absorbs.
+        let verdict;
+        try {
+          const response = await api.publish(parsed, raw);
+          const message = String(response.message);
+          verdict = classifyOkResponse(response.accepted, message);
+          if (verdict === PERMANENT) log(`permanently rejected ${entry.id}: ${message}`);
+          if (verdict !== DELIVERED && verdict !== PERMANENT) {
+            log(`retryable rejection for ${entry.id}: ${message}`);
+            if (message.startsWith("auth-required:")) {
+              authBlocked = true;
+              authRefused.add(entry.id);
+            }
+          }
+        } catch (error) {
+          // Includes the genuinely-unknown case: sent, socket closed, no OK. The
+          // entry stays cached and the relay's id dedupe makes the replay a no-op
+          // if it did in fact land.
+          log(`delivery unresolved for ${entry.id}: ${error.message}`);
+          outcome.set(entry.id, RETRYABLE);
+          continue;
+        }
+
+        outcome.set(entry.id, verdict);
+        if (verdict !== DELIVERED && verdict !== PERMANENT) continue;
+        try {
+          unlinkSync(entry.file);
+        } catch (error) {
+          log(`could not drop settled cache entry ${entry.name}: ${error.message}`);
+        }
       }
-      try {
-        unlinkSync(entry.file);
-      } catch (error) {
-        log(`could not drop settled cache entry ${entry.name}: ${error.message}`);
+      return authBlocked;
+    };
+
+    const blockedByProvisioning = await provisionChannel();
+    const blockedByDrain = await drain(pending);
+
+    // `auth-required:` here means the handshake window closed before the relay's
+    // challenge arrived, not that this home may not publish. Settling that
+    // challenge and re-offering exactly what it refused is what keeps a relay
+    // that challenges late from wedging the cache: without it the same race is
+    // re-run every time and the home never publishes at all.
+    if (blockedByProvisioning || blockedByDrain) {
+      const late = await api.completeLateAuthentication();
+      if (late === "authenticated") {
+        const retry = pending.filter((entry) => authRefused.has(entry.id));
+        log(`authenticated after the handshake window; re-attempting ${retry.length} refused event(s)`);
+        await provisionChannel();
+        await drain(retry);
+      } else if (late === "refused" || late === "unacknowledged") {
+        log(`NIP-42 authentication ${late} after the handshake window; refused events stay cached`);
       }
     }
   });
+
+  let delivered = 0;
+  let kept = 0;
+  let discarded = 0;
+  for (const verdict of outcome.values()) {
+    if (verdict === DELIVERED) delivered += 1;
+    else if (verdict === PERMANENT) discarded += 1;
+    else kept += 1;
+  }
 
   log(`delivered=${delivered} retained=${kept} discarded=${discarded} relay=${relay}`);
   return kept === 0 ? 0 : 1;

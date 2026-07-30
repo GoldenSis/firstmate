@@ -508,6 +508,41 @@ EOF
   pass "a challenge that lands late is still answered before anything is published"
 }
 
+test_a_challenge_past_the_handshake_window_still_lands_the_event() {
+  # The window that waits for the challenge cannot be unbounded - an open relay
+  # never sends one and would pay the whole deadline for nothing - so a challenge
+  # can always arrive after it closes. That is the case this pins: 800ms against a
+  # 500ms window, which means the first pass really does publish unauthenticated
+  # and really is refused `auth-required:`. What must not follow is the failure
+  # this replaced: refused, classified retryable, retained, and the same race lost
+  # again on every future run, so the home never publishes at all. The challenge is
+  # answered from the frame handler, the second window collects that answer, and
+  # exactly the refused events are re-offered.
+  local home relay output
+  home=$(make_home past-window-challenge)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub --challenge --challenge-delay-ms 800)
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"past-window"}' \
+    | run_publish "$home" "$relay" 2>&1)
+  kill "$STUB_PID" 2>/dev/null
+  STUB_PID=""
+
+  assert_contains "$output" "auth-required" \
+    "the first pass was expected to publish before the challenge arrived; this test no longer covers the late-challenge branch"
+  assert_contains "$output" "authenticated after the handshake window" \
+    "the challenge that arrived after the window was never settled"
+  assert_contains "$output" "delivered=1" \
+    "the event refused before authentication was never re-attempted"
+  assert_contains "$output" "retained=0" \
+    "an event refused only for want of authentication was left in the cache"
+  [ "$(replay_count "$home")" = "0" ] \
+    || fail "the event was retained even though the connection ended up authenticated"
+  pass "a challenge arriving past the handshake window still lands the refused event"
+}
+
 test_permanent_rejection_is_not_replayed_forever() {
   local home relay
   home=$(make_home permanent)
@@ -575,6 +610,37 @@ test_replay_cache_is_capped_at_100() {
   pass "the replay cache is capped at 100, dropping oldest first"
 }
 
+test_an_interrupted_cache_write_is_swept_not_leaked() {
+  # A `.json.tmp` is the half of the atomic cache write that a kill between the
+  # write and the rename leaves behind. It matches neither the drain's filter nor
+  # the cap's accounting, so unswept it is invisible AND immortal: never sent,
+  # never counted, never removed, one leaked signed projection per interrupted
+  # run. An in-flight write from a concurrent run must survive, though, so the
+  # sweep is age-gated and this checks both halves.
+  local home stale fresh count
+  home=$(make_home orphan-tmp)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  mkdir -p "$home/state/buzz-replay"
+
+  stale="$home/state/buzz-replay/1700000001-$(printf '%064d' 1).json.tmp"
+  fresh="$home/state/buzz-replay/1700000002-$(printf '%064d' 2).json.tmp"
+  printf '["EVENT",{"id":"%064d","created_at":1700000001}]' 1 > "$stale"
+  printf '["EVENT",{"id":"%064d","created_at":1700000002}]' 2 > "$fresh"
+  touch -t 202001010000 "$stale" || fail "could not age the stale temp file"
+
+  printf '%s' '{"schema":"fm-bearings.v1","note":"orphan"}' \
+    | run_publish "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
+
+  assert_absent "$stale" "an interrupted cache write was left behind forever"
+  assert_present "$fresh" "the sweep deleted a concurrent run's in-flight write"
+
+  # And the surviving temp file must not be mistaken for a deliverable entry.
+  count=$(replay_count "$home")
+  [ "$count" = "1" ] \
+    || fail "a .json.tmp was counted as a cache entry (found $count, expected only the new event)"
+  pass "an interrupted cache write is swept, and a fresh one is not"
+}
+
 # --- the contract means TERMINATING, not just exiting 0 --------------------
 
 test_a_writer_that_never_closes_does_not_hang_the_publish() {
@@ -627,6 +693,60 @@ test_a_writer_that_never_closes_does_not_hang_the_publish() {
   [ "$(replay_count "$home")" = "0" ] \
     || fail "a truncated projection must never be signed and enqueued"
   pass "a writer that never closes stdin cannot hang the publish"
+}
+
+test_a_signalled_read_leaves_no_projection_in_temp() {
+  # The spool holds the bearings projection - task ids, project names, blockers,
+  # PR URLs - in a shared temp directory. Being killed mid-read is precisely the
+  # case the watchdog exists for, so it is precisely the case that must not leave
+  # that content lying around with no owner.
+  local home fifo spooldir pid waited
+  home=$(make_home stdin-signal)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  spooldir="$TMP_ROOT/stdin-signal-tmp"
+  mkdir -p "$spooldir"
+  fifo="$TMP_ROOT/signal.fifo"
+  rm -f "$fifo"
+  mkfifo "$fifo" || fail "could not create the test fifo"
+
+  # Read-write, so this end never sends EOF and the read is still in flight when
+  # the signal lands.
+  exec 8<>"$fifo"
+  printf '%s' '{"schema":"fm-bearings.v1","note":"in-flight' >&8
+
+  # `env` rather than run_publish, so the recorded pid is the script itself: a
+  # signal sent to an intervening subshell would never reach the trap under test.
+  env TMPDIR="$spooldir" FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" \
+    FM_STATE_OVERRIDE="$home/state" XDG_DATA_HOME="$home/xdg" \
+    FM_BUZZ_FORCE_FILE_STORE=1 FM_BUZZ_TIMEOUT_MS=8000 \
+    "$PUBLISH" --relay "ws://127.0.0.1:1" < "$fifo" > /dev/null 2>&1 &
+  pid=$!
+
+  waited=0
+  while [ -z "$(find "$spooldir" -name 'fm-buzz-stdin.*' 2>/dev/null)" ] && [ "$waited" -lt 100 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if [ -z "$(find "$spooldir" -name 'fm-buzz-stdin.*' 2>/dev/null)" ]; then
+    kill "$pid" 2>/dev/null
+    exec 8>&-
+    rm -f "$fifo"
+    fail "the read never spooled, so this test is not exercising the signal path"
+  fi
+
+  kill -TERM "$pid" 2>/dev/null
+  waited=0
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 100 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  exec 8>&-
+  rm -f "$fifo"
+
+  [ -z "$(find "$spooldir" -name 'fm-buzz-stdin.*' 2>/dev/null)" ] \
+    || fail "a signalled run left the bearings projection behind in $spooldir"
+  pass "a signalled stdin read leaves no projection in the temp directory"
 }
 
 # --- the contract itself ---------------------------------------------------
@@ -691,10 +811,13 @@ test_reconnect_replays_the_identical_event_id
 test_replaying_a_known_event_is_deduped_and_evicted
 test_an_unacknowledged_publish_does_not_starve_the_drain
 test_a_late_auth_challenge_is_still_answered
+test_a_challenge_past_the_handshake_window_still_lands_the_event
 test_permanent_rejection_is_not_replayed_forever
 test_retryable_rejection_is_kept
 test_replay_cache_is_capped_at_100
+test_an_interrupted_cache_write_is_swept_not_leaked
 test_a_writer_that_never_closes_does_not_hang_the_publish
+test_a_signalled_read_leaves_no_projection_in_temp
 test_fire_and_forget_contract_is_intact
 test_the_private_key_reaches_no_command_line
 test_no_firstmate_path_depends_on_buzz

@@ -197,9 +197,17 @@ function buildAuthEvent(relayUrl, challenge, privateKeyHex) {
 // come, and it is the sole timer here that can expire in normal operation: a
 // NIP-42 relay issues its AUTH frame with the handshake, so the wait ends on
 // arrival, while an open relay never sends one and the deadline is what lets the
-// run proceed. A late challenge is answered when it lands (see the AUTH branch
-// below), so the deadline costs an unauthenticated first attempt at worst rather
-// than an unauthenticated connection.
+// run proceed. It cannot be unbounded, because "never challenged" and "challenged
+// eventually" are indistinguishable until the deadline passes, and an open relay
+// must not pay for that.
+//
+// Losing that race therefore costs a whole unauthenticated pass, not one event:
+// the caller publishes, every event comes back `auth-required:`, and every one is
+// classified retryable. `completeLateAuthentication` is the second and last
+// window - it settles the challenge that arrived during that pass and lets the
+// caller re-attempt what the unauthenticated window refused. Honest worst case:
+// a relay whose AUTH lands after BOTH windows leaves the run unauthenticated and
+// every event cached for the next run, which will race it again.
 async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = {}) {
   if (typeof WebSocket !== "function") {
     throw new Error("this Node build has no global WebSocket");
@@ -212,6 +220,7 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = 
   let challengeWaiter = null; // resolve fn armed while authenticateIfChallenged waits
   let challengeWaitDone = false; // true once the up-front handshake attempt settled
   let authSent = false;
+  let lateAuth = null; // promise for a challenge answered after the handshake window
   const subscriptions = new Map(); // sub id -> {events, resolve}
 
   const closed = new Promise((resolve) => {
@@ -252,10 +261,12 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = 
         resolve(authChallenge);
       } else if (challengeWaitDone && !authSent) {
         // The up-front handshake gave up before this challenge landed, so nobody
-        // will ever wait for it. Answer it here instead, so the rest of the
-        // connection is authenticated rather than every remaining event being
-        // refused with `auth-required:` for want of a reply nobody sent.
-        socket.send(authFrame(buildAuthResponse(authChallenge)));
+        // will ever wait for it. Answer it here instead, and KEEP the promise:
+        // sending the response is not the same as the relay having accepted it,
+        // and a caller whose events were refused while this was outstanding needs
+        // to know when - and whether - authentication actually completed before it
+        // re-attempts them.
+        lateAuth = respondToChallenge(authChallenge);
       }
       // Before that point the challenge is simply recorded: authenticateIfChallenged
       // picks it up and waits for the relay's answer to the response, which is the
@@ -310,15 +321,26 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = 
     }
   }
 
-  // Sign the NIP-42 response to `challenge`. Marks the handshake as answered, so
-  // one challenge is never responded to twice.
-  function buildAuthResponse(challenge) {
+  // Sign the NIP-42 response to `challenge`, send it, and settle on the OK the
+  // relay keys to the auth event's id. Marks the handshake as answered before it
+  // awaits anything, so one challenge is never responded to twice. Never rejects:
+  // the outcome is always one of the four names below.
+  async function respondToChallenge(challenge) {
     authSent = true;
-    return buildAuthEvent(relayUrl, challenge, privateKeyHex);
-  }
-
-  function authFrame(authEvent) {
-    return JSON.stringify(["AUTH", authEvent]);
+    const authEvent = buildAuthEvent(relayUrl, challenge, privateKeyHex);
+    try {
+      const response = await sendAndAwaitOk(
+        JSON.stringify(["AUTH", authEvent]),
+        authEvent.id,
+        publishTimeoutMs,
+      );
+      return response.accepted ? "authenticated" : "refused";
+    } catch {
+      // A relay that takes the AUTH and says nothing is not a reason to abandon
+      // the run: publishing decides delivery, and an `auth-required:` answer
+      // there is already classified as retryable.
+      return "unacknowledged";
+    }
   }
 
   // Resolve with the challenge the moment it arrives, or with null when the
@@ -356,17 +378,29 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = 
     async authenticateIfChallenged() {
       const challenge = await awaitChallenge();
       if (!challenge) return "not-challenged";
+      if (lateAuth) return lateAuth;
       if (authSent) return "already-answered";
-      const authEvent = buildAuthResponse(challenge);
-      try {
-        const response = await sendAndAwaitOk(authFrame(authEvent), authEvent.id, publishTimeoutMs);
-        return response.accepted ? "authenticated" : "refused";
-      } catch {
-        // A relay that takes the AUTH and says nothing is not a reason to abandon
-        // the run: publishing decides delivery, and an `auth-required:` answer
-        // there is already classified as retryable.
-        return "unacknowledged";
-      }
+      return respondToChallenge(challenge);
+    },
+
+    // The second and final authentication window, for a caller that published
+    // during the unauthenticated gap and got `auth-required:` back. Three cases,
+    // all of which end here rather than in another guess:
+    //   the challenge landed mid-publish - the frame handler already answered it
+    //     and this returns that answer's real outcome;
+    //   the challenge has not landed yet - wait one more bounded window, since
+    //     `auth-required:` proves the relay does intend to challenge;
+    //   it never lands - "not-challenged", and the caller keeps its events cached.
+    // Returns the same names as authenticateIfChallenged.
+    async completeLateAuthentication() {
+      if (lateAuth) return lateAuth;
+      if (authSent) return "already-answered";
+      const challenge = await awaitChallenge();
+      if (!challenge) return "not-challenged";
+      if (lateAuth) return lateAuth;
+      if (authSent) return "already-answered";
+      lateAuth = respondToChallenge(challenge);
+      return lateAuth;
     },
 
     // Send one already-signed event and wait for its OK. `raw` is the exact

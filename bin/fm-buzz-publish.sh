@@ -75,7 +75,34 @@ log() {
   printf 'fm-buzz-publish: %s\n' "$1" >&2
 }
 
-# Spool stdin to a file under a total deadline, then print it.
+# The stdin spool holds the bearings projection - task ids, project names,
+# blockers, PR URLs - in a shared temp directory, so it must not outlive the run
+# that created it. The in-line `rm` covers the ordinary returns; this covers the
+# signalled ones, which is exactly the case the read watchdog exists for.
+#
+# The handler deliberately does NOT exit: a trapped signal interrupts the pending
+# `wait`, the read reports failure, and the script falls through to its single
+# unconditional `exit 0` on its own. Adding an `exit` here would put a second exit
+# on a signal path, and swallowing the signal without one would make the script
+# unkillable; letting the normal tail run does neither.
+STDIN_SPOOL=""
+drop_stdin_spool() {
+  if [ -n "$STDIN_SPOOL" ]; then
+    rm -f -- "$STDIN_SPOOL"
+    STDIN_SPOOL=""
+  fi
+}
+trap drop_stdin_spool EXIT INT TERM HUP
+
+# Spool stdin into the caller's file under a total deadline. Reports status only;
+# the caller owns the spool and reads it afterwards.
+#
+# The spool path is the CALLER's, and this function is invoked as a plain command
+# rather than inside `$(...)`, both for the same reason: a command substitution
+# runs in a subshell, where a trap set out here does not fire and an assignment
+# made in there never reaches the trap's variable. Spooling from the main shell is
+# what lets the signal handler above see the file at all - and what lets the signal
+# interrupt the `wait` below instead of being deferred until the substitution ends.
 #
 # An unbounded read is the one way this script could fail to RETURN even though it
 # cannot fail to exit non-zero, and for a caller a hang is strictly worse than a
@@ -95,9 +122,8 @@ log() {
 # after the read finished, and a caller doing `output=$(fm-buzz-publish.sh ...)`
 # blocks on that fd until it drains - which would reintroduce, in the caller, the
 # very hang this function exists to prevent.
-read_stdin_bounded() {
-  local spool reader watchdog rc
-  spool=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-stdin.XXXXXX") || return 1
+read_stdin_bounded() {  # <spool>
+  local spool=$1 reader watchdog rc
   cat <&0 > "$spool" &
   reader=$!
   (
@@ -115,13 +141,6 @@ read_stdin_bounded() {
   rc=$?
   kill "$watchdog" 2>/dev/null
   wait "$watchdog" 2>/dev/null
-  if [ "$rc" -ne 0 ]; then
-    rm -f -- "$spool"
-    return 1
-  fi
-  cat "$spool"
-  rc=$?
-  rm -f -- "$spool"
   return "$rc"
 }
 
@@ -144,10 +163,17 @@ publish() {
       log "stdin is a terminal; pipe the projection in or use --refresh"
       return 1
     fi
-    content=$(read_stdin_bounded) || {
-      log "could not read the projection from stdin within ${STDIN_TIMEOUT_S}s"
+    STDIN_SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-stdin.XXXXXX") || {
+      log "could not create a temporary file for the projection"
       return 1
     }
+    if ! read_stdin_bounded "$STDIN_SPOOL"; then
+      drop_stdin_spool
+      log "could not read the projection from stdin within ${STDIN_TIMEOUT_S}s"
+      return 1
+    fi
+    content=$(cat "$STDIN_SPOOL")
+    drop_stdin_spool
   fi
   [ -n "$content" ] || { log "the projection is empty; skipping publish"; return 1; }
 
