@@ -123,7 +123,11 @@ async function main() {
   let discarded = 0;
 
   await withRelay(relay, privateKey, timeoutMs, async (api) => {
-    await api.authenticateIfChallenged();
+    // A challenged relay that refuses or never answers the response will refuse
+    // the events too, and `auth-required:` on its own does not say why. Naming the
+    // handshake outcome once is what makes that stderr line diagnosable.
+    const auth = await api.authenticateIfChallenged();
+    if (auth === "refused" || auth === "unacknowledged") log(`NIP-42 authentication ${auth}`);
 
     // Idempotent channel provisioning. The relay answers `duplicate: channel
     // already exists` on every run after the first; a failure here is not fatal

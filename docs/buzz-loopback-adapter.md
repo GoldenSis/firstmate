@@ -27,6 +27,13 @@ Each one is the reason a specific failure mode cannot occur, and breaching any o
 2. **Loopback only.**
    The relay is published to `127.0.0.1` and nothing else, and there is no hosted `buzz.xyz` account.
    This is what makes Buzz's missing rate limiting irrelevant: upstream defines four rate-limit tiers but ships only a test-stub limiter, so an internet-exposed relay would have no flood or brute-force protection at the application layer.
+
+   Loopback is not the same boundary as single-user, and the difference is worth stating rather than blurring.
+   The relay runs open - no auth token, no membership enforcement - so any local process on this host, running as any user, can reach `127.0.0.1:3000` and publish.
+   The channel id is not a secret either: `channelIdForLabel` is a plain SHA-256 of the `FM_HOME` path, derived on purpose so a lost keypair cannot orphan the channel.
+   A local process that created the group first would own it and could read the bearings projections published into it.
+   That is an accepted risk for a proof of concept on a single-user laptop with a disposable stack; the boundary actually being relied on is "no other local user", not "no remote party".
+   Closing it means enforcing membership, which belongs to Milestone 2 along with the rest of channel membership management.
 3. **Publishing is fire-and-forget.**
    `bin/fm-buzz-publish.sh` always exits 0.
    A non-zero exit from it is a bug, and `tests/fm-buzz-publish.test.sh` asserts both the behavior and the structure that produces it.
@@ -156,8 +163,9 @@ It exists because this host has no secp256k1 binding and the repo deliberately c
 It is checked against the official BIP-340 vectors, including all ten negative cases, but it must not be reused for a key that guards anything.
 That is acceptable for exactly this key: it signs fleet-status projections on a loopback relay, grants no authority, and is cheap to re-mint.
 
-Buzz documents no key-rotation procedure.
-Rotation here means deleting the keychain entry and `data/buzz-keypair.public`, then re-running `bin/fm-buzz-keypair.sh`.
+Buzz documents no key-rotation procedure, so `bin/fm-buzz-keypair.sh --rotate` is this adapter's.
+It clears both stores - the keychain entry and the `0600` fallback file - plus `data/buzz-keypair.public`, then mints a fresh keypair and prints the new public key, and it refuses to report success if the old key is still loadable afterwards.
+Rotating by hand is not offered because it does not work reliably: which store holds the key depends on the host, and the fallback file's name carries a digest of the home path, so deleting "the keychain entry" on a machine whose key lives in the file clears nothing and the next run re-prints the same public key.
 Historical events stay signed by the retired key, which is acceptable precisely because the key grants nothing.
 
 Buzz is pre-1.0 with no long-term support branches and a very high release cadence, so `ghcr.io/block/buzz:main` can move under this adapter at any time.

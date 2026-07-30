@@ -21,13 +21,14 @@
 //
 // Usage: node tests/fm-buzz-stub-relay.mjs [--port N] [--reject <message>]
 //                                          [--drop-after-event] [--challenge]
+//                                          [--challenge-delay-ms N]
 //                                          [--duplicate-refused] [--silent-ok]
 // Prints "listening <port>" on stdout once ready, so a caller can use port 0 and
 // learn the ephemeral port.
 
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
-import { computeEventId } from "../bin/fm-buzz-lib.mjs";
+import { computeEventId, KIND_NIP42_AUTH } from "../bin/fm-buzz-lib.mjs";
 import { schnorrVerify } from "../bin/fm-buzz-crypto.mjs";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -36,7 +37,16 @@ const argv = process.argv.slice(2);
 let port = 0;
 let reject = null;
 let dropAfterEvent = false;
+// --challenge models a NIP-42 relay properly, which means ENFORCING it: the
+// challenge goes out on upgrade, an unauthenticated EVENT is refused with
+// `auth-required:`, and the AUTH response is answered with an OK keyed to the auth
+// event's id. A stub that challenged and then accepted everything anyway would let
+// a broken handshake pass every test.
 let challenge = false;
+// How long after the upgrade the challenge is sent. The default is "immediately",
+// which is what a real relay does; a delay is how a test proves the client waits
+// for the frame instead of guessing when it will arrive.
+let challengeDelayMs = 0;
 // A relay may answer a known id either way: NIP-01 suggests OK true for an event
 // it already has, but Buzz refuses an existing row outright - the publisher's own
 // channel-provisioning check exists because `duplicate: channel already exists`
@@ -55,6 +65,7 @@ for (let i = 0; i < argv.length; i += 1) {
   else if (argv[i] === "--reject") reject = argv[++i];
   else if (argv[i] === "--drop-after-event") dropAfterEvent = true;
   else if (argv[i] === "--challenge") challenge = true;
+  else if (argv[i] === "--challenge-delay-ms") challengeDelayMs = Number(argv[++i]);
   else if (argv[i] === "--duplicate-refused") duplicateRefused = true;
   else if (argv[i] === "--silent-ok") silentOk = true;
 }
@@ -158,7 +169,17 @@ server.on("upgrade", (req, socket) => {
     if (!socket.destroyed) socket.write(encodeFrame(JSON.stringify(message)));
   };
 
-  if (challenge) send(["AUTH", "0".repeat(64)]);
+  const challengeString = "0".repeat(64);
+  let challengeIssued = false;
+  let authenticated = false;
+  if (challenge) {
+    const issue = () => {
+      challengeIssued = true;
+      send(["AUTH", challengeString]);
+    };
+    if (challengeDelayMs > 0) setTimeout(issue, challengeDelayMs).unref();
+    else issue();
+  }
 
   let buffer = Buffer.alloc(0);
   socket.on("data", (chunk) => {
@@ -177,9 +198,31 @@ server.on("upgrade", (req, socket) => {
         continue;
       }
       const [type] = parsed;
-      if (type === "AUTH") continue; // accepted without further checks
+      if (type === "AUTH") {
+        // NIP-42: the response is a kind-22242 event carrying the challenge, and
+        // the relay answers it with an OK keyed to that event's id. Verifying it
+        // here is what turns "authenticated" into a real assertion, and answering
+        // it is the frame the client waits on instead of sleeping.
+        const event = parsed[1] ?? {};
+        const carries = (event.tags ?? []).some(
+          (tag) => tag[0] === "challenge" && tag[1] === challengeString,
+        );
+        const valid =
+          challengeIssued &&
+          event.kind === KIND_NIP42_AUTH &&
+          carries &&
+          computeEventId(event) === event.id &&
+          schnorrVerify(event.id, event.pubkey, event.sig);
+        if (valid) authenticated = true;
+        send(["OK", event.id, valid, valid ? "" : "error: bad auth response"]);
+        continue;
+      }
       if (type === "EVENT") {
         const event = parsed[1];
+        if (challenge && !authenticated) {
+          send(["OK", event.id, false, "auth-required: we only accept events from authenticated users"]);
+          continue;
+        }
         if (dropAfterEvent) {
           // Simulate a kill mid-publish: the relay received the event but the
           // connection dies before the OK is written. The client must treat this

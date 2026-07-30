@@ -15,6 +15,23 @@
 # has no brute-force or flood protection. Loopback-only is what makes that gap
 # irrelevant. See docs/buzz-loopback-adapter.md for the full invariant list.
 #
+# WHAT LOOPBACK DOES AND DOES NOT BUY, STATED PLAINLY
+# Loopback keeps the relay off the network. It does NOT make it single-user. Every
+# local process running as any user on this host can open 127.0.0.1:3000 and speak
+# to the relay, and the settings below accept them: this is an open relay, with no
+# auth token and no membership enforcement. The channel is no barrier either -
+# channelIdForLabel (bin/fm-buzz-lib.mjs) is a plain SHA-256 of the FM_HOME path,
+# derived rather than random and therefore not a secret. A local process that
+# creates the group first becomes its owner and can read the bearings projections
+# published into it, which are captain-private fleet state (task ids, project
+# names, blockers, PR URLs).
+#
+# That local-process exposure is an ACCEPTED RISK for this proof of concept, on a
+# single-user laptop, with a disposable stack. It is recorded here rather than
+# argued away, because the real boundary being relied on is "no other local user",
+# not "no remote party". Enforcing membership so the boundary matches the claim
+# belongs to Milestone 2, which already owns channel membership management.
+#
 # THE ONE PUBLISHED PORT, AND WHY IT READS AS IT DOES
 # Only the relay is published, and only to 127.0.0.1. Postgres, Redis and MinIO are
 # deliberately NOT published at all - they are reachable only over the internal
@@ -65,9 +82,11 @@ services:
       # Disposable stack: migrate on boot so `up -d` is the whole setup step and
       # `down -v` is the whole teardown step.
       BUZZ_AUTO_MIGRATE: "true"
-      # Open relay. Correct ONLY because the relay is loopback-only: the single
-      # local Firstmate key needs no membership provisioning to publish, and no
-      # remote party can reach the socket to take advantage of it.
+      # Open relay: the single local Firstmate key publishes with no membership
+      # provisioning step. What this rests on is that no REMOTE party can reach the
+      # socket - it does not keep other LOCAL processes out, and nothing here does.
+      # See "WHAT LOOPBACK DOES AND DOES NOT BUY" above for the accepted risk and
+      # for why enforcement is Milestone 2's rather than a value flipped here.
       BUZZ_REQUIRE_AUTH_TOKEN: "false"
       BUZZ_REQUIRE_RELAY_MEMBERSHIP: "false"
       BUZZ_GIT_CONFORMANCE_PROBE: "false"

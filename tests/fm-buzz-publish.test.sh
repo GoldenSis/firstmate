@@ -216,6 +216,40 @@ test_two_homes_sharing_one_xdg_get_separate_keys() {
   pass "two homes sharing one XDG_DATA_HOME get separate keys"
 }
 
+test_rotation_replaces_the_key_in_whichever_store_holds_it() {
+  # A rotation that clears one store and leaves the other is a rotation that
+  # silently does not rotate: the next load finds the surviving key and re-prints
+  # the same public key. On every host with no reachable keychain - which is this
+  # suite, CI, and all of Linux - the key is in the fallback file, under a
+  # digest-derived name no operator can delete by hand. So the check that matters
+  # is behavioural: the public key must actually change.
+  local home first second third keyfile stored combined code
+  home=$(make_home rotate)
+  keyfile=$(key_file "$home" "$home/xdg")
+
+  first=$(run_keypair "$home" 2>/dev/null) || fail "keypair creation failed"
+  second=$(run_keypair "$home" --rotate 2>/dev/null) || fail "rotation failed"
+  [ "$first" != "$second" ] \
+    || fail "rotation re-printed the same public key ($first); the old key was never cleared"
+  assert_grep "$second" "$home/data/buzz-keypair.public" \
+    "rotation did not re-record the new public key"
+
+  # The rotated-in key must be the one the publisher would now load.
+  third=$(run_keypair "$home" --public 2>/dev/null) || fail "--public failed after rotation"
+  [ "$third" = "$second" ] || fail "the stored key does not match the rotated public key"
+
+  # And rotation must stay as silent about key material as creation is.
+  combined=$(run_keypair "$home" --rotate 2>&1)
+  stored=$(sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$keyfile")
+  [ -n "$stored" ] || fail "rotation left no usable key behind"
+  assert_not_contains "$combined" "$stored" "the private key leaked into --rotate's output"
+
+  run_keypair "$home" --rotate --public >/dev/null 2>&1
+  code=$?
+  expect_code 2 "$code" "--rotate --public asks for two contradictory things"
+  pass "rotation replaces the key in whichever store holds it"
+}
+
 test_public_flag_fails_before_a_keypair_exists() {
   local home output code
   home=$(make_home public-first)
@@ -445,6 +479,35 @@ EOF
   pass "one unacknowledged publish does not starve the replay drain"
 }
 
+test_a_late_auth_challenge_is_still_answered() {
+  # NIP-42 gives a signal in both directions - the relay's AUTH frame, and the OK
+  # it keys to the auth event's id - and the client must wait for those frames
+  # rather than guess when they arrive. A fixed nap before looking for the
+  # challenge loses the race on any loaded or cold relay, and then every event
+  # comes back `auth-required:`, is classified retryable, and is retained run after
+  # run with nothing but a stderr line to show for it. This stub challenges late
+  # and refuses unauthenticated events, so a guessed wait cannot pass it.
+  local home relay output
+  home=$(make_home late-challenge)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub --challenge --challenge-delay-ms 250)
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"late-challenge"}' \
+    | run_publish "$home" "$relay" 2>&1)
+  kill "$STUB_PID" 2>/dev/null
+  STUB_PID=""
+
+  assert_contains "$output" "delivered=1" \
+    "the late challenge was never answered, so the relay refused the event"
+  assert_not_contains "$output" "auth-required" \
+    "an event was published before the NIP-42 handshake finished"
+  [ "$(replay_count "$home")" = "0" ] \
+    || fail "the event was retained even though the connection was authenticated"
+  pass "a challenge that lands late is still answered before anything is published"
+}
+
 test_permanent_rejection_is_not_replayed_forever() {
   local home relay
   home=$(make_home permanent)
@@ -619,6 +682,7 @@ test_no_firstmate_path_depends_on_buzz() {
 test_bip340_official_vectors
 test_keypair_is_idempotent_and_never_prints_the_private_key
 test_public_flag_fails_before_a_keypair_exists
+test_rotation_replaces_the_key_in_whichever_store_holds_it
 test_two_homes_sharing_one_xdg_get_separate_keys
 test_publish_with_relay_down_exits_zero_and_enqueues
 test_publish_without_a_keypair_still_exits_zero
@@ -626,6 +690,7 @@ test_publish_with_relay_up_delivers_and_lands
 test_reconnect_replays_the_identical_event_id
 test_replaying_a_known_event_is_deduped_and_evicted
 test_an_unacknowledged_publish_does_not_starve_the_drain
+test_a_late_auth_challenge_is_still_answered
 test_permanent_rejection_is_not_replayed_forever
 test_retryable_rejection_is_kept
 test_replay_cache_is_capped_at_100

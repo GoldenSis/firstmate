@@ -23,6 +23,12 @@
 # its own channel rather than silently publishing under the main home's identity.
 # The two stores must agree on this or the invariant would hold only on macOS.
 #
+# ROTATION CLEARS BOTH STORES
+# fm_buzz_key_forget is the one supported way to retire a key, and it clears the
+# keychain entry AND the fallback file, then verifies nothing loads any more.
+# Which store holds the key depends on the host, so anything that clears only one
+# of them is a rotation that may silently not rotate.
+#
 # THE KEY NEVER REACHES AN ARGV
 # A command line is world-readable through the process table, so no helper here
 # may pass the private key as an argument to anything. Storing it goes through
@@ -141,13 +147,47 @@ fm_buzz_key_store() {
   dir=$(dirname "$file")
   mkdir -p "$dir" 2>/dev/null || return 1
   chmod 0700 "$dir" 2>/dev/null || true
+  # mktemp creates at 0600 regardless of umask, and the mode is tightened again
+  # before a single byte of key material is written, so the key is never in a file
+  # a second process could open. Doing it this way rather than with `umask 077`
+  # keeps this sourced function from mutating the caller's umask for the rest of
+  # the process, which would silently tighten unrelated files created later.
   local tmp
-  umask 077
   tmp=$(mktemp "$dir/.buzz-keypair.XXXXXX") || return 1
-  printf '{\n  "private_key": "%s"\n}\n' "$private" > "$tmp" || { rm -f -- "$tmp"; return 1; }
   chmod 0600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  printf '{\n  "private_key": "%s"\n}\n' "$private" > "$tmp" || { rm -f -- "$tmp"; return 1; }
   mv -f -- "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
   printf 'file\n'
+}
+
+# Remove this home's private key from EVERY store, printing one line per store
+# actually cleared. Returns 1 when a key is still loadable afterwards.
+#
+# Rotation is the only caller, and it is why this cannot be keychain-only: on a
+# non-Darwin host, or under FM_BUZZ_FORCE_FILE_STORE=1, the key lives in the
+# fallback file, whose name carries a digest of the home account and so cannot be
+# found by hand. A rotation procedure that clears the store the key is NOT in
+# leaves fm_buzz_key_load finding the old key and re-printing the same public key -
+# a rotation that silently does not rotate, which is worse than none at all.
+fm_buzz_key_forget() {
+  local home=${1:?home required} account file attempts
+  account=$(fm_buzz_key_account "$home")
+  if fm_buzz_keychain_available; then
+    # Loop, bounded: `-U` keeps this to one entry, but a keychain that somehow
+    # holds several would otherwise hand the next load a key we thought was gone.
+    attempts=0
+    while [ "$attempts" -lt 10 ] \
+      && security delete-generic-password -s "$FM_BUZZ_KEYCHAIN_SERVICE" -a "$account" >/dev/null 2>&1; do
+      attempts=$((attempts + 1))
+    done
+    [ "$attempts" -gt 0 ] && printf 'keychain\n'
+  fi
+  file=$(fm_buzz_key_fallback_file "$home") || return 1
+  if [ -f "$file" ]; then
+    rm -f -- "$file" || return 1
+    printf 'file\n'
+  fi
+  ! fm_buzz_key_load "$home" >/dev/null 2>&1
 }
 
 # --- shared helpers ----------------------------------------------------------

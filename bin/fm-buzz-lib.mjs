@@ -192,14 +192,26 @@ function buildAuthEvent(relayUrl, challenge, privateKeyHex) {
 // drain completely and no cached event is ever attempted. Per-publish it costs one
 // slow event instead of every remaining one. A fifth of the connection budget
 // leaves room for a useful drain after the worst single stall.
+//
+// `authChallengeTimeoutMs` bounds only the wait for a challenge that may never
+// come, and it is the sole timer here that can expire in normal operation: a
+// NIP-42 relay issues its AUTH frame with the handshake, so the wait ends on
+// arrival, while an open relay never sends one and the deadline is what lets the
+// run proceed. A late challenge is answered when it lands (see the AUTH branch
+// below), so the deadline costs an unauthenticated first attempt at worst rather
+// than an unauthenticated connection.
 async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = {}) {
   if (typeof WebSocket !== "function") {
     throw new Error("this Node build has no global WebSocket");
   }
   const publishTimeoutMs = options.publishTimeoutMs ?? Math.max(1000, Math.floor(timeoutMs / 5));
+  const authChallengeTimeoutMs = options.authChallengeTimeoutMs ?? Math.min(publishTimeoutMs, 500);
   const socket = new WebSocket(relayUrl);
   const pending = new Map(); // event id -> {resolve}
   let authChallenge = null;
+  let challengeWaiter = null; // resolve fn armed while authenticateIfChallenged waits
+  let challengeWaitDone = false; // true once the up-front handshake attempt settled
+  let authSent = false;
   const subscriptions = new Map(); // sub id -> {events, resolve}
 
   const closed = new Promise((resolve) => {
@@ -234,6 +246,20 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = 
       }
     } else if (type === "AUTH") {
       authChallenge = message[1];
+      if (challengeWaiter) {
+        const resolve = challengeWaiter;
+        challengeWaiter = null;
+        resolve(authChallenge);
+      } else if (challengeWaitDone && !authSent) {
+        // The up-front handshake gave up before this challenge landed, so nobody
+        // will ever wait for it. Answer it here instead, so the rest of the
+        // connection is authenticated rather than every remaining event being
+        // refused with `auth-required:` for want of a reply nobody sent.
+        socket.send(authFrame(buildAuthResponse(authChallenge)));
+      }
+      // Before that point the challenge is simply recorded: authenticateIfChallenged
+      // picks it up and waits for the relay's answer to the response, which is the
+      // only path that can report whether authentication actually succeeded.
     } else if (type === "EVENT") {
       const sub = subscriptions.get(message[1]);
       if (sub) sub.events.push(message[2]);
@@ -257,44 +283,97 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = 
     // no OK is bounded by the socket-close race and the timeout instead.
   });
 
+  // Send one frame and settle on the OK the relay keys to `id`. Every wait in
+  // this client is one of these: an OK frame, a socket close, or a deadline.
+  async function sendAndAwaitOk(frame, id, deadlineMs) {
+    const response = new Promise((resolve) => pending.set(id, { resolve }));
+    let deadline;
+    // Expiring drops the waiter, so a late OK for this id is ignored rather
+    // than resolving a promise nobody is holding any more.
+    const expired = new Promise((_, reject) => {
+      deadline = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`no acknowledgement within ${deadlineMs}ms`));
+      }, deadlineMs);
+    });
+    try {
+      socket.send(frame);
+      return await Promise.race([response, expired, closed.then(() => {
+        // The socket closed with no OK: genuinely unknown delivery. Report it as
+        // retryable so the event stays cached; the relay's id dedupe makes a
+        // redundant replay a no-op rather than a duplicate.
+        throw new Error("relay closed before acknowledging the event");
+      })]);
+    } finally {
+      clearTimeout(deadline);
+      pending.delete(id);
+    }
+  }
+
+  // Sign the NIP-42 response to `challenge`. Marks the handshake as answered, so
+  // one challenge is never responded to twice.
+  function buildAuthResponse(challenge) {
+    authSent = true;
+    return buildAuthEvent(relayUrl, challenge, privateKeyHex);
+  }
+
+  function authFrame(authEvent) {
+    return JSON.stringify(["AUTH", authEvent]);
+  }
+
+  // Resolve with the challenge the moment it arrives, or with null when the
+  // deadline passes or the socket closes without one.
+  function awaitChallenge() {
+    if (authChallenge) {
+      challengeWaitDone = true;
+      return Promise.resolve(authChallenge);
+    }
+    return new Promise((resolve) => {
+      const settle = (challenge) => {
+        clearTimeout(challengeTimer);
+        challengeWaiter = null;
+        challengeWaitDone = true;
+        resolve(challenge);
+      };
+      const challengeTimer = setTimeout(() => settle(null), authChallengeTimeoutMs);
+      challengeWaiter = settle;
+      closed.then(() => settle(authChallenge));
+    });
+  }
+
   const api = {
-    // NIP-42: answer the challenge if the relay issued one. Harmless when it did
-    // not - an open relay simply never sends AUTH.
+    // NIP-42: answer the challenge if the relay issued one, and do not return
+    // until the relay has answered that response, so a publish is never sent into
+    // an unfinished handshake. Every step is driven by a frame rather than a
+    // fixed delay: the challenge wait ends when the AUTH frame lands, and the
+    // response wait ends on the OK the relay keys to the auth event's id.
+    // Returns one of:
+    //   not-challenged  the relay never sent AUTH (an open relay; not an error)
+    //   authenticated   the relay accepted the response
+    //   refused         the relay rejected the response
+    //   unacknowledged  no answer within the deadline; the run proceeds anyway
+    //   already-answered  a late challenge was answered from the frame handler
     async authenticateIfChallenged() {
-      // Give a challenge that arrived with the handshake a moment to land.
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      if (!authChallenge) return false;
-      socket.send(JSON.stringify(["AUTH", buildAuthEvent(relayUrl, authChallenge, privateKeyHex)]));
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      return true;
+      const challenge = await awaitChallenge();
+      if (!challenge) return "not-challenged";
+      if (authSent) return "already-answered";
+      const authEvent = buildAuthResponse(challenge);
+      try {
+        const response = await sendAndAwaitOk(authFrame(authEvent), authEvent.id, publishTimeoutMs);
+        return response.accepted ? "authenticated" : "refused";
+      } catch {
+        // A relay that takes the AUTH and says nothing is not a reason to abandon
+        // the run: publishing decides delivery, and an `auth-required:` answer
+        // there is already classified as retryable.
+        return "unacknowledged";
+      }
     },
 
     // Send one already-signed event and wait for its OK. `raw` is the exact
     // stored bytes when replaying, so the id - and therefore the relay's dedupe
     // decision - is unchanged.
     async publish(event, raw) {
-      const response = new Promise((resolve) => pending.set(event.id, { resolve }));
-      let deadline;
-      // Expiring drops the waiter, so a late OK for this id is ignored rather
-      // than resolving a promise nobody is holding any more.
-      const expired = new Promise((_, reject) => {
-        deadline = setTimeout(() => {
-          pending.delete(event.id);
-          reject(new Error(`no acknowledgement within ${publishTimeoutMs}ms`));
-        }, publishTimeoutMs);
-      });
-      try {
-        socket.send(raw ?? JSON.stringify(["EVENT", event]));
-        return await Promise.race([response, expired, closed.then(() => {
-          // The socket closed with no OK: genuinely unknown delivery. Report it as
-          // retryable so the event stays cached; the relay's id dedupe makes a
-          // redundant replay a no-op rather than a duplicate.
-          throw new Error("relay closed before acknowledging the event");
-        })]);
-      } finally {
-        clearTimeout(deadline);
-        pending.delete(event.id);
-      }
+      return sendAndAwaitOk(raw ?? JSON.stringify(["EVENT", event]), event.id, publishTimeoutMs);
     },
 
     // Read-only, human-facing: used by bin/fm-buzz-inspect.mjs to prove a

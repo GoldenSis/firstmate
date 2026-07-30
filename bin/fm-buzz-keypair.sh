@@ -13,6 +13,7 @@
 # Usage:
 #   fm-buzz-keypair.sh             ensure a keypair exists; print the public key
 #   fm-buzz-keypair.sh --public    print the public key; fail if none exists yet
+#   fm-buzz-keypair.sh --rotate    retire this home's key and mint a new one
 #   fm-buzz-keypair.sh --help      this text
 #
 # Exit status: 0 when a keypair exists (created or already present), 1 on a real
@@ -21,11 +22,20 @@
 # deliberately, by a human, and a silent failure to create a key would be worse
 # than a loud one.
 #
-# Rotation: Buzz documents no key-rotation procedure. Rotating this key therefore
-# means deleting the keychain entry (`security delete-generic-password -s
-# firstmate-buzz -a "<FM_HOME>"`) plus data/buzz-keypair.public and re-running
-# this script. Historical events stay signed by the retired key, which is
-# acceptable precisely because this key grants no authority.
+# Rotation: Buzz documents no key-rotation procedure, so `--rotate` is this
+# adapter's. It clears BOTH stores - the keychain entry and the 0600 fallback
+# file - plus data/buzz-keypair.public, then mints a fresh keypair and prints the
+# new public key. It never prints the private key, old or new.
+#
+# It is a flag rather than instructions to run by hand because the two stores are
+# not interchangeable: which one holds the key depends on the host, and the
+# fallback file's name carries a digest of the home path, so hand-deleting "the
+# keychain entry" on a machine whose key lives in the file clears nothing and the
+# next run re-prints the SAME public key. A rotation that silently does not rotate
+# is worse than no rotation procedure at all.
+#
+# Historical events stay signed by the retired key, which is acceptable precisely
+# because this key grants no authority.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,15 +48,22 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 PUBLIC_FILE="$DATA/buzz-keypair.public"
 PUBLIC_ONLY=0
+ROTATE=0
 
 while [ "$#" -gt 0 ]; do
   case $1 in
     --public) PUBLIC_ONLY=1 ;;
+    --rotate) ROTATE=1 ;;
     --help|-h) awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; exit 0 ;;
     *) printf 'fm-buzz-keypair.sh: unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
   shift
 done
+
+if [ "$ROTATE" -eq 1 ] && [ "$PUBLIC_ONLY" -eq 1 ]; then
+  printf 'fm-buzz-keypair.sh: --rotate and --public are mutually exclusive\n' >&2
+  exit 2
+fi
 
 command -v node >/dev/null 2>&1 || {
   printf 'fm-buzz-keypair.sh: node is required to derive the public key\n' >&2
@@ -77,6 +94,21 @@ record_public() {
   chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
   mv -f -- "$tmp" "$PUBLIC_FILE" || { rm -f -- "$tmp"; return 1; }
 }
+
+# Retire the old key before the lookup below, so rotation falls through into the
+# minting path instead of finding the key it was asked to replace.
+if [ "$ROTATE" -eq 1 ]; then
+  cleared=$(fm_buzz_key_forget "$FM_HOME") || {
+    printf 'fm-buzz-keypair.sh: the old key is still readable after rotation; nothing was replaced\n' >&2
+    exit 1
+  }
+  if [ -n "$cleared" ]; then
+    printf 'rotated: cleared the previous key from %s\n' "$(printf '%s' "$cleared" | tr '\n' ' ' | sed 's/ $//')" >&2
+  else
+    printf 'fm-buzz-keypair.sh: no previous key was stored for this home; minting one\n' >&2
+  fi
+  rm -f -- "$PUBLIC_FILE"
+fi
 
 if fm_buzz_key_load "$FM_HOME" >/dev/null 2>&1; then
   public=$(derive_public) || {
