@@ -11,7 +11,12 @@
 // Adding an npm dependency tree to a repo that deliberately has none, for a
 // proof of concept, is the worse trade. So the curve arithmetic lives here,
 // self-contained, and tests/fm-buzz-publish.test.sh proves it correct against the
-// official BIP-340 test vectors rather than asserting it by inspection.
+// official BIP-340 test vectors rather than asserting it by inspection - every
+// 32-byte-message vector, signing and verification, including all ten negative
+// cases. The variable-length-message vectors (15-18) are deliberately excluded
+// and are NOT covered: this signer accepts a 32-byte message only, because that
+// is all NIP-01 ever produces, so it throws on those inputs and schnorrVerify
+// returns false for them. That is the fail-closed answer, not a passing one.
 //
 // KNOWN LIMITATION - NOT CONSTANT TIME
 // JavaScript BigInt operations are not constant time, so this signer leaks timing

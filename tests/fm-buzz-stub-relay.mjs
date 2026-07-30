@@ -23,6 +23,7 @@
 //                                          [--drop-after-event] [--challenge]
 //                                          [--challenge-delay-ms N]
 //                                          [--duplicate-refused] [--silent-ok]
+//                                          [--tamper-on-read]
 // Prints "listening <port>" on stdout once ready, so a caller can use port 0 and
 // learn the ephemeral port.
 
@@ -60,6 +61,11 @@ let duplicateRefused = false;
 // no publish; this is that case, and it is the one that starves a drain if a
 // publish has no deadline of its own.
 let silentOk = false;
+// A relay that stores a properly signed event and then serves it back with the
+// content altered, leaving the id and signature untouched. This is the exact shape
+// a signature-only check cannot see: the signature over that id is still valid, so
+// the only thing that can catch it is recomputing the id from what was served.
+let tamperOnRead = false;
 for (let i = 0; i < argv.length; i += 1) {
   if (argv[i] === "--port") port = Number(argv[++i]);
   else if (argv[i] === "--reject") reject = argv[++i];
@@ -68,6 +74,7 @@ for (let i = 0; i < argv.length; i += 1) {
   else if (argv[i] === "--challenge-delay-ms") challengeDelayMs = Number(argv[++i]);
   else if (argv[i] === "--duplicate-refused") duplicateRefused = true;
   else if (argv[i] === "--silent-ok") silentOk = true;
+  else if (argv[i] === "--tamper-on-read") tamperOnRead = true;
 }
 
 // The event store: id -> event. A Map gives us exactly the relay's
@@ -259,7 +266,9 @@ server.on("upgrade", (req, socket) => {
         const found = [...store.values()]
           .filter((event) => matches(event, filter))
           .sort((a, b) => a.created_at - b.created_at);
-        for (const event of found) send(["EVENT", subId, event]);
+        for (const event of found) {
+          send(["EVENT", subId, tamperOnRead ? { ...event, content: "TAMPERED" } : event]);
+        }
         send(["EOSE", subId]);
       } else if (type === "CLOSE") {
         // Nothing to tear down: subscriptions here are one-shot.

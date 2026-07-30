@@ -90,8 +90,8 @@ export function nowSeconds() {
 }
 
 // Both entry points are fed one JSON envelope on stdin - that is how the private
-// key stays off every command line - so both need this, and it lives here rather
-// than being copied into each of them.
+// key, and the projection with it, stay off every command line - so both need
+// this, and it lives here rather than being copied into each of them.
 export function readStdin() {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -217,7 +217,7 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = 
   const socket = new WebSocket(relayUrl);
   const pending = new Map(); // event id -> {resolve}
   let authChallenge = null;
-  let challengeWaiter = null; // resolve fn armed while authenticateIfChallenged waits
+  let challengeWaiter = null; // resolve fn armed while an authentication window waits
   let challengeWaitDone = false; // true once the up-front handshake attempt settled
   let authSent = false;
   let lateAuth = null; // promise for a challenge answered after the handshake window
@@ -363,25 +363,38 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = 
     });
   }
 
+  // Both authentication windows are the same routine and share one body, because
+  // two copies of a state machine over these mutable flags is exactly the kind of
+  // thing that drifts apart on the next edit. It settles whatever is outstanding:
+  // an answer already in flight is awaited rather than duplicated, a challenge in
+  // hand is answered, and a challenge that never comes is not an error.
+  //
+  // The single answer is kept in `lateAuth` whichever window produced it, so the
+  // second caller learns the handshake's real outcome - authenticated, refused, or
+  // unacknowledged - rather than only that somebody else answered first. That is
+  // the whole point of calling twice: the caller re-attempts refused events only
+  // when authentication actually completed.
+  // Returns one of:
+  //   not-challenged  the relay never sent AUTH (an open relay; not an error)
+  //   authenticated   the relay accepted the response
+  //   refused         the relay rejected the response
+  //   unacknowledged  no answer within the deadline; the run proceeds anyway
+  async function settleAuthentication() {
+    if (lateAuth) return lateAuth;
+    const challenge = await awaitChallenge();
+    if (!challenge) return "not-challenged";
+    if (lateAuth) return lateAuth;
+    lateAuth = respondToChallenge(challenge);
+    return lateAuth;
+  }
+
   const api = {
     // NIP-42: answer the challenge if the relay issued one, and do not return
     // until the relay has answered that response, so a publish is never sent into
     // an unfinished handshake. Every step is driven by a frame rather than a
     // fixed delay: the challenge wait ends when the AUTH frame lands, and the
     // response wait ends on the OK the relay keys to the auth event's id.
-    // Returns one of:
-    //   not-challenged  the relay never sent AUTH (an open relay; not an error)
-    //   authenticated   the relay accepted the response
-    //   refused         the relay rejected the response
-    //   unacknowledged  no answer within the deadline; the run proceeds anyway
-    //   already-answered  a late challenge was answered from the frame handler
-    async authenticateIfChallenged() {
-      const challenge = await awaitChallenge();
-      if (!challenge) return "not-challenged";
-      if (lateAuth) return lateAuth;
-      if (authSent) return "already-answered";
-      return respondToChallenge(challenge);
-    },
+    authenticateIfChallenged: settleAuthentication,
 
     // The second and final authentication window, for a caller that published
     // during the unauthenticated gap and got `auth-required:` back. Three cases,
@@ -391,17 +404,7 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = 
     //   the challenge has not landed yet - wait one more bounded window, since
     //     `auth-required:` proves the relay does intend to challenge;
     //   it never lands - "not-challenged", and the caller keeps its events cached.
-    // Returns the same names as authenticateIfChallenged.
-    async completeLateAuthentication() {
-      if (lateAuth) return lateAuth;
-      if (authSent) return "already-answered";
-      const challenge = await awaitChallenge();
-      if (!challenge) return "not-challenged";
-      if (lateAuth) return lateAuth;
-      if (authSent) return "already-answered";
-      lateAuth = respondToChallenge(challenge);
-      return lateAuth;
-    },
+    completeLateAuthentication: settleAuthentication,
 
     // Send one already-signed event and wait for its OK. `raw` is the exact
     // stored bytes when replaying, so the id - and therefore the relay's dedupe

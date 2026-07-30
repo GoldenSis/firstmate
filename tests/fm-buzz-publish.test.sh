@@ -3,8 +3,8 @@
 #
 # Covers the five cases the milestone's exit gate names, plus the two properties
 # everything else rests on: that the signing is really BIP-340 (checked against
-# the official test vectors, not against our own verifier alone) and that the
-# fire-and-forget contract has not been edited away.
+# the official 32-byte-message test vectors, not against our own verifier alone)
+# and that the fire-and-forget contract has not been edited away.
 #
 # These run against tests/fm-buzz-stub-relay.mjs, not the real Buzz stack, so they
 # pass on a CI runner with no Docker. The real relay was exercised by hand for the
@@ -17,6 +17,7 @@ set -u
 
 KEYPAIR="$ROOT/bin/fm-buzz-keypair.sh"
 PUBLISH="$ROOT/bin/fm-buzz-publish.sh"
+INSPECT="$ROOT/bin/fm-buzz-inspect.sh"
 STUB="$ROOT/tests/fm-buzz-stub-relay.mjs"
 TMP_ROOT=$(fm_test_tmproot fm-buzz)
 
@@ -53,6 +54,14 @@ run_publish() {  # <home> <relay> [args...]
     XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 \
     FM_BUZZ_TIMEOUT_MS=8000 \
     "$PUBLISH" --relay "$relay" "$@"
+}
+
+run_inspect() {  # <home> <relay> [args...]
+  local home=$1 relay=$2
+  shift 2
+  FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$home/state" \
+    XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 \
+    "$INSPECT" --relay "$relay" "$@"
 }
 
 # Start the stub on an ephemeral port and echo "<pid> <url>".
@@ -131,7 +140,7 @@ test_bip340_official_vectors() {
     });
   ' "$ROOT/bin/fm-buzz-crypto.mjs")
   [ "$result" = "ok" ] || fail "BIP-340 official vectors failed: $result"
-  pass "signing matches the official BIP-340 vectors and rejects all 10 invalid ones"
+  pass "signing matches the official BIP-340 32-byte-message vectors and rejects all 10 invalid ones"
 }
 
 # --- (a) keypair generation ------------------------------------------------
@@ -749,6 +758,78 @@ test_a_signalled_read_leaves_no_projection_in_temp() {
   pass "a signalled stdin read leaves no projection in the temp directory"
 }
 
+test_a_signalled_read_releases_the_callers_output() {
+  # The other half of the signal path, and the half the spool test cannot see
+  # because it discards the output. The background reader is not reaped by the
+  # signal: it keeps running against a deleted spool while holding the stderr this
+  # script inherited, so a caller doing `out=$(fm-buzz-publish.sh ... 2>&1)` blocks
+  # on that pipe long after the script exited - the same caller-side hang the read
+  # watchdog exists to prevent, reached from the other direction.
+  #
+  # Asserted by pipe lifetime, which is the property that actually matters: the
+  # output goes down a fifo whose only reader is this test's `cat`, so that reader
+  # sees EOF exactly when the last writer - script, watchdog, or leaked reader -
+  # lets go. It never returning IS the caller hanging.
+  local home fifo outfifo outlog pid drainer waited
+  home=$(make_home stdin-signal-output)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  fifo="$TMP_ROOT/signal-output-stdin.fifo"
+  outfifo="$TMP_ROOT/signal-output.fifo"
+  outlog="$TMP_ROOT/signal-output.log"
+  rm -f "$fifo" "$outfifo"
+  mkfifo "$fifo" || fail "could not create the test stdin fifo"
+  mkfifo "$outfifo" || fail "could not create the test output fifo"
+
+  exec 8<>"$fifo"
+  printf '%s' '{"schema":"fm-bearings.v1","note":"in-flight' >&8
+
+  # The drainer opens the read end first so the script's open of the write end
+  # does not block, and it is the only reader, so its exit means EOF.
+  cat "$outfifo" > "$outlog" &
+  drainer=$!
+
+  env TMPDIR="$TMP_ROOT" FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" \
+    FM_STATE_OVERRIDE="$home/state" XDG_DATA_HOME="$home/xdg" \
+    FM_BUZZ_FORCE_FILE_STORE=1 FM_BUZZ_TIMEOUT_MS=8000 \
+    "$PUBLISH" --relay "ws://127.0.0.1:1" < "$fifo" > "$outfifo" 2>&1 &
+  pid=$!
+
+  waited=0
+  while [ -z "$(find "$TMP_ROOT" -maxdepth 1 -name 'fm-buzz-stdin.*' 2>/dev/null)" ] \
+    && [ "$waited" -lt 100 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  kill -TERM "$pid" 2>/dev/null
+  waited=0
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 100 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  # Generous, because a surviving reader would hold this open forever and the only
+  # honest way to tell "slow" from "never" is to wait longer than anything on this
+  # path legitimately takes. The watchdog's own worst case is one second.
+  waited=0
+  while kill -0 "$drainer" 2>/dev/null && [ "$waited" -lt 100 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  if kill -0 "$drainer" 2>/dev/null; then
+    kill "$drainer" 2>/dev/null
+    exec 8>&-
+    rm -f "$fifo" "$outfifo"
+    fail "a signalled run left a reader holding the caller's output open"
+  fi
+
+  exec 8>&-
+  rm -f "$fifo" "$outfifo"
+  pass "a signalled read releases the caller's output instead of holding it open"
+}
+
 # --- the contract itself ---------------------------------------------------
 
 test_fire_and_forget_contract_is_intact() {
@@ -765,25 +846,74 @@ test_fire_and_forget_contract_is_intact() {
   pass "the fire-and-forget contract is structurally intact"
 }
 
-test_the_private_key_reaches_no_command_line() {
+test_nothing_private_reaches_a_command_line() {
   # A structural guard, for the same reason as the one above: an argv is
   # world-readable through the process table, and `--arg`/`-w <secret>` are the
-  # obvious-looking spellings that put the key there. Both are one careless edit
+  # obvious-looking spellings that put a secret there. Both are one careless edit
   # away, and neither shows up in any behavioural assertion.
+  #
+  # The projection is guarded alongside the key rather than after it, because it is
+  # private for the same reason the stdin spool is: task ids, project names,
+  # blockers, PR URLs. It was on jq's argv for exactly as long as it took someone
+  # to notice that the fix for the key had not been applied to it.
   # Match real shell lines only, never the header comments that explain why these
   # spellings are banned - the same distinction the fire-and-forget guard makes.
   local offenders
-  offenders=$(grep -nE '^[[:space:]]*[^#]*--arg[[:space:]]+privateKey' \
+  offenders=$(grep -nE '^[[:space:]]*[^#]*--arg[[:space:]]+(privateKey|content)' \
     "$ROOT/bin/fm-buzz-publish.sh" "$ROOT/bin/fm-buzz-inspect.sh" || true)
   [ -z "$offenders" ] \
-    || fail "the private key must reach jq through a file descriptor, not argv:"$'\n'"$offenders"
+    || fail "the key and the projection must reach jq through a file descriptor, not argv:"$'\n'"$offenders"
 
   offenders=$(grep -nE '^[[:space:]]*[^#]*security[[:space:]]+add-generic-password' \
     "$ROOT/bin/fm-buzz-key-lib.sh" || true)
   [ -z "$offenders" ] \
     || fail "the keychain write must go through 'security -i' so the secret is not in argv:"$'\n'"$offenders"
 
-  pass "the private key reaches no command line"
+  pass "neither the private key nor the projection reaches a command line"
+}
+
+test_the_inspector_rejects_a_tampered_event() {
+  # The inspector's whole job is answering "is the published projection legible AND
+  # authentic?", and it is the only place a human looks for that answer. A relay
+  # that serves a validly-signed id beside altered content passes a signature check
+  # unchanged - the signature covers the id, not the bytes printed under it - so
+  # only recomputing the id from what was served can catch it. This stub does
+  # exactly that: it stores a real event and hands back other content with the id
+  # and signature intact.
+  local home relay clean tampered
+  home=$(make_home tampered-read)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"authentic"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  clean=$(run_inspect "$home" "$relay" 2>&1)
+  kill "$STUB_PID" 2>/dev/null
+  STUB_PID=""
+
+  assert_contains "$clean" "signature verified" \
+    "an untouched event must read back as verified, or this test proves nothing"
+  assert_contains "$clean" "authentic" "the projection did not read back"
+
+  # Same home, same key, same channel - only the relay's honesty differs.
+  read -r STUB_PID relay <<EOF
+$(start_stub --tamper-on-read)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"authentic"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  tampered=$(run_inspect "$home" "$relay" 2>&1)
+  kill "$STUB_PID" 2>/dev/null
+  STUB_PID=""
+
+  assert_contains "$tampered" "TAMPERED" \
+    "the stub did not serve altered content, so the check under test was never reached"
+  assert_not_contains "$tampered" "signature verified" \
+    "altered content was reported as verified: the id is not being recomputed"
+  assert_contains "$tampered" "INVALID" \
+    "altered content was not reported as invalid"
+  pass "the inspector refuses to call altered content verified"
 }
 
 test_no_firstmate_path_depends_on_buzz() {
@@ -818,6 +948,8 @@ test_replay_cache_is_capped_at_100
 test_an_interrupted_cache_write_is_swept_not_leaked
 test_a_writer_that_never_closes_does_not_hang_the_publish
 test_a_signalled_read_leaves_no_projection_in_temp
+test_a_signalled_read_releases_the_callers_output
 test_fire_and_forget_contract_is_intact
-test_the_private_key_reaches_no_command_line
+test_nothing_private_reaches_a_command_line
+test_the_inspector_rejects_a_tampered_event
 test_no_firstmate_path_depends_on_buzz

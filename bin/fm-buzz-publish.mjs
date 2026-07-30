@@ -18,9 +18,10 @@
 // acknowledges it (including `duplicate:`, which means the relay already has that
 // id) or when the rejection is permanent and replaying could never succeed.
 //
-// Reads one JSON envelope on stdin so the private key never appears in a command
-// line or in the process environment. Fields: privateKey, content, relay,
-// channelId, channelName, timeoutMs, replayDir, maxCache.
+// Reads one JSON envelope on stdin so that neither the private key nor the
+// projection - which carries task ids, project names, blockers and PR URLs -
+// appears in a command line or in the process environment. Fields: privateKey,
+// content, relay, channelId, channelName, timeoutMs, replayDir, maxCache.
 
 import {
   readFileSync,

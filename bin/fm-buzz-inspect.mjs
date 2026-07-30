@@ -16,7 +16,13 @@
 // output, that is not an increment - it re-opens the question of who owns
 // canonical state.
 
-import { channelIdForLabel, readStdin, withRelay, KIND_STREAM_MESSAGE } from "./fm-buzz-lib.mjs";
+import {
+  channelIdForLabel,
+  computeEventId,
+  readStdin,
+  withRelay,
+  KIND_STREAM_MESSAGE,
+} from "./fm-buzz-lib.mjs";
 import { generateKeypair, schnorrVerify } from "./fm-buzz-crypto.mjs";
 
 const envelope = JSON.parse(await readStdin());
@@ -53,10 +59,20 @@ try {
   }
   for (const event of events.sort((a, b) => a.created_at - b.created_at)) {
     const when = new Date(event.created_at * 1000).toISOString();
-    const valid = schnorrVerify(event.id, event.pubkey, event.sig);
+    // Both halves, and neither on its own is worth anything here. The signature
+    // proves the author committed to this ID; recomputing the id proves the ID is
+    // the hash of the CONTENT printed below it. Checking only the signature would
+    // let a relay serve a validly-signed id beside altered content, tags, or
+    // timestamp and have this tool - the one place a human looks for that
+    // assurance - print "verified" over text the author never wrote.
+    const idMatches = computeEventId(event) === event.id;
+    const signed = schnorrVerify(event.id, event.pubkey, event.sig);
+    const verdict = !idMatches ? "INVALID (id does not match this content)"
+      : signed ? "verified"
+      : "INVALID";
     process.stdout.write(
       `\n--- ${event.id}\n    at        ${when}\n    author    ${event.pubkey}\n` +
-        `    signature ${valid ? "verified" : "INVALID"}\n\n`,
+        `    signature ${verdict}\n\n`,
     );
     process.stdout.write(full ? `${event.content}\n` : `${event.content.slice(0, 600)}\n`);
   }

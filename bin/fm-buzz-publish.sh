@@ -85,8 +85,21 @@ log() {
 # unconditional `exit 0` on its own. Adding an `exit` here would put a second exit
 # on a signal path, and swallowing the signal without one would make the script
 # unkillable; letting the normal tail run does neither.
+#
+# The background reader goes with it. On the signalled path nothing else reaps it:
+# the script falls through to `exit 0` while the `cat` keeps running against a
+# deleted inode, still holding the stderr this script inherited - so a caller doing
+# `output=$(fm-buzz-publish.sh ... 2>&1)` blocks on that pipe until the writer that
+# feeds it finally closes. That is the same caller-side hang the read watchdog
+# exists to prevent, arrived at from the other direction. On the ordinary paths the
+# reader has already been reaped and the pid cleared, so the kill is a no-op.
 STDIN_SPOOL=""
+STDIN_READER=""
 drop_stdin_spool() {
+  if [ -n "$STDIN_READER" ]; then
+    kill "$STDIN_READER" 2>/dev/null
+    STDIN_READER=""
+  fi
   if [ -n "$STDIN_SPOOL" ]; then
     rm -f -- "$STDIN_SPOOL"
     STDIN_SPOOL=""
@@ -124,8 +137,11 @@ trap drop_stdin_spool EXIT INT TERM HUP
 # very hang this function exists to prevent.
 read_stdin_bounded() {  # <spool>
   local spool=$1 reader watchdog rc
+  # Published to the script scope so the signal handler can reap it too; cleared
+  # again below once `wait` has.
   cat <&0 > "$spool" &
-  reader=$!
+  STDIN_READER=$!
+  reader=$STDIN_READER
   (
     exec >/dev/null 2>&1
     local elapsed=0
@@ -139,6 +155,7 @@ read_stdin_bounded() {  # <spool>
   watchdog=$!
   wait "$reader" 2>/dev/null
   rc=$?
+  STDIN_READER=""
   kill "$watchdog" 2>/dev/null
   wait "$watchdog" 2>/dev/null
   return "$rc"
@@ -198,14 +215,17 @@ publish() {
   mkdir -p "$REPLAY_DIR" 2>/dev/null || { log "could not create $REPLAY_DIR"; return 1; }
   chmod 0700 "$REPLAY_DIR" 2>/dev/null || true
 
-  # The envelope goes down a pipe, and the key reaches jq the same way: through a
-  # file descriptor, never `--arg` (which would put it in jq's own argv, visible
-  # in the process table) and never the environment. --rawfile takes the fd's
-  # bytes verbatim, and the writing printf is a bash builtin, so the key is not on
-  # any command line at any point.
+  # The envelope goes down a pipe, and both of its private parts reach jq the same
+  # way: through a file descriptor, never `--arg` (which would put them in jq's
+  # own argv, world-readable through the process table) and never the environment.
+  # The key is one of them; the projection is the other, and it is private for the
+  # same reason the spool above is - it carries task ids, project names, blockers
+  # and PR URLs. --rawfile takes the fd's bytes verbatim, and the writing printf is
+  # a bash builtin, so neither is an argument to any process at any point. The
+  # remaining --arg values - relay URL, channel id, cache path - are not secrets.
   jq -n \
     --rawfile privateKey <(printf '%s' "$key") \
-    --arg content "$content" \
+    --rawfile content <(printf '%s' "$content") \
     --arg relay "$RELAY" \
     --arg channelId "$channel" \
     --arg replayDir "$REPLAY_DIR" \
