@@ -89,6 +89,21 @@ export function nowSeconds() {
   return Math.floor(Date.now() / 1000);
 }
 
+// Both entry points are fed one JSON envelope on stdin - that is how the private
+// key stays off every command line - so both need this, and it lives here rather
+// than being copied into each of them.
+export function readStdin() {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => {
+      data += chunk;
+    });
+    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("error", reject);
+  });
+}
+
 // Build the idempotent private-channel creation event. Re-sending it is safe:
 // the relay answers `duplicate: channel already exists` when the row is present.
 export function buildChannelCreateEvent(channelId, name, about, privateKeyHex) {
@@ -170,10 +185,18 @@ function buildAuthEvent(relayUrl, challenge, privateKeyHex) {
 // failure mode - refused connection, handshake error, timeout, mid-flight socket
 // drop - surfaces as a rejected promise for the caller to log; nothing here
 // decides what a failure means for the process exit code.
-async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler) {
+// `publishTimeoutMs` bounds ONE acknowledgement rather than the whole connection.
+// Without it the only bound is `timeoutMs`, and a single publish that never gets
+// an OK - a relay that answers with a NOTICE, say - eats the entire connection
+// budget, so the channel-create that runs before the replay drain can starve the
+// drain completely and no cached event is ever attempted. Per-publish it costs one
+// slow event instead of every remaining one. A fifth of the connection budget
+// leaves room for a useful drain after the worst single stall.
+async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = {}) {
   if (typeof WebSocket !== "function") {
     throw new Error("this Node build has no global WebSocket");
   }
+  const publishTimeoutMs = options.publishTimeoutMs ?? Math.max(1000, Math.floor(timeoutMs / 5));
   const socket = new WebSocket(relayUrl);
   const pending = new Map(); // event id -> {resolve}
   let authChallenge = null;
@@ -251,13 +274,27 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler) {
     // decision - is unchanged.
     async publish(event, raw) {
       const response = new Promise((resolve) => pending.set(event.id, { resolve }));
-      socket.send(raw ?? JSON.stringify(["EVENT", event]));
-      return Promise.race([response, closed.then(() => {
-        // The socket closed with no OK: genuinely unknown delivery. Report it as
-        // retryable so the event stays cached; the relay's id dedupe makes a
-        // redundant replay a no-op rather than a duplicate.
-        throw new Error("relay closed before acknowledging the event");
-      })]);
+      let deadline;
+      // Expiring drops the waiter, so a late OK for this id is ignored rather
+      // than resolving a promise nobody is holding any more.
+      const expired = new Promise((_, reject) => {
+        deadline = setTimeout(() => {
+          pending.delete(event.id);
+          reject(new Error(`no acknowledgement within ${publishTimeoutMs}ms`));
+        }, publishTimeoutMs);
+      });
+      try {
+        socket.send(raw ?? JSON.stringify(["EVENT", event]));
+        return await Promise.race([response, expired, closed.then(() => {
+          // The socket closed with no OK: genuinely unknown delivery. Report it as
+          // retryable so the event stays cached; the relay's id dedupe makes a
+          // redundant replay a no-op rather than a duplicate.
+          throw new Error("relay closed before acknowledging the event");
+        })]);
+      } finally {
+        clearTimeout(deadline);
+        pending.delete(event.id);
+      }
     },
 
     // Read-only, human-facing: used by bin/fm-buzz-inspect.mjs to prove a

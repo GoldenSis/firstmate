@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# fm-buzz-key-lib.sh - custody of the loopback Buzz publishing key.
+# fm-buzz-key-lib.sh - shared shell helpers for the loopback Buzz adapter.
 #
-# Sourced by bin/fm-buzz-keypair.sh (which creates the key) and
-# bin/fm-buzz-publish.sh (which spends it). The single owner of WHERE the private
-# key lives and how it is fetched, so the two callers cannot drift into different
-# storage assumptions.
+# Sourced by bin/fm-buzz-keypair.sh (which creates the key), bin/fm-buzz-publish.sh
+# (which spends it) and bin/fm-buzz-inspect.sh (which reads with it). Its main job
+# is custody: the single owner of WHERE the private key lives and how it is
+# fetched, so the callers cannot drift into different storage assumptions. It also
+# owns the small helpers more than one of those entry points needs, for the same
+# anti-drift reason.
 #
 # CUSTODY MODEL
 # Preferred store is the OS keychain, matching what Buzz's own desktop client
@@ -15,16 +17,24 @@
 # and it is never consulted in preference to a keychain entry that exists.
 #
 # ONE KEY PER HOME
-# The keychain account is the resolved FM_HOME path, so a secondmate home with its
-# own FM_HOME gets its own key and its own channel rather than silently publishing
-# under the main home's identity.
+# Both stores key on the resolved FM_HOME path - the keychain through its account
+# attribute, the fallback file through a digest of that same account baked into
+# the filename - so a secondmate home with its own FM_HOME gets its own key and
+# its own channel rather than silently publishing under the main home's identity.
+# The two stores must agree on this or the invariant would hold only on macOS.
 #
-# fm_buzz_key_load PRINTS THE PRIVATE KEY ON STDOUT. That is how a shell function
-# returns a value, and it is the reason this is a library and not a CLI: its
-# output must be piped straight into the consumer and must never be echoed,
-# logged, put in a command line (visible in the process table), or captured into a
-# variable that later gets printed. bin/fm-buzz-keypair.sh deliberately exposes no
-# flag that prints it. The publishing key is low-value by construction - it signs
+# THE KEY NEVER REACHES AN ARGV
+# A command line is world-readable through the process table, so no helper here
+# may pass the private key as an argument to anything. Storing it goes through
+# `security -i`, which reads its command line off stdin - `add-generic-password -w
+# <secret>` typed into a pipe leaves the secret out of the `security` process's
+# own argv, and it still reports the underlying error status, so the fallback to
+# the file store keeps working. (`-w` with the value omitted is not usable here:
+# it prompts, which hangs under automation.) Reading goes through
+# fm_buzz_key_load, whose output must be piped straight into the consumer -
+# never echoed, logged, put in a command line, or captured into a variable that
+# later gets printed. bin/fm-buzz-keypair.sh deliberately exposes no flag that
+# prints it. The publishing key is low-value by construction - it signs
 # fleet-status projections on a loopback relay and grants no authority, since
 # merge authority stays in bin/fm-pr-merge.sh per AGENTS.md section 7 - but low
 # value is not no value, and leaking it into a log would be a real defect.
@@ -48,10 +58,39 @@ fm_buzz_keychain_available() {
   [ "$(uname -s)" = "Darwin" ] && command -v security >/dev/null 2>&1
 }
 
+# SHA-256 of stdin, hex. Same shape as bin/fm-prototype.sh and bin/fm-fusion-gate.sh.
+fm_buzz_key_sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
 # The 0600 fallback file for hosts with no reachable keychain.
+#
+# The filename carries a digest of the home account, not a fixed name: two homes
+# frequently share one XDG_DATA_HOME (it follows the user, not FM_HOME), and a
+# fixed name would hand a secondmate the main home's key on every non-Darwin host
+# and on every FM_BUZZ_FORCE_FILE_STORE=1 run - breaking ONE KEY PER HOME exactly
+# where the keychain is not there to enforce it. A digest rather than the path
+# itself because a home path can be longer than a filename may be.
 fm_buzz_key_fallback_file() {
-  local base=${XDG_DATA_HOME:-$HOME/.local/share}
-  printf '%s/firstmate/buzz-keypair.json\n' "$base"
+  local home=${1:?home required} base account digest
+  base=${XDG_DATA_HOME:-$HOME/.local/share}
+  account=$(fm_buzz_key_account "$home")
+  digest=$(printf '%s' "$account" | fm_buzz_key_sha256) || return 1
+  [ -n "$digest" ] || return 1
+  printf '%s/firstmate/buzz-keypair-%s.json\n' "$base" "${digest:0:16}"
+}
+
+# Emit a `security -i` command word: double-quoted, with the two characters that
+# parser treats as special (\ and ") escaped. Keeps a home path containing a space
+# from splitting into two arguments.
+fm_buzz_security_word() {
+  printf '"%s"' "$(printf '%s' "$1" | sed 's/[\\"]/\\&/g')"
 }
 
 # Print the stored private key, or return 1 when none is stored. Read the header
@@ -64,7 +103,7 @@ fm_buzz_key_load() {
       return 0
     fi
   fi
-  file=$(fm_buzz_key_fallback_file)
+  file=$(fm_buzz_key_fallback_file "$home") || return 1
   if [ -f "$file" ]; then
     # Single-key file; a missing/blank field means the file is unusable rather
     # than that no key exists, so fail closed instead of returning an empty key.
@@ -86,16 +125,19 @@ fm_buzz_key_store() {
   account=$(fm_buzz_key_account "$home")
   if fm_buzz_keychain_available; then
     # -U updates an existing entry instead of failing, which keeps a re-run after
-    # a partial failure idempotent. -w takes the secret without echoing it.
-    if security add-generic-password -U \
-      -s "$FM_BUZZ_KEYCHAIN_SERVICE" -a "$account" \
-      -l "firstmate buzz publishing key" \
-      -w "$private" 2>/dev/null; then
+    # a partial failure idempotent. The whole command line goes down `security -i`
+    # on stdin so the secret never lands in an argv; see the header.
+    if printf 'add-generic-password -U -s %s -a %s -l %s -w %s\n' \
+      "$(fm_buzz_security_word "$FM_BUZZ_KEYCHAIN_SERVICE")" \
+      "$(fm_buzz_security_word "$account")" \
+      "$(fm_buzz_security_word 'firstmate buzz publishing key')" \
+      "$(fm_buzz_security_word "$private")" \
+      | security -i >/dev/null 2>&1; then
       printf 'keychain\n'
       return 0
     fi
   fi
-  file=$(fm_buzz_key_fallback_file)
+  file=$(fm_buzz_key_fallback_file "$home") || return 1
   dir=$(dirname "$file")
   mkdir -p "$dir" 2>/dev/null || return 1
   chmod 0700 "$dir" 2>/dev/null || true
@@ -106,4 +148,18 @@ fm_buzz_key_store() {
   chmod 0600 "$tmp" || { rm -f -- "$tmp"; return 1; }
   mv -f -- "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
   printf 'file\n'
+}
+
+# --- shared helpers ----------------------------------------------------------
+
+# Print the channel id a label derives to. Both entry points must agree on this
+# or the publisher and the inspector would look at different channels, so the
+# derivation has exactly one caller-visible spelling and it lives here.
+fm_buzz_channel_id() {  # <script dir> <label>
+  local script_dir=${1:?script dir required} label=${2-}
+  node -e '
+    import(process.argv[1]).then(({ channelIdForLabel }) => {
+      process.stdout.write(channelIdForLabel(process.argv[2]));
+    });
+  ' "$script_dir/fm-buzz-lib.mjs" "$label"
 }

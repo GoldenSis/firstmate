@@ -21,6 +21,7 @@
 //
 // Usage: node tests/fm-buzz-stub-relay.mjs [--port N] [--reject <message>]
 //                                          [--drop-after-event] [--challenge]
+//                                          [--duplicate-refused] [--silent-ok]
 // Prints "listening <port>" on stdout once ready, so a caller can use port 0 and
 // learn the ephemeral port.
 
@@ -36,11 +37,26 @@ let port = 0;
 let reject = null;
 let dropAfterEvent = false;
 let challenge = false;
+// A relay may answer a known id either way: NIP-01 suggests OK true for an event
+// it already has, but Buzz refuses an existing row outright - the publisher's own
+// channel-provisioning check exists because `duplicate: channel already exists`
+// arrives with accepted=false. Only the refusing shape reaches the `duplicate:`
+// branch of classifyOkResponse; accepted=true is DELIVERED before that branch is
+// ever consulted. Both are worth modelling, so this is a flag rather than a
+// hardcoded choice.
+let duplicateRefused = false;
+// A relay that takes events and answers nothing at all. NIP-01 lets a relay reply
+// to a bad frame with a NOTICE, which is not scoped to any event and so resolves
+// no publish; this is that case, and it is the one that starves a drain if a
+// publish has no deadline of its own.
+let silentOk = false;
 for (let i = 0; i < argv.length; i += 1) {
   if (argv[i] === "--port") port = Number(argv[++i]);
   else if (argv[i] === "--reject") reject = argv[++i];
   else if (argv[i] === "--drop-after-event") dropAfterEvent = true;
   else if (argv[i] === "--challenge") challenge = true;
+  else if (argv[i] === "--duplicate-refused") duplicateRefused = true;
+  else if (argv[i] === "--silent-ok") silentOk = true;
 }
 
 // The event store: id -> event. A Map gives us exactly the relay's
@@ -172,6 +188,10 @@ server.on("upgrade", (req, socket) => {
           socket.destroy();
           return;
         }
+        if (silentOk) {
+          store.set(event.id, event);
+          continue; // received, stored, never acknowledged
+        }
         if (reject) {
           send(["OK", event.id, false, reject]);
           continue;
@@ -185,7 +205,8 @@ server.on("upgrade", (req, socket) => {
           continue;
         }
         if (store.has(event.id)) {
-          send(["OK", event.id, true, "duplicate:"]);
+          if (duplicateRefused) send(["OK", event.id, false, "duplicate: event already stored"]);
+          else send(["OK", event.id, true, "duplicate:"]);
           continue;
         }
         store.set(event.id, event);

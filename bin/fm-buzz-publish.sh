@@ -69,8 +69,60 @@ MAX_CACHE=${FM_BUZZ_MAX_CACHE:-100}
 REFRESH=0
 REPLAY_DIR="$STATE/buzz-replay"
 
+STDIN_TIMEOUT_S=${FM_BUZZ_STDIN_TIMEOUT_S:-30}
+
 log() {
   printf 'fm-buzz-publish: %s\n' "$1" >&2
+}
+
+# Spool stdin to a file under a total deadline, then print it.
+#
+# An unbounded read is the one way this script could fail to RETURN even though it
+# cannot fail to exit non-zero, and for a caller a hang is strictly worse than a
+# refusal - "never blocks Firstmate" has to mean termination, not just status 0.
+# A writer that produces some bytes and then never closes its end would otherwise
+# park `cat` forever, so a watchdog kills the read at the deadline.
+#
+# An expired read is DISCARDED, never published: half a projection is not a
+# smaller projection, it is malformed JSON, and the omitted[] disclosure that
+# makes a bounded projection honest is at the end of it. Truncating silently
+# would turn "this was cut short" into an unmarked absence, which is the one thing
+# the disclosure exists to prevent.
+#
+# The watchdog polls in one-second steps instead of sleeping the whole deadline in
+# one go, and gives up its stdout and stderr on the way in. Both matter: a plain
+# `sleep $deadline` leaves an orphan holding this script's output pipe open long
+# after the read finished, and a caller doing `output=$(fm-buzz-publish.sh ...)`
+# blocks on that fd until it drains - which would reintroduce, in the caller, the
+# very hang this function exists to prevent.
+read_stdin_bounded() {
+  local spool reader watchdog rc
+  spool=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-stdin.XXXXXX") || return 1
+  cat <&0 > "$spool" &
+  reader=$!
+  (
+    exec >/dev/null 2>&1
+    local elapsed=0
+    while [ "$elapsed" -lt "$STDIN_TIMEOUT_S" ]; do
+      sleep 1
+      kill -0 "$reader" 2>/dev/null || exit 0
+      elapsed=$((elapsed + 1))
+    done
+    kill "$reader" 2>/dev/null
+  ) &
+  watchdog=$!
+  wait "$reader" 2>/dev/null
+  rc=$?
+  kill "$watchdog" 2>/dev/null
+  wait "$watchdog" 2>/dev/null
+  if [ "$rc" -ne 0 ]; then
+    rm -f -- "$spool"
+    return 1
+  fi
+  cat "$spool"
+  rc=$?
+  rm -f -- "$spool"
+  return "$rc"
 }
 
 # Everything substantive runs inside this function so the tail of the script can
@@ -86,7 +138,16 @@ publish() {
       return 1
     }
   else
-    content=$(cat) || { log "could not read the projection from stdin"; return 1; }
+    # A terminal on stdin means nobody is piping a projection in at all, so this
+    # is answerable without waiting out the deadline below.
+    if [ -t 0 ]; then
+      log "stdin is a terminal; pipe the projection in or use --refresh"
+      return 1
+    fi
+    content=$(read_stdin_bounded) || {
+      log "could not read the projection from stdin within ${STDIN_TIMEOUT_S}s"
+      return 1
+    }
   fi
   [ -n "$content" ] || { log "the projection is empty; skipping publish"; return 1; }
 
@@ -103,11 +164,7 @@ publish() {
   fi
 
   local channel
-  channel=$(node -e '
-    import(process.argv[1]).then(({ channelIdForLabel }) => {
-      process.stdout.write(channelIdForLabel(process.argv[2]));
-    });
-  ' "$SCRIPT_DIR/fm-buzz-lib.mjs" "$label") || {
+  channel=$(fm_buzz_channel_id "$SCRIPT_DIR" "$label") || {
     log "could not derive the channel id"
     return 1
   }
@@ -115,10 +172,13 @@ publish() {
   mkdir -p "$REPLAY_DIR" 2>/dev/null || { log "could not create $REPLAY_DIR"; return 1; }
   chmod 0700 "$REPLAY_DIR" 2>/dev/null || true
 
-  # The envelope goes down a pipe: the private key never reaches a command line
-  # (visible in the process table) or the environment.
+  # The envelope goes down a pipe, and the key reaches jq the same way: through a
+  # file descriptor, never `--arg` (which would put it in jq's own argv, visible
+  # in the process table) and never the environment. --rawfile takes the fd's
+  # bytes verbatim, and the writing printf is a bash builtin, so the key is not on
+  # any command line at any point.
   jq -n \
-    --arg privateKey "$key" \
+    --rawfile privateKey <(printf '%s' "$key") \
     --arg content "$content" \
     --arg relay "$RELAY" \
     --arg channelId "$channel" \

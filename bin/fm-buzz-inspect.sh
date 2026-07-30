@@ -50,11 +50,7 @@ command -v jq >/dev/null 2>&1 || { printf 'fm-buzz-inspect.sh: jq is required\n'
 
 [ -n "$CHANNEL_LABEL" ] || CHANNEL_LABEL=$(fm_buzz_key_account "$FM_HOME")
 
-CHANNEL=$(node -e '
-  import(process.argv[1]).then(({ channelIdForLabel }) => {
-    process.stdout.write(channelIdForLabel(process.argv[2]));
-  });
-' "$SCRIPT_DIR/fm-buzz-lib.mjs" "$CHANNEL_LABEL") || {
+CHANNEL=$(fm_buzz_channel_id "$SCRIPT_DIR" "$CHANNEL_LABEL") || {
   printf 'fm-buzz-inspect.sh: could not derive the channel id\n' >&2
   exit 1
 }
@@ -67,9 +63,11 @@ if [ "$ANONYMOUS" -eq 0 ]; then
   }
 fi
 
-# The key travels down a pipe only - never a command line, never the environment.
+# The key travels down file descriptors only - never a command line, never the
+# environment. --rawfile rather than --arg for the same reason as in
+# bin/fm-buzz-publish.sh: jq's own argv is world-readable in the process table.
 jq -n \
-  --arg privateKey "$KEY" \
+  --rawfile privateKey <(printf '%s' "$KEY") \
   --arg relay "$RELAY" \
   --arg channelId "$CHANNEL" \
   --argjson limit "$LIMIT" \

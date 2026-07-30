@@ -53,10 +53,15 @@ docker compose -f docker-compose.buzz-loopback.yml down -v         # clean slate
 ```
 
 `bin/fm-buzz-publish.sh` reads the projection on stdin when `--refresh` is not given, so an already-captured snapshot can be republished without regenerating it.
+That read is bounded (`FM_BUZZ_STDIN_TIMEOUT_S`, default 30) and refuses a terminal outright, because "never blocks Firstmate" has to mean the script terminates, not merely that it exits 0.
+An expired read is discarded rather than published: a truncated projection is malformed JSON, and the `omitted[]` disclosure that makes a bounded projection honest sits at the end of it.
 
 The keypair is created once per home and stored in the OS keychain, falling back to a `0600` file when no keychain is reachable.
-The keychain account is the resolved `FM_HOME`, so a secondmate home gets its own key and its own channel rather than publishing under the main home's identity.
-No command prints the private key, and no keypair material is committed.
+Both stores key on the resolved `FM_HOME` - the keychain through its account attribute, the fallback file through a digest of that account in its filename - so a secondmate home gets its own key and its own channel rather than publishing under the main home's identity.
+The file store has to derive per-home too, not just the keychain: `XDG_DATA_HOME` follows the user rather than `FM_HOME`, so homes normally share one, and a fixed filename would break the invariant on exactly the hosts with no keychain to enforce it.
+
+No command prints the private key, no keypair material is committed, and the key reaches no process's argv: `security -i` takes the keychain write on stdin, and `jq` receives the key through a file descriptor (`--rawfile`) rather than `--arg`.
+An argv is world-readable through the process table, which is the whole reason for both.
 
 ## Two facts about this host that are easy to lose
 

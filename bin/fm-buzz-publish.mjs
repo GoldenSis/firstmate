@@ -28,22 +28,11 @@ import {
   buildBearingsEvent,
   buildChannelCreateEvent,
   classifyOkResponse,
+  readStdin,
   withRelay,
   DELIVERED,
   PERMANENT,
 } from "./fm-buzz-lib.mjs";
-
-function readStdin() {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk) => {
-      data += chunk;
-    });
-    process.stdin.on("end", () => resolve(data));
-    process.stdin.on("error", reject);
-  });
-}
 
 function log(message) {
   process.stderr.write(`fm-buzz-publish: ${message}\n`);
@@ -174,19 +163,20 @@ async function main() {
         discarded += 1;
         continue;
       }
+      // The relay verdict and the cache eviction are settled separately on
+      // purpose. Evicting inside the publish try meant a failed unlink AFTER a
+      // successful delivery was caught as "delivery unresolved" and counted as
+      // retained - reporting a landed event as lost and turning a local
+      // filesystem hiccup into a non-zero exit. The event's fate is decided by
+      // the relay; a leftover file is only a redundant replay, which the relay's
+      // id dedupe absorbs.
+      let verdict;
       try {
         const response = await api.publish(parsed, raw);
-        const verdict = classifyOkResponse(response.accepted, response.message);
-        if (verdict === DELIVERED) {
-          unlinkSync(entry.file);
-          delivered += 1;
-        } else if (verdict === PERMANENT) {
-          log(`permanently rejected ${entry.id}: ${response.message}`);
-          unlinkSync(entry.file);
-          discarded += 1;
-        } else {
+        verdict = classifyOkResponse(response.accepted, response.message);
+        if (verdict === PERMANENT) log(`permanently rejected ${entry.id}: ${response.message}`);
+        if (verdict !== DELIVERED && verdict !== PERMANENT) {
           log(`retryable rejection for ${entry.id}: ${response.message}`);
-          kept += 1;
         }
       } catch (error) {
         // Includes the genuinely-unknown case: sent, socket closed, no OK. The
@@ -194,6 +184,19 @@ async function main() {
         // if it did in fact land.
         log(`delivery unresolved for ${entry.id}: ${error.message}`);
         kept += 1;
+        continue;
+      }
+
+      if (verdict === DELIVERED) delivered += 1;
+      else if (verdict === PERMANENT) discarded += 1;
+      else {
+        kept += 1;
+        continue;
+      }
+      try {
+        unlinkSync(entry.file);
+      } catch (error) {
+        log(`could not drop settled cache entry ${entry.name}: ${error.message}`);
       }
     }
   });

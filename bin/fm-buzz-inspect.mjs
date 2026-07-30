@@ -16,20 +16,8 @@
 // output, that is not an increment - it re-opens the question of who owns
 // canonical state.
 
-import { channelIdForLabel, withRelay, KIND_STREAM_MESSAGE } from "./fm-buzz-lib.mjs";
+import { channelIdForLabel, readStdin, withRelay, KIND_STREAM_MESSAGE } from "./fm-buzz-lib.mjs";
 import { generateKeypair, schnorrVerify } from "./fm-buzz-crypto.mjs";
-
-function readStdin() {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk) => {
-      data += chunk;
-    });
-    process.stdin.on("end", () => resolve(data));
-    process.stdin.on("error", reject);
-  });
-}
 
 const envelope = JSON.parse(await readStdin());
 const relay = envelope.relay ?? "ws://localhost:3000";

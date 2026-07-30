@@ -77,6 +77,16 @@ replay_count() {  # <home>
   find "$home/state/buzz-replay" -name '*.json' 2>/dev/null | wc -l | tr -d ' '
 }
 
+# Ask the custody library itself where a home's key file is, rather than hardcoding
+# the name here: the per-home derivation is the thing under test, and a test that
+# recomputed it would agree with a broken library by construction.
+key_file() {  # <home> <xdg>
+  ( XDG_DATA_HOME=$2 FM_BUZZ_FORCE_FILE_STORE=1
+    # shellcheck disable=SC1091
+    . "$ROOT/bin/fm-buzz-key-lib.sh"
+    fm_buzz_key_fallback_file "$1" )
+}
+
 # --- the signing really is BIP-340 -----------------------------------------
 #
 # Everything else in this suite would still pass if the signer were subtly wrong
@@ -127,8 +137,9 @@ test_bip340_official_vectors() {
 # --- (a) keypair generation ------------------------------------------------
 
 test_keypair_is_idempotent_and_never_prints_the_private_key() {
-  local home first second stored
+  local home first second stored keyfile
   home=$(make_home keypair)
+  keyfile=$(key_file "$home" "$home/xdg")
 
   first=$(run_keypair "$home" 2>/dev/null) || fail "keypair creation failed"
   case $first in
@@ -145,9 +156,7 @@ test_keypair_is_idempotent_and_never_prints_the_private_key() {
     "the public key was not recorded in data/buzz-keypair.public"
 
   # The private key must appear in NO output stream of either run.
-  stored=$(FM_BUZZ_FORCE_FILE_STORE=1 XDG_DATA_HOME="$home/xdg" \
-    sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' \
-    "$home/xdg/firstmate/buzz-keypair.json")
+  stored=$(sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$keyfile")
   [ -n "$stored" ] || fail "no private key was stored"
   [ "$stored" != "$first" ] || fail "the public and private keys are identical"
 
@@ -158,11 +167,53 @@ test_keypair_is_idempotent_and_never_prints_the_private_key() {
 
   # And the fallback file must not be world-readable.
   local mode
-  mode=$(stat -f '%Lp' "$home/xdg/firstmate/buzz-keypair.json" 2>/dev/null \
-    || stat -c '%a' "$home/xdg/firstmate/buzz-keypair.json")
+  mode=$(stat -f '%Lp' "$keyfile" 2>/dev/null || stat -c '%a' "$keyfile")
   [ "$mode" = "600" ] || fail "the key file mode is $mode, expected 600"
 
   pass "keypair generation is idempotent and never prints the private key"
+}
+
+# --- one key per home, in the store that cannot enforce it ------------------
+
+test_two_homes_sharing_one_xdg_get_separate_keys() {
+  # XDG_DATA_HOME follows the USER, not FM_HOME, so the realistic arrangement is
+  # one XDG dir shared by the main home and every secondmate. The keychain keys on
+  # the FM_HOME account and so is safe by construction; the file fallback has to
+  # derive per-home too or a secondmate silently publishes under the main home's
+  # identity on every non-Darwin host. Giving each synthetic home its own
+  # XDG_DATA_HOME - which the rest of this suite does - cannot see that at all,
+  # so this test deliberately shares one.
+  local xdg main second main_key second_key main_file second_file
+  xdg="$TMP_ROOT/shared-xdg"
+  mkdir -p "$xdg"
+  main=$(make_home per-home-main)
+  second=$(make_home per-home-second)
+
+  main_key=$(FM_HOME="$main" FM_DATA_OVERRIDE="$main/data" XDG_DATA_HOME="$xdg" \
+    FM_BUZZ_FORCE_FILE_STORE=1 "$KEYPAIR" 2>/dev/null) \
+    || fail "keypair creation failed for the main home"
+  second_key=$(FM_HOME="$second" FM_DATA_OVERRIDE="$second/data" XDG_DATA_HOME="$xdg" \
+    FM_BUZZ_FORCE_FILE_STORE=1 "$KEYPAIR" 2>/dev/null) \
+    || fail "keypair creation failed for the second home"
+
+  [ "$main_key" != "$second_key" ] \
+    || fail "two homes sharing one XDG_DATA_HOME got the SAME public key ($main_key); the second home would publish under the first home's identity"
+
+  main_file=$(key_file "$main" "$xdg")
+  second_file=$(key_file "$second" "$xdg")
+  [ "$main_file" != "$second_file" ] \
+    || fail "both homes resolved to one key file: $main_file"
+  assert_present "$main_file" "the main home's key file is missing"
+  assert_present "$second_file" "the second home's key file is missing"
+
+  # And the first home's key must survive the second home's creation unchanged.
+  local reread
+  reread=$(FM_HOME="$main" FM_DATA_OVERRIDE="$main/data" XDG_DATA_HOME="$xdg" \
+    FM_BUZZ_FORCE_FILE_STORE=1 "$KEYPAIR" --public 2>/dev/null)
+  [ "$reread" = "$main_key" ] \
+    || fail "the second home's keypair overwrote the first home's key"
+
+  pass "two homes sharing one XDG_DATA_HOME get separate keys"
 }
 
 test_public_flag_fails_before_a_keypair_exists() {
@@ -298,6 +349,102 @@ EOF
   pass "reconnect replays the identical event id and produces no duplicate"
 }
 
+replaying_a_known_event_is_deduped_and_evicted() {  # <label> [stub args...]
+  # The `duplicate:` -> DELIVERED classification is what makes replay idempotent,
+  # and it is only reachable against a relay that ALREADY holds the id - which a
+  # reconnect to a fresh stub never is. One long-lived stub, and the same signed
+  # bytes offered twice, is the only shape that exercises it.
+  local label=$1
+  shift
+  local home relay stashed cached output
+  home=$(make_home "duplicate-$label")
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  # Publish against a dead relay purely to capture the exact signed bytes the
+  # cache holds, then stash them.
+  printf '%s' '{"schema":"fm-bearings.v1","note":"first"}' \
+    | run_publish "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
+  [ "$(replay_count "$home")" = "1" ] || fail "the first event was not cached"
+  cached=$(find "$home/state/buzz-replay" -name '*.json' | head -1)
+  stashed="$TMP_ROOT/stashed-$label-$(basename "$cached")"
+  cp "$cached" "$stashed"
+
+  # Drain it into a long-lived stub. The relay now holds this id.
+  read -r STUB_PID relay <<EOF
+$(start_stub "$@")
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"second"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  [ "$(replay_count "$home")" = "0" ] || fail "the cache did not drain against a live relay"
+
+  # Put the very same bytes back, as an unacknowledged delivery would have. The
+  # relay answers `duplicate:`, which must count as DELIVERED and evict the entry
+  # rather than being retained and replayed forever.
+  cp "$stashed" "$cached"
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"third"}' \
+    | run_publish "$home" "$relay" 2>&1)
+
+  assert_contains "$output" "delivered=2" \
+    "a duplicate must count as delivered, not retained"
+  assert_contains "$output" "retained=0" \
+    "a duplicate was retained instead of evicted"
+  [ "$(replay_count "$home")" = "0" ] \
+    || fail "a relay-deduped event must be evicted from the replay cache"
+
+  # And the relay must hold one copy of that id, not two.
+  local ids duplicates
+  ids=$(node -e '
+    import(process.argv[1]).then(async ({ withRelay, KIND_STREAM_MESSAGE }) => {
+      const { generateKeypair } = await import(process.argv[3]);
+      const { events } = await withRelay(process.argv[2], generateKeypair().privateKey, 8000,
+        async (api) => api.query({ kinds: [KIND_STREAM_MESSAGE] }));
+      process.stdout.write(events.map((e) => e.id).join("\n"));
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay" "$ROOT/bin/fm-buzz-crypto.mjs")
+  duplicates=$(printf '%s\n' "$ids" | sort | uniq -d)
+  [ -z "$duplicates" ] || fail "the relay stored the replayed event twice: $duplicates"
+
+  kill "$STUB_PID" 2>/dev/null
+  STUB_PID=""
+  pass "replaying an event the relay already has is deduped and evicted ($label)"
+}
+
+test_replaying_a_known_event_is_deduped_and_evicted() {
+  # Both relay answers for a known id. The refusing one is the case that actually
+  # exercises classifyOkResponse's `duplicate:` branch: an accepted=true answer is
+  # DELIVERED on the first line and never consults the message at all, so a suite
+  # that only modelled that shape would pass with the branch broken.
+  replaying_a_known_event_is_deduped_and_evicted accepted
+  replaying_a_known_event_is_deduped_and_evicted refused --duplicate-refused
+}
+
+test_an_unacknowledged_publish_does_not_starve_the_drain() {
+  # The channel-create publish runs BEFORE the replay drain, so if one publish can
+  # consume the whole connection budget the drain never starts and the run dies
+  # before a single cached event is attempted. Against a relay that acknowledges
+  # nothing, each publish must give up on its own deadline and the run must still
+  # reach its summary.
+  local home relay output
+  home=$(make_home starve)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub --silent-ok)
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"starve"}' \
+    | run_publish "$home" "$relay" 2>&1)
+  kill "$STUB_PID" 2>/dev/null
+  STUB_PID=""
+
+  assert_contains "$output" "delivered=0 retained=1" \
+    "the cached event was never attempted; one stalled publish ate the whole budget"
+  assert_not_contains "$output" "relay timeout after" \
+    "the connection-wide timeout fired, so no publish had a deadline of its own"
+  [ "$(replay_count "$home")" = "1" ] \
+    || fail "an unacknowledged event must stay cached"
+  pass "one unacknowledged publish does not starve the replay drain"
+}
+
 test_permanent_rejection_is_not_replayed_forever() {
   local home relay
   home=$(make_home permanent)
@@ -365,6 +512,60 @@ test_replay_cache_is_capped_at_100() {
   pass "the replay cache is capped at 100, dropping oldest first"
 }
 
+# --- the contract means TERMINATING, not just exiting 0 --------------------
+
+test_a_writer_that_never_closes_does_not_hang_the_publish() {
+  # Exit status 0 is worth nothing to a caller if the script never returns, and an
+  # unbounded `cat` on stdin is the one place that can happen. A fifo whose write
+  # end this test holds open is a writer that never sends EOF: the read must hit
+  # its deadline, log, and still exit 0 - and it must not publish the partial read.
+  local home fifo output code
+  home=$(make_home stdin-stall)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  fifo="$TMP_ROOT/stall.fifo"
+  rm -f "$fifo"
+  mkfifo "$fifo" || fail "could not create the test fifo"
+
+  # Read-write, so opening it does not block waiting for the other end to appear;
+  # holding it open is what makes this a writer that never sends EOF.
+  exec 9<>"$fifo"
+  printf '%s' '{"schema":"fm-bearings.v1","note":"partial' >&9
+
+  # Run it detached and give it a wall-clock budget of its own. If the bound ever
+  # regresses this must FAIL, not inherit the hang it is testing for - a suite
+  # that hangs in CI reports nothing at all.
+  local spool pid waited
+  spool="$TMP_ROOT/stall.out"
+  FM_BUZZ_STDIN_TIMEOUT_S=2 run_publish "$home" "ws://127.0.0.1:1" < "$fifo" > "$spool" 2>&1 &
+  pid=$!
+  waited=0
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null
+    exec 9>&-
+    rm -f "$fifo"
+    fail "the publish never returned; an unbounded stdin read hangs the caller"
+  fi
+  wait "$pid"
+  code=$?
+  output=$(cat "$spool")
+  exec 9>&-
+  rm -f "$fifo"
+
+  expect_code 0 "$code" "a stalled stdin read must still exit 0"
+  assert_contains "$output" "could not read the projection from stdin within 2s" \
+    "the bounded read did not report its deadline"
+  assert_contains "$output" "Firstmate is unaffected" \
+    "the stalled read did not go through the fire-and-forget conversion"
+  [ "$(replay_count "$home")" = "0" ] \
+    || fail "a truncated projection must never be signed and enqueued"
+  pass "a writer that never closes stdin cannot hang the publish"
+}
+
 # --- the contract itself ---------------------------------------------------
 
 test_fire_and_forget_contract_is_intact() {
@@ -379,6 +580,27 @@ test_fire_and_forget_contract_is_intact() {
   [ "$(tail -1 "$PUBLISH")" = "exit 0" ] \
     || fail "bin/fm-buzz-publish.sh must end with an unconditional exit 0"
   pass "the fire-and-forget contract is structurally intact"
+}
+
+test_the_private_key_reaches_no_command_line() {
+  # A structural guard, for the same reason as the one above: an argv is
+  # world-readable through the process table, and `--arg`/`-w <secret>` are the
+  # obvious-looking spellings that put the key there. Both are one careless edit
+  # away, and neither shows up in any behavioural assertion.
+  # Match real shell lines only, never the header comments that explain why these
+  # spellings are banned - the same distinction the fire-and-forget guard makes.
+  local offenders
+  offenders=$(grep -nE '^[[:space:]]*[^#]*--arg[[:space:]]+privateKey' \
+    "$ROOT/bin/fm-buzz-publish.sh" "$ROOT/bin/fm-buzz-inspect.sh" || true)
+  [ -z "$offenders" ] \
+    || fail "the private key must reach jq through a file descriptor, not argv:"$'\n'"$offenders"
+
+  offenders=$(grep -nE '^[[:space:]]*[^#]*security[[:space:]]+add-generic-password' \
+    "$ROOT/bin/fm-buzz-key-lib.sh" || true)
+  [ -z "$offenders" ] \
+    || fail "the keychain write must go through 'security -i' so the secret is not in argv:"$'\n'"$offenders"
+
+  pass "the private key reaches no command line"
 }
 
 test_no_firstmate_path_depends_on_buzz() {
@@ -397,12 +619,17 @@ test_no_firstmate_path_depends_on_buzz() {
 test_bip340_official_vectors
 test_keypair_is_idempotent_and_never_prints_the_private_key
 test_public_flag_fails_before_a_keypair_exists
+test_two_homes_sharing_one_xdg_get_separate_keys
 test_publish_with_relay_down_exits_zero_and_enqueues
 test_publish_without_a_keypair_still_exits_zero
 test_publish_with_relay_up_delivers_and_lands
 test_reconnect_replays_the_identical_event_id
+test_replaying_a_known_event_is_deduped_and_evicted
+test_an_unacknowledged_publish_does_not_starve_the_drain
 test_permanent_rejection_is_not_replayed_forever
 test_retryable_rejection_is_kept
 test_replay_cache_is_capped_at_100
+test_a_writer_that_never_closes_does_not_hang_the_publish
 test_fire_and_forget_contract_is_intact
+test_the_private_key_reaches_no_command_line
 test_no_firstmate_path_depends_on_buzz
