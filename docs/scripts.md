@@ -84,3 +84,9 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-x-dismiss.sh`        | Dismiss a skipped X-mode mention at the relay without replying                       |
 | `fm-x-link.sh`           | Link a spawned task to its originating X-mode mention in task meta                   |
 | `fm-x-followup.sh`       | Detect, post, and cap completion follow-ups for an X-mode-linked task                |
+| `fm-buzz-keypair.sh`     | Create this home's loopback Buzz publishing keypair once, in the OS keychain (docs/buzz-loopback-adapter.md) |
+| `fm-buzz-publish.sh`     | Publish one bearings projection to the loopback Buzz relay; always exits 0, never blocks Firstmate |
+| `fm-buzz-inspect.sh`     | Human diagnostic: read published bearings events back off the loopback relay         |
+| `fm-buzz-key-lib.sh`     | Shared custody of the loopback Buzz publishing key (keychain, or a 0600 fallback)    |
+| `fm-buzz-lib.mjs`        | NIP-01 event construction and the loopback Buzz relay client                          |
+| `fm-buzz-crypto.mjs`     | Dependency-free BIP-340 Schnorr signing over secp256k1 for the Buzz adapter          |
