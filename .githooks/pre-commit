@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Secret-scan gate — blocks a commit that would add a private key, PII dump, or a
+# known hardcoded secret to the index. Added after audit C-1 (2026-07-11).
+# Bypass ONLY with a deliberate `git commit --no-verify` when you know better.
+set -u
+
+staged() { git diff --cached --name-only --diff-filter=ACM; }
+
+fail=0
+note() { echo "  ⛔ $1"; fail=1; }
+
+# 1) Secret-artifact filenames should never be committed.
+while IFS= read -r f; do
+  case "$f" in
+    *.pem|*.key|*.p12|*.pfx|*.vcf|*/id_rsa|*/id_ed25519|*vapid_private*|*.env|*/.env.*|*credentials.json|*/history.jsonl)
+      note "secret-artifact file staged: $f" ;;
+  esac
+done < <(staged)
+
+# 2) Secret CONTENT patterns in staged diffs.
+#    (public keys / .txt pubkeys are fine; we look for private material + known keys.)
+# (no leading '-' in the alternation, and -e below, so grep never parses the pattern as flags)
+# NOTE 2026-07-31: the original list only had sk_ (UNDERSCORE, Stripe-style) and so
+# missed every hyphenated vendor key — sk-ant-, sk-proj-, sk-or- — which is exactly
+# what was found sitting in ~/.claude/history.jsonl. Hyphen variants added below.
+patterns='BEGIN[ A-Z]*PRIVATE KEY|k7m2p9x4qz6w|sk_[A-Za-z0-9]{20,}|sk-(ant|proj|or)-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{30,}|gho_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{50,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{20,}|AIza[A-Za-z0-9_-]{30,}|[0-9]{9,10}:[A-Za-z0-9_-]{35}'
+# (exclude this hook itself — it necessarily contains the patterns it scans for)
+scan_paths=$(staged | grep -v '^\.githooks/pre-commit$')
+hits=""
+if [ -n "$scan_paths" ]; then
+  hits=$(git diff --cached -U0 --diff-filter=ACM -- $scan_paths 2>/dev/null \
+    | grep -E '^\+[^+]' | grep -nE -e "$patterns")
+  hits=$(printf '%s' "$hits" | sed -n '1,20p')
+fi
+if [ -n "$hits" ]; then
+  note "secret pattern in staged changes (private key / API key / PNK shared key):"
+  printf '%s\n' "$hits" | sed 's/^/       /'
+fi
+
+if [ "$fail" = "1" ]; then
+  echo
+  echo "Commit blocked by secret-scan (.githooks/pre-commit)."
+  echo "Move the secret out of git (local-only), rotate it if it was ever committed,"
+  echo "or bypass deliberately with:  git commit --no-verify"
+  exit 1
+fi
+exit 0
