@@ -39,6 +39,17 @@ make_home() {  # <name>
   printf '%s\n' "$home"
 }
 
+# Portable file mode. Do NOT use the `stat -f <fmt> || stat -c <fmt>` fallback
+# form: on Linux `stat -f` is *filesystem* stat, so it succeeds and prints a
+# filesystem report instead of the mode, and the `-c` branch never runs.
+file_mode() {  # <path>
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%Lp' "$1" 2>/dev/null
+  else
+    stat -c '%a' "$1" 2>/dev/null
+  fi
+}
+
 run_keypair() {  # <home> [args...]
   local home=$1
   shift
@@ -176,7 +187,7 @@ test_keypair_is_idempotent_and_never_prints_the_private_key() {
 
   # And the fallback file must not be world-readable.
   local mode
-  mode=$(stat -f '%Lp' "$keyfile" 2>/dev/null || stat -c '%a' "$keyfile")
+  mode=$(file_mode "$keyfile")
   [ "$mode" = "600" ] || fail "the key file mode is $mode, expected 600"
 
   pass "keypair generation is idempotent and never prints the private key"
