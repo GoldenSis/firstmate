@@ -62,6 +62,7 @@ docker compose -f docker-compose.buzz-loopback.yml down -v         # clean slate
 `bin/fm-buzz-publish.sh` reads the projection on stdin when `--refresh` is not given, so an already-captured snapshot can be republished without regenerating it.
 That read is bounded (`FM_BUZZ_STDIN_TIMEOUT_S`, default 30) and refuses a terminal outright, because "never blocks Firstmate" has to mean the script terminates, not merely that it exits 0.
 An expired read is discarded rather than published: a truncated projection is malformed JSON, and the `omitted[]` disclosure that makes a bounded projection honest sits at the end of it.
+The rest of the runtime knobs (`FM_BUZZ_RELAY`, `FM_BUZZ_TIMEOUT_MS`, `FM_BUZZ_MAX_CACHE`, `FM_BUZZ_FORCE_FILE_STORE`) are listed with their defaults in [`configuration.md`](configuration.md#environment-variables), and the compose stack itself takes `BUZZ_IMAGE` and `BUZZ_LOOPBACK_PORT`; a non-default port needs a matching `FM_BUZZ_RELAY`.
 
 The keypair is created once per home and stored in the OS keychain, falling back to a `0600` file when no keychain is reachable.
 Both stores key on the resolved `FM_HOME` - the keychain through its account attribute, the fallback file through a digest of that account in its filename - so a secondmate home gets its own key and its own channel rather than publishing under the main home's identity.

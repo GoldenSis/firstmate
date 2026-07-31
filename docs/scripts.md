@@ -88,5 +88,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-buzz-publish.sh`     | Publish one bearings projection to the loopback Buzz relay; always exits 0, never blocks Firstmate |
 | `fm-buzz-inspect.sh`     | Human diagnostic: read published bearings events back off the loopback relay         |
 | `fm-buzz-key-lib.sh`     | Shared custody of the loopback Buzz publishing key (keychain, or a 0600 fallback)    |
+| `fm-buzz-publish.mjs`    | Publishing engine behind `fm-buzz-publish.sh`: sign, cache, and drain to the relay    |
+| `fm-buzz-inspect.mjs`    | Read-back engine behind `fm-buzz-inspect.sh`; never consumed by firstmate            |
 | `fm-buzz-lib.mjs`        | NIP-01 event construction and the loopback Buzz relay client                          |
 | `fm-buzz-crypto.mjs`     | Dependency-free BIP-340 Schnorr signing over secp256k1 for the Buzz adapter          |
