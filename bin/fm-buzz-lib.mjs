@@ -3,8 +3,9 @@
 //
 // Layered on bin/fm-buzz-crypto.mjs (BIP-340 signing) and consumed by
 // bin/fm-buzz-publish.sh via bin/fm-buzz-publish.mjs. This module owns the wire
-// format and the relay conversation; it owns no policy. The fire-and-forget
-// contract, the replay cache, and the snapshot plumbing live in the publisher.
+// format, the relay conversation, and the loopback-only relay policy shared by
+// both entry points. The fire-and-forget contract, the replay cache, and the
+// snapshot plumbing live in the publisher.
 //
 // WHY THE EVENT ID MATTERS MORE THAN USUAL HERE
 // A NIP-01 event id is SHA-256 over [0, pubkey, created_at, kind, tags, content],
@@ -23,6 +24,21 @@
 // captain edits. Append-only messages only.
 
 import { schnorrSign, sha256, bytesToHex, publicKeyFromPrivate } from "./fm-buzz-crypto.mjs";
+
+const LOOPBACK_RELAY_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+export function resolveLoopbackRelayHost(relay) {
+  let url;
+  try {
+    url = new URL(relay);
+  } catch {
+    throw new Error(`invalid relay URL: ${relay}`);
+  }
+  if (!LOOPBACK_RELAY_HOSTS.has(url.hostname)) {
+    throw new Error(`rejected relay host: ${url.hostname}`);
+  }
+  return url.host;
+}
 
 // Buzz kind numbers, from crates/buzz-core/src/kind.rs at commit 7fb008f9.
 export const KIND_STREAM_MESSAGE = 9; // NIP-29 channel chat message (append-only)
@@ -209,6 +225,7 @@ function buildAuthEvent(relayUrl, challenge, privateKeyHex) {
 // a relay whose AUTH lands after BOTH windows leaves the run unauthenticated and
 // every event cached for the next run, which will race it again.
 async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = {}) {
+  resolveLoopbackRelayHost(relayUrl);
   if (typeof WebSocket !== "function") {
     throw new Error("this Node build has no global WebSocket");
   }

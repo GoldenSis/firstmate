@@ -129,6 +129,7 @@ The relay dedupes on that id with `INSERT ... ON CONFLICT DO NOTHING`.
 The consequence is sharp: resubmitting the byte-identical signed event is perfectly idempotent, while rebuilding and re-signing the same logical message mints a new id and lands a duplicate.
 
 So the replay cache stores exact signed bytes and replays those bytes.
+It is partitioned by relay host, using the layout in [`configuration.md`](configuration.md#operational-home-layout-and-state), so changing relays cannot expose one relay's queued snapshots to another.
 It is written before any network attempt, which is what makes a kill between signing and delivery lossless.
 An entry is removed when the relay acknowledges it, including a `duplicate:` answer, which means the relay already holds that id.
 An entry is also removed when the rejection is permanent (`invalid:`, `blocked:`, `pow:`), because replaying it could never succeed and would loop forever.

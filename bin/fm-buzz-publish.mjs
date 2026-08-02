@@ -38,6 +38,7 @@ import {
   buildChannelCreateEvent,
   classifyOkResponse,
   readStdin,
+  resolveLoopbackRelayHost,
   withRelay,
   DELIVERED,
   PERMANENT,
@@ -48,9 +49,15 @@ function log(message) {
   process.stderr.write(`fm-buzz-publish: ${message}\n`);
 }
 
-// Cache entries are named <created_at>-<id>.json. created_at is parsed back out
-// for ordering rather than relying on lexicographic sort, which would misorder
-// the moment the epoch gains a digit.
+// Each relay host gets its own directory, with entries named
+// <created_at>-<id>.json. The directory is part of the cache key: changing relay
+// host (including its port) cannot expose one relay's queued snapshots to
+// another. created_at is parsed back out for ordering rather than relying on
+// lexicographic sort, which would misorder the moment the epoch gains a digit.
+function relayCacheDirectory(replayDir, relayHost) {
+  return path.join(replayDir, encodeURIComponent(relayHost));
+}
+
 function cacheEntries(replayDir) {
   let names;
   try {
@@ -67,6 +74,28 @@ function cacheEntries(replayDir) {
     })
     .filter(Boolean)
     .sort((a, b) => (a.createdAt - b.createdAt) || a.id.localeCompare(b.id));
+}
+
+// The cap remains global across relay hosts. A separate 100-entry allowance per
+// port would let repeated local relay switches grow the private queue without
+// bound, so pruning considers both keyed directories and pre-key legacy files.
+function cacheDirectories(replayDir) {
+  let names;
+  try {
+    names = readdirSync(replayDir);
+  } catch {
+    return [replayDir];
+  }
+  const directories = [replayDir];
+  for (const name of names) {
+    const directory = path.join(replayDir, name);
+    try {
+      if (statSync(directory).isDirectory()) directories.push(directory);
+    } catch {
+      // Vanished under us, or not readable.
+    }
+  }
+  return directories;
 }
 
 // A `.json.tmp` is the half of cacheEvent's atomic write that a kill between the
@@ -105,8 +134,12 @@ function sweepOrphanTemporaries(replayDir, now) {
 // without limit and replay ancient fleet state; oldest-first is the right thing to
 // drop because a newer bearings projection supersedes an older one anyway.
 function pruneCache(replayDir, maxCache) {
-  sweepOrphanTemporaries(replayDir, Date.now());
-  const entries = cacheEntries(replayDir);
+  const directories = cacheDirectories(replayDir);
+  const now = Date.now();
+  for (const directory of directories) sweepOrphanTemporaries(directory, now);
+  const entries = directories
+    .flatMap((directory) => cacheEntries(directory))
+    .sort((a, b) => (a.createdAt - b.createdAt) || a.id.localeCompare(b.id));
   const excess = entries.length - maxCache;
   if (excess <= 0) return 0;
   let dropped = 0;
@@ -150,17 +183,19 @@ async function main() {
   for (const [name, value] of Object.entries({ privateKey, content, relay, channelId, replayDir })) {
     if (typeof value !== "string" || value === "") throw new Error(`missing envelope field: ${name}`);
   }
+  const relayHost = resolveLoopbackRelayHost(relay);
+  const relayCacheDir = relayCacheDirectory(replayDir, relayHost);
 
   // Sign and cache first: from here on the event survives a crash, a kill, or a
   // relay that is not running at all.
   const event = buildBearingsEvent(channelId, content, privateKey, [
     ["fm-schema", "fm-bearings.v1"],
   ]);
-  cacheEvent(replayDir, event);
+  cacheEvent(relayCacheDir, event);
   pruneCache(replayDir, maxCache);
   log(`signed event ${event.id} (${Buffer.byteLength(content, "utf8")} bytes) for channel ${channelId}`);
 
-  const pending = cacheEntries(replayDir);
+  const pending = cacheEntries(relayCacheDir);
   // Final verdict per cache entry rather than running counters, because an entry
   // can be attempted twice: a pass that ran before a late NIP-42 handshake
   // completed is superseded by the one that ran after it, and incrementing

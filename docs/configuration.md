@@ -413,7 +413,7 @@ FM_SEND_RETRIES=3       # fm-send Enter-retry attempts after typing the line onc
 FM_SEND_SLEEP=0.4       # seconds between fm-send submit checks
 FM_SEND_SETTLE=1        # seconds fm-send waits after a successful text submit; 0 disables
 # loopback Buzz bearings publisher (docs/buzz-loopback-adapter.md); additive, and nothing in firstmate reads it
-FM_BUZZ_RELAY=ws://localhost:3000   # loopback Buzz relay URL; the `localhost` spelling is load-bearing, since the relay resolves its tenant from the HTTP Host header
+FM_BUZZ_RELAY=ws://localhost:3000   # loopback Buzz relay URL; only 127.0.0.1, localhost, and [::1] hosts are accepted, and the `localhost` spelling is load-bearing for the bundled relay's HTTP Host routing
 FM_BUZZ_TIMEOUT_MS=15000            # whole-connection budget for one publish run; `fm-buzz-publish.sh --timeout` overrides it
 FM_BUZZ_MAX_CACHE=100               # replay-cache entries kept before the oldest signed events are dropped
 FM_BUZZ_STDIN_TIMEOUT_S=30          # deadline for reading the projection on stdin; an expired read is discarded rather than published
@@ -514,7 +514,7 @@ state/               volatile runtime signals; gitignored
   x-context/         generated X-mode durable per-request reply context (platform/budget), keyed by request_id; survives inbox cleanup so a delayed follow-up recovers the original platform (section 14; bin/fm-x-lib.sh)
   x-outbox/          generated X-mode dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
   x-poll.error       generated X-mode relay diagnostic dedupe marker
-  buzz-replay/       loopback Buzz publisher's replay cache of EXACT signed event bytes, named <created_at>-<id>.json; written before any network attempt, drained on acknowledgement, and capped by FM_BUZZ_MAX_CACHE (docs/buzz-loopback-adapter.md)
+  buzz-replay/       loopback Buzz publisher's replay cache of EXACT signed event bytes, keyed as <encoded-relay-host>/<created_at>-<id>.json; written before any network attempt, drained only by the matching relay host, and globally capped by FM_BUZZ_MAX_CACHE (docs/buzz-loopback-adapter.md)
   .wake-queue        durable queued wakes: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
   .afk               durable away-mode flag; present = sub-supervisor may inject escalations (set by /afk, cleared on user return)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks

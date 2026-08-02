@@ -92,6 +92,20 @@ start_stub() {  # [stub args...]
   printf '%s %s\n' "$pid" "ws://127.0.0.1:$port"
 }
 
+stop_stub() {  # <pid>
+  local pid=$1 waited=0
+  kill "$pid" 2>/dev/null
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 100 ]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null
+    fail "stub relay $pid did not stop"
+  fi
+  STUB_PID=""
+}
+
 replay_count() {  # <home>
   local home=$1
   find "$home/state/buzz-replay" -name '*.json' 2>/dev/null | wc -l | tr -d ' '
@@ -310,6 +324,42 @@ test_publish_without_a_keypair_still_exits_zero() {
   pass "publish with no keypair exits 0"
 }
 
+test_non_loopback_env_relay_is_rejected_before_network() {
+  local home guard sentinel output code
+  home=$(make_home relay-allowlist)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  # Replace Node's network boundary for this one invocation. Reaching the
+  # WebSocket constructor records durable evidence before throwing, so the test
+  # distinguishes an allowlist rejection from a fast DNS or connection failure.
+  guard="$TMP_ROOT/network-guard.mjs"
+  sentinel="$TMP_ROOT/network-attempted"
+  cat > "$guard" <<'EOF'
+import { writeFileSync } from "node:fs";
+globalThis.WebSocket = class NetworkAttempt {
+  constructor() {
+    writeFileSync(process.env.FM_BUZZ_NETWORK_SENTINEL, "attempted\n");
+    throw new Error("network boundary reached");
+  }
+};
+EOF
+
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"must-stay-local"}' \
+    | env FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$home/state" \
+      XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 FM_BUZZ_TIMEOUT_MS=8000 \
+      FM_BUZZ_RELAY="wss://evil.example" FM_BUZZ_NETWORK_SENTINEL="$sentinel" \
+      NODE_OPTIONS="--import=$guard" "$PUBLISH" 2>&1)
+  code=$?
+
+  expect_code 0 "$code" "a rejected relay must preserve fire-and-forget"
+  assert_contains "$output" "rejected relay host: evil.example" \
+    "the publisher did not identify the rejected host"
+  assert_absent "$sentinel" "a non-loopback relay reached the network boundary"
+  [ "$(replay_count "$home")" = "0" ] \
+    || fail "a projection was cached before the non-loopback relay was rejected"
+  pass "FM_BUZZ_RELAY rejects a non-loopback host before cache or network access"
+}
+
 # --- (c) relay up ----------------------------------------------------------
 
 test_publish_with_relay_up_delivers_and_lands() {
@@ -342,7 +392,10 @@ EOF
     });
   ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay" "$ROOT/bin/fm-buzz-crypto.mjs")
 
-  assert_contains "$readback" "1" "the relay did not store exactly one message"
+  local stored_count
+  stored_count=$(printf '%s\n' "$readback" | sed -n '1p')
+  [ "$stored_count" = "1" ] \
+    || fail "the relay stored $stored_count messages, expected exactly one"
   assert_contains "$readback" '"prs: not requested (--include-prs)"' \
     "the omitted[] disclosure did not survive publication verbatim"
   assert_contains "$readback" "$content" "the projection was altered in transit"
@@ -352,10 +405,54 @@ EOF
   pass "publish with the relay up delivers, lands, and preserves omitted[] verbatim"
 }
 
+test_relay_switch_does_not_replay_another_relays_cache() {
+  local home relay output readback stored_count
+  home=$(make_home relay-switch)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  # Queue one projection for a relay that is down.
+  printf '%s' '{"schema":"fm-bearings.v1","note":"relay-a-only"}' \
+    | run_publish "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
+  [ "$(replay_count "$home")" = "1" ] \
+    || fail "relay A did not retain exactly one cached projection"
+
+  # Switching to another relay must publish only the new projection. Relay A's
+  # cached bytes remain queued for A and are invisible to B.
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"relay-b-only"}' \
+    | run_publish "$home" "$relay" 2>&1)
+  assert_contains "$output" "delivered=1" \
+    "relay B did not receive exactly its own newly cached projection"
+  [ "$(replay_count "$home")" = "1" ] \
+    || fail "switching relays drained or duplicated relay A's cached projection"
+
+  readback=$(node -e '
+    import(process.argv[1]).then(async ({ withRelay, KIND_STREAM_MESSAGE }) => {
+      const { generateKeypair } = await import(process.argv[3]);
+      const { events } = await withRelay(process.argv[2], generateKeypair().privateKey, 8000,
+        async (api) => api.query({ kinds: [KIND_STREAM_MESSAGE] }));
+      process.stdout.write(String(events.length) + "\n");
+      for (const event of events) process.stdout.write(event.content + "\n");
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay" "$ROOT/bin/fm-buzz-crypto.mjs")
+  stored_count=$(printf '%s\n' "$readback" | sed -n '1p')
+  [ "$stored_count" = "1" ] \
+    || fail "relay B stored $stored_count messages, expected exactly its own one"
+  assert_contains "$readback" "relay-b-only" "relay B did not store its own projection"
+  assert_not_contains "$readback" "relay-a-only" \
+    "relay B received a projection cached for relay A"
+
+  kill "$STUB_PID" 2>/dev/null
+  STUB_PID=""
+  pass "switching relay hosts produces a cache miss for the prior relay"
+}
+
 # --- (d) reconnect replays the identical event id --------------------------
 
 test_reconnect_replays_the_identical_event_id() {
-  local home relay first_id after_kill stored
+  local home relay port first_id after_kill stored
   home=$(make_home reconnect)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
 
@@ -364,20 +461,20 @@ test_reconnect_replays_the_identical_event_id() {
   read -r STUB_PID relay <<EOF
 $(start_stub --drop-after-event)
 EOF
+  port=${relay##*:}
   printf '%s' '{"schema":"fm-bearings.v1","note":"mid-publish"}' \
     | run_publish "$home" "$relay" >/dev/null 2>&1
-  kill "$STUB_PID" 2>/dev/null
-  STUB_PID=""
+  stop_stub "$STUB_PID"
 
   [ "$(replay_count "$home")" = "1" ] \
     || fail "an unacknowledged event must stay in the replay cache"
   first_id=$(find "$home/state/buzz-replay" -name '*.json' -exec basename {} \; | sed 's/^[0-9]*-//; s/\.json$//')
 
-  # Reconnect to a fresh relay and publish again. The cached event must go out
+  # Reconnect to the same relay host and publish again. The cached event must go out
   # under its ORIGINAL id - not a freshly signed one - so a relay that already
   # has it dedupes instead of storing a second copy.
   read -r STUB_PID relay <<EOF
-$(start_stub)
+$(start_stub --port "$port")
 EOF
   printf '%s' '{"schema":"fm-bearings.v1","note":"after-reconnect"}' \
     | run_publish "$home" "$relay" >/dev/null 2>&1
@@ -410,14 +507,19 @@ replaying_a_known_event_is_deduped_and_evicted() {  # <label> [stub args...]
   # bytes offered twice, is the only shape that exercises it.
   local label=$1
   shift
-  local home relay stashed cached output
+  local home relay port stashed cached output
   home=$(make_home "duplicate-$label")
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
 
-  # Publish against a dead relay purely to capture the exact signed bytes the
-  # cache holds, then stash them.
+  # Reserve a relay URL, stop it, then publish against that dead URL to capture
+  # the exact signed bytes the host-keyed cache holds.
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  port=${relay##*:}
+  stop_stub "$STUB_PID"
   printf '%s' '{"schema":"fm-bearings.v1","note":"first"}' \
-    | run_publish "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
+    | run_publish "$home" "$relay" >/dev/null 2>&1
   [ "$(replay_count "$home")" = "1" ] || fail "the first event was not cached"
   cached=$(find "$home/state/buzz-replay" -name '*.json' | head -1)
   stashed="$TMP_ROOT/stashed-$label-$(basename "$cached")"
@@ -425,7 +527,7 @@ replaying_a_known_event_is_deduped_and_evicted() {  # <label> [stub args...]
 
   # Drain it into a long-lived stub. The relay now holds this id.
   read -r STUB_PID relay <<EOF
-$(start_stub "$@")
+$(start_stub --port "$port" "$@")
 EOF
   printf '%s' '{"schema":"fm-bearings.v1","note":"second"}' \
     | run_publish "$home" "$relay" >/dev/null 2>&1
@@ -947,7 +1049,9 @@ test_rotation_replaces_the_key_in_whichever_store_holds_it
 test_two_homes_sharing_one_xdg_get_separate_keys
 test_publish_with_relay_down_exits_zero_and_enqueues
 test_publish_without_a_keypair_still_exits_zero
+test_non_loopback_env_relay_is_rejected_before_network
 test_publish_with_relay_up_delivers_and_lands
+test_relay_switch_does_not_replay_another_relays_cache
 test_reconnect_replays_the_identical_event_id
 test_replaying_a_known_event_is_deduped_and_evicted
 test_an_unacknowledged_publish_does_not_starve_the_drain
