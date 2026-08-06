@@ -47,7 +47,8 @@ extract_literal_references() {
         return
       }
       if (literal ~ /^https?:\/\// ||
-          literal ~ /^(data|state|config|projects)\//) {
+          literal ~ /^(data|state|config|projects)\// ||
+          literal == "docs/adr/") {
         return
       }
       if (literal ~ /^(bin|docs|tests)\// ||
@@ -222,6 +223,7 @@ test_reference_fixture_matrix() {
     'case-only|fail|case|AGENTS.md:1: docs/guide.md: case does not match the tracked target|Use `docs/guide.md`.'
     'missing-skill|fail|none|AGENTS.md:3: absent-skill: missing exact internal skill target .agents/skills/absent-skill/SKILL.md|## 13. Agent-only reference skills\n\n- `absent-skill` - load for the fixture.'
     'private-runtime|pass|none||Use `data/private.md`, `state/task.status`, `config/backend`, and `projects/example/README.md`.'
+    'optional-domain-docs|pass|none||Read `docs/adr/` when that lazily-created directory exists.'
     'placeholder|pass|none||Use `bin/<name>.sh` for a selected name.'
     'glob|pass|none||Run `tests/*.test.sh`.'
     'url|pass|none||Read `https://example.invalid/docs/missing.md`.'
