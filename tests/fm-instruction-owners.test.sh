@@ -200,8 +200,7 @@ test_compressed_agents_retains_authority_and_supervision_safety() {
     'worker runs the full pipeline (review, fixes, tests, docs, push, PR, CI)' \
     'A separate review/audit is allowed only when the captain explicitly requests that deliverable or the task is knowledge-only.' \
     'If fast-path risk needs more rigor, escalate whether to use no-mistakes rather than inventing a manual gate.' \
-    '**local-only**' \
-    'worker stops with a clean ready branch, then waits for approval' \
+    '**local-only** - worker stops with a clean ready branch, then waits for approval before firstmate uses the guarded fast-forward merge (`bin/fm-merge-local.sh`).' \
     'A status line is a wake event, not current state' \
     'keep exactly one live supervision cycle' \
     'Never broadly kill watchers' \

@@ -27,8 +27,15 @@ section_9() {
 }
 
 translation_owner() {
-  sed -n '/^## Internal.*plain translation table /,$p' "$ARCHITECTURE"
+  awk '
+    /^## Internal.*plain translation table/ { found = 1; print; next }
+    found && /^## / { exit }
+    found { print }
+  ' "$ARCHITECTURE"
 }
+
+[ -n "$(translation_owner)" ] \
+  || fail "docs/architecture.md lost the internal-to-plain translation table heading, so no contract below can be checked"
 
 test_section_9_keeps_stub_and_points_to_full_owner() {
   local stub owner
