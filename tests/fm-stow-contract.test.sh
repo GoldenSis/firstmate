@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Behavior tests for /stow's inspect-then-update memory contract.
+# shellcheck disable=SC2016
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -20,17 +21,17 @@ test_agents_backlog_task_note_contract() {
   local agents="$ROOT/AGENTS.md"
 
   # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
-  assert_grep 'current `tasks-axi --help` own the backlog schema' "$agents" \
+  assert_grep 'current `tasks-axi --help` own the schema, retention, and command syntax' "$agents" \
     "AGENTS.md does not point exact task-note mechanics to the command owner"
-  assert_grep 'Inspect the current task note before replacing its considered body' "$agents" \
-    "AGENTS.md does not require inspecting task notes before replacement"
-  assert_grep 'archive the superseded body when recoverability matters rather than appending by default' "$agents" \
-    "AGENTS.md lost recoverable replacement and no-append semantics"
+  assert_grep 'task-scoped notes → the backlog item' "$agents" \
+    "AGENTS.md no longer routes task-scoped notes to the backlog item"
+  assert_grep 'On `/stow`, load the `stow` skill.' "$agents" \
+    "AGENTS.md does not route conditional task-note hygiene to the stow owner"
   assert_no_grep 'tasks-axi show <id> --full' "$agents" \
     "AGENTS.md duplicates exact task-note read syntax from its conditional owner"
   assert_no_grep 'tasks-axi update <id> --body-file <path>' "$agents" \
     "AGENTS.md duplicates exact task-note update syntax from its conditional owner"
-  pass "AGENTS.md keeps task-note hygiene inline and points exact mechanics to their owner"
+  pass "AGENTS.md routes task notes and points exact mechanics to their conditional owner"
 }
 
 test_stow_skill_task_note_contract

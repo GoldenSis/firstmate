@@ -173,17 +173,17 @@ test_state_startup_and_ordinary_recovery_placement() {
 test_compressed_agents_owner_map() {
   assert_grep '`docs/configuration.md` is the single owner of the operational-home layout' "$AGENTS" \
     "AGENTS.md lost the state-layout owner pointer"
-  assert_grep 'header is the single owner of composed commands, ordering, digest contents' "$AGENTS" \
+  assert_grep 'Its header owns the composed commands, ordering, digest contents' "$AGENTS" \
     "AGENTS.md lost the session-start owner pointer"
   assert_grep '`docs/configuration.md` owns dispatch-profile and runtime-backend schemas' "$AGENTS" \
     "AGENTS.md lost the dispatch-schema owner pointer"
-  assert_grep 'That skill owns registry syntax, delivery-mode selection' "$AGENTS" \
+  assert_grep 'it owns registry syntax, delivery-mode selection' "$AGENTS" \
     "AGENTS.md lost the project-management owner pointer"
-  assert_grep 'The delivery lifecycle is an always-loaded operational contract' "$AGENTS" \
+  assert_grep 'Decision points (referenced scripts/skills own exact commands and mechanics)' "$AGENTS" \
     "AGENTS.md no longer owns the delivery lifecycle"
-  assert_grep 'Fleet supervision is an always-loaded operational contract' "$AGENTS" \
+  assert_grep 'Whenever work is under way, keep exactly one live supervision cycle' "$AGENTS" \
     "AGENTS.md no longer owns fleet supervision"
-  assert_grep '`.tasks.toml`, `docs/configuration.md`, and current `tasks-axi --help` own the backlog schema' "$AGENTS" \
+  assert_grep '`.tasks.toml`, `docs/configuration.md`, and current `tasks-axi --help` own the schema, retention, and command syntax' "$AGENTS" \
     "AGENTS.md lost the backlog-mechanics owner pointer"
   assert_grep '`bin/fm-brief.sh` and its help own scaffold syntax' "$AGENTS" \
     "AGENTS.md lost the brief-mechanics owner pointer"
@@ -194,14 +194,14 @@ test_compressed_agents_owner_map() {
 
 test_compressed_agents_retains_authority_and_supervision_safety() {
   for phrase in \
-    'A lock-refused session must not spawn, steer, merge, drain the wake queue' \
-    'A diagnostic request, report, recommendation, or implementation-ready finding is evidence, not authorization to change code.' \
-    'The selected delivery path owns its own rigor.' \
-    'When no-mistakes is selected, no-mistakes alone owns review, fixes, tests, documentation, push, PR, and CI; otherwise follow the faster path without adding an independent reviewer.' \
-    'Never hold work outside no-mistakes for a manual clean verdict, stack serial manual reviews, or infer authority for one from security, architecture, or risk alone.' \
-    'A separate review or audit is allowed only when the captain explicitly requests that deliverable or the authorized task is a knowledge-only review; one named question remains scoped to that question.' \
-    'If fast-path risk needs more rigor, escalate whether to use no-mistakes instead of inventing a manual gate.' \
-    '**local-only** has the worker stop with a clean ready branch, then waits for the configured merge authority' \
+    'remain read-only: do not spawn, steer, merge, drain the wake queue' \
+    'A diagnostic/report/recommendation is evidence, not authorization to change code' \
+    'Delivery mode (owns its own rigor; do not stack manual reviews)' \
+    'worker runs the full pipeline (review, fixes, tests, docs, push, PR, CI)' \
+    'A separate review/audit is allowed only when the captain explicitly requests that deliverable or the task is knowledge-only.' \
+    'If fast-path risk needs more rigor, escalate whether to use no-mistakes rather than inventing a manual gate.' \
+    '**local-only**' \
+    'worker stops with a clean ready branch, then waits for approval' \
     'A status line is a wake event, not current state' \
     'keep exactly one live supervision cycle' \
     'Never broadly kill watchers' \
@@ -234,7 +234,7 @@ test_model_fusion_instruction_ownership() {
   # One mechanical owner: the deterministic gate helper.
   assert_grep "fm-fusion-gate.sh" "$fusion" "model-fusion skill does not point at its mechanical owner bin/fm-fusion-gate.sh"
   # No weakening of the no-stacked-reviews boundary.
-  assert_grep 'Never hold work outside no-mistakes for a manual clean verdict, stack serial manual reviews' "$AGENTS" \
+  assert_grep 'Delivery mode (owns its own rigor; do not stack manual reviews)' "$AGENTS" \
     "AGENTS.md weakened the no-stacked-reviews boundary alongside the fusion overlay"
   pass "model-fusion has one precise trigger, one semantic owner, and one mechanical owner"
 }
