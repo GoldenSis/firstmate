@@ -33,7 +33,7 @@
 #   profile consultation. A --secondmate spawn is exempt and resolves the SECONDMATE
 #   harness (config/secondmate-harness -> config/crew-harness -> own), so the
 #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
-#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|grok)
+#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|grok|gemini)
 #   overrides it for this spawn (either kind). A non-flag string containing
 #   whitespace is treated as a RAW launch command - the escape hatch for verifying
 #   new adapters.
@@ -293,7 +293,7 @@ FIRSTMATE_HOME=
 
 if [ "$KIND" = secondmate ]; then
   case "${POS[1]:-}" in
-    ''|claude|codex|opencode|pi|grok)
+    ''|claude|codex|opencode|pi|grok|gemini)
       ARG3=${POS[1]:-}
       ;;
     *' '*)
@@ -446,7 +446,7 @@ model_flag_for_harness() {
   fi
   [ -n "$model" ] && [ "$model" != default ] || return 0
   case "$harness" in
-    claude|codex|opencode|pi|grok)
+    claude|codex|opencode|pi|grok|gemini)
       printf -- '--model %s ' "$(shell_quote "$model")"
       ;;
   esac
@@ -908,6 +908,17 @@ if [ "$KIND" != secondmate ]; then
 {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch '$TURNEND'"}]}]}}
 EOF
       exclude_path '.claude/settings.local.json'
+      ;;
+    gemini*)
+      # gemini reads Claude-Code-shaped hooks (Stop|SessionStart|SessionEnd|
+      # Notification, verified in the 0.54.4 bundle) from the project file
+      # <worktree>/.gemini/settings.json. Same shape as the claude adapter above,
+      # in gemini's own settings file.
+      mkdir -p "$WT/.gemini"
+      cat > "$WT/.gemini/settings.json" <<EOF
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch '$TURNEND'"}]}]}}
+EOF
+      exclude_path '.gemini/settings.json'
       ;;
     opencode*)
       mkdir -p "$WT/.opencode/plugins"
