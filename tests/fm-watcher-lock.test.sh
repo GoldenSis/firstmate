@@ -456,8 +456,9 @@ test_watch_restart_reports_healthy_peer_without_attaching() {
     sleep 0.1
     i=$((i + 1))
   done
-  [ -s "$ready" ] || fail "peer stand-in never installed its SIGTERM handler"
-  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || fail "could not identify peer pid"
+  [ -s "$ready" ] || { kill -KILL "$peer" 2>/dev/null || true; fail "peer stand-in never installed its SIGTERM handler"; }
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") \
+    || { kill -KILL "$peer" 2>/dev/null || true; fail "could not identify peer pid"; }
   mkdir "$state/.watch.lock"
   printf '%s\n' "$peer" > "$state/.watch.lock/pid"
   printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"

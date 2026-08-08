@@ -180,7 +180,7 @@ test_compressed_agents_owner_map() {
   assert_grep 'it owns registry syntax, delivery-mode selection' "$AGENTS" \
     "AGENTS.md lost the project-management owner pointer"
   assert_grep 'Decision points (referenced scripts/skills own exact commands and mechanics)' "$AGENTS" \
-    "AGENTS.md no longer owns the delivery lifecycle"
+    "AGENTS.md lost the task-lifecycle owner pointer"
   assert_grep 'Whenever work is under way, keep exactly one live supervision cycle' "$AGENTS" \
     "AGENTS.md no longer owns fleet supervision"
   assert_grep '`.tasks.toml`, `docs/configuration.md`, and current `tasks-axi --help` own the schema, retention, and command syntax' "$AGENTS" \
