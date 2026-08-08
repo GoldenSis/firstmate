@@ -317,7 +317,7 @@ EOF
   chmod "$FM_SHARED_CAPTAIN_MODE" "$sm/data/captain-shared.md"
   write_shared "$data_override/captain-shared.md" "changed override shared bytes"
 
-  out=$(PATH="$BASE_PATH" TMUX='' FM_BACKEND=tmux FM_HOME="$home" FM_ROOT_OVERRIDE="$root" \
+  out=$(PATH="$BASE_PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$root" \
     FM_DATA_OVERRIDE="$data_override" \
     "$ROOT/bin/fm-config-push.sh" 2>/dev/null)
 

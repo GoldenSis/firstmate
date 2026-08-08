@@ -245,7 +245,11 @@ unit_signal_exits_with_lock_cleanup() {
   FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
     . "$1"
     signal_ready=$3
-    fm_afk_launch_start() { printf ready > "$signal_ready"; sleep 30; }
+    fm_afk_launch_start() {
+      sleep 30 >/dev/null 2>&1 &
+      printf "%s" "$!" > "$signal_ready"
+      wait $!
+    }
     fm_afk_launch_main start
     : > "$2"
   ' _ "$LAUNCH" "$marker" "$ready" &
@@ -257,6 +261,7 @@ unit_signal_exits_with_lock_cleanup() {
   [ -s "$ready" ] || fail "launcher signal: mocked lifecycle operation never became ready"
   kill -TERM "$child" 2>/dev/null || true
   wait "$child" 2>/dev/null || true
+  kill "$(cat "$ready")" 2>/dev/null || true
   if [ ! -e "$marker" ] && [ ! -e "$st/state/.afk-launch.lock" ]; then
     pass "launcher signal: TERM exits and releases the lifecycle lock"
   else

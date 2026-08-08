@@ -51,9 +51,9 @@ extract_literal_references() {
         return
       }
       # Lazily-created domain-model docs (docs/agents/domain.md owns the rule):
-      # /domain-modeling creates CONTEXT.md and docs/adr/ on first use, so a repo
-      # that has not modelled its domain yet legitimately has neither tracked.
-      if (literal == "CONTEXT.md" || literal == "docs/adr/") {
+      # /domain-modeling creates docs/adr/ on first use, so a repo that has not
+      # modelled its domain yet legitimately has it untracked.
+      if (literal == "docs/adr/") {
         return
       }
       if (literal ~ /^(bin|docs|tests)\// ||

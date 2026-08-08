@@ -30,8 +30,8 @@ export FM_BACKEND_CMUX_BUNDLE_BIN="$TMP_ROOT/no-bundled-cmux"
 # fm_backend_name and flip a default-backend case onto a non-tmux backend. Unset
 # them once so the suite resolves the tmux reference backend unless a case says
 # otherwise - the same hermeticity discipline as pinning PATH via BASE_PATH.
-# The two macOS-only cmux fallback signals (__CFBundleIdentifier and process
-# ancestry) survive that unset, so every case that relies on the DEFAULT backend
+# The macOS-only cmux process-ancestry fallback is the one signal that survives
+# that unset, so every case that would otherwise rely on the DEFAULT backend
 # additionally pins FM_BACKEND=tmux on its bootstrap invocation; cases that write
 # config/backend need no pin, because an explicit config always beats detection.
 unset TMUX TMUX_PANE HERDR_ENV HERDR_PANE_ID HERDR_SESSION HERDR_SOCKET_PATH \
@@ -373,7 +373,7 @@ test_orca_backend_gates_orca_tool_only_when_selected() {
   out=$(PATH="$fakebin:$BASE_PATH" FM_BACKEND=tmux FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   assert_not_contains "$out" "MISSING: orca" "bootstrap should not require orca unless backend=orca is selected"
-  pass "bootstrap: backend=orca gates the Orca CLI without requiring it on the default backend"
+  pass "bootstrap: backend=orca gates the Orca CLI without requiring it on a non-orca backend"
 }
 
 # Build a fake toolchain with tmux REMOVED and the named backend session CLI(s)
