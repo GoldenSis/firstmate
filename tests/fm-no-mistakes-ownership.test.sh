@@ -22,7 +22,7 @@ test_worker_owns_synchronous_driver() {
     "delivery contract does not assign the run to its task worker"
   assert_contains "$contract" 'a worker hand-editing, committing, aborting, or restarting during an active run duplicates pipeline ownership' \
     "delivery contract does not name side-stepping an active run as duplicated pipeline ownership"
-  pass "delivery contract assigns the synchronous driver loop to the task worker"
+  pass "delivery contract assigns every no-mistakes pipeline call to the task worker"
 }
 
 test_firstmate_never_responds_for_crew_run() {

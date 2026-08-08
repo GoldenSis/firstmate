@@ -80,7 +80,7 @@ test_compressed_safety_labels_have_plain_renderings() {
     "fail-open" \
     "fails open" \
     "fail loudly"; do
-    assert_contains "$contract" "$phrase" "section 9 does not cover compressed safety label '$phrase'"
+    assert_contains "$contract" "$phrase" "translation owner does not cover compressed safety label '$phrase'"
   done
   assert_contains "$contract" "stops safely when something goes wrong" \
     "fail-closed behavior lacks a concrete plain rendering"
