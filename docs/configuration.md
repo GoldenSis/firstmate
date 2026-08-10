@@ -415,7 +415,7 @@ FM_SEND_SETTLE=1        # seconds fm-send waits after a successful text submit; 
 # loopback Buzz bearings publisher (docs/buzz-loopback-adapter.md); additive, and nothing in firstmate reads it
 FM_BUZZ_RELAY=ws://localhost:3000   # loopback Buzz relay URL; only 127.0.0.1, localhost, and [::1] hosts are accepted, and the `localhost` spelling is load-bearing for the bundled relay's HTTP Host routing
 FM_BUZZ_TIMEOUT_MS=15000            # whole-connection budget for one publish run; `fm-buzz-publish.sh --timeout` overrides it
-FM_BUZZ_MAX_CACHE=100               # replay-cache entries kept before the oldest signed events are dropped
+FM_BUZZ_MAX_CACHE=100               # positive-integer replay-cache cap before the oldest signed events are dropped
 FM_BUZZ_STDIN_TIMEOUT_S=30          # deadline for reading the projection on stdin; an expired read is discarded rather than published
 FM_BUZZ_FORCE_FILE_STORE=           # set to 1 to skip the OS keychain and keep this home's publishing key in the 0600 fallback file
 # sub-supervisor (bin/fm-supervise-daemon.sh); presence-gated via /afk
@@ -496,7 +496,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   <id>/brief.md      per-task crewmate brief, or per-secondmate charter brief when kind=secondmate
   <id>/report.md     scout task deliverable, written by the crewmate; survives teardown
   buzz-keypair.public  this home's loopback Buzz publishing PUBLIC key; LOCAL, gitignored; written by fm-buzz-keypair.sh, which never records the private half here (docs/buzz-loopback-adapter.md)
-  buzz-keypair.public-history  public keys this home has retired, one per line; LOCAL, gitignored; appended by fm-buzz-keypair.sh --rotate so pre-rotation events stay attributable to this home, withheld for the key being retired by --rotate --compromised, and withdrawn one named key at a time by --forget-key <hex> (docs/buzz-loopback-adapter.md)
+  buzz-keypair.public-history  public keys this home still trusts for pre-rotation event attribution, one per line; LOCAL, gitignored; exact lifecycle owned by fm-buzz-keypair.sh --help
 projects/            cloned repos; gitignored; READ-ONLY for you
 state/               volatile runtime signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth

@@ -1,58 +1,10 @@
 # docker-compose.buzz-loopback.yml - loopback-only Buzz relay for the M1 proof of concept.
 #
-# WHAT THIS IS
-# Disposable proof-of-concept infrastructure for the read-only bearings publisher
-# (bin/fm-buzz-publish.sh). It is checked in so the stack is reproducible; the
-# RUNNING instance is throwaway. `docker compose -f docker-compose.buzz-loopback.yml
-# down -v` returns the machine to a clean state, volumes included.
-#
-# WHY IT IS LOOPBACK-ONLY (decision D2)
-# The captain answered the relay-hosting decision as self-hosted loopback, not
-# hosted buzz.xyz, so captain-private fleet state (task ids, project names,
-# blockers, PR URLs) never leaves this machine. The scout study also found Buzz
-# ships NO application-layer rate limiting: RateLimitConfig defines four tiers but
-# the only RateLimiter implementation is a test stub, so an internet-exposed relay
-# has no brute-force or flood protection. Loopback-only is what makes that gap
-# irrelevant. See docs/buzz-loopback-adapter.md for the full invariant list.
-#
-# WHAT LOOPBACK DOES AND DOES NOT BUY, STATED PLAINLY
-# Loopback keeps the relay off the network. It does NOT make it single-user. Every
-# local process running as any user on this host can open 127.0.0.1:3000 and speak
-# to the relay, and the settings below accept them: this is an open relay, with no
-# auth token and no membership enforcement. The channel is no barrier either -
-# channelIdForLabel (bin/fm-buzz-lib.mjs) is a plain SHA-256 of the FM_HOME path,
-# derived rather than random and therefore not a secret. A local process that
-# creates the group first becomes its owner and can read the bearings projections
-# published into it, which are captain-private fleet state (task ids, project
-# names, blockers, PR URLs).
-#
-# That local-process exposure is an ACCEPTED RISK for this proof of concept, on a
-# single-user laptop, with a disposable stack. It is recorded here rather than
-# argued away, because the real boundary being relied on is "no other local user",
-# not "no remote party". Enforcing membership so the boundary matches the claim
-# belongs to Milestone 2, which already owns channel membership management.
-#
-# The relay does not restart itself, so a reboot ends the exposure. The datastores
-# do, and they self-resume across a host reboot still holding every published
-# bearings projection; only `docker compose -f docker-compose.buzz-loopback.yml
-# down -v` ends the exposure for good, volumes included.
-#
-# THE ONE PUBLISHED PORT, AND WHY IT READS AS IT DOES
-# Only the relay is published, and only to 127.0.0.1. Postgres, Redis and MinIO are
-# deliberately NOT published at all - they are reachable only over the internal
-# compose network, which is stricter than loopback. BUZZ_BIND_ADDR is 0.0.0.0:3000
-# INSIDE the container because Docker's port proxy connects to the container's own
-# address; binding 127.0.0.1 inside the container would make the published port
-# unreachable. The host-facing exposure is the `ports:` mapping, and that mapping is
-# loopback-only. There is no 0.0.0.0 host publish anywhere in this file.
-#
-# CREDENTIALS
-# The literals below are non-secret, PoC-only values, deliberately inline so the
-# stack starts with no .env step. They are safe here precisely because nothing that
-# consumes them is reachable off this host: the datastores publish no port, and the
-# relay publishes only to 127.0.0.1. Do not reuse this file, or these values, for
-# any exposed deployment - upstream's deploy/compose/compose.yml is the reference
-# for that, and it requires real secrets.
+# Disposable proof-of-concept infrastructure for bin/fm-buzz-publish.sh.
+# Warning: the relay is open to local processes, and its datastores retain fleet
+# projections across reboots until the volumes are removed with `down -v`.
+# See docs/buzz-loopback-adapter.md for the full threat model, invariants, and
+# reboot-persistence contract.
 #
 # Reference: upstream deploy/compose/compose.yml at github.com/block/buzz
 # commit 7fb008f9 (Apache-2.0), reduced to the four services M1 needs and
@@ -70,8 +22,7 @@ services:
   relay:
     image: ${BUZZ_IMAGE:-ghcr.io/block/buzz:main}
     environment:
-      # Container-internal bind. See "THE ONE PUBLISHED PORT" above: this is not a
-      # host exposure, the `ports:` mapping below is, and it is loopback-only.
+      # Container-internal bind; only the host-facing `ports:` mapping controls exposure.
       BUZZ_BIND_ADDR: 0.0.0.0:3000
       BUZZ_HEALTH_PORT: "8080"
       BUZZ_METRICS_PORT: "9102"
@@ -87,11 +38,7 @@ services:
       # Disposable stack: migrate on boot so `up -d` is the whole setup step and
       # `down -v` is the whole teardown step.
       BUZZ_AUTO_MIGRATE: "true"
-      # Open relay: the single local Firstmate key publishes with no membership
-      # provisioning step. What this rests on is that no REMOTE party can reach the
-      # socket - it does not keep other LOCAL processes out, and nothing here does.
-      # See "WHAT LOOPBACK DOES AND DOES NOT BUY" above for the accepted risk and
-      # for why enforcement is Milestone 2's rather than a value flipped here.
+      # Open to local processes by PoC design; see docs/buzz-loopback-adapter.md.
       BUZZ_REQUIRE_AUTH_TOKEN: "false"
       BUZZ_REQUIRE_RELAY_MEMBERSHIP: "false"
       BUZZ_GIT_CONFORMANCE_PROBE: "false"
@@ -122,11 +69,7 @@ services:
       timeout: 3s
       retries: 12
       start_period: 30s
-    # Deliberately NOT unless-stopped, unlike the datastores below. This is the one
-    # service that accepts connections from the host, so a relay that came back by
-    # itself after a reboot would silently resume the local-process exposure above
-    # long after the operator finished with the PoC. The datastores keep restarting
-    # because they only serve the internal compose network.
+    # Do not auto-restart the host-facing relay; datastores retain projections.
     restart: "no"
     networks:
       - buzz-loopback-net

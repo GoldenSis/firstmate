@@ -119,18 +119,31 @@ function cacheEntries(replayDir) {
   let names;
   try {
     names = readdirSync(replayDir);
-  } catch {
-    return [];
+  } catch (error) {
+    if (error.code === "ENOENT") return { entries: [], failures: [] };
+    log(`could not inspect cache directory ${replayDir}: ${error.message}`);
+    return { entries: [], failures: [replayDir] };
   }
-  return names
+  const entries = names
     .filter((name) => name.endsWith(".json"))
     .map((name) => {
       const match = /^(\d+)-([0-9a-f]{64})\.json$/.exec(name);
-      if (!match) return null;
-      return { name, createdAt: Number(match[1]), id: match[2], file: path.join(replayDir, name) };
+      const createdAt = match ? Number(match[1]) : undefined;
+      if (!match || !Number.isSafeInteger(createdAt)) {
+        return {
+          name,
+          file: path.join(replayDir, name),
+          malformed: true,
+        };
+      }
+      return { name, createdAt, id: match[2], file: path.join(replayDir, name), malformed: false };
     })
-    .filter(Boolean)
-    .sort((a, b) => (a.createdAt - b.createdAt) || a.id.localeCompare(b.id));
+    .sort((a, b) => {
+      if (a.malformed !== b.malformed) return a.malformed ? -1 : 1;
+      if (a.malformed) return a.name.localeCompare(b.name);
+      return (a.createdAt - b.createdAt) || a.id.localeCompare(b.id);
+    });
+  return { entries, failures: [] };
 }
 
 // The cap remains global across relay hosts. A separate 100-entry allowance per
@@ -140,19 +153,25 @@ function cacheDirectories(replayDir) {
   let names;
   try {
     names = readdirSync(replayDir);
-  } catch {
-    return [replayDir];
+  } catch (error) {
+    if (error.code === "ENOENT") return { directories: [replayDir], failures: [] };
+    log(`could not inspect cache directory ${replayDir}: ${error.message}`);
+    return { directories: [replayDir], failures: [replayDir] };
   }
   const directories = [replayDir];
+  const failures = [];
   for (const name of names) {
+    if (name.endsWith(".json") || name.endsWith(".json.tmp")) continue;
     const directory = path.join(replayDir, name);
     try {
       if (statSync(directory).isDirectory()) directories.push(directory);
-    } catch {
-      // Vanished under us, or not readable.
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      log(`could not inspect cache path ${directory}: ${error.message}`);
+      failures.push(directory);
     }
   }
-  return directories;
+  return { directories, failures };
 }
 
 // A `.json.tmp` is the half of cacheEvent's atomic write that a kill between the
@@ -201,24 +220,55 @@ function sweepOrphanTemporaries(replayDir, now) {
 // without limit and replay ancient fleet state; oldest-first is the right thing to
 // drop because a newer bearings projection supersedes an older one anyway.
 function pruneCache(replayDir, maxCache) {
-  const directories = cacheDirectories(replayDir);
+  const topology = cacheDirectories(replayDir);
+  const directories = topology.directories;
   const now = Date.now();
-  let failed = 0;
+  let failed = topology.failures.length;
+  const outcomes = new Map(topology.failures.map((file) => [`uninspected:${file}`, RETRYABLE]));
   for (const directory of directories) failed += sweepOrphanTemporaries(directory, now).failed;
-  const entries = directories
-    .flatMap((directory) => cacheEntries(directory))
-    .sort((a, b) => (a.createdAt - b.createdAt) || a.id.localeCompare(b.id));
-  const excess = entries.length - maxCache;
-  if (excess <= 0) return { dropped: 0, failed };
-  let dropped = 0;
+  const inventories = directories.map((directory) => cacheEntries(directory));
+  for (const inventory of inventories) {
+    failed += inventory.failures.length;
+    for (const file of inventory.failures) outcomes.set(`unreadable:${file}`, RETRYABLE);
+  }
+  const entries = inventories.flatMap((inventory) => inventory.entries);
+  const validEntries = [];
+  let malformedRetained = 0;
   for (const entry of entries) {
+    if (!entry.malformed) {
+      validEntries.push(entry);
+      continue;
+    }
+    log(`dropping invalid cache entry ${entry.name}: malformed cache filename`);
+    const removal = removeCacheFile(entry.file, `drop invalid cache entry ${entry.name}`);
+    if (removal.removed) outcomes.set(`invalid:${entry.file}`, PERMANENT);
+    if (removal.failed) {
+      failed += 1;
+      malformedRetained += 1;
+      outcomes.set(`invalid:${entry.file}`, RETRYABLE);
+    }
+  }
+  validEntries.sort((a, b) => (a.createdAt - b.createdAt) || a.id.localeCompare(b.id));
+  const excess = validEntries.length + malformedRetained - maxCache;
+  if (excess <= 0) return { entries: validEntries, dropped: 0, failed, outcomes };
+  let dropped = 0;
+  const pruned = new Set();
+  for (const entry of validEntries) {
     if (dropped >= excess) break;
     const removal = removeCacheFile(entry.file, `prune cache entry ${entry.name}`);
-    if (removal.removed) dropped += 1;
+    if (removal.removed) {
+      dropped += 1;
+      pruned.add(entry.file);
+    }
     if (removal.failed) failed += 1;
   }
   if (dropped > 0) log(`replay cache over ${maxCache}; dropped ${dropped} oldest event(s)`);
-  return { dropped, failed };
+  return {
+    entries: validEntries.filter((entry) => !pruned.has(entry.file)),
+    dropped,
+    failed,
+    outcomes,
+  };
 }
 
 // Write the frame atomically so a crash mid-write cannot leave a truncated event
@@ -249,6 +299,9 @@ async function main() {
   for (const [name, value] of Object.entries({ privateKey, content, relay, channelId, replayDir })) {
     if (typeof value !== "string" || value === "") throw new Error(`missing envelope field: ${name}`);
   }
+  if (!Number.isSafeInteger(maxCache) || maxCache <= 0) {
+    throw new Error(`invalid FM_BUZZ_MAX_CACHE value ${JSON.stringify(maxCache)}: expected a positive integer`);
+  }
   const relayHost = resolveLoopbackRelayHost(relay);
   const relayCacheDir = relayCacheDirectory(replayDir, relayHost);
 
@@ -262,12 +315,12 @@ async function main() {
   let cleanupFailures = cacheMaintenance.failed;
   log(`signed event ${event.id} (${Buffer.byteLength(content, "utf8")} bytes) for channel ${channelId}`);
 
-  const pending = cacheEntries(relayCacheDir);
+  const pending = cacheMaintenance.entries.filter((entry) => path.dirname(entry.file) === relayCacheDir);
   // Final verdict per cache entry rather than running counters, because an entry
   // can be attempted twice: a pass that ran before a late NIP-42 handshake
   // completed is superseded by the one that ran after it, and incrementing
   // counters would report the same event as both retained and delivered.
-  const outcome = new Map();
+  const outcome = new Map(cacheMaintenance.outcomes);
   const authRefused = new Set();
 
   await withRelay(relay, privateKey, timeoutMs, async (api) => {
@@ -312,11 +365,11 @@ async function main() {
           raw = readFileSync(entry.file, "utf8");
         } catch (error) {
           if (error.code === "ENOENT") {
-            outcome.delete(entry.id);
+            outcome.delete(entry.file);
             continue;
           }
           log(`could not read cache entry ${entry.name}: ${error.message}`);
-          outcome.set(entry.id, RETRYABLE);
+          outcome.set(entry.file, RETRYABLE);
           continue;
         }
         let parsed;
@@ -327,9 +380,9 @@ async function main() {
           const removal = removeCacheFile(entry.file, `drop invalid cache entry ${entry.name}`);
           if (removal.failed) {
             cleanupFailures += 1;
-            outcome.set(entry.id, RETRYABLE);
+            outcome.set(entry.file, RETRYABLE);
           } else {
-            outcome.set(entry.id, PERMANENT);
+            outcome.set(entry.file, PERMANENT);
           }
           continue;
         }
@@ -358,11 +411,11 @@ async function main() {
           // entry stays cached and the relay's id dedupe makes the replay a no-op
           // if it did in fact land.
           log(`delivery unresolved for ${entry.id}: ${error.message}`);
-          outcome.set(entry.id, RETRYABLE);
+          outcome.set(entry.file, RETRYABLE);
           continue;
         }
 
-        outcome.set(entry.id, verdict);
+        outcome.set(entry.file, verdict);
         if (verdict !== DELIVERED && verdict !== PERMANENT) continue;
         const removal = removeCacheFile(entry.file, `drop settled cache entry ${entry.name}`);
         if (removal.failed) cleanupFailures += 1;

@@ -1200,6 +1200,105 @@ test_replay_cache_is_capped_at_100() {
   pass "the replay cache is capped at 100, dropping oldest first"
 }
 
+test_cache_limit_must_be_a_positive_integer() {
+  local home invalid output code
+  home=$(make_home invalid-cache-limit)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  for invalid in 0 -5 abc; do
+    output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"invalid-limit"}' \
+      | FM_BUZZ_MAX_CACHE=$invalid run_publish "$home" "ws://127.0.0.1:1" 2>&1)
+    code=$?
+    expect_code 0 "$code" "invalid cache limit $invalid through the fire-and-forget wrapper"
+    assert_contains "$output" "invalid FM_BUZZ_MAX_CACHE value '$invalid'" \
+      "invalid cache limit $invalid was not diagnosed"
+    assert_not_contains "$output" "signed event" \
+      "invalid cache limit $invalid reached signing"
+    [ "$(replay_count "$home")" = "0" ] \
+      || fail "invalid cache limit $invalid created a replay entry"
+  done
+  pass "cache limits reject zero, negative, and nonnumeric values before signing"
+}
+
+test_cache_limit_one_preserves_the_pending_event() {
+  local home relay output
+  home=$(make_home cache-limit-one)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"limit-one"}' \
+    | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$output" "delivered=1 retained=0 discarded=0 cleanup_failed=0" \
+    "a cache limit of one removed the just-signed event before delivery accounting"
+  [ "$(replay_count "$home")" = "0" ] \
+    || fail "the cache-limit-one event remained after acknowledgement"
+  pass "a cache limit of one preserves and delivers the pending event"
+}
+
+test_malformed_cache_names_are_discarded_or_accounted_for() {
+  local home relay replay removable retained output
+  home=$(make_home malformed-cache-names)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  replay="$home/state/buzz-replay"
+  mkdir -p "$replay"
+  removable="$replay/not-an-event.json"
+  retained="$replay/still-not-an-event.json"
+  printf '%s' '{"malformed":true}' > "$removable"
+  mkdir "$retained"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"malformed-cache-name"}' \
+    | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$output" "dropping invalid cache entry not-an-event.json" \
+    "a malformed cache filename was silently ignored"
+  assert_contains "$output" "could not drop invalid cache entry still-not-an-event.json" \
+    "a failed malformed-entry cleanup was silently ignored"
+  assert_contains "$output" "retained=1 discarded=1 cleanup_failed=1" \
+    "malformed cache filenames were not truthfully accounted for"
+  assert_contains "$output" "replay cache over 1; dropped 1 oldest event(s)" \
+    "an undeletable malformed cache entry did not consume the configured cap"
+  assert_absent "$removable" "a removable malformed cache entry survived cleanup"
+  assert_present "$retained" "the failed-cleanup fixture disappeared unexpectedly"
+  [ "$(replay_count "$home")" = "1" ] \
+    || fail "malformed cache entries escaped the configured cap"
+  pass "malformed cache filenames are discarded or retained with truthful accounting"
+}
+
+test_cache_directory_stat_failures_are_accounted_for() {
+  local home relay replay loop output
+  home=$(make_home cache-stat-failure)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  replay="$home/state/buzz-replay"
+  mkdir -p "$replay"
+  loop="$replay/uninspectable-relay"
+  ln -s "$(basename "$loop")" "$loop" || fail "could not create the stat-failure fixture"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"stat-failure"}' \
+    | run_publish "$home" "$relay" 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$output" "could not inspect cache path" \
+    "a non-ENOENT cache child stat failure was silently ignored"
+  assert_contains "$output" "uninspectable-relay" \
+    "the cache child stat failure did not identify the affected path"
+  assert_contains "$output" "delivered=1 retained=1 discarded=0 cleanup_failed=1" \
+    "a cache child stat failure was omitted from retained or cleanup accounting"
+  assert_contains "$output" "publish did not complete; Firstmate is unaffected" \
+    "a cache child stat failure did not reach the fire-and-forget conversion"
+  pass "cache directory stat failures remain visible in outcome accounting"
+}
+
 test_an_interrupted_cache_write_is_swept_not_leaked() {
   # A `.json.tmp` is the half of the atomic cache write that a kill between the
   # write and the rename leaves behind. It matches neither the drain's filter nor
@@ -2131,6 +2230,10 @@ test_permanent_rejection_is_not_replayed_forever
 test_retryable_rejection_is_kept
 test_truthy_non_boolean_ok_is_not_accepted
 test_replay_cache_is_capped_at_100
+test_cache_limit_must_be_a_positive_integer
+test_cache_limit_one_preserves_the_pending_event
+test_malformed_cache_names_are_discarded_or_accounted_for
+test_cache_directory_stat_failures_are_accounted_for
 test_an_interrupted_cache_write_is_swept_not_leaked
 test_unreadable_cache_entry_is_retained_as_retryable
 test_parseable_cache_corruption_is_discarded_without_replay

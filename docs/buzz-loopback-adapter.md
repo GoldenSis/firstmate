@@ -178,24 +178,10 @@ It is checked against the official BIP-340 vectors for 32-byte messages, includi
 That is the whole of NIP-01's usage and the whole of the coverage: the variable-length-message vectors (15-18) are excluded, and the signer rejects such messages outright rather than signing them.
 That is acceptable for exactly this key: it signs fleet-status projections on a loopback relay, grants no authority, and is cheap to re-mint.
 
-Buzz documents no key-rotation procedure, so `bin/fm-buzz-keypair.sh --rotate` is this adapter's.
-It clears both stores - the keychain entry and the `0600` fallback file - plus `data/buzz-keypair.public`, then mints a fresh keypair and prints the new public key, and it refuses to report success if the old key is still loadable afterwards.
-Rotating by hand is not offered because it does not work reliably: which store holds the key depends on the host, and the fallback file's name carries a digest of the home path, so deleting "the keychain entry" on a machine whose key lives in the file clears nothing and the next run re-prints the same public key.
-Historical events stay signed by the retired key, which grants nothing and so needs no revocation.
-The retired PUBLIC key is still evidence, though, when only this home ever held it: `bin/fm-buzz-inspect.sh --anonymous` decides whether a served event is this home's own content by its author, and the relay keeps serving pre-rotation events under a channel id that rotation does not change.
-So rotation retains the retired public key in `data/buzz-keypair.public-history` before recording the new one, and the inspector attributes an event to this home if it was signed by any recorded key, current or retired.
-Without that, rotating would make the probe report this home's own leaked projections as somebody else's content.
-
-Retention assumes the retired key was never exposed.
-If retiring due to suspected compromise, use `--compromised` so the key is not retained for verdict-matching.
-A key whose private half somebody else may hold is no longer evidence of authorship at all: the channel id is not a secret, so that holder can mint an event the probe would report as this home's own leaked projection.
-`--rotate --compromised` therefore declines to record the key it is retiring in that same run, at the cost of no longer attributing this home's genuine pre-rotation events.
-It governs that key and no other: every rotation mints a fresh random key, so the key being retired is never one an earlier rotation already recorded, and a rotation cannot reach back to withdraw one.
-An exposure that comes to light after the rotation that retired the key names the key instead - `bin/fm-buzz-keypair.sh --forget-key <hex>` drops exactly that public key from `data/buzz-keypair.public-history` and leaves every other recorded key, and this home's current key, alone.
-It is its own operation rather than a rotation flag: nothing is minted, cleared, or re-recorded, and a key that is not in the recorded set is reported as such rather than treated as an error.
-Either way the recorded-key set is settled before the private half is cleared, and the rotation stops rather than proceeding if it cannot be: once the key is forgotten nothing can derive the retired public key a second time, so a write failure at that point would permanently and silently cost the probe its attribution.
-The outgoing key is accepted only as 64 lowercase hex characters, since `data/buzz-keypair.public` is a cache that can be truncated or half-written; anything else falls back to deriving the public half from the still-stored private key.
-Ordinary rotation stops when the stored identity is unreadable, divergent, or inconsistent with that record, while `--rotate --compromised` is the explicit no-retention recovery path for removing every identifiable outgoing identity before minting a replacement.
+Buzz documents no key-rotation procedure, so this adapter supplies one to keep historical projections attributable without trusting compromised identities.
+Rotation must stay adapter-owned rather than manual because custody location varies by host and the fallback path is derived from the operational home.
+The inspector uses current and uncompromised historical public keys as authorship evidence, while private-key exposure invalidates that evidence and requires explicit withdrawal.
+`bin/fm-buzz-keypair.sh --help` owns the detailed rotation, compromised-recovery, and historical-key withdrawal decision procedure.
 
 Buzz is pre-1.0 with no long-term support branches and a very high release cadence, so `ghcr.io/block/buzz:main` can move under this adapter at any time.
 The relay stack is disposable by design; `down -v` and `up -d` is the whole recovery procedure.

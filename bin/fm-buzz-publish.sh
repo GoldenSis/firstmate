@@ -166,6 +166,12 @@ read_stdin_bounded() {  # <spool>
 publish() {
   command -v node >/dev/null 2>&1 || { log "node is unavailable; skipping publish"; return 1; }
   command -v jq >/dev/null 2>&1 || { log "jq is unavailable; skipping publish"; return 1; }
+  case $MAX_CACHE in
+    ''|0|*[!0-9]*|0*)
+      log "invalid FM_BUZZ_MAX_CACHE value '$MAX_CACHE': expected a positive integer"
+      return 1
+      ;;
+  esac
 
   STDIN_SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-stdin.XXXXXX") || {
     log "could not create a temporary file for the projection"
