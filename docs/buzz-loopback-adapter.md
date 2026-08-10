@@ -9,7 +9,8 @@ Mechanics live in each script's own header and `--help`; this file covers the sh
 ## What it is
 
 Buzz is Block's open-source Nostr-based workspace (Apache-2.0).
-Its relevant property is that every message is an individually signed, individually verified event in an append-only log, and a private channel is enforced server-side rather than trusted from the client.
+Its relevant property is that every message is an individually signed, individually verified event in an append-only log, and a private channel is enforced server-side - when membership is required - rather than trusted from the client.
+The M1 stack deliberately does not require it, so nothing here relies on that enforcement; see invariant 2.
 The adapter uses exactly that and nothing else: it signs one event per invocation carrying `bin/fm-bearings-snapshot.sh --json` verbatim, and publishes it to a private channel on a relay bound to loopback.
 
 The projection is already report-shaped, so the adapter is a renderer rather than a data model.

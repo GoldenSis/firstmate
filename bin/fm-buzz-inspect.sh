@@ -10,10 +10,13 @@
 #                 is legible, and verifies each event's signature
 #   --anonymous   read as a stranger - probes whether the private channel is
 #                 invisible to non-members. Zero events is only an answer when the
-#                 relay REFUSES the subscription; an unrefused empty read is
-#                 reported INCONCLUSIVE, because a wiped relay, a channel id from
-#                 another home, a publish that never landed, and an empty channel
-#                 all look identical to enforced privacy.
+#                 relay refuses the subscription on MEMBERSHIP grounds, i.e. with
+#                 NIP-01's `restricted:`. Every other outcome is reported
+#                 INCONCLUSIVE and prints the relay's own words: an `auth-required:`
+#                 or `rate-limited:` refusal would be sent to any reader asking for
+#                 any channel, and an unrefused empty read looks identical to a
+#                 wiped relay, a channel id from another home, a publish that never
+#                 landed, or a channel that is simply empty.
 #
 # Unlike bin/fm-buzz-publish.sh this is NOT fire-and-forget: it is a diagnostic run
 # by hand, and a failure to reach the relay should be visible in its exit status.

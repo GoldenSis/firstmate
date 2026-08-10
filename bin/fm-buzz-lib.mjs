@@ -180,6 +180,27 @@ export function classifyOkResponse(accepted, message = "") {
   return RETRYABLE;
 }
 
+// A CLOSED reason refuses a whole subscription, and only one shape of it says
+// anything about the READER: `restricted:` is NIP-01's "you are not permitted to
+// see this", which for a private channel means the reading identity is not a
+// member. Every other prefix describes the request or the relay instead -
+// `auth-required:` means the relay wants NIP-42 before it serves any read at all,
+// `invalid:` faults the filter, `error:`/`rate-limited:` fault the relay - and a
+// relay that refuses every anonymous read refuses one regardless of which channel
+// was asked for, so those reasons cannot carry a membership conclusion.
+// classifyOkResponse deliberately collapses `restricted:` and `auth-required:`
+// (both are worth a retry), which is why membership needs its own predicate
+// rather than a reuse of that one.
+export const REFUSAL_NONE = "none";
+export const REFUSAL_MEMBERSHIP = "membership";
+export const REFUSAL_OTHER = "other";
+
+export function classifyRefusalReason(reason = "") {
+  const text = String(reason).trim();
+  if (!text) return REFUSAL_NONE;
+  return text.startsWith("restricted:") ? REFUSAL_MEMBERSHIP : REFUSAL_OTHER;
+}
+
 // --- relay client -----------------------------------------------------------
 
 function buildAuthEvent(relayUrl, challenge, privateKeyHex) {
@@ -293,15 +314,23 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = 
       if (sub) sub.events.push(message[2]);
     } else if (type === "EOSE") {
       const sub = subscriptions.get(message[1]);
-      if (sub) sub.resolve(sub.events);
+      if (sub) {
+        sub.served = true;
+        sub.resolve(sub.events);
+      }
     } else if (type === "CLOSED") {
       // CLOSED is subscription-scoped in NIP-01, and it is the relay's way of
       // refusing a REQ outright - a private channel answers a non-member with
       // `restricted: not a channel member` and then sends no EOSE at all. Resolve
       // the subscription with whatever arrived (usually nothing) so the reader
       // reports the refusal instead of hanging until the timeout.
+      //
+      // A CLOSED that FOLLOWS an EOSE is a different frame with the same name: the
+      // relay served this subscription and is now tearing it down. Recording its
+      // reason as a refusal would hand the reader a rejection that never happened,
+      // which is exactly the over-claim the anonymous read is gated against.
       const sub = subscriptions.get(message[1]);
-      if (sub) {
+      if (sub && !sub.served) {
         sub.closedReason = String(message[2] ?? "");
         sub.resolve(sub.events);
       }
@@ -437,7 +466,7 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = 
     // events" apart from "you may not see this channel".
     async query(filter, subId = "fm-inspect") {
       const events = [];
-      const entry = { events, resolve: null, closedReason: "" };
+      const entry = { events, resolve: null, closedReason: "", served: false };
       const done = new Promise((resolve) => {
         entry.resolve = resolve;
       });

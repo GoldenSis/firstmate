@@ -1034,9 +1034,10 @@ test_an_anonymous_read_only_claims_privacy_when_the_relay_refuses() {
   # read is the weakest possible evidence for one: a wiped relay, a channel id
   # derived from another home, a publish that never landed, and a genuinely empty
   # channel are all indistinguishable from enforced privacy. Only the relay
-  # refusing the subscription separates them, so the assurance is gated on that
-  # refusal and everything else must read INCONCLUSIVE.
-  local home relay served refused
+  # refusing the subscription ON MEMBERSHIP GROUNDS separates them, so the
+  # assurance is gated on that one refusal shape and everything else - including a
+  # refusal for some other reason - must read INCONCLUSIVE.
+  local home relay served refused unrelated
   home=$(make_home anonymous-read)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
 
@@ -1071,7 +1072,25 @@ EOF
     "a refused subscription must still report the privacy assurance"
   assert_not_contains "$refused" "INCONCLUSIVE" \
     "a refused subscription is conclusive and must not be hedged"
-  pass "an anonymous empty read claims privacy only when the relay refused it"
+
+  # A relay that refuses every anonymous read, membership or not. It would answer
+  # a request for ANY channel the same way, so its refusal carries no privacy
+  # conclusion even though it is a refusal.
+  read -r STUB_PID relay <<EOF
+$(start_stub --refuse-req "auth-required: we only serve authenticated readers")
+EOF
+  unrelated=$(run_inspect "$home" "$relay" --anonymous 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$unrelated" "auth-required: we only serve authenticated readers" \
+    "a non-membership refusal must be reported in the relay's own words"
+  assert_contains "$unrelated" "INCONCLUSIVE" \
+    "a refusal that is not about membership must stay inconclusive"
+  assert_not_contains "$unrelated" "That refusal is the assurance" \
+    "a non-membership refusal was reported as proof of privacy"
+  assert_not_contains "$unrelated" "never added to this private channel" \
+    "a non-membership refusal was described as a membership refusal"
+  pass "an anonymous empty read claims privacy only on a membership refusal"
 }
 
 test_no_firstmate_path_depends_on_buzz() {
