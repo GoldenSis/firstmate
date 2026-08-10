@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# fm-buzz-keypair.sh - create this home's loopback Buzz publishing keypair, once.
+# fm-buzz-keypair.sh - manage this home's loopback Buzz publishing keypair.
 #
-# Idempotent: the first run mints a keypair and stores the private half in the OS
-# keychain; every later run finds it and just prints the public key. There is no
-# flag that prints the private key, by design - see bin/fm-buzz-key-lib.sh, which
-# owns custody and explains the reasoning.
+# Idempotent ensure: the first run mints and stores a keypair, and later runs
+# derive the stored identity and refresh its public record. Store selection and
+# private-key custody are owned by bin/fm-buzz-key-lib.sh. There is no flag that
+# prints the private key, by design.
 #
 # The public key is recorded in <FM_HOME>/data/buzz-keypair.public so the value is
 # readable without touching the keychain. Retired public keys are kept alongside
@@ -13,14 +13,15 @@
 #
 # Usage:
 #   fm-buzz-keypair.sh                       ensure a keypair exists; print the public key
-#   fm-buzz-keypair.sh --public              print the public key; fail if none exists yet
+#   fm-buzz-keypair.sh --public              print the stored identity without changing records
 #   fm-buzz-keypair.sh --rotate              retire this home's key and mint a new one
 #   fm-buzz-keypair.sh --rotate --compromised  as above, but do not keep the retired key
 #   fm-buzz-keypair.sh --forget-key <hex>    withdraw one already-retired public key
 #   fm-buzz-keypair.sh --help                this text
 #
-# Exit status: 0 when ensure, --public, or --rotate leaves a recorded keypair, or
-# when --forget-key completes even if the named key was not recorded.
+# Exit status: 0 when ensure or --rotate leaves a recorded keypair, when --public
+# prints an existing stored identity, or when --forget-key completes even if the
+# named key was not recorded.
 # Exit status 1 reports an operational or inconsistent-state failure, and 2
 # reports invalid or contradictory arguments.
 # Unlike bin/fm-buzz-publish.sh this script is NOT fire-and-forget: it is run
@@ -419,7 +420,11 @@ if [ "$load_status" -eq 0 ]; then
     printf 'fm-buzz-keypair.sh: a key is stored but its public half could not be derived\n' >&2
     exit 1
   }
-  # Re-record on every run: cheap, and it self-heals a deleted or truncated file.
+  if [ "$PUBLIC_ONLY" -eq 1 ]; then
+    printf '%s\n' "$public"
+    exit 0
+  fi
+  # Re-record on every ensure: cheap, and it self-heals a deleted or truncated file.
   record_public "$public" || {
     printf 'fm-buzz-keypair.sh: could not record %s; the private key remains stored for a safe retry\n' "$PUBLIC_FILE" >&2
     exit 1

@@ -417,7 +417,8 @@ FM_BUZZ_RELAY=ws://localhost:3000   # loopback Buzz relay URL; only 127.0.0.1, l
 FM_BUZZ_TIMEOUT_MS=15000            # whole-connection budget for one publish run; `fm-buzz-publish.sh --timeout` overrides it
 FM_BUZZ_MAX_CACHE=100               # positive-integer replay-cache cap before the oldest signed events are dropped
 FM_BUZZ_STDIN_TIMEOUT_S=30          # deadline for reading the projection on stdin; an expired read is discarded rather than published
-FM_BUZZ_FORCE_FILE_STORE=           # set to 1 to skip the OS keychain and keep this home's publishing key in the 0600 fallback file
+FM_BUZZ_LOCK_TIMEOUT_S=30           # deadline for acquiring replay-cache ownership; timeout and interruption remain logged exit-0 non-events
+FM_BUZZ_FORCE_FILE_STORE=           # set to 1 to select the 0600 fallback for normal loads and stores; rotation still inspects and clears every store per `fm-buzz-keypair.sh --help`
 # sub-supervisor (bin/fm-supervise-daemon.sh); presence-gated via /afk
 FM_SUPERVISOR_BACKEND=             # optional supervisor pane backend override; tmux/herdr only, otherwise detects $TMUX_PANE then HERDR_ENV/HERDR_PANE_ID before tmux fallback
 FM_SUPERVISOR_TARGET=              # optional supervisor pane target override; tmux target or herdr <session>:<pane-id>, otherwise auto-detected
@@ -515,7 +516,7 @@ state/               volatile runtime signals; gitignored
   x-context/         generated X-mode durable per-request reply context (platform/budget), keyed by request_id; survives inbox cleanup so a delayed follow-up recovers the original platform (section 14; bin/fm-x-lib.sh)
   x-outbox/          generated X-mode dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
   x-poll.error       generated X-mode relay diagnostic dedupe marker
-  buzz-replay/       loopback Buzz publisher's replay cache of EXACT signed event bytes, keyed as <encoded-relay-host>/<created_at>-<id>.json; written before any network attempt, drained only by the matching relay host, and globally capped by FM_BUZZ_MAX_CACHE (docs/buzz-loopback-adapter.md)
+  buzz-replay/       loopback Buzz publisher's replay cache of EXACT signed event bytes, keyed as <normalized-relay-endpoint-sha256>/<created_at>-<id>.json; written before any network attempt, drained only by the matching complete normalized relay endpoint URL, and globally capped by FM_BUZZ_MAX_CACHE (docs/buzz-loopback-adapter.md)
   .wake-queue        durable queued wakes: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
   .afk               durable away-mode flag; present = sub-supervisor may inject escalations (set by /afk, cleared on user return)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks

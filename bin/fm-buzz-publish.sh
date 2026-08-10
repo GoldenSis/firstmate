@@ -47,6 +47,10 @@
 #   fm-buzz-publish.sh --timeout <ms>  relay timeout (default 15000)
 #   fm-buzz-publish.sh --help          this text
 #
+# Cache ownership waits at most FM_BUZZ_LOCK_TIMEOUT_S seconds (default 30).
+# Invalid deadlines, acquisition timeouts, and interrupted waits are logged and
+# converted to the same exit-0 non-event as every other publishing failure.
+#
 # Relay host note: the default is ws://localhost:3000, not ws://127.0.0.1:3000.
 # Buzz resolves its tenant from the HTTP Host header and the bundled deployment
 # community is registered as `localhost:3000`, so a bare-IP Host is answered with
@@ -72,6 +76,7 @@ REFRESH=0
 REPLAY_DIR="$STATE/buzz-replay"
 
 STDIN_TIMEOUT_S=${FM_BUZZ_STDIN_TIMEOUT_S:-30}
+PUBLISH_LOCK_TIMEOUT_S=${FM_BUZZ_LOCK_TIMEOUT_S:-30}
 
 log() {
   printf 'fm-buzz-publish: %s\n' "$1" >&2
@@ -98,6 +103,7 @@ log() {
 STDIN_SPOOL=""
 STDIN_READER=""
 PUBLISH_LOCK=""
+PUBLISH_INTERRUPTED=0
 drop_stdin_spool() {
   if [ -n "$STDIN_READER" ]; then
     kill "$STDIN_READER" 2>/dev/null
@@ -112,7 +118,13 @@ drop_stdin_spool() {
     PUBLISH_LOCK=""
   fi
 }
-trap drop_stdin_spool EXIT INT TERM HUP
+# shellcheck disable=SC2329 # Invoked by the signal traps below.
+interrupt_publish() {
+  PUBLISH_INTERRUPTED=1
+  drop_stdin_spool
+}
+trap drop_stdin_spool EXIT
+trap interrupt_publish INT TERM HUP
 
 # Spool stdin into the caller's file under a total deadline. Reports status only;
 # the caller owns the spool and reads it afterwards.
@@ -168,8 +180,8 @@ read_stdin_bounded() {  # <spool>
   return "$rc"
 }
 
-validate_stdin_timeout() {
-  local normalized=$STDIN_TIMEOUT_S
+normalize_shell_timeout() {
+  local normalized=$1
   case $normalized in
     ''|*[!0-9]*) return 1 ;;
   esac
@@ -180,7 +192,34 @@ validate_stdin_timeout() {
   [ "${#normalized}" -lt 10 ] \
     || { [ "${#normalized}" -eq 10 ] && [ "$normalized" -le 2147483647 ]; } \
     || return 1
-  STDIN_TIMEOUT_S=$normalized
+  printf '%s\n' "$normalized"
+}
+
+validate_stdin_timeout() {
+  STDIN_TIMEOUT_S=$(normalize_shell_timeout "$STDIN_TIMEOUT_S") || return 1
+}
+
+validate_publish_lock_timeout() {
+  PUBLISH_LOCK_TIMEOUT_S=$(normalize_shell_timeout "$PUBLISH_LOCK_TIMEOUT_S") || return 1
+}
+
+acquire_publish_lock() {  # <lock>
+  local lock=$1 attempts=0 max_attempts
+  max_attempts=$((PUBLISH_LOCK_TIMEOUT_S * 10))
+  while [ "$attempts" -lt "$max_attempts" ]; do
+    [ "$PUBLISH_INTERRUPTED" -eq 0 ] || return 2
+    if fm_lock_try_acquire "$lock"; then
+      if [ "$PUBLISH_INTERRUPTED" -eq 0 ]; then
+        return 0
+      fi
+      fm_lock_release "$lock"
+      return 2
+    fi
+    [ "$PUBLISH_INTERRUPTED" -eq 0 ] || return 2
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  return 1
 }
 
 # Everything substantive runs inside this function so the tail of the script can
@@ -194,6 +233,10 @@ publish() {
       return 1
       ;;
   esac
+  if ! validate_publish_lock_timeout; then
+    log "FM_BUZZ_LOCK_TIMEOUT_S must be a positive integer no greater than 2147483647"
+    return 1
+  fi
 
   STDIN_SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-stdin.XXXXXX") || {
     log "could not create a temporary file for the projection"
@@ -234,7 +277,7 @@ publish() {
     return 1
   }
 
-  local key load_status rc
+  local key load_status rc lock_status
   key=$(fm_buzz_key_load "$FM_HOME")
   load_status=$?
   if [ "$load_status" -ne 0 ]; then
@@ -268,7 +311,17 @@ publish() {
     || { log "replay cache path $REPLAY_DIR is not a regular directory"; return 1; }
   chmod 0700 "$REPLAY_DIR" 2>/dev/null || true
   PUBLISH_LOCK="$STATE/.buzz-replay-publish.lock"
-  fm_lock_acquire_wait "$PUBLISH_LOCK"
+  acquire_publish_lock "$PUBLISH_LOCK"
+  lock_status=$?
+  if [ "$lock_status" -ne 0 ]; then
+    if [ "$lock_status" -eq 2 ]; then
+      log "interrupted while waiting for replay cache ownership"
+    else
+      log "could not acquire replay cache ownership within ${PUBLISH_LOCK_TIMEOUT_S}s"
+    fi
+    drop_stdin_spool
+    return 1
+  fi
 
   # The envelope goes down a pipe, and neither private value is passed with `--arg`,
   # which would put it in jq's world-readable argv. The key reaches jq through a

@@ -202,6 +202,32 @@ EOF
   printf '%s\n' "$tools"
 }
 
+make_delayed_derive_tools() {
+  local tools="$TMP_ROOT/delayed-derive-tools" real_node
+  mkdir -p "$tools"
+  real_node=$(command -v node)
+  cat > "$tools/node" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  case \$arg in
+    *publicKeyFromPrivate*)
+      : > "\$FM_DELAY_BUZZ_DERIVE_READY"
+      waited=0
+      while [ ! -e "\$FM_DELAY_BUZZ_DERIVE_RELEASE" ] && [ "\$waited" -lt 1000 ]; do
+        sleep 0.01
+        waited=\$((waited + 1))
+      done
+      [ -e "\$FM_DELAY_BUZZ_DERIVE_RELEASE" ] || exit 70
+      break
+      ;;
+  esac
+done
+exec "$real_node" "\$@"
+EOF
+  chmod +x "$tools/node"
+  printf '%s\n' "$tools"
+}
+
 # --- the signing really is BIP-340 -----------------------------------------
 #
 # Everything else in this suite would still pass if the signer were subtly wrong
@@ -801,6 +827,44 @@ test_keypair_transactions_are_serialized_per_home() {
   [ "$(tail -1 "$output")" = "$current" ] \
     || fail "serialized keypair output disagrees with its recorded identity"
   pass "keypair ensure, rotation, and withdrawal share one home transaction lock"
+}
+
+test_public_read_cannot_restore_a_concurrently_retired_identity() {
+  local home tools ready release output reader waited old rotated observed recorded
+  home=$(make_home concurrent-public-read)
+  tools=$(make_delayed_derive_tools)
+  ready="$home/public-derive-ready"
+  release="$home/public-derive-release"
+  output="$home/public-output"
+  old=$(run_keypair "$home" 2>/dev/null) || fail "concurrent public-read fixture setup failed"
+
+  (PATH="$tools:$PATH" FM_DELAY_BUZZ_DERIVE_READY="$ready" \
+    FM_DELAY_BUZZ_DERIVE_RELEASE="$release" run_keypair "$home" --public > "$output" 2>&1) &
+  reader=$!
+  waited=0
+  while [ ! -e "$ready" ] && [ "$waited" -lt 100 ]; do
+    sleep 0.01
+    waited=$((waited + 1))
+  done
+  [ -e "$ready" ] || {
+    kill "$reader" 2>/dev/null
+    fail "the public read did not pause after loading the outgoing key"
+  }
+
+  rotated=$(run_keypair "$home" --rotate 2>/dev/null) || {
+    : > "$release"
+    wait "$reader" 2>/dev/null
+    fail "rotation failed while the public read was paused"
+  }
+  : > "$release"
+  wait "$reader" || fail "the concurrent public read failed"
+
+  observed=$(tail -1 "$output")
+  recorded=$(cat "$home/data/buzz-keypair.public")
+  [ "$observed" = "$old" ] || fail "the paused public read did not observe the outgoing identity"
+  [ "$recorded" = "$rotated" ] \
+    || fail "a read-only --public call restored the concurrently retired identity"
+  pass "--public cannot rewrite a public record after concurrent rotation"
 }
 
 test_public_key_history_is_normalized_consistently() {
@@ -1465,6 +1529,127 @@ EOF
   [ "$(replay_count "$home")" = "1" ] \
     || fail "concurrent cache pruning lost every in-flight projection"
   pass "concurrent publishers serialize signing, pruning, and delivery accounting"
+}
+
+test_publish_lock_acquisition_is_validated_bounded_and_interruptible() {
+  local home lock projection out_file result invalid code pid waited ready holder
+  home=$(make_home bounded-publish-lock)
+  lock="$home/state/.buzz-replay-publish.lock"
+  projection="$home/projection.json"
+  out_file="$home/publish-lock.out"
+  ready="$home/publish-lock-ready"
+  run_keypair "$home" >/dev/null 2>&1 || fail "publish-lock fixture setup failed"
+  printf '%s' '{"schema":"fm-bearings.v1","note":"publish-lock"}' > "$projection"
+
+  for invalid in 0 -1 abc 2147483648; do
+    result=$(FM_BUZZ_LOCK_TIMEOUT_S=$invalid run_publish "$home" "ws://127.0.0.1:1" \
+      < "$projection" 2>&1)
+    code=$?
+    expect_code 0 "$code" "invalid publish-lock deadline $invalid"
+    assert_contains "$result" "FM_BUZZ_LOCK_TIMEOUT_S must be a positive integer" \
+      "invalid publish-lock deadline $invalid was not rejected"
+  done
+
+  mkdir "$lock"
+  : > "$lock/blocker"
+  env FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$home/state" \
+    XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 FM_BUZZ_TIMEOUT_MS=8000 \
+    FM_BUZZ_LOCK_TIMEOUT_S=1 "$PUBLISH" --relay "ws://127.0.0.1:1" \
+    < "$projection" > "$out_file" 2>&1 &
+  pid=$!
+  waited=0
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    fail "an uncreatable publish lock exceeded its acquisition deadline"
+  fi
+  wait "$pid"
+  code=$?
+  expect_code 0 "$code" "uncreatable publish lock through the fire-and-forget wrapper"
+  assert_contains "$(cat "$out_file")" "could not acquire replay cache ownership within 1s" \
+    "an uncreatable publish lock did not report its bounded refusal"
+
+  rm -rf "$lock"
+  (
+    # shellcheck disable=SC1091
+    . "$ROOT/bin/fm-wake-lib.sh"
+    fm_lock_acquire_wait "$lock"
+    trap 'fm_lock_release "$lock"' EXIT
+    : > "$ready"
+    sleep 30
+  ) &
+  holder=$!
+  waited=0
+  while [ ! -e "$ready" ] && [ "$waited" -lt 100 ]; do
+    sleep 0.01
+    waited=$((waited + 1))
+  done
+  [ -e "$ready" ] || {
+    kill "$holder" 2>/dev/null
+    fail "the persistent publish-lock fixture did not acquire ownership"
+  }
+
+  # shellcheck disable=SC2031
+  env FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$home/state" \
+    XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 FM_BUZZ_TIMEOUT_MS=8000 \
+    FM_BUZZ_LOCK_TIMEOUT_S=1 "$PUBLISH" --relay "ws://127.0.0.1:1" \
+    < "$projection" > "$out_file" 2>&1 &
+  pid=$!
+  waited=0
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null
+    kill "$holder" 2>/dev/null
+    wait "$pid" "$holder" 2>/dev/null
+    fail "a persistently held publish lock exceeded its acquisition deadline"
+  fi
+  wait "$pid"
+  code=$?
+  expect_code 0 "$code" "persistently held publish lock through the fire-and-forget wrapper"
+  assert_contains "$(cat "$out_file")" "could not acquire replay cache ownership within 1s" \
+    "a persistently held publish lock did not report its bounded refusal"
+
+  # shellcheck disable=SC2031
+  env FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$home/state" \
+    XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 FM_BUZZ_TIMEOUT_MS=8000 \
+    FM_BUZZ_LOCK_TIMEOUT_S=30 "$PUBLISH" --relay "ws://127.0.0.1:1" \
+    < "$projection" > "$out_file" 2>&1 &
+  pid=$!
+  sleep 0.2
+  kill -0 "$pid" 2>/dev/null || {
+    kill "$holder" 2>/dev/null
+    wait "$holder" 2>/dev/null
+    fail "the interrupted publisher was not waiting for cache ownership"
+  }
+  kill -TERM "$pid" 2>/dev/null
+  waited=0
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null
+    kill "$holder" 2>/dev/null
+    wait "$pid" "$holder" 2>/dev/null
+    fail "a signal did not terminate the publish-lock wait"
+  fi
+  wait "$pid"
+  code=$?
+  kill "$holder" 2>/dev/null
+  wait "$holder" 2>/dev/null
+  expect_code 0 "$code" "interrupted publish-lock wait through the fire-and-forget wrapper"
+  assert_contains "$(cat "$out_file")" "interrupted while waiting for replay cache ownership" \
+    "an interrupted publish-lock wait was not diagnosed"
+  assert_contains "$(cat "$out_file")" "Firstmate is unaffected" \
+    "an interrupted publish-lock wait bypassed the exit-0 conversion path"
+  pass "publish-lock waits validate deadlines, time out, and honor signals"
 }
 
 test_replay_cache_rejects_symlink_boundaries() {
@@ -2540,6 +2725,7 @@ test_public_record_failures_are_fatal_and_retryable
 test_key_record_targets_reject_non_files
 test_key_record_replace_is_exact_destination
 test_keypair_transactions_are_serialized_per_home
+test_public_read_cannot_restore_a_concurrently_retired_identity
 test_public_key_history_is_normalized_consistently
 test_two_homes_sharing_one_xdg_get_separate_keys
 test_publish_with_relay_down_exits_zero_and_enqueues
@@ -2562,6 +2748,7 @@ test_replay_cache_is_capped_at_100
 test_cache_limit_must_be_a_positive_integer
 test_cache_limit_one_preserves_the_pending_event
 test_concurrent_publishers_serialize_the_cache_lifecycle
+test_publish_lock_acquisition_is_validated_bounded_and_interruptible
 test_replay_cache_rejects_symlink_boundaries
 test_relay_timeout_must_fit_the_node_timer_range
 test_malformed_cache_names_are_discarded_or_accounted_for
