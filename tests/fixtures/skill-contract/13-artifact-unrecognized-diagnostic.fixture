@@ -1,0 +1,4 @@
+check: SC006
+mutation: reference-diagnostic
+diagnostic-line: .agents/skills/alpha/SKILL.md:1: docs/fixture.md: resolver spoke in tongues
+expected-receipt: SC006 artifact-reachability: the reference resolver emitted an unrecognized diagnostic '.agents/skills/alpha/SKILL.md:1: docs/fixture.md: resolver spoke in tongues'

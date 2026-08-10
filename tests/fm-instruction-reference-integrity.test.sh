@@ -284,6 +284,8 @@ test_reference_fixture_matrix() {
     'example|pass|none||Example: use `bin/missing.sh`.'
     'directory|pass|none||Inspect `docs/` and `.github/workflows/`.'
     'missing-directory|fail|none|AGENTS.md:1: docs/absent/: no exact tracked target|Inspect `docs/absent/`.'
+    'invocation-span|fail|none|AGENTS.md:1: bin/missing.sh: no exact tracked target|Use `bin/missing.sh --flag`.'
+    'path-plus-prose|pass|none||Read `AGENTS.md section 1` and `bin/tool.sh --flag`.'
   )
 
   for row in "${cases[@]}"; do

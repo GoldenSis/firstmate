@@ -1,0 +1,4 @@
+check: SC006
+mutation: reference-diagnostic
+diagnostic-line: .agents/skills/alpha/SKILL.md:1: .agents/skills/alpha/SKILL.md: missing file
+expected-receipt: SC006 artifact-reachability: tracked skill file .agents/skills/alpha/SKILL.md is absent from the working tree

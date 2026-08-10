@@ -1,0 +1,3 @@
+check: SC006
+mutation: case-mismatched-artifact
+expected-receipt: SC006 artifact-reachability: .agents/skills/alpha/SKILL.md references local target 'docs/fixture.md' with a different tracked case

@@ -1,0 +1,3 @@
+check: SC005
+mutation: unknown-trigger-owner
+expected-receipt: SC005 trigger-overlap: trigger 'load when the fixture alarm fires' is claimed by alpha,beta under trigger-owner 'gamma', which is not one of the claiming skills

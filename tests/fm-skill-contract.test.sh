@@ -210,6 +210,34 @@ skill_reference_diagnostics() {
   /bin/bash "$REFERENCE_CHECKER" --check-files "$root" "$@" > "$destination" 2>&1
 }
 
+# Translates one delegate diagnostic into its SC006 receipt. Kept out of
+# audit_skill_tree so every outcome branch, including the ones a repo mutation
+# cannot reach in isolation, stays directly reachable from a fixture.
+sc006_receipt() {
+  local diagnostic_line=$1 reference_file reference_literal reference_message
+  IFS=: read -r reference_file _ reference_literal reference_message <<< "$diagnostic_line"
+  reference_literal=${reference_literal# }
+  reference_message=${reference_message# }
+  case "$reference_message" in
+    'case does not match'*)
+      structural_error "SC006 artifact-reachability: $reference_file references local target '$reference_literal' with a different tracked case"
+      ;;
+    'no exact tracked target')
+      structural_error "SC006 artifact-reachability: $reference_file references missing local target '$reference_literal'"
+      ;;
+    'missing file')
+      structural_error "SC006 artifact-reachability: tracked skill file $reference_file is absent from the working tree"
+      ;;
+    'cannot read the tracked-file index')
+      structural_error "SC006 artifact-reachability: the reference resolver could not read the tracked-file index"
+      ;;
+    *)
+      structural_error "SC006 artifact-reachability: the reference resolver emitted an unrecognized diagnostic '$diagnostic_line'"
+      ;;
+  esac
+  return 1
+}
+
 validate_receipt_label() {
   local label=$1
   if [ "$label" = "$RECEIPT_LABEL" ]; then
@@ -224,17 +252,19 @@ audit_skill_tree() {
   local root=$1 agents="$1/AGENTS.md" failed=0 check_failed=0
   local relative file directory_name declared_name user_invocable internal name
   local count referenced standalone trigger owner marker
-  local trigger_rows trigger_groups phrase names
-  local diagnostic_line reference_file reference_literal reference_message
-  local reference_output reference_status
-  local -a skill_files=()
+  local trigger_rows trigger_groups kind phrase names
+  local diagnostic_line reference_output reference_status
+  local -a skill_files=() internal_skill_files=()
   local skill_count=0 internal_count=0 public_count=0
 
   # The tracked skill list cannot change mid-audit, so resolve it once and let
-  # every check iterate the same materialized set.
+  # every check iterate the same materialized set. Only `.agents/skills/` is
+  # loaded by a running firstmate (AGENTS.md section 12), so reachability
+  # evidence is tracked separately from the installer-facing public tree.
   while IFS= read -r relative; do
     [ -n "$relative" ] || continue
     skill_files+=("$relative")
+    case "$relative" in .agents/skills/*) internal_skill_files+=("$relative") ;; esac
   done < <(tracked_skill_files "$root")
   skill_count=${#skill_files[@]}
 
@@ -317,7 +347,7 @@ audit_skill_tree() {
     referenced=0
     [ -f "$agents" ] && grep -F -- "\`$name\`" "$agents" >/dev/null && referenced=1
     if [ "$referenced" -eq 0 ] &&
-      ! skill_has_inbound_reference "$root" "$name" "$relative" "${skill_files[@]}" &&
+      ! skill_has_inbound_reference "$root" "$name" "$relative" "${internal_skill_files[@]}" &&
       [ "$user_invocable" != "true" ] && [ "$standalone" != "true" ]; then
       structural_error "SC004 orphan: agent-only skill '$name' has no AGENTS.md reference, inbound skill reference, or standalone posture"
       check_failed=1
@@ -340,8 +370,22 @@ audit_skill_tree() {
     done < <(frontmatter_triggers "$file")
   done
   LC_ALL=C sort -u "$trigger_rows" | awk -F '|' '
+    function claims(candidate, list,   parts, total, i) {
+      total = split(list, parts, ",")
+      for (i = 1; i <= total; i++) if (parts[i] == candidate) return 1
+      return 0
+    }
     function flush() {
-      if (count > 1 && !resolved) print phrase "|" names
+      if (count <= 1) return
+      if (!resolved) {
+        print "collision|" phrase "|" names "|"
+        return
+      }
+      # A recorded owner is a decision about which claimant wins, so it only
+      # resolves the collision when it names one of them.
+      if (!claims(shared_owner, names)) {
+        print "unknown-owner|" phrase "|" names "|" shared_owner
+      }
     }
     {
       if (NR > 1 && $1 != phrase) flush()
@@ -359,9 +403,16 @@ audit_skill_tree() {
     }
     END { if (NR > 0) flush() }
   ' > "$trigger_groups"
-  while IFS='|' read -r phrase names; do
+  while IFS='|' read -r kind phrase names owner; do
     [ -n "$phrase" ] || continue
-    structural_error "SC005 trigger-overlap: trigger '$phrase' is claimed by $names without one shared trigger-owner"
+    case "$kind" in
+      unknown-owner)
+        structural_error "SC005 trigger-overlap: trigger '$phrase' is claimed by $names under trigger-owner '$owner', which is not one of the claiming skills"
+        ;;
+      *)
+        structural_error "SC005 trigger-overlap: trigger '$phrase' is claimed by $names without one shared trigger-owner"
+        ;;
+    esac
     check_failed=1
     failed=1
   done < "$trigger_groups"
@@ -380,26 +431,7 @@ audit_skill_tree() {
     else
       while IFS= read -r diagnostic_line; do
         [ -n "$diagnostic_line" ] || continue
-        IFS=: read -r reference_file _ reference_literal reference_message <<< "$diagnostic_line"
-        reference_literal=${reference_literal# }
-        reference_message=${reference_message# }
-        case "$reference_message" in
-          'case does not match'*)
-            structural_error "SC006 artifact-reachability: $reference_file references local target '$reference_literal' with a different tracked case"
-            ;;
-          'no exact tracked target')
-            structural_error "SC006 artifact-reachability: $reference_file references missing local target '$reference_literal'"
-            ;;
-          'missing file')
-            structural_error "SC006 artifact-reachability: tracked skill file $reference_file is absent from the working tree"
-            ;;
-          'cannot read the tracked-file index')
-            structural_error "SC006 artifact-reachability: the reference resolver could not read the tracked-file index"
-            ;;
-          *)
-            structural_error "SC006 artifact-reachability: the reference resolver emitted an unrecognized diagnostic '$diagnostic_line'"
-            ;;
-        esac
+        sc006_receipt "$diagnostic_line" || true
         check_failed=1
         failed=1
       done < "$reference_output"
@@ -426,6 +458,12 @@ audit_skill_tree() {
 # are documented escapes, so the fixtures exercise each one.
 write_fixture_skill() {
   local file=$1 name=$2 include_internal=$3 trigger=$4 body=${5:-} placement=${6:-frontmatter}
+  local owner=${7:-}
+  # The metadata placement needs the metadata block, so refuse the combination
+  # that would silently emit a skill with no trigger at either placement.
+  if [ "$placement" = "metadata" ] && [ "$include_internal" != "yes" ]; then
+    fail "write_fixture_skill cannot place a trigger under metadata while omitting the metadata block"
+  fi
   mkdir -p "$(dirname "$file")"
   {
     printf '%s\n' '---'
@@ -434,6 +472,7 @@ write_fixture_skill() {
     if [ "$placement" = "frontmatter" ]; then
       printf 'trigger: %s\n' "$trigger"
     fi
+    [ -z "$owner" ] || printf 'trigger-owner: %s\n' "$owner"
     printf '%s\n' 'user-invocable: false'
     if [ "$include_internal" = "yes" ]; then
       printf '%s\n' 'metadata:' '  internal: true'
@@ -494,9 +533,29 @@ make_contract_fixture() {
         'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' metadata
       write_fixture_agents "$repo/AGENTS.md" alpha beta
       ;;
+    shared-trigger-owner)
+      write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
+        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' frontmatter alpha
+      write_fixture_skill "$repo/.agents/skills/beta/SKILL.md" beta yes \
+        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' frontmatter alpha
+      write_fixture_agents "$repo/AGENTS.md" alpha beta
+      ;;
+    unknown-trigger-owner)
+      write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
+        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' frontmatter gamma
+      write_fixture_skill "$repo/.agents/skills/beta/SKILL.md" beta yes \
+        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' frontmatter gamma
+      write_fixture_agents "$repo/AGENTS.md" alpha beta
+      ;;
     stale-artifact)
       write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
         'load when the alpha fixture runs' 'Read `docs/missing.md`.'
+      ;;
+    case-mismatched-artifact)
+      write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
+        'load when the alpha fixture runs' 'Read `docs/fixture.md`.'
+      mv "$repo/docs/fixture.md" "$repo/docs/fixture.tmp"
+      mv "$repo/docs/fixture.tmp" "$repo/docs/Fixture.md"
       ;;
     stub-sentinel)
       write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
@@ -634,22 +693,29 @@ test_admission_fixtures() {
   done
 }
 
-# Control for the shared fixture builders: an unmutated fixture repo must be
+# Controls for the shared fixture builders: an unmutated fixture repo must be
 # fully clean. Without it, drift in write_fixture_skill / write_fixture_agents
-# would add a spurious receipt to every seeded case and still look green.
-test_clean_contract_fixture() {
-  local repo="$TMP_ROOT/clean-baseline" output status=0
-  make_contract_fixture "$repo" none
-  output=$(audit_skill_tree "$repo") || status=$?
-  printf '%s\n' "$output"
-  expect_code 0 "$status" "unmutated skill-contract fixture"
-  assert_not_contains "$output" "not ok - [$RECEIPT_LABEL] " \
-    "unmutated skill-contract fixture emitted a structural failure receipt"
-  pass "[clean control] unmutated skill-contract fixture emits only passing receipts"
+# would add a spurious receipt to every seeded case and still look green. The
+# second control keeps the documented `trigger-owner:` escape working, so
+# tightening it into a real ownership claim cannot silently reject a valid one.
+test_clean_contract_fixtures() {
+  local mutation repo output status
+  for mutation in none shared-trigger-owner; do
+    repo="$TMP_ROOT/clean-$mutation"
+    status=0
+    make_contract_fixture "$repo" "$mutation"
+    output=$(audit_skill_tree "$repo") || status=$?
+    printf '%s\n' "$output"
+    expect_code 0 "$status" "clean skill-contract fixture '$mutation'"
+    assert_not_contains "$output" "not ok - [$RECEIPT_LABEL] " \
+      "clean skill-contract fixture '$mutation' emitted a structural failure receipt"
+    pass "[clean control] skill-contract fixture '$mutation' emits only passing receipts"
+  done
 }
 
 test_contract_failure_fixtures() {
   local fixture check mutation expected label repo output status other
+  local diagnostic saved_checker
   local count=0
   for fixture in "$CONTRACT_FIXTURES"/*.fixture; do
     count=$((count + 1))
@@ -657,14 +723,31 @@ test_contract_failure_fixtures() {
     mutation=$(fixture_value "$fixture" mutation)
     expected=$(fixture_value "$fixture" expected-receipt)
     status=0
-    if [ "$mutation" = "false-behavioral-claim" ]; then
-      label=$(fixture_value "$fixture" receipt-label)
-      output=$(validate_receipt_label "$label") || status=$?
-    else
-      repo="$TMP_ROOT/$mutation"
-      make_contract_fixture "$repo" "$mutation"
-      output=$(audit_skill_tree "$repo") || status=$?
-    fi
+    case "$mutation" in
+      false-behavioral-claim)
+        label=$(fixture_value "$fixture" receipt-label)
+        output=$(validate_receipt_label "$label") || status=$?
+        ;;
+      reference-diagnostic)
+        # Delegate diagnostics that no repo mutation can raise in isolation are
+        # fed straight to the translator that turns them into receipts.
+        diagnostic=$(fixture_value "$fixture" diagnostic-line)
+        output=$(sc006_receipt "$diagnostic") || status=$?
+        ;;
+      broken-reference-delegation)
+        repo="$TMP_ROOT/$mutation"
+        make_contract_fixture "$repo" none
+        saved_checker="$REFERENCE_CHECKER"
+        REFERENCE_CHECKER="$TMP_ROOT/absent-reference-checker.sh"
+        output=$(audit_skill_tree "$repo") || status=$?
+        REFERENCE_CHECKER="$saved_checker"
+        ;;
+      *)
+        repo="$TMP_ROOT/$mutation"
+        make_contract_fixture "$repo" "$mutation"
+        output=$(audit_skill_tree "$repo") || status=$?
+        ;;
+    esac
     [ "$status" -ne 0 ] || fail "$(basename "$fixture") did not fail"
     assert_contains "$output" "not ok - [$RECEIPT_LABEL] $expected" \
       "$(basename "$fixture") did not emit its specific structural error receipt"
@@ -676,11 +759,11 @@ test_contract_failure_fixtures() {
     done
     pass "[seeded failure] $(basename "$fixture") => $expected"
   done
-  [ "$count" -eq 8 ] || fail "expected exactly 8 skill-contract failure fixtures, found $count"
+  [ "$count" -eq 14 ] || fail "expected exactly 14 skill-contract failure fixtures, found $count"
 }
 
 test_current_skill_contract
 test_admission_rubric_owner
 test_admission_fixtures
-test_clean_contract_fixture
+test_clean_contract_fixtures
 test_contract_failure_fixtures
