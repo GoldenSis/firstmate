@@ -21,7 +21,8 @@
 #                 who can publish to the relay. Authorship is checked against this
 #                 home's current AND retired publishing keys, so a rotation does
 #                 not blind the probe to pre-rotation events the relay still holds.
-#                 Combining it with --channel-label rules the conclusive answer out
+#                 Pointing it with --channel-label at a channel derived from some
+#                 other label than this home's rules the conclusive answer out
 #                 entirely: see that flag below.
 #                 Zero events is only an answer the other way when the relay
 #                 refuses the subscription on MEMBERSHIP grounds, i.e. with
@@ -32,13 +33,16 @@
 #                 wiped relay, a channel id from another home, a publish that never
 #                 landed, or a channel that is simply empty.
 #
-# --channel-label points the read at a channel derived from some other label than
-# this home's, and the only publishing keys on disk here are this home's own. So
-# --anonymous cannot reach the conclusive answer for such a channel: it reports
-# INCONCLUSIVE with "cannot verify authorship for a channel not derived from this
-# home; use --anonymous only on this home's own channel". Reading another home's
-# recorded keys is not the answer - firstmate does not reach into another home's
-# files - so probe a channel from the home that owns it.
+# --channel-label points the read at whatever channel the given label derives to.
+# When that label is a DIFFERENT one than this home's, the only publishing keys on
+# disk here are still this home's own, so --anonymous cannot reach the conclusive
+# answer for such a channel: it reports INCONCLUSIVE with "cannot verify authorship
+# for a channel not derived from this home; use --anonymous only on this home's own
+# channel". Reading another home's recorded keys is not the answer - firstmate does
+# not reach into another home's files - so probe a channel from the home that owns
+# it. Passing this home's own resolved path is not that case and keeps the
+# conclusive answer available: what rules it out is the label differing from this
+# home's, not the flag being present.
 #
 # Unlike bin/fm-buzz-publish.sh this is NOT fire-and-forget: it is a diagnostic run
 # by hand, and a failure to reach the relay should be visible in its exit status.
@@ -78,11 +82,19 @@ done
 command -v node >/dev/null 2>&1 || { printf 'fm-buzz-inspect.sh: node is required\n' >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { printf 'fm-buzz-inspect.sh: jq is required\n' >&2; exit 1; }
 
-if [ -n "$CHANNEL_LABEL" ]; then
-  OWN_CHANNEL=false
-else
+OWN_LABEL=$(fm_buzz_key_account "$FM_HOME")
+[ -n "$CHANNEL_LABEL" ] || CHANNEL_LABEL=$OWN_LABEL
+
+# Whether the recorded keys can attribute what the relay serves is a property of
+# the RESOLVED label, not of whether --channel-label was typed. Deciding it from
+# the flag's presence throws the conclusive answer away for an operator who
+# spelled their own home path out - a natural thing to do when checking which
+# channel id a label derives to - and that is a false negative over a real leak of
+# this home's own content.
+if [ "$CHANNEL_LABEL" = "$OWN_LABEL" ]; then
   OWN_CHANNEL=true
-  CHANNEL_LABEL=$(fm_buzz_key_account "$FM_HOME")
+else
+  OWN_CHANNEL=false
 fi
 
 CHANNEL=$(fm_buzz_channel_id "$SCRIPT_DIR" "$CHANNEL_LABEL") || {

@@ -496,7 +496,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   <id>/brief.md      per-task crewmate brief, or per-secondmate charter brief when kind=secondmate
   <id>/report.md     scout task deliverable, written by the crewmate; survives teardown
   buzz-keypair.public  this home's loopback Buzz publishing PUBLIC key; LOCAL, gitignored; written by fm-buzz-keypair.sh, which never records the private half here (docs/buzz-loopback-adapter.md)
-  buzz-keypair.public-history  public keys this home has retired, one per line; LOCAL, gitignored; appended by fm-buzz-keypair.sh --rotate so pre-rotation events stay attributable to this home (docs/buzz-loopback-adapter.md)
+  buzz-keypair.public-history  public keys this home has retired, one per line; LOCAL, gitignored; appended by fm-buzz-keypair.sh --rotate so pre-rotation events stay attributable to this home, and withheld by --rotate --compromised (docs/buzz-loopback-adapter.md)
 projects/            cloned repos; gitignored; READ-ONLY for you
 state/               volatile runtime signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth

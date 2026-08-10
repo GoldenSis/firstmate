@@ -120,9 +120,10 @@ try {
   // author's signature, carries this channel's `h` tag, AND was signed by one of
   // the publishing keys this home has held. A relay that serves altered, replayed
   // or fabricated frames would otherwise have this tool report a definite breach
-  // of a channel that never leaked. Under --channel-label that last piece of
-  // evidence cannot exist here at all, so the verdict is ruled out first: the
-  // channel belongs to another home, whose keys this one does not read.
+  // of a channel that never leaked. For a channel derived from another home's
+  // label that last piece of evidence cannot exist here at all, so the verdict is
+  // ruled out first: the channel belongs to another home, whose keys this one
+  // does not read.
   if (anonymous && !ownChannel && events.length > 0) {
     process.stdout.write(
       `\nINCONCLUSIVE: the relay served ${events.length} event(s) to this non-member, but\n` +

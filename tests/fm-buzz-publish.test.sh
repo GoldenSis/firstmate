@@ -284,6 +284,49 @@ test_rotation_replaces_the_key_in_whichever_store_holds_it() {
   pass "rotation replaces the key in whichever store holds it"
 }
 
+test_a_compromised_rotation_does_not_keep_the_retired_key() {
+  # Retention rests on the retired key being one only this home ever held, and the
+  # commonest reason to rotate breaks exactly that premise: a private half that may
+  # have leaked is a key somebody else holds too, and the channel id is not a
+  # secret, so that somebody can mint an event the probe would report as this
+  # home's own leaked projection. --compromised is how a rotation says so: it
+  # declines to record the outgoing key, and withdraws it if it is already there.
+  local home first second third history code
+  home=$(make_home rotate-compromised)
+  history="$home/data/buzz-keypair.public-history"
+
+  first=$(run_keypair "$home" 2>/dev/null) || fail "keypair creation failed"
+  second=$(run_keypair "$home" --rotate --compromised 2>/dev/null) \
+    || fail "compromised rotation failed"
+  [ "$first" != "$second" ] \
+    || fail "the compromised rotation re-printed the same public key; nothing was replaced"
+  assert_not_contains "$(cat "$history" 2>/dev/null)" "$first" \
+    "a compromised rotation kept the retired key in the recorded set"
+
+  # And it withdraws a key an earlier ordinary rotation already recorded, which is
+  # the only way to take back a retention made before the exposure was known.
+  printf '%s\n' "$second" >> "$history"
+  third=$(run_keypair "$home" --rotate --compromised 2>/dev/null) \
+    || fail "second compromised rotation failed"
+  [ "$third" != "$second" ] \
+    || fail "the second compromised rotation did not replace the key"
+  assert_not_contains "$(cat "$history" 2>/dev/null)" "$second" \
+    "a compromised rotation left an already-recorded copy of the retired key in place"
+
+  # An ordinary rotation must still retain, or the flag would be describing the
+  # default rather than an opt-out.
+  assert_grep "$third" "$home/data/buzz-keypair.public" \
+    "the compromised rotation did not record the new public key"
+  run_keypair "$home" --rotate >/dev/null 2>&1 || fail "ordinary rotation failed"
+  assert_grep "$third" "$history" \
+    "an ordinary rotation stopped retaining the key it retired"
+
+  run_keypair "$home" --compromised >/dev/null 2>&1
+  code=$?
+  expect_code 2 "$code" "--compromised without --rotate describes nothing"
+  pass "a compromised rotation does not keep the retired key"
+}
+
 test_public_flag_fails_before_a_keypair_exists() {
   local home output code
   home=$(make_home public-first)
@@ -1307,6 +1350,42 @@ EOF
   pass "an anonymous read of a foreign channel claims no verdict"
 }
 
+test_an_anonymous_read_of_this_homes_own_label_still_reaches_a_verdict() {
+  # What rules the conclusive answer out is the channel belonging to another home,
+  # not --channel-label being typed. Spelling this home's own resolved path out is
+  # a natural way to check which channel id a label derives to, and it inspects
+  # precisely this home's channel with precisely this home's keys on disk - so
+  # deciding attributability from the flag's presence would throw the verdict away
+  # over a real leak of this home's own content.
+  local home relay label explicit
+  home=$(make_home own-label-explicit)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  # Resolved the same way bin/fm-buzz-key-lib.sh resolves this home's own label.
+  label=$(cd "$home" && pwd -P)
+
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"own-label-spelled-out"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  explicit=$(run_inspect "$home" "$relay" --anonymous --channel-label "$label" 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$explicit" "own-label-spelled-out" \
+    "the event was not served, so the check under test was never reached"
+  assert_contains "$explicit" "this home's publisher" \
+    "this home's own event was not attributed to it when its label was passed explicitly"
+  assert_contains "$explicit" \
+    "The channel was readable by an identity that is not a member — this is a definite negative privacy result." \
+    "spelling out this home's own label suppressed the verdict over a real leak"
+  assert_not_contains "$explicit" "INCONCLUSIVE" \
+    "a leak of this home's own content is conclusive, not inconclusive"
+  assert_not_contains "$explicit" "channel not derived from this home" \
+    "this home's own label was treated as another home's"
+  pass "an anonymous read of this home's own label still reaches a verdict"
+}
+
 test_no_firstmate_path_depends_on_buzz() {
   # Invariant: Buzz is additive. If any other Firstmate script, skill, workflow or
   # AGENTS.md instruction ever calls the adapter, a stopped relay could reach a
@@ -1324,6 +1403,7 @@ test_bip340_official_vectors
 test_keypair_is_idempotent_and_never_prints_the_private_key
 test_public_flag_fails_before_a_keypair_exists
 test_rotation_replaces_the_key_in_whichever_store_holds_it
+test_a_compromised_rotation_does_not_keep_the_retired_key
 test_two_homes_sharing_one_xdg_get_separate_keys
 test_publish_with_relay_down_exits_zero_and_enqueues
 test_publish_without_a_keypair_still_exits_zero
@@ -1351,4 +1431,5 @@ test_an_anonymous_read_of_unverifiable_events_claims_no_breach
 test_an_anonymous_read_of_a_foreign_authors_event_claims_no_breach
 test_a_rotated_home_still_recognises_its_own_leaked_events
 test_an_anonymous_read_of_a_foreign_channel_claims_no_verdict
+test_an_anonymous_read_of_this_homes_own_label_still_reaches_a_verdict
 test_no_firstmate_path_depends_on_buzz

@@ -182,9 +182,15 @@ Buzz documents no key-rotation procedure, so `bin/fm-buzz-keypair.sh --rotate` i
 It clears both stores - the keychain entry and the `0600` fallback file - plus `data/buzz-keypair.public`, then mints a fresh keypair and prints the new public key, and it refuses to report success if the old key is still loadable afterwards.
 Rotating by hand is not offered because it does not work reliably: which store holds the key depends on the host, and the fallback file's name carries a digest of the home path, so deleting "the keychain entry" on a machine whose key lives in the file clears nothing and the next run re-prints the same public key.
 Historical events stay signed by the retired key, which grants nothing and so needs no revocation.
-The retired PUBLIC key is still evidence, though, because only this home ever held it: `bin/fm-buzz-inspect.sh --anonymous` decides whether a served event is this home's own content by its author, and the relay keeps serving pre-rotation events under a channel id that rotation does not change.
+The retired PUBLIC key is still evidence, though, when only this home ever held it: `bin/fm-buzz-inspect.sh --anonymous` decides whether a served event is this home's own content by its author, and the relay keeps serving pre-rotation events under a channel id that rotation does not change.
 So rotation retains the retired public key in `data/buzz-keypair.public-history` before recording the new one, and the inspector attributes an event to this home if it was signed by any recorded key, current or retired.
 Without that, rotating would make the probe report this home's own leaked projections as somebody else's content.
+
+Retention assumes the retired key was never exposed.
+If retiring due to suspected compromise, use `--compromised` so the key is not retained for verdict-matching.
+A key whose private half somebody else may hold is no longer evidence of authorship at all: the channel id is not a secret, so that holder can mint an event the probe would report as this home's own leaked projection.
+`--rotate --compromised` therefore declines to record the outgoing key and drops it from the history file if an earlier ordinary rotation put it there, at the cost of no longer attributing this home's genuine pre-rotation events.
+Either way the recorded-key set is settled before the private half is cleared, and the rotation stops rather than proceeding if it cannot be: once the key is forgotten nothing can derive the retired public key a second time, so a write failure at that point would permanently and silently cost the probe its attribution.
 
 Buzz is pre-1.0 with no long-term support branches and a very high release cadence, so `ghcr.io/block/buzz:main` can move under this adapter at any time.
 The relay stack is disposable by design; `down -v` and `up -d` is the whole recovery procedure.
