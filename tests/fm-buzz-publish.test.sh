@@ -1179,6 +1179,49 @@ EOF
   pass "an anonymous read of unverifiable events claims no breach"
 }
 
+test_an_anonymous_read_of_a_foreign_authors_event_claims_no_breach() {
+  # id, signature and `h` tag are all satisfiable by a stranger: the channel id is
+  # a digest of the home path, printed by this very tool and sent to the relay in
+  # the filter, so anyone who can publish to the open loopback relay can mint a
+  # keypair and sign a perfectly valid event tagged for this channel. Nothing about
+  # that event says this home's projection leaked, so it must not trigger the
+  # verdict. The publisher's PUBLIC key is the evidence that separates the two, and
+  # bin/fm-buzz-keypair.sh records it exactly where an anonymous read can find it.
+  local home other relay label foreign
+  home=$(make_home anonymous-foreign)
+  other=$(make_home anonymous-foreign-stranger)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  run_keypair "$other" >/dev/null 2>&1 || fail "stranger keypair setup failed"
+
+  # The label the inspected home derives its channel from, resolved the same way
+  # bin/fm-buzz-key-lib.sh resolves it.
+  label=$(cd "$home" && pwd -P)
+
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  # A different home, a different key, aimed at this home's channel.
+  printf '%s' '{"schema":"fm-bearings.v1","note":"planted-by-a-stranger"}' \
+    | run_publish "$other" "$relay" --channel-label "$label" >/dev/null 2>&1
+  foreign=$(run_inspect "$home" "$relay" --anonymous 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$foreign" "events:   1" \
+    "the planted event was not served, so the check under test was never reached"
+  assert_contains "$foreign" "signature verified" \
+    "the planted event must verify, or it fails an earlier gate and proves nothing"
+  assert_contains "$foreign" "channel   this channel" \
+    "the planted event must carry this channel's h tag, or an earlier gate catches it"
+  assert_contains "$foreign" "NOT this home's publisher" \
+    "the foreign author was not reported"
+  assert_not_contains "$foreign" \
+    "The channel was readable by an identity that is not a member" \
+    "a definite breach was declared over an event this home's publisher never wrote"
+  assert_contains "$foreign" "INCONCLUSIVE" \
+    "an event from a foreign author must be reported as inconclusive"
+  pass "an anonymous read of a foreign author's event claims no breach"
+}
+
 test_no_firstmate_path_depends_on_buzz() {
   # Invariant: Buzz is additive. If any other Firstmate script, skill, workflow or
   # AGENTS.md instruction ever calls the adapter, a stopped relay could reach a
@@ -1220,4 +1263,5 @@ test_the_inspector_rejects_a_tampered_event
 test_an_anonymous_read_only_claims_privacy_when_the_relay_refuses
 test_an_anonymous_read_that_returns_events_reports_the_breach
 test_an_anonymous_read_of_unverifiable_events_claims_no_breach
+test_an_anonymous_read_of_a_foreign_authors_event_claims_no_breach
 test_no_firstmate_path_depends_on_buzz

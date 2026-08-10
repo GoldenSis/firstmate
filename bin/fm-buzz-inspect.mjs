@@ -4,7 +4,9 @@
 // Driven by bin/fm-buzz-inspect.sh, which is the supported entry point: it owns
 // resolving the reading identity so no private key reaches a command line. This
 // file reads one JSON envelope on stdin: {privateKey, relay, channelId, limit,
-// full}. An empty privateKey means "read with a throwaway identity".
+// full, expectedAuthor}. An empty privateKey means "read with a throwaway
+// identity"; expectedAuthor is this home's PUBLIC publishing key, which the
+// wrapper reads from data/buzz-keypair.public without touching the keychain.
 //
 // IT IS NOT A STATE READ PATH. Nothing in Firstmate invokes this, parses its
 // output, or makes a decision from it. It exists to answer one human question -
@@ -32,6 +34,7 @@ const relay = envelope.relay ?? "ws://localhost:3000";
 const limit = envelope.limit ?? 3;
 const full = Boolean(envelope.full);
 const channelId = envelope.channelId || channelIdForLabel(envelope.channelLabel ?? "");
+const expectedAuthor = (envelope.expectedAuthor ?? "").trim().toLowerCase();
 // A blank key means read as a stranger. That is the useful shape for probing
 // whether a private channel is invisible to non-members. Events that verify as
 // this channel's own content settle it negatively outright; an absence settles it
@@ -65,13 +68,30 @@ try {
   // the third half: the `#h` filter went out on the wire, but a relay is free to
   // ignore it, so what came back is only this channel's content if the events
   // themselves say so under a signature.
+  //
+  // And a signature alone says only that SOMEBODY signed it. The channel id is not
+  // a secret - it is a digest of the home path, printed in the header above and
+  // sent to the relay in the `#h` filter - so anyone who can publish to this open
+  // loopback relay can mint a keypair and sign an event carrying this channel's
+  // `h` tag: id recomputes, signature verifies, tag matches, all three of the
+  // checks above satisfied by content this home's publisher never wrote. Binding
+  // the author to this home's recorded PUBLIC key is what separates "this channel
+  // leaked" from "someone put a lookalike event on the relay".
   const assessed = events
     .sort((a, b) => a.created_at - b.created_at)
     .map((event) => {
       const idMatches = computeEventId(event) === event.id;
       const signed = schnorrVerify(event.id, event.pubkey, event.sig);
       const inChannel = (event.tags ?? []).some((tag) => tag[0] === "h" && tag[1] === channelId);
-      return { event, idMatches, signed, inChannel, authentic: idMatches && signed && inChannel };
+      const byPublisher = expectedAuthor !== "" && event.pubkey?.toLowerCase() === expectedAuthor;
+      return {
+        event,
+        idMatches,
+        signed,
+        inChannel,
+        byPublisher,
+        authentic: idMatches && signed && inChannel && byPublisher,
+      };
     });
   const authentic = assessed.filter((entry) => entry.authentic);
 
@@ -82,9 +102,10 @@ try {
   // like a successful legibility check. But the accusation earns no more trust in
   // the relay than the reassurance does: the evidence for "a non-member read THIS
   // channel" is an event that recomputes to its own id, verifies under its
-  // author's signature, and carries this channel's `h` tag. A relay that serves
-  // altered, replayed or fabricated frames would otherwise have this tool report a
-  // definite breach of a channel that never leaked.
+  // author's signature, carries this channel's `h` tag, AND was signed by this
+  // home's own publishing key. A relay that serves altered, replayed or fabricated
+  // frames would otherwise have this tool report a definite breach of a channel
+  // that never leaked.
   if (anonymous && authentic.length > 0) {
     process.stdout.write(
       "\nThe channel was readable by an identity that is not a member — this is a definite negative privacy result.\n",
@@ -92,9 +113,15 @@ try {
   } else if (anonymous && events.length > 0) {
     process.stdout.write(
       `\nINCONCLUSIVE: the relay served ${events.length} event(s) to this non-member, but\n` +
-        "none of them are this channel's content: they are served by relay but not\n" +
-        "verifiable / not tagged for this channel. A relay that alters, replays or\n" +
-        "fabricates what it serves proves nothing about who may read this channel.\n" +
+        "none of them are this home's own content: they are served by relay but not\n" +
+        "verifiable / not tagged for this channel / not signed by this home's\n" +
+        "publishing key. A relay that alters, replays or fabricates what it serves\n" +
+        "proves nothing about who may read this channel, and neither does an event\n" +
+        "any stranger could have signed against a channel id that is not a secret.\n" +
+        (expectedAuthor === ""
+          ? "This home has no recorded publisher public key, so no served event can be\n" +
+            "attributed to it at all - run bin/fm-buzz-keypair.sh to record one.\n"
+          : "") +
         "See the per-event verdicts below.\n",
     );
   }
@@ -143,14 +170,20 @@ try {
       );
     }
   }
-  for (const { event, idMatches, signed, inChannel } of assessed) {
+  for (const { event, idMatches, signed, inChannel, byPublisher } of assessed) {
     const when = new Date(event.created_at * 1000).toISOString();
     const verdict = !idMatches ? "INVALID (id does not match this content)"
       : signed ? "verified"
       : "INVALID";
     const channelVerdict = inChannel ? "this channel" : "NOT tagged for this channel";
+    const authorVerdict = byPublisher
+      ? "this home's publisher"
+      : expectedAuthor === ""
+        ? "unknown (no publisher public key recorded for this home)"
+        : "NOT this home's publisher";
     process.stdout.write(
-      `\n--- ${event.id}\n    at        ${when}\n    author    ${event.pubkey}\n` +
+      `\n--- ${event.id}\n    at        ${when}\n` +
+        `    author    ${event.pubkey} (${authorVerdict})\n` +
         `    signature ${verdict}\n    channel   ${channelVerdict}\n\n`,
     );
     process.stdout.write(full ? `${event.content}\n` : `${event.content.slice(0, 600)}\n`);

@@ -10,12 +10,15 @@
 #                 is legible, and verifies each event's signature
 #   --anonymous   read as a stranger - probes whether the private channel is
 #                 invisible to non-members. An event that recomputes to its own id,
-#                 verifies under its author's signature and carries this channel's
-#                 `h` tag is the conclusive answer, and it is a negative one: a
-#                 non-member read the channel. Events the relay served but that
-#                 fail any of those checks are reported INCONCLUSIVE instead, since
-#                 a relay that alters, replays or fabricates frames says nothing
-#                 about who may read this channel.
+#                 verifies under its author's signature, carries this channel's
+#                 `h` tag AND was signed by this home's recorded publishing key is
+#                 the conclusive answer, and it is a negative one: a non-member read
+#                 the channel. Events the relay served but that fail any of those
+#                 checks are reported INCONCLUSIVE instead, since a relay that
+#                 alters, replays or fabricates frames says nothing about who may
+#                 read this channel - and the channel id is not a secret, so a
+#                 correctly signed event tagged for it can come from any stranger
+#                 who can publish to the relay.
 #                 Zero events is only an answer the other way when the relay
 #                 refuses the subscription on MEMBERSHIP grounds, i.e. with
 #                 NIP-01's `restricted:`. Every other outcome is reported
@@ -36,6 +39,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 # shellcheck source=bin/fm-buzz-key-lib.sh
 . "$SCRIPT_DIR/fm-buzz-key-lib.sh"
@@ -69,6 +73,17 @@ CHANNEL=$(fm_buzz_channel_id "$SCRIPT_DIR" "$CHANNEL_LABEL") || {
   exit 1
 }
 
+# The PUBLIC half of this home's publishing key, so the engine can tell an event
+# this home actually wrote from one any stranger could have signed against the
+# same (non-secret) channel id. bin/fm-buzz-keypair.sh records it here precisely so
+# it is readable without touching the keychain, which matters under --anonymous:
+# no private key is loaded on that path. An absent file is not an error - the
+# engine then declines to attribute any event rather than guessing.
+EXPECTED_AUTHOR=""
+if [ -r "$DATA/buzz-keypair.public" ]; then
+  EXPECTED_AUTHOR=$(sed -n 1p "$DATA/buzz-keypair.public" | tr -d '[:space:]')
+fi
+
 KEY=""
 if [ "$ANONYMOUS" -eq 0 ]; then
   KEY=$(fm_buzz_key_load "$FM_HOME") || {
@@ -84,7 +99,9 @@ jq -n \
   --rawfile privateKey <(printf '%s' "$KEY") \
   --arg relay "$RELAY" \
   --arg channelId "$CHANNEL" \
+  --arg expectedAuthor "$EXPECTED_AUTHOR" \
   --argjson limit "$LIMIT" \
   --argjson full "$FULL" \
-  '{privateKey:$privateKey, relay:$relay, channelId:$channelId, limit:$limit, full:$full}' \
+  '{privateKey:$privateKey, relay:$relay, channelId:$channelId,
+    expectedAuthor:$expectedAuthor, limit:$limit, full:$full}' \
   | node "$SCRIPT_DIR/fm-buzz-inspect.mjs"
