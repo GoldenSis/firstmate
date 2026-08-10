@@ -18,18 +18,18 @@ The goal is a session that is safe to reset or destroy because everything durabl
 1. **Sweep the session for uncaptured durable knowledge.**
    Read back over this conversation and look for:
    - Operational learnings: fleet-local facts and gotchas discovered while operating firstmate (a script's sharp edge, a harness quirk, a recurring false alarm and its real cause).
-   - Captain preferences expressed in passing: a working-style or approval preference the captain stated conversationally rather than through the destination selected by AGENTS.md's knowledge-routing table.
+   - Captain preferences expressed in passing: a working-style or approval preference the captain stated conversationally rather than through the destination selected by AGENTS.md's knowledge-routing rule.
    - Project-intrinsic facts discovered: build, test, release, or architecture facts about a project that belong in that project's own `AGENTS.md`.
    - Decisions made: a standing choice the captain made this session that should outlive it.
    - Undone next steps: anything left open that has not yet been filed as backlog work.
 
-2. **Route each finding using AGENTS.md's knowledge-routing table.**
-   AGENTS.md (section 6, "Knowledge routing") is the single source of truth for where each kind of knowledge belongs.
-   Read that table and route each finding there instead of re-deriving the mapping here.
+2. **Route each finding using AGENTS.md's knowledge-routing rule.**
+   AGENTS.md section 6 ("Project and knowledge management") is the single source of truth for where each kind of knowledge belongs.
+   Read its "Route durable knowledge to its most specific owner" list and route each finding there instead of re-deriving the mapping here.
 
 3. **Write within firstmate's existing write boundaries.**
    This skill does not grant any new write permission; it only prompts firstmate to use the boundaries that already exist (AGENTS.md section 1):
-   - Captain preferences and fleet-local operational facts: hand-write directly to the destination selected by AGENTS.md's knowledge-routing table, using inspect-then-update every time.
+   - Captain preferences and fleet-local operational facts: hand-write directly to the destination selected by AGENTS.md's knowledge-routing rule, using inspect-then-update every time.
      Before writing, inspect the destination, find the existing bullet or section the finding duplicates or supersedes, and rewrite it in place rather than adding a new trailing entry.
      `data/learnings.md` may not exist yet; create it on first local learning, in the same dated, evidence-backed, curated style as the captain-preference files.
    - Project-intrinsic knowledge: never hand-write a project's `AGENTS.md`.

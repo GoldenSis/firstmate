@@ -257,7 +257,7 @@ EOF
   write_shared "$data_override/captain-shared.md" "shared from override"
   fakebin=$(make_fake_spawn_toolchain "$w")
 
-  PATH="$fakebin:$BASE_PATH" TMUX='' \
+  PATH="$fakebin:$BASE_PATH" TMUX='' FM_BACKEND=tmux \
     FM_ROOT_OVERRIDE="$root" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$data_override" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
@@ -288,7 +288,7 @@ EOF
   fakebin=$(make_fake_spawn_toolchain "$w")
   fm_fake_exit0 "$fakebin" node gh-axi chrome-devtools-axi lavish-axi gh treehouse no-mistakes tasks-axi quota-axi
 
-  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$root" \
+  out=$(PATH="$fakebin:$BASE_PATH" TMUX='' FM_BACKEND=tmux FM_HOME="$home" FM_ROOT_OVERRIDE="$root" \
     FM_DATA_OVERRIDE="$data_override" \
     "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
 
@@ -338,7 +338,7 @@ EOF
   fakebin=$(make_fake_spawn_toolchain "$w")
   fm_fake_exit0 "$fakebin" node gh-axi chrome-devtools-axi lavish-axi gh treehouse no-mistakes tasks-axi quota-axi pgrep
 
-  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$root" \
+  out=$(PATH="$fakebin:$BASE_PATH" TMUX='' FM_BACKEND=tmux FM_HOME="$home" FM_ROOT_OVERRIDE="$root" \
     "$ROOT/bin/fm-session-start.sh")
 
   assert_contains "$out" "data/captain-shared.md (shared, main-authoritative, read-only in secondmate homes)" \
