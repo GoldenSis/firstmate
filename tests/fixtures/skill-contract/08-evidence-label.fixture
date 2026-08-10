@@ -1,0 +1,4 @@
+check: SC008
+mutation: false-behavioral-claim
+receipt-label: executed behavioral test
+expected-receipt: SC008 evidence-label: contract audit receipts must say 'structural presence', not 'executed behavioral test'

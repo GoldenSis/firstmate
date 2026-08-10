@@ -1,0 +1,3 @@
+check: SC002
+mutation: missing-internal-metadata
+expected-receipt: SC002 frontmatter-posture: .agents/skills/alpha/SKILL.md must declare metadata.internal: true

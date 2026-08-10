@@ -1,0 +1,14 @@
+id: one-off-helper
+contexts: 1
+durable-lines: 12
+trigger-clear: true
+intents: 1
+target-owner: bin/fm-brief.sh
+harnesses: claude,codex,opencode,pi,grok
+backends: tmux,herdr,zellij,orca,cmux
+name-kind: tool
+readable: true
+route: existing-script-or-brief
+files-created: 0
+expected: non-skill
+expected-reason: recurrence

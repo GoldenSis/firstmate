@@ -1,0 +1,14 @@
+id: investigate-failure
+contexts: 3
+durable-lines: 46
+trigger-clear: true
+intents: 1
+target-owner: diagnostic-reasoning
+harnesses: claude,codex,opencode,pi,grok
+backends: tmux,herdr,zellij,orca,cmux
+name-kind: job
+readable: true
+route: internal-skill
+files-created: 0
+expected: skill-worthy
+expected-reason: gates-passed

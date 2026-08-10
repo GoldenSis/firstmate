@@ -1,0 +1,3 @@
+check: SC003
+mutation: missing-trigger-pointer
+expected-receipt: SC003 trigger-pointer: agent-only skill 'alpha' is referenced from AGENTS.md but has 0 precise trigger pointers

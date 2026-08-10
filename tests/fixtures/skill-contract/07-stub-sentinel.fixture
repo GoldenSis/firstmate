@@ -1,0 +1,3 @@
+check: SC007
+mutation: stub-sentinel
+expected-receipt: SC007 stub-sentinel: .agents/skills/alpha/SKILL.md contains forbidden placeholder marker 'SKILLIFY_STUB'

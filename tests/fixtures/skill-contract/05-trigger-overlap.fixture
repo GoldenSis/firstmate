@@ -1,0 +1,3 @@
+check: SC005
+mutation: duplicate-trigger
+expected-receipt: SC005 trigger-overlap: trigger 'load when the fixture alarm fires' is claimed by alpha,beta without one shared trigger-owner
