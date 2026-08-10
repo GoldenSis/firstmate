@@ -1029,6 +1029,51 @@ EOF
   pass "the inspector refuses to call altered content verified"
 }
 
+test_an_anonymous_read_only_claims_privacy_when_the_relay_refuses() {
+  # --anonymous is the only place this tool makes a SECURITY claim, and an empty
+  # read is the weakest possible evidence for one: a wiped relay, a channel id
+  # derived from another home, a publish that never landed, and a genuinely empty
+  # channel are all indistinguishable from enforced privacy. Only the relay
+  # refusing the subscription separates them, so the assurance is gated on that
+  # refusal and everything else must read INCONCLUSIVE.
+  local home relay served refused
+  home=$(make_home anonymous-read)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  # Nothing published: an ordinary relay that serves the subscription and has
+  # nothing to hand back. This is the ambiguous case.
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  served=$(run_inspect "$home" "$relay" --anonymous 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$served" "events:   0" "the empty read did not happen"
+  assert_not_contains "$served" "refused:" \
+    "the stub refused the subscription, so the ambiguous case was never reached"
+  assert_contains "$served" "INCONCLUSIVE" \
+    "an unrefused empty read must be reported as inconclusive"
+  assert_not_contains "$served" "CORRECT" \
+    "an unrefused empty read was reported as proof of privacy"
+  assert_not_contains "$served" "That refusal is the assurance" \
+    "the reassurance was printed without any refusal behind it"
+
+  # A relay that enforces membership: same empty result, but it says why.
+  read -r STUB_PID relay <<EOF
+$(start_stub --refuse-req "restricted: not a channel member")
+EOF
+  refused=$(run_inspect "$home" "$relay" --anonymous 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$refused" "refused:  restricted: not a channel member" \
+    "the relay's refusal reason did not reach the reader"
+  assert_contains "$refused" "That refusal is the assurance" \
+    "a refused subscription must still report the privacy assurance"
+  assert_not_contains "$refused" "INCONCLUSIVE" \
+    "a refused subscription is conclusive and must not be hedged"
+  pass "an anonymous empty read claims privacy only when the relay refused it"
+}
+
 test_no_firstmate_path_depends_on_buzz() {
   # Invariant: Buzz is additive. If any other Firstmate script, skill, workflow or
   # AGENTS.md instruction ever calls the adapter, a stopped relay could reach a
@@ -1067,4 +1112,5 @@ test_a_signalled_read_releases_the_callers_output
 test_fire_and_forget_contract_is_intact
 test_nothing_private_reaches_a_command_line
 test_the_inspector_rejects_a_tampered_event
+test_an_anonymous_read_only_claims_privacy_when_the_relay_refuses
 test_no_firstmate_path_depends_on_buzz

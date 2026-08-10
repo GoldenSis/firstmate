@@ -23,7 +23,7 @@
 //                                          [--drop-after-event] [--challenge]
 //                                          [--challenge-delay-ms N]
 //                                          [--duplicate-refused] [--silent-ok]
-//                                          [--tamper-on-read]
+//                                          [--tamper-on-read] [--refuse-req <msg>]
 // Prints "listening <port>" on stdout once ready, so a caller can use port 0 and
 // learn the ephemeral port.
 
@@ -66,6 +66,13 @@ let silentOk = false;
 // a signature-only check cannot see: the signature over that id is still valid, so
 // the only thing that can catch it is recomputing the id from what was served.
 let tamperOnRead = false;
+// A relay that enforces channel membership on reads: it answers a REQ with a
+// subscription-scoped CLOSED and no EOSE, which is how a real private channel
+// tells a non-member it may not see the events. Without this the stub serves every
+// stored event to every reader, so an empty anonymous read here means "nothing
+// stored" and never "you are not a member" - the exact ambiguity the inspector
+// must not report as an assurance.
+let refuseReq = null;
 for (let i = 0; i < argv.length; i += 1) {
   if (argv[i] === "--port") port = Number(argv[++i]);
   else if (argv[i] === "--reject") reject = argv[++i];
@@ -75,6 +82,7 @@ for (let i = 0; i < argv.length; i += 1) {
   else if (argv[i] === "--duplicate-refused") duplicateRefused = true;
   else if (argv[i] === "--silent-ok") silentOk = true;
   else if (argv[i] === "--tamper-on-read") tamperOnRead = true;
+  else if (argv[i] === "--refuse-req") refuseReq = argv[++i];
 }
 
 // The event store: id -> event. A Map gives us exactly the relay's
@@ -263,6 +271,12 @@ server.on("upgrade", (req, socket) => {
         send(["OK", event.id, true, ""]);
       } else if (type === "REQ") {
         const [, subId, filter = {}] = parsed;
+        if (refuseReq) {
+          // CLOSED and deliberately no EOSE, matching a relay that rejects the
+          // subscription outright rather than serving an empty result set.
+          send(["CLOSED", subId, refuseReq]);
+          continue;
+        }
         const found = [...store.values()]
           .filter((event) => matches(event, filter))
           .sort((a, b) => a.created_at - b.created_at);

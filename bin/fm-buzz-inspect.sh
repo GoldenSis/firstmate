@@ -8,8 +8,12 @@
 # It answers two different questions depending on the identity it reads with:
 #   default       read as the publisher (a channel member) - proves the projection
 #                 is legible, and verifies each event's signature
-#   --anonymous   read as a stranger - proves the private channel really is
-#                 invisible to non-members, which should return zero events
+#   --anonymous   read as a stranger - probes whether the private channel is
+#                 invisible to non-members. Zero events is only an answer when the
+#                 relay REFUSES the subscription; an unrefused empty read is
+#                 reported INCONCLUSIVE, because a wiped relay, a channel id from
+#                 another home, a publish that never landed, and an empty channel
+#                 all look identical to enforced privacy.
 #
 # Unlike bin/fm-buzz-publish.sh this is NOT fire-and-forget: it is a diagnostic run
 # by hand, and a failure to reach the relay should be visible in its exit status.

@@ -30,8 +30,9 @@ const relay = envelope.relay ?? "ws://localhost:3000";
 const limit = envelope.limit ?? 3;
 const full = Boolean(envelope.full);
 const channelId = envelope.channelId || channelIdForLabel(envelope.channelLabel ?? "");
-// A blank key means read as a stranger, which is the useful shape for confirming
-// that a private channel really is invisible to non-members.
+// A blank key means read as a stranger. That is the useful shape for probing
+// whether a private channel is invisible to non-members, but only the relay
+// REFUSING the subscription can settle the question - see the empty-read branch.
 const anonymous = !envelope.privateKey;
 const privateKey = anonymous ? generateKeypair().privateKey : envelope.privateKey;
 
@@ -50,11 +51,28 @@ try {
     `relay:    ${relay}\nchannel:  ${channelId}\nidentity: ${anonymous ? "ephemeral non-member" : "channel member"}\nevents:   ${events.length}\n`,
   );
   if (refusal) process.stdout.write(`refused:  ${refusal}\n`);
+  // An empty anonymous read is not evidence of privacy on its own. The relay
+  // REFUSING the subscription is the only signal here that distinguishes "you may
+  // not see this channel" from every mundane way a read comes back empty, so the
+  // reassurance is gated on that refusal and an unrefused empty read says so
+  // plainly. Printing the security conclusion over an ambiguous absence is worse
+  // than printing nothing: this is the one place a human looks for that answer.
   if (events.length === 0 && anonymous) {
     process.stdout.write(
-      "\nNothing visible, which is the CORRECT answer here: the reading identity is\n" +
-        "ephemeral and was never added to this private channel, so the relay withholds\n" +
-        "the events. Re-run without --anonymous to read as the publisher.\n",
+      refusal
+        ? "\nNothing visible, and the relay said why: the reading identity is ephemeral\n" +
+            "and was never added to this private channel, so the subscription was refused\n" +
+            "rather than served. That refusal is the assurance - re-run without\n" +
+            "--anonymous to read as the publisher.\n"
+        : "\nINCONCLUSIVE: the relay served this subscription without refusing it and\n" +
+            "returned nothing, which on its own proves nothing about privacy. An empty\n" +
+            "unrefused read is equally what you get from:\n" +
+            "  - a relay that is down, restarted, or had its storage wiped\n" +
+            "  - a channel id derived from a different home than the publisher's\n" +
+            "  - a publish that never actually landed\n" +
+            "  - a channel that is simply empty\n" +
+            "  - privacy enforcement that withholds events silently instead of refusing\n" +
+            "Re-run without --anonymous to read as the publisher and tell these apart.\n",
     );
   }
   for (const event of events.sort((a, b) => a.created_at - b.created_at)) {
