@@ -175,20 +175,30 @@ EOF
 }
 
 make_public_record_failure_tools() {
-  local tools="$TMP_ROOT/public-record-failure-tools"
+  local tools="$TMP_ROOT/public-record-failure-tools" real_node
   mkdir -p "$tools"
-  cat > "$tools/mv" <<'EOF'
+  real_node=$(command -v node)
+  cat > "$tools/node" <<EOF
 #!/usr/bin/env bash
-if [ "${FM_FAIL_BUZZ_PUBLIC_MV:-0}" = "1" ]; then
-  for arg in "$@"; do
-    case $arg in
+if [ "\${FM_FAIL_BUZZ_PUBLIC_MV:-0}" = "1" ]; then
+  for arg in "\$@"; do
+    case \$arg in
       */buzz-keypair.public) exit 1 ;;
     esac
   done
 fi
-exec /bin/mv "$@"
+if [ -n "\${FM_RACE_BUZZ_REPLACE_TARGET:-}" ]; then
+  for arg in "\$@"; do
+    if [ "\$arg" = "\$FM_RACE_BUZZ_REPLACE_TARGET" ]; then
+      rm -f -- "\$FM_RACE_BUZZ_REPLACE_TARGET"
+      mkdir "\$FM_RACE_BUZZ_REPLACE_TARGET"
+      break
+    fi
+  done
+fi
+exec "$real_node" "\$@"
 EOF
-  chmod +x "$tools/mv"
+  chmod +x "$tools/node"
   printf '%s\n' "$tools"
 }
 
@@ -738,6 +748,61 @@ test_key_record_targets_reject_non_files() {
   pass "public, history, and fallback records reject non-file targets"
 }
 
+test_key_record_replace_is_exact_destination() {
+  local tools home target output code
+  tools=$(make_public_record_failure_tools)
+  home=$(make_home exact-key-record-replace)
+  target="$home/data/buzz-keypair.public"
+
+  output=$(PATH="$tools:$PATH" FM_RACE_BUZZ_REPLACE_TARGET="$target" \
+    run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "public record replacement raced by a directory target"
+  assert_contains "$output" "could not record" \
+    "a directory race was treated as successful public-record persistence"
+  [ -d "$target" ] || fail "the exact-destination race fixture was unexpectedly replaced"
+  [ -z "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+    || fail "record replacement redirected its temporary file inside the raced directory"
+  pass "key record replacement cannot be redirected by a directory race"
+}
+
+test_keypair_transactions_are_serialized_per_home() {
+  local home ready output holder worker waited current
+  home=$(make_home serialized-keypair)
+  ready="$home/key-lock-ready"
+  output="$home/keypair-output"
+
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" bash -c '
+    . "$1"
+    fm_lock_acquire_wait "$2"
+    : > "$3"
+    sleep 1
+    fm_lock_release "$2"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$home/data/.buzz-keypair.lock" "$ready" &
+  holder=$!
+  waited=0
+  while [ ! -e "$ready" ] && [ "$waited" -lt 100 ]; do
+    sleep 0.01
+    waited=$((waited + 1))
+  done
+  [ -e "$ready" ] || fail "the keypair lock fixture did not acquire its lock"
+
+  run_keypair "$home" > "$output" 2>&1 &
+  worker=$!
+  sleep 0.1
+  kill -0 "$worker" 2>/dev/null \
+    || fail "keypair creation did not wait for the active per-home transaction"
+  assert_absent "$home/data/buzz-keypair.public" \
+    "keypair creation mutated public state before acquiring the transaction lock"
+
+  wait "$holder" || fail "the keypair lock fixture failed"
+  wait "$worker" || fail "serialized keypair creation failed"
+  current=$(run_keypair "$home" --public 2>/dev/null) || fail "serialized keypair was unreadable"
+  [ "$(tail -1 "$output")" = "$current" ] \
+    || fail "serialized keypair output disagrees with its recorded identity"
+  pass "keypair ensure, rotation, and withdrawal share one home transaction lock"
+}
+
 test_public_key_history_is_normalized_consistently() {
   local home history first first_upper second second_upper third
   home=$(make_home normalized-history)
@@ -973,7 +1038,29 @@ EOF
 
   kill "$STUB_PID" 2>/dev/null
   STUB_PID=""
-  pass "switching relay hosts produces a cache miss for the prior relay"
+  pass "switching relay endpoints produces a cache miss for the prior relay"
+}
+
+test_relay_cache_partition_uses_the_normalized_complete_endpoint() {
+  local result
+  result=$(node -e '
+    import(process.argv[1]).then(({ normalizeRelayEndpoint, relayCacheKey }) => {
+      const a = "ws://relay:3000/a";
+      const b = "ws://relay:3000/b";
+      const rootUpper = "ws://Relay:3000/";
+      const rootLower = "ws://relay:3000";
+      const facts = {
+        distinctPaths: relayCacheKey(a) !== relayCacheKey(b),
+        canonicalRoot: normalizeRelayEndpoint(rootUpper) === normalizeRelayEndpoint(rootLower),
+        sharedRootPartition: relayCacheKey(rootUpper) === relayCacheKey(rootLower),
+        distinctSchemes: relayCacheKey(rootLower) !== relayCacheKey("wss://relay:3000"),
+      };
+      process.stdout.write(JSON.stringify(facts));
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs")
+  [ "$result" = '{"distinctPaths":true,"canonicalRoot":true,"sharedRootPartition":true,"distinctSchemes":true}' ] \
+    || fail "relay endpoint normalization or cache partitioning drifted: $result"
+  pass "relay caches key the normalized complete endpoint"
 }
 
 # --- (d) reconnect replays the identical event id --------------------------
@@ -1339,6 +1426,115 @@ EOF
   pass "a cache limit of one protects the current event across same-second ties"
 }
 
+test_concurrent_publishers_serialize_the_cache_lifecycle() {
+  local home relay first_output second_output first_pid second_pid lock waited
+  home=$(make_home concurrent-cache)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  first_output="$home/first-publish.out"
+  second_output="$home/second-publish.out"
+  lock="$home/state/.buzz-replay-publish.lock"
+  read -r STUB_PID relay <<EOF
+$(start_stub --silent-ok)
+EOF
+
+  (printf '%s' '{"schema":"fm-bearings.v1","note":"concurrent-first"}' \
+    | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" --timeout 1500) \
+    > "$first_output" 2>&1 &
+  first_pid=$!
+  waited=0
+  while [ ! -L "$lock" ] && [ "$waited" -lt 100 ]; do
+    sleep 0.01
+    waited=$((waited + 1))
+  done
+  [ -L "$lock" ] || fail "the first publisher never acquired cache ownership"
+
+  (printf '%s' '{"schema":"fm-bearings.v1","note":"concurrent-second"}' \
+    | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" --timeout 1500) \
+    > "$second_output" 2>&1 &
+  second_pid=$!
+  sleep 0.1
+  kill -0 "$second_pid" 2>/dev/null || fail "the second publisher exited before cache ownership cleared"
+  assert_not_contains "$(cat "$second_output")" "signed event" \
+    "the second publisher signed and pruned while another projection was in flight"
+
+  wait "$first_pid" || fail "the first concurrent publisher failed its fire-and-forget contract"
+  wait "$second_pid" || fail "the second concurrent publisher failed its fire-and-forget contract"
+  stop_stub "$STUB_PID"
+  assert_contains "$(cat "$first_output")" "signed event" "the first concurrent projection was not processed"
+  assert_contains "$(cat "$second_output")" "signed event" "the second concurrent projection was not processed"
+  [ "$(replay_count "$home")" = "1" ] \
+    || fail "concurrent cache pruning lost every in-flight projection"
+  pass "concurrent publishers serialize signing, pruning, and delivery accounting"
+}
+
+test_replay_cache_rejects_symlink_boundaries() {
+  local root_home relay_home entry_home outside replay relay digest link target output
+  root_home=$(make_home cache-root-symlink)
+  run_keypair "$root_home" >/dev/null 2>&1 || fail "root-symlink keypair setup failed"
+  outside="$root_home/outside-cache"
+  mkdir "$outside"
+  rm -rf "$root_home/state/buzz-replay"
+  ln -s "$outside" "$root_home/state/buzz-replay"
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"root-symlink"}' \
+    | run_publish "$root_home" "ws://127.0.0.1:1" 2>&1)
+  assert_contains "$output" "replay cache path" "a replay-root symlink was not rejected"
+  [ -z "$(find "$outside" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+    || fail "a replay-root symlink redirected cache mutation outside the cache"
+
+  relay_home=$(make_home cache-relay-symlink)
+  run_keypair "$relay_home" >/dev/null 2>&1 || fail "relay-symlink keypair setup failed"
+  replay="$relay_home/state/buzz-replay"
+  relay="ws://127.0.0.1:1/a"
+  digest=$(node -e '
+    import(process.argv[1]).then(({ relayCacheKey }) => process.stdout.write(relayCacheKey(process.argv[2])));
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay")
+  outside="$relay_home/outside-relay-cache"
+  mkdir -p "$replay" "$outside"
+  ln -s "$outside" "$replay/$digest"
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"relay-symlink"}' \
+    | run_publish "$relay_home" "$relay" 2>&1)
+  assert_contains "$output" "relay cache path" "a relay-directory symlink was not rejected"
+  [ -z "$(find "$outside" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+    || fail "a relay-directory symlink redirected cache mutation outside the cache"
+
+  entry_home=$(make_home cache-entry-symlink)
+  run_keypair "$entry_home" >/dev/null 2>&1 || fail "entry-symlink keypair setup failed"
+  replay="$entry_home/state/buzz-replay"
+  relay="ws://127.0.0.1:1"
+  digest=$(node -e '
+    import(process.argv[1]).then(({ relayCacheKey }) => process.stdout.write(relayCacheKey(process.argv[2])));
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay")
+  mkdir -p "$replay/$digest"
+  target="$entry_home/outside-entry.json"
+  printf '%s' '{"outside":true}' > "$target"
+  link="$replay/$digest/1700000000-$(printf '%064d' 7).json"
+  ln -s "$target" "$link"
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"entry-symlink"}' \
+    | run_publish "$entry_home" "$relay" 2>&1)
+  assert_contains "$output" "cache entry is a symbolic link" \
+    "a cache-entry symlink was treated as a replayable event"
+  assert_absent "$link" "a rejected cache-entry symlink remained queued"
+  [ "$(cat "$target")" = '{"outside":true}' ] \
+    || fail "cache-entry cleanup mutated the symlink target"
+  pass "replay cache mutations reject root, relay, and entry symlinks"
+}
+
+test_relay_timeout_must_fit_the_node_timer_range() {
+  local home invalid output code
+  home=$(make_home invalid-relay-timeout)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  for invalid in 0 -1 1.5 2147483648; do
+    output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"invalid-relay-timeout"}' \
+      | run_publish "$home" "ws://127.0.0.1:1" --timeout "$invalid" 2>&1)
+    code=$?
+    expect_code 0 "$code" "invalid relay timeout $invalid through the fire-and-forget wrapper"
+    assert_contains "$output" "invalid relay timeout" "relay timeout $invalid was not rejected"
+    assert_not_contains "$output" "signed event" "relay timeout $invalid reached signing"
+    [ "$(replay_count "$home")" = "0" ] || fail "relay timeout $invalid created a cache entry"
+  done
+  pass "relay timeouts fit the supported Node timer range before signing"
+}
+
 test_malformed_cache_names_are_discarded_or_accounted_for() {
   local home relay replay removable retained output
   home=$(make_home malformed-cache-names)
@@ -1386,15 +1582,15 @@ EOF
     | run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
-  assert_contains "$output" "could not inspect cache path" \
-    "a non-ENOENT cache child stat failure was silently ignored"
+  assert_contains "$output" "rejected cache directory symlink" \
+    "a cache child symlink was silently ignored"
   assert_contains "$output" "uninspectable-relay" \
     "the cache child stat failure did not identify the affected path"
   assert_contains "$output" "delivered=1 retained=1 discarded=0 cleanup_failed=1" \
     "a cache child stat failure was omitted from retained or cleanup accounting"
   assert_contains "$output" "publish did not complete; Firstmate is unaffected" \
     "a cache child stat failure did not reach the fire-and-forget conversion"
-  pass "cache directory stat failures remain visible in outcome accounting"
+  pass "cache directory inspection failures remain visible in outcome accounting"
 }
 
 test_an_interrupted_cache_write_is_swept_not_leaked() {
@@ -1580,7 +1776,7 @@ test_invalid_stdin_timeouts_are_rejected_before_reading() {
   home=$(make_home invalid-stdin-timeout)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
 
-  for invalid in 0 -1 nope; do
+  for invalid in 0 -1 nope 2147483648 999999999999999999999999999999; do
     fifo="$TMP_ROOT/invalid-timeout-$invalid.fifo"
     spool="$TMP_ROOT/invalid-timeout-$invalid.out"
     rm -f "$fifo"
@@ -1615,6 +1811,34 @@ test_invalid_stdin_timeouts_are_rejected_before_reading() {
   [ "$(replay_count "$home")" = "0" ] \
     || fail "an invalid stdin timeout allowed a partial projection into the replay cache"
   pass "invalid stdin timeout values are rejected before starting a reader"
+}
+
+test_required_option_operands_are_not_consumed_as_flags() {
+  local home output code option following
+  home=$(make_home missing-option-operands)
+
+  for option in --relay --channel-label --timeout; do
+    following=--refresh
+    output=$(FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$home/state" \
+      XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 \
+      "$PUBLISH" "$option" "$following" 2>&1)
+    code=$?
+    expect_code 0 "$code" "publish option $option without a value"
+    assert_contains "$output" "$option requires a value" \
+      "publish option $option consumed the following flag as its value"
+    assert_not_contains "$output" "signed event" "publish option $option reached signing without a value"
+  done
+
+  for option in --relay --channel-label --limit; do
+    output=$(FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$home/state" \
+      XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 \
+      "$INSPECT" "$option" --anonymous 2>&1)
+    code=$?
+    expect_code 2 "$code" "inspect option $option without a value"
+    assert_contains "$output" "$option requires a value" \
+      "inspect option $option consumed the following flag as its value"
+  done
+  pass "publish and inspect reject missing option operands before shifting"
 }
 
 test_a_signalled_read_leaves_no_projection_in_temp() {
@@ -2314,6 +2538,8 @@ test_forget_key_refuses_when_history_cannot_be_read
 test_keychain_errors_refuse_rotation_without_minting_a_fallback_key
 test_public_record_failures_are_fatal_and_retryable
 test_key_record_targets_reject_non_files
+test_key_record_replace_is_exact_destination
+test_keypair_transactions_are_serialized_per_home
 test_public_key_history_is_normalized_consistently
 test_two_homes_sharing_one_xdg_get_separate_keys
 test_publish_with_relay_down_exits_zero_and_enqueues
@@ -2323,6 +2549,7 @@ test_publish_without_a_keypair_still_exits_zero
 test_non_loopback_env_relay_is_rejected_before_network
 test_publish_with_relay_up_delivers_and_lands
 test_relay_switch_does_not_replay_another_relays_cache
+test_relay_cache_partition_uses_the_normalized_complete_endpoint
 test_reconnect_replays_the_identical_event_id
 test_replaying_a_known_event_is_deduped_and_evicted
 test_an_unacknowledged_publish_does_not_starve_the_drain
@@ -2334,6 +2561,9 @@ test_truthy_non_boolean_ok_is_not_accepted
 test_replay_cache_is_capped_at_100
 test_cache_limit_must_be_a_positive_integer
 test_cache_limit_one_preserves_the_pending_event
+test_concurrent_publishers_serialize_the_cache_lifecycle
+test_replay_cache_rejects_symlink_boundaries
+test_relay_timeout_must_fit_the_node_timer_range
 test_malformed_cache_names_are_discarded_or_accounted_for
 test_cache_directory_stat_failures_are_accounted_for
 test_an_interrupted_cache_write_is_swept_not_leaked
@@ -2342,6 +2572,7 @@ test_parseable_cache_corruption_is_discarded_without_replay
 test_cache_prune_failures_are_reported_and_accounted_for
 test_a_writer_that_never_closes_does_not_hang_the_publish
 test_invalid_stdin_timeouts_are_rejected_before_reading
+test_required_option_operands_are_not_consumed_as_flags
 test_a_signalled_read_leaves_no_projection_in_temp
 test_a_signalled_read_releases_the_callers_output
 test_fire_and_forget_contract_is_intact

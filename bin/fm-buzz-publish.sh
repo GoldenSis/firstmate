@@ -61,6 +61,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 # shellcheck source=bin/fm-buzz-key-lib.sh
 . "$SCRIPT_DIR/fm-buzz-key-lib.sh"
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
 
 RELAY=${FM_BUZZ_RELAY:-ws://localhost:3000}
 CHANNEL_LABEL=""
@@ -95,6 +97,7 @@ log() {
 # reader has already been reaped and the pid cleared, so the kill is a no-op.
 STDIN_SPOOL=""
 STDIN_READER=""
+PUBLISH_LOCK=""
 drop_stdin_spool() {
   if [ -n "$STDIN_READER" ]; then
     kill "$STDIN_READER" 2>/dev/null
@@ -103,6 +106,10 @@ drop_stdin_spool() {
   if [ -n "$STDIN_SPOOL" ]; then
     rm -f -- "$STDIN_SPOOL"
     STDIN_SPOOL=""
+  fi
+  if [ -n "$PUBLISH_LOCK" ]; then
+    fm_lock_release "$PUBLISH_LOCK"
+    PUBLISH_LOCK=""
   fi
 }
 trap drop_stdin_spool EXIT INT TERM HUP
@@ -161,6 +168,21 @@ read_stdin_bounded() {  # <spool>
   return "$rc"
 }
 
+validate_stdin_timeout() {
+  local normalized=$STDIN_TIMEOUT_S
+  case $normalized in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  while [ "${normalized#0}" != "$normalized" ]; do
+    normalized=${normalized#0}
+  done
+  [ -n "$normalized" ] || return 1
+  [ "${#normalized}" -lt 10 ] \
+    || { [ "${#normalized}" -eq 10 ] && [ "$normalized" -le 2147483647 ]; } \
+    || return 1
+  STDIN_TIMEOUT_S=$normalized
+}
+
 # Everything substantive runs inside this function so the tail of the script can
 # hold the single unconditional `exit 0` that the contract above demands.
 publish() {
@@ -184,16 +206,9 @@ publish() {
       return 1
     }
   else
-    case $STDIN_TIMEOUT_S in
-      ''|*[!0-9]*)
-        drop_stdin_spool
-        log "FM_BUZZ_STDIN_TIMEOUT_S must be a positive integer"
-        return 1
-        ;;
-    esac
-    if [ "$STDIN_TIMEOUT_S" -le 0 ]; then
+    if ! validate_stdin_timeout; then
       drop_stdin_spool
-      log "FM_BUZZ_STDIN_TIMEOUT_S must be a positive integer"
+      log "FM_BUZZ_STDIN_TIMEOUT_S must be a positive integer no greater than 2147483647"
       return 1
     fi
     # A terminal on stdin means nobody is piping a projection in at all, so this
@@ -244,8 +259,16 @@ publish() {
     return 1
   }
 
+  if [ -L "$REPLAY_DIR" ] || { [ -e "$REPLAY_DIR" ] && [ ! -d "$REPLAY_DIR" ]; }; then
+    log "replay cache path $REPLAY_DIR is not a regular directory"
+    return 1
+  fi
   mkdir -p "$REPLAY_DIR" 2>/dev/null || { log "could not create $REPLAY_DIR"; return 1; }
+  [ -d "$REPLAY_DIR" ] && [ ! -L "$REPLAY_DIR" ] \
+    || { log "replay cache path $REPLAY_DIR is not a regular directory"; return 1; }
   chmod 0700 "$REPLAY_DIR" 2>/dev/null || true
+  PUBLISH_LOCK="$STATE/.buzz-replay-publish.lock"
+  fm_lock_acquire_wait "$PUBLISH_LOCK"
 
   # The envelope goes down a pipe, and neither private value is passed with `--arg`,
   # which would put it in jq's world-readable argv. The key reaches jq through a
@@ -263,16 +286,35 @@ publish() {
       replayDir:$replayDir, timeoutMs:$timeoutMs, maxCache:$maxCache}' \
     | node "$SCRIPT_DIR/fm-buzz-publish.mjs"
   rc=$?
+  fm_lock_release "$PUBLISH_LOCK"
+  PUBLISH_LOCK=""
   drop_stdin_spool
   return "$rc"
 }
 
+ARGUMENT_ERROR=0
 while [ "$#" -gt 0 ]; do
   case $1 in
     --refresh) REFRESH=1 ;;
-    --relay) shift; RELAY=${1:-$RELAY} ;;
-    --channel-label) shift; CHANNEL_LABEL=${1:-} ;;
-    --timeout) shift; TIMEOUT_MS=${1:-$TIMEOUT_MS} ;;
+    --relay|--channel-label|--timeout)
+      option=$1
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        log "$option requires a value"
+        ARGUMENT_ERROR=1
+      else
+        case $2 in
+          --*) log "$option requires a value"; ARGUMENT_ERROR=1 ;;
+          *)
+            shift
+            case $option in
+              --relay) RELAY=$1 ;;
+              --channel-label) CHANNEL_LABEL=$1 ;;
+              --timeout) TIMEOUT_MS=$1 ;;
+            esac
+            ;;
+        esac
+      fi
+      ;;
     --help|-h)
       # Print the header comment block and stop at the first line of code, so
       # help never drifts out of sync with a hardcoded line range.
@@ -284,7 +326,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-if ! publish; then
+if [ "$ARGUMENT_ERROR" -eq 1 ] || ! publish; then
   # The single conversion point: a real failure becomes a logged non-event.
   log "publish did not complete; Firstmate is unaffected"
 fi

@@ -68,9 +68,25 @@ ANONYMOUS=0
 
 while [ "$#" -gt 0 ]; do
   case $1 in
-    --relay) shift; RELAY=${1:-$RELAY} ;;
-    --channel-label) shift; CHANNEL_LABEL=${1:-} ;;
-    --limit) shift; LIMIT=${1:-$LIMIT} ;;
+    --relay|--channel-label|--limit)
+      option=$1
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        printf 'fm-buzz-inspect.sh: %s requires a value\n' "$option" >&2
+        exit 2
+      fi
+      case $2 in
+        --*)
+          printf 'fm-buzz-inspect.sh: %s requires a value\n' "$option" >&2
+          exit 2
+          ;;
+      esac
+      shift
+      case $option in
+        --relay) RELAY=$1 ;;
+        --channel-label) CHANNEL_LABEL=$1 ;;
+        --limit) LIMIT=$1 ;;
+      esac
+      ;;
     --full) FULL=true ;;
     --anonymous) ANONYMOUS=1 ;;
     --help|-h) awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; exit 0 ;;

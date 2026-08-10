@@ -34,16 +34,31 @@ import {
 const LOOPBACK_RELAY_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
 
 export function resolveLoopbackRelayHost(relay) {
+  const normalized = normalizeRelayEndpoint(relay);
+  const url = new URL(normalized);
+  if (!LOOPBACK_RELAY_HOSTS.has(url.hostname)) {
+    throw new Error(`rejected relay host: ${url.hostname}`);
+  }
+  return url.host;
+}
+
+export function normalizeRelayEndpoint(relay) {
   let url;
   try {
     url = new URL(relay);
   } catch {
     throw new Error(`invalid relay URL: ${relay}`);
   }
-  if (!LOOPBACK_RELAY_HOSTS.has(url.hostname)) {
-    throw new Error(`rejected relay host: ${url.hostname}`);
+  if (url.protocol !== "ws:" && url.protocol !== "wss:") {
+    throw new Error(`invalid relay protocol: ${url.protocol}`);
   }
-  return url.host;
+  url.hash = "";
+  const rootPath = url.pathname === "/" ? "" : url.pathname;
+  return `${url.protocol}//${url.host}${rootPath}${url.search}`;
+}
+
+export function relayCacheKey(relay) {
+  return bytesToHex(sha256(Buffer.from(normalizeRelayEndpoint(relay), "utf8")));
 }
 
 // Buzz kind numbers, from crates/buzz-core/src/kind.rs at commit 7fb008f9.

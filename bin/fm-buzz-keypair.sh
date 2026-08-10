@@ -56,10 +56,12 @@
 # served event is this home's own content, and keeping it would let that somebody
 # mint an event the probe reports as this home's leaked projection.
 #
-# --compromised governs ONLY the key that rotation is retiring in that same run.
-# It cannot reach a key an earlier ordinary rotation already recorded, because
-# every rotation mints a fresh random key and so retires a different one. When an
-# exposure comes to light after the rotation that retired the key, name the key:
+# --compromised governs every identity being retired or recovered in that same
+# run. It purges the current recorded key, divergent keychain and fallback-file
+# identities, and an orphan record whose private material is unavailable, then
+# mints one fresh key without retaining any purged identity. It cannot reach a key
+# an earlier ordinary rotation already recorded. When an exposure comes to light
+# after the rotation that retired the key, name the key:
 #   fm-buzz-keypair.sh --forget-key <public key hex>
 # withdraws exactly that key from data/buzz-keypair.public-history, leaving every
 # other recorded key and this home's current key alone. It is its own operation,
@@ -122,6 +124,32 @@ if [ "$FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ];
   printf 'fm-buzz-keypair.sh: --forget-key is its own operation; run it on its own\n' >&2
   exit 2
 fi
+
+KEYPAIR_LOCK=""
+release_keypair_lock() {
+  if [ -n "$KEYPAIR_LOCK" ]; then
+    fm_lock_release "$KEYPAIR_LOCK"
+    KEYPAIR_LOCK=""
+  fi
+}
+
+if [ "$PUBLIC_ONLY" -eq 0 ]; then
+  mkdir -p "$DATA" 2>/dev/null || {
+    printf 'fm-buzz-keypair.sh: could not create %s\n' "$DATA" >&2
+    exit 1
+  }
+  # shellcheck source=bin/fm-wake-lib.sh
+  . "$SCRIPT_DIR/fm-wake-lib.sh"
+  KEYPAIR_LOCK="$DATA/.buzz-keypair.lock"
+  fm_lock_acquire_wait "$KEYPAIR_LOCK"
+  trap release_keypair_lock EXIT
+  trap 'exit 1' HUP INT TERM
+fi
+
+command -v node >/dev/null 2>&1 || {
+  printf 'fm-buzz-keypair.sh: node is required for key management\n' >&2
+  exit 1
+}
 
 read_history() {
   local raw line normalized
@@ -260,11 +288,6 @@ if [ "$FORGETTING" -eq 1 ]; then
   fi
   exit 0
 fi
-
-command -v node >/dev/null 2>&1 || {
-  printf 'fm-buzz-keypair.sh: node is required to derive the public key\n' >&2
-  exit 1
-}
 
 add_recovery_reason() {  # <reason>
   if [ -n "$recovery_reason" ]; then

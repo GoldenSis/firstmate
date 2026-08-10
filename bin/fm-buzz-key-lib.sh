@@ -166,7 +166,10 @@ fm_buzz_file_target_replaceable() {
 fm_buzz_replace_file() {
   local source=${1:?source required} target=${2:?target required}
   fm_buzz_file_target_replaceable "$target" || return 1
-  mv -f -- "$source" "$target"
+  node -e '
+    const { renameSync } = require("node:fs");
+    renameSync(process.argv[1], process.argv[2]);
+  ' "$source" "$target" >/dev/null 2>&1
 }
 
 # Store a private key. Tries the keychain first and falls back to a 0600 file.

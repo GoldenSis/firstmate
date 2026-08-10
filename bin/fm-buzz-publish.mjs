@@ -28,7 +28,8 @@ import {
   writeFileSync,
   mkdirSync,
   readdirSync,
-  statSync,
+  lstatSync,
+  realpathSync,
   unlinkSync,
   renameSync,
 } from "node:fs";
@@ -38,6 +39,7 @@ import {
   buildChannelCreateEvent,
   classifyOkResponse,
   readStdin,
+  relayCacheKey,
   resolveLoopbackRelayHost,
   validateSignedEvent,
   withRelay,
@@ -81,7 +83,16 @@ function cachedEventFromFrame(raw, entry) {
   return event;
 }
 
-function removeCacheFile(file, description) {
+function containedCachePath(replayDir, candidate) {
+  const relative = path.relative(replayDir, path.resolve(candidate));
+  return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function removeCacheFile(replayDir, file, description) {
+  if (!containedCachePath(replayDir, file)) {
+    log(`could not ${description}: path escapes replay cache`);
+    return { removed: false, failed: true };
+  }
   try {
     unlinkSync(file);
     return { removed: true, failed: false };
@@ -92,13 +103,42 @@ function removeCacheFile(file, description) {
   }
 }
 
-// Each relay host gets its own directory, with entries named
-// <created_at>-<id>.json. The directory is part of the cache key: changing relay
-// host (including its port) cannot expose one relay's queued snapshots to
-// another. created_at is parsed back out for ordering rather than relying on
+// Each normalized relay endpoint gets its own digest directory, with entries
+// named <created_at>-<id>.json. created_at is parsed back out for ordering rather than relying on
 // lexicographic sort, which would misorder the moment the epoch gains a digit.
-function relayCacheDirectory(replayDir, relayHost) {
-  return path.join(replayDir, encodeURIComponent(relayHost));
+function relayCacheDirectory(replayDir, relay) {
+  return path.join(replayDir, relayCacheKey(relay));
+}
+
+function prepareCacheRoot(replayDir) {
+  const requested = path.resolve(replayDir);
+  mkdirSync(requested, { recursive: true, mode: 0o700 });
+  const metadata = lstatSync(requested);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`replay cache path ${replayDir} is not a regular directory`);
+  }
+  return realpathSync(requested);
+}
+
+function prepareRelayCacheDirectory(replayDir, relay) {
+  const directory = relayCacheDirectory(replayDir, relay);
+  if (!containedCachePath(replayDir, directory)) throw new Error("relay cache path escapes replay cache");
+  try {
+    const metadata = lstatSync(directory);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new Error(`relay cache path ${directory} is not a regular directory`);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    mkdirSync(directory, { mode: 0o700 });
+  }
+  const metadata = lstatSync(directory);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`relay cache path ${directory} is not a regular directory`);
+  }
+  const resolved = realpathSync(directory);
+  if (!containedCachePath(replayDir, resolved)) throw new Error("relay cache path escapes replay cache");
+  return directory;
 }
 
 function cacheEntries(replayDir) {
@@ -110,26 +150,42 @@ function cacheEntries(replayDir) {
     log(`could not inspect cache directory ${replayDir}: ${error.message}`);
     return { entries: [], failures: [replayDir] };
   }
-  const entries = names
-    .filter((name) => name.endsWith(".json"))
-    .map((name) => {
-      const match = /^(\d+)-([0-9a-f]{64})\.json$/.exec(name);
-      const createdAt = match ? Number(match[1]) : undefined;
-      if (!match || !Number.isSafeInteger(createdAt)) {
-        return {
-          name,
-          file: path.join(replayDir, name),
-          malformed: true,
-        };
-      }
-      return { name, createdAt, id: match[2], file: path.join(replayDir, name), malformed: false };
-    })
-    .sort((a, b) => {
+  const entries = [];
+  const failures = [];
+  for (const name of names.filter((candidate) => candidate.endsWith(".json"))) {
+    const file = path.join(replayDir, name);
+    if (!containedCachePath(replayDir, file)) {
+      failures.push(file);
+      continue;
+    }
+    let metadata;
+    try {
+      metadata = lstatSync(file);
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      log(`could not inspect cache entry ${file}: ${error.message}`);
+      failures.push(file);
+      continue;
+    }
+    const match = /^(\d+)-([0-9a-f]{64})\.json$/.exec(name);
+    const createdAt = match ? Number(match[1]) : undefined;
+    if (metadata.isSymbolicLink() || !match || !Number.isSafeInteger(createdAt)) {
+      entries.push({
+        name,
+        file,
+        malformed: true,
+        reason: metadata.isSymbolicLink() ? "cache entry is a symbolic link" : "malformed cache filename",
+      });
+      continue;
+    }
+    entries.push({ name, createdAt, id: match[2], file, malformed: false });
+  }
+  entries.sort((a, b) => {
       if (a.malformed !== b.malformed) return a.malformed ? -1 : 1;
       if (a.malformed) return a.name.localeCompare(b.name);
       return (a.createdAt - b.createdAt) || a.id.localeCompare(b.id);
     });
-  return { entries, failures: [] };
+  return { entries, failures };
 }
 
 // The cap remains global across relay hosts. A separate 100-entry allowance per
@@ -150,7 +206,13 @@ function cacheDirectories(replayDir) {
     if (name.endsWith(".json") || name.endsWith(".json.tmp")) continue;
     const directory = path.join(replayDir, name);
     try {
-      if (statSync(directory).isDirectory()) directories.push(directory);
+      const metadata = lstatSync(directory);
+      if (metadata.isSymbolicLink()) {
+        log(`rejected cache directory symlink ${directory}`);
+        failures.push(directory);
+      } else if (metadata.isDirectory()) {
+        directories.push(directory);
+      }
     } catch (error) {
       if (error.code === "ENOENT") continue;
       log(`could not inspect cache path ${directory}: ${error.message}`);
@@ -185,7 +247,7 @@ function sweepOrphanTemporaries(replayDir, now) {
     const file = path.join(replayDir, name);
     let modified;
     try {
-      modified = statSync(file).mtimeMs;
+      modified = lstatSync(file).mtimeMs;
     } catch (error) {
       if (error.code !== "ENOENT") {
         log(`could not inspect interrupted cache write ${name}: ${error.message}`);
@@ -194,7 +256,7 @@ function sweepOrphanTemporaries(replayDir, now) {
       continue;
     }
     if (now - modified < ORPHAN_TMP_AGE_MS) continue;
-    const removal = removeCacheFile(file, `sweep interrupted cache write ${name}`);
+    const removal = removeCacheFile(replayDir, file, `sweep interrupted cache write ${name}`);
     if (removal.removed) swept += 1;
     if (removal.failed) failed += 1;
   }
@@ -225,8 +287,8 @@ function pruneCache(replayDir, maxCache, protectedFile) {
       validEntries.push(entry);
       continue;
     }
-    log(`dropping invalid cache entry ${entry.name}: malformed cache filename`);
-    const removal = removeCacheFile(entry.file, `drop invalid cache entry ${entry.name}`);
+    log(`dropping invalid cache entry ${entry.name}: ${entry.reason}`);
+    const removal = removeCacheFile(replayDir, entry.file, `drop invalid cache entry ${entry.name}`);
     if (removal.removed) outcomes.set(`invalid:${entry.file}`, PERMANENT);
     if (removal.failed) {
       failed += 1;
@@ -242,7 +304,7 @@ function pruneCache(replayDir, maxCache, protectedFile) {
   for (const entry of validEntries) {
     if (dropped >= excess) break;
     if (entry.file === protectedFile) continue;
-    const removal = removeCacheFile(entry.file, `prune cache entry ${entry.name}`);
+    const removal = removeCacheFile(replayDir, entry.file, `prune cache entry ${entry.name}`);
     if (removal.removed) {
       dropped += 1;
       pruned.add(entry.file);
@@ -261,12 +323,28 @@ function pruneCache(replayDir, maxCache, protectedFile) {
 // Write the frame atomically so a crash mid-write cannot leave a truncated event
 // in the cache that would be replayed forever and rejected every time.
 function cacheEvent(replayDir, event) {
-  mkdirSync(replayDir, { recursive: true, mode: 0o700 });
+  const metadata = lstatSync(replayDir);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`relay cache path ${replayDir} is not a regular directory`);
+  }
   const frame = JSON.stringify(["EVENT", event]);
   const target = path.join(replayDir, `${event.created_at}-${event.id}.json`);
   const tmp = `${target}.tmp`;
-  writeFileSync(tmp, frame, { mode: 0o600 });
-  renameSync(tmp, target);
+  const root = path.dirname(replayDir);
+  if (!containedCachePath(root, target) || !containedCachePath(root, tmp)) {
+    throw new Error("cache event path escapes replay cache");
+  }
+  writeFileSync(tmp, frame, { mode: 0o600, flag: "wx" });
+  try {
+    renameSync(tmp, target);
+  } catch (error) {
+    try {
+      unlinkSync(tmp);
+    } catch (cleanupError) {
+      if (cleanupError.code !== "ENOENT") log(`could not remove interrupted cache write: ${cleanupError.message}`);
+    }
+    throw error;
+  }
   return target;
 }
 
@@ -289,8 +367,12 @@ async function main() {
   if (!Number.isSafeInteger(maxCache) || maxCache <= 0) {
     throw new Error(`invalid FM_BUZZ_MAX_CACHE value ${JSON.stringify(maxCache)}: expected a positive integer`);
   }
-  const relayHost = resolveLoopbackRelayHost(relay);
-  const relayCacheDir = relayCacheDirectory(replayDir, relayHost);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) {
+    throw new Error(`invalid relay timeout ${JSON.stringify(timeoutMs)}: expected an integer from 1 to 2147483647`);
+  }
+  resolveLoopbackRelayHost(relay);
+  const cacheRoot = prepareCacheRoot(replayDir);
+  const relayCacheDir = prepareRelayCacheDirectory(cacheRoot, relay);
 
   // Sign and cache first: from here on the event survives a crash, a kill, or a
   // relay that is not running at all.
@@ -298,7 +380,7 @@ async function main() {
     ["fm-schema", "fm-bearings.v1"],
   ]);
   const currentFile = cacheEvent(relayCacheDir, event);
-  const cacheMaintenance = pruneCache(replayDir, maxCache, currentFile);
+  const cacheMaintenance = pruneCache(cacheRoot, maxCache, currentFile);
   let cleanupFailures = cacheMaintenance.failed;
   log(`signed event ${event.id} (${Buffer.byteLength(content, "utf8")} bytes) for channel ${channelId}`);
 
@@ -364,7 +446,7 @@ async function main() {
           parsed = cachedEventFromFrame(raw, entry);
         } catch (error) {
           log(`dropping invalid cache entry ${entry.name}: ${error.message}`);
-          const removal = removeCacheFile(entry.file, `drop invalid cache entry ${entry.name}`);
+          const removal = removeCacheFile(cacheRoot, entry.file, `drop invalid cache entry ${entry.name}`);
           if (removal.failed) {
             cleanupFailures += 1;
             outcome.set(entry.file, RETRYABLE);
@@ -404,7 +486,7 @@ async function main() {
 
         outcome.set(entry.file, verdict);
         if (verdict !== DELIVERED && verdict !== PERMANENT) continue;
-        const removal = removeCacheFile(entry.file, `drop settled cache entry ${entry.name}`);
+        const removal = removeCacheFile(cacheRoot, entry.file, `drop settled cache entry ${entry.name}`);
         if (removal.failed) cleanupFailures += 1;
       }
       return authBlocked;
