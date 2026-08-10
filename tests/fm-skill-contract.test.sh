@@ -259,8 +259,10 @@ audit_skill_tree() {
 
   # The tracked skill list cannot change mid-audit, so resolve it once and let
   # every check iterate the same materialized set. Only `.agents/skills/` is
-  # loaded by a running firstmate (AGENTS.md section 12), so reachability
-  # evidence is tracked separately from the installer-facing public tree.
+  # loaded by a running firstmate (AGENTS.md section 12), so every runtime
+  # check - posture, pointers, reachability, trigger collisions, and local
+  # reference resolution - runs over that tree alone, and the installer-facing
+  # public tree is held to the tree-wide checks only.
   while IFS= read -r relative; do
     [ -n "$relative" ] || continue
     skill_files+=("$relative")
@@ -362,7 +364,7 @@ audit_skill_tree() {
   check_failed=0
   trigger_rows=$(mktemp "$TMP_ROOT/triggers.XXXXXX")
   trigger_groups=$(mktemp "$TMP_ROOT/trigger-groups.XXXXXX")
-  for relative in "${skill_files[@]+"${skill_files[@]}"}"; do
+  for relative in "${internal_skill_files[@]+"${internal_skill_files[@]}"}"; do
     file="$root/$relative"
     name=$(basename "$(dirname "$relative")")
     owner=$(frontmatter_scalar "$file" trigger-owner)
@@ -431,10 +433,10 @@ audit_skill_tree() {
   [ "$check_failed" -ne 0 ] || structural_ok "SC005 trigger-overlap: declared and description-derived triggers have no unresolved collisions"
 
   check_failed=0
-  if [ "$skill_count" -gt 0 ]; then
+  if [ "${#internal_skill_files[@]}" -gt 0 ]; then
     reference_output=$(mktemp "$TMP_ROOT/references.XXXXXX")
     reference_status=0
-    skill_reference_diagnostics "$root" "$reference_output" "${skill_files[@]}" ||
+    skill_reference_diagnostics "$root" "$reference_output" "${internal_skill_files[@]}" ||
       reference_status=$?
     if [ "$reference_status" -gt 1 ]; then
       structural_error "SC006 artifact-reachability: the reference resolver could not run (exit $reference_status): $(tr '\n' ' ' < "$reference_output")"
@@ -472,7 +474,7 @@ audit_skill_tree() {
 # description heuristic derives nothing from.
 write_fixture_skill() {
   local file=$1 name=$2 include_internal=$3 trigger=$4 body=${5:-} placement=${6:-frontmatter}
-  local owner=${7:-}
+  local owner=${7:-} standalone=${8:-}
   case "$placement" in
     frontmatter|metadata|none) ;;
     *) fail "write_fixture_skill got unsupported trigger placement '$placement'" ;;
@@ -481,6 +483,17 @@ write_fixture_skill() {
   # that would silently emit a skill with no trigger at either placement.
   if [ "$placement" = "metadata" ] && [ "$include_internal" != "yes" ]; then
     fail "write_fixture_skill cannot place a trigger under metadata while omitting the metadata block"
+  fi
+  # The symmetric mistake: a caller that asks for no declaration while passing a
+  # real trigger would get a skill the description heuristic derives nothing
+  # from, so an intended collision fixture would pass vacuously.
+  if [ "$placement" = "none" ] && [ -n "$trigger" ]; then
+    fail "write_fixture_skill cannot declare trigger '$trigger' with placement 'none'"
+  fi
+  # `standalone` follows the recommended `metadata:` placement, so it needs the
+  # metadata block too.
+  if [ -n "$standalone" ] && [ "$include_internal" != "yes" ]; then
+    fail "write_fixture_skill cannot place standalone under metadata while omitting the metadata block"
   fi
   mkdir -p "$(dirname "$file")"
   {
@@ -497,6 +510,7 @@ write_fixture_skill() {
       if [ "$placement" = "metadata" ]; then
         printf '  trigger: %s\n' "$trigger"
       fi
+      [ -z "$standalone" ] || printf '  standalone: %s\n' "$standalone"
     fi
     printf '%s\n\n# %s\n\n%s\n' '---' "$name" "$body"
   } > "$file"
@@ -545,6 +559,15 @@ make_contract_fixture() {
     inbound-reference-only)
       # alpha's only inbound evidence is prose inside beta, which an agent can
       # only read after loading beta.
+      write_fixture_skill "$repo/.agents/skills/beta/SKILL.md" beta yes \
+        'load when the beta fixture runs' 'The `alpha` skill owns the cheap rung.'
+      write_fixture_agents "$repo/AGENTS.md" beta
+      ;;
+    standalone-orphan)
+      # The same inbound-reference-only tree, with alpha taking the documented
+      # remedy at the recommended `metadata:` placement.
+      write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
+        'load when the alpha fixture runs' 'Use `bin/fixture.sh`.' frontmatter '' true
       write_fixture_skill "$repo/.agents/skills/beta/SKILL.md" beta yes \
         'load when the beta fixture runs' 'The `alpha` skill owns the cheap rung.'
       write_fixture_agents "$repo/AGENTS.md" beta
@@ -672,6 +695,8 @@ test_admission_rubric_owner() {
     '`standalone: true` records that a skill is deliberately reachable'; do
     assert_grep "$phrase" "$CODING_GUIDELINES" "skill-admission rubric does not document the audit escape '$phrase'"
   done
+  assert_grep 'named owner must itself be one of the claiming skills' "$CODING_GUIDELINES" \
+    "skill-admission rubric no longer documents the enforced trigger-owner claimant rule"
   assert_grep 'materially expanding an existing skill' "$CODING_GUIDELINES" \
     "skill-admission rubric no longer scopes the gates to creation and scope expansion"
   assert_grep 'Declare any of the three nested under `metadata:`' "$CODING_GUIDELINES" \
@@ -727,11 +752,12 @@ test_admission_fixtures() {
 # Controls for the shared fixture builders: an unmutated fixture repo must be
 # fully clean. Without it, drift in write_fixture_skill / write_fixture_agents
 # would add a spurious receipt to every seeded case and still look green. The
-# second control keeps the documented `trigger-owner:` escape working, so
-# tightening it into a real ownership claim cannot silently reject a valid one.
+# second and third controls keep the documented `trigger-owner:` and
+# `standalone:` escapes working, so tightening either one into a stricter claim
+# cannot silently reject a valid declaration and leave its check inescapable.
 test_clean_contract_fixtures() {
   local mutation repo output status
-  for mutation in none shared-trigger-owner; do
+  for mutation in none shared-trigger-owner standalone-orphan; do
     repo="$TMP_ROOT/clean-$mutation"
     status=0
     make_contract_fixture "$repo" "$mutation"

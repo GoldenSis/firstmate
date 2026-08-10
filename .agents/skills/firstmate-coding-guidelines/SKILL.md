@@ -110,7 +110,7 @@ That same test anchors the gate headings, the fail-closed default, and the routi
 `tests/fm-skill-contract.test.sh` honors three frontmatter keys, each a recorded decision rather than a way to silence a receipt.
 
 - `trigger:` declares the load condition explicitly, and when present it replaces the description-derived phrases the SC005 overlap check compares for that skill.
-- `trigger-owner:` names the single skill that owns a trigger phrase claimed by more than one skill; SC005 clears the overlap only when every claimant names the same owner.
+- `trigger-owner:` names the single skill that owns a trigger phrase claimed by more than one skill; SC005 clears the overlap only when every claimant names the same owner, and the named owner must itself be one of the claiming skills rather than a third arbitrating skill.
 - `standalone: true` records that a skill is deliberately reachable without an `AGENTS.md` pointer, and it is the only thing that clears the SC004 orphan check for a skill whose sole inbound evidence is prose inside another skill.
 
 Declare any of the three nested under `metadata:`, which is where every tracked skill already keeps its private frontmatter keys and the only placement this repo has verified across its supported harnesses.
