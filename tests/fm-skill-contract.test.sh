@@ -468,32 +468,44 @@ audit_skill_tree() {
   return "$failed"
 }
 
-# `placement` selects where the explicit trigger is declared. `frontmatter` and
-# `metadata` are the two documented escapes, so the fixtures exercise each one;
-# `none` deliberately omits the declaration so a fixture can pin a skill the
-# description heuristic derives nothing from.
+# Each declared escape carries its own placement so both honored spellings stay
+# pinned: the audit reads every one at the top level and again under `metadata:`,
+# and a fixture that only ever exercised one spelling would leave the other read
+# free to be deleted. `frontmatter` and `metadata` are those two documented
+# placements; the trigger additionally accepts `none`, which deliberately omits
+# the declaration so a fixture can pin a skill the description heuristic derives
+# nothing from.
 write_fixture_skill() {
   local file=$1 name=$2 include_internal=$3 trigger=$4 body=${5:-} placement=${6:-frontmatter}
   local owner=${7:-} standalone=${8:-}
+  local owner_placement=${9:-frontmatter} standalone_placement=${10:-metadata}
   case "$placement" in
     frontmatter|metadata|none) ;;
     *) fail "write_fixture_skill got unsupported trigger placement '$placement'" ;;
   esac
-  # The metadata placement needs the metadata block, so refuse the combination
-  # that would silently emit a skill with no trigger at either placement.
-  if [ "$placement" = "metadata" ] && [ "$include_internal" != "yes" ]; then
-    fail "write_fixture_skill cannot place a trigger under metadata while omitting the metadata block"
+  case "$owner_placement" in
+    frontmatter|metadata) ;;
+    *) fail "write_fixture_skill got unsupported trigger-owner placement '$owner_placement'" ;;
+  esac
+  case "$standalone_placement" in
+    frontmatter|metadata) ;;
+    *) fail "write_fixture_skill got unsupported standalone placement '$standalone_placement'" ;;
+  esac
+  # A metadata placement needs the metadata block, so refuse every combination
+  # that would silently emit a skill missing the declaration it was asked for.
+  if [ "$include_internal" != "yes" ]; then
+    [ "$placement" != "metadata" ] ||
+      fail "write_fixture_skill cannot place a trigger under metadata while omitting the metadata block"
+    [ -z "$owner" ] || [ "$owner_placement" != "metadata" ] ||
+      fail "write_fixture_skill cannot place trigger-owner under metadata while omitting the metadata block"
+    [ -z "$standalone" ] || [ "$standalone_placement" != "metadata" ] ||
+      fail "write_fixture_skill cannot place standalone under metadata while omitting the metadata block"
   fi
   # The symmetric mistake: a caller that asks for no declaration while passing a
   # real trigger would get a skill the description heuristic derives nothing
   # from, so an intended collision fixture would pass vacuously.
   if [ "$placement" = "none" ] && [ -n "$trigger" ]; then
     fail "write_fixture_skill cannot declare trigger '$trigger' with placement 'none'"
-  fi
-  # `standalone` follows the recommended `metadata:` placement, so it needs the
-  # metadata block too.
-  if [ -n "$standalone" ] && [ "$include_internal" != "yes" ]; then
-    fail "write_fixture_skill cannot place standalone under metadata while omitting the metadata block"
   fi
   mkdir -p "$(dirname "$file")"
   {
@@ -503,14 +515,24 @@ write_fixture_skill() {
     if [ "$placement" = "frontmatter" ]; then
       printf 'trigger: %s\n' "$trigger"
     fi
-    [ -z "$owner" ] || printf 'trigger-owner: %s\n' "$owner"
+    if [ -n "$owner" ] && [ "$owner_placement" = "frontmatter" ]; then
+      printf 'trigger-owner: %s\n' "$owner"
+    fi
+    if [ -n "$standalone" ] && [ "$standalone_placement" = "frontmatter" ]; then
+      printf 'standalone: %s\n' "$standalone"
+    fi
     printf '%s\n' 'user-invocable: false'
     if [ "$include_internal" = "yes" ]; then
       printf '%s\n' 'metadata:' '  internal: true'
       if [ "$placement" = "metadata" ]; then
         printf '  trigger: %s\n' "$trigger"
       fi
-      [ -z "$standalone" ] || printf '  standalone: %s\n' "$standalone"
+      if [ -n "$owner" ] && [ "$owner_placement" = "metadata" ]; then
+        printf '  trigger-owner: %s\n' "$owner"
+      fi
+      if [ -n "$standalone" ] && [ "$standalone_placement" = "metadata" ]; then
+        printf '  standalone: %s\n' "$standalone"
+      fi
     fi
     printf '%s\n\n# %s\n\n%s\n' '---' "$name" "$body"
   } > "$file"
@@ -531,7 +553,7 @@ write_fixture_agents() {
 }
 
 make_contract_fixture() {
-  local repo=$1 mutation=$2
+  local repo=$1 mutation=$2 standalone_placement
   mkdir -p "$repo/bin" "$repo/docs" "$repo/tests"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$repo/bin/fixture.sh"
   printf '# Fixture\n' > "$repo/docs/fixture.md"
@@ -563,11 +585,15 @@ make_contract_fixture() {
         'load when the beta fixture runs' 'The `alpha` skill owns the cheap rung.'
       write_fixture_agents "$repo/AGENTS.md" beta
       ;;
-    standalone-orphan)
+    standalone-orphan|standalone-orphan-top-level)
       # The same inbound-reference-only tree, with alpha taking the documented
-      # remedy at the recommended `metadata:` placement.
+      # remedy once at the recommended `metadata:` placement and once at the
+      # tolerated top level, so neither read the audit performs is unpinned.
+      standalone_placement=metadata
+      [ "$mutation" = "standalone-orphan" ] || standalone_placement=frontmatter
       write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
-        'load when the alpha fixture runs' 'Use `bin/fixture.sh`.' frontmatter '' true
+        'load when the alpha fixture runs' 'Use `bin/fixture.sh`.' frontmatter '' true \
+        frontmatter "$standalone_placement"
       write_fixture_skill "$repo/.agents/skills/beta/SKILL.md" beta yes \
         'load when the beta fixture runs' 'The `alpha` skill owns the cheap rung.'
       write_fixture_agents "$repo/AGENTS.md" beta
@@ -586,10 +612,13 @@ make_contract_fixture() {
       write_fixture_agents "$repo/AGENTS.md" alpha beta
       ;;
     shared-trigger-owner)
+      # alpha records the shared owner at the tolerated top level and beta at the
+      # recommended `metadata:` placement, so dropping either read turns this
+      # resolved collision back into a failing one.
       write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
         'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' frontmatter alpha
       write_fixture_skill "$repo/.agents/skills/beta/SKILL.md" beta yes \
-        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' frontmatter alpha
+        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' frontmatter alpha '' metadata
       write_fixture_agents "$repo/AGENTS.md" alpha beta
       ;;
     unknown-trigger-owner)
@@ -620,6 +649,18 @@ make_contract_fixture() {
   git -C "$repo" add -A
 }
 
+# The rubric is fail-closed, so its classifier must be too. An absent or
+# malformed count would make every arithmetic gate below evaluate falsy and let
+# the chain fall through toward "skill-worthy", admitting a fixture on a typo.
+require_fixture_integer() {
+  local file=$1 key=$2 value=$3
+  case "$value" in
+    ''|*[!0-9]*)
+      fail "$(basename "$file") must declare a non-negative integer '$key', found '$value'"
+      ;;
+  esac
+}
+
 classify_admission_fixture() {
   local file=$1 contexts durable_lines trigger_clear intents target_owner
   local harnesses backends name_kind readable override
@@ -633,6 +674,9 @@ classify_admission_fixture() {
   name_kind=$(fixture_value "$file" name-kind)
   readable=$(fixture_value "$file" readable)
   override=$(fixture_value "$file" non-triviality-override)
+  require_fixture_integer "$file" contexts "$contexts"
+  require_fixture_integer "$file" durable-lines "$durable_lines"
+  require_fixture_integer "$file" intents "$intents"
 
   if [ "$contexts" -lt 2 ]; then
     printf '%s\n' 'non-skill|recurrence'
@@ -752,12 +796,13 @@ test_admission_fixtures() {
 # Controls for the shared fixture builders: an unmutated fixture repo must be
 # fully clean. Without it, drift in write_fixture_skill / write_fixture_agents
 # would add a spurious receipt to every seeded case and still look green. The
-# second and third controls keep the documented `trigger-owner:` and
-# `standalone:` escapes working, so tightening either one into a stricter claim
-# cannot silently reject a valid declaration and leave its check inescapable.
+# remaining controls keep the documented `trigger-owner:` and `standalone:`
+# escapes working at both honored placements, so tightening either one into a
+# stricter claim - or dropping either read - cannot silently reject a valid
+# declaration and leave its check inescapable.
 test_clean_contract_fixtures() {
   local mutation repo output status
-  for mutation in none shared-trigger-owner standalone-orphan; do
+  for mutation in none shared-trigger-owner standalone-orphan standalone-orphan-top-level; do
     repo="$TMP_ROOT/clean-$mutation"
     status=0
     make_contract_fixture "$repo" "$mutation"

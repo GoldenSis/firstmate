@@ -53,6 +53,10 @@ extract_literal_references() {
       # token; the rest are arguments or words, not targets to resolve.
       literal = span
       sub(/[[:space:]].*$/, "", literal)
+      # Truncating to the first token can leave prose punctuation glued to it
+      # ("`docs/one.md, docs/two.md`"), which resolves nothing and would name a
+      # path that appears in no file.
+      sub(/[,;.)]+$/, "", literal)
       if (literal == "" || literal ~ /[<>{}*?\[\]]/) {
         return
       }
@@ -286,6 +290,8 @@ test_reference_fixture_matrix() {
     'missing-directory|fail|none|AGENTS.md:1: docs/absent/: no exact tracked target|Inspect `docs/absent/`.'
     'invocation-span|fail|none|AGENTS.md:1: bin/missing.sh: no exact tracked target|Use `bin/missing.sh --flag`.'
     'path-plus-prose|pass|none||Read `AGENTS.md section 1` and `bin/tool.sh --flag`.'
+    'path-list|pass|none||Read `docs/guide.md, bin/tool.sh` together.'
+    'punctuated-span|fail|none|AGENTS.md:1: bin/missing.sh: no exact tracked target|Use `bin/missing.sh; then stop`.'
   )
 
   for row in "${cases[@]}"; do
