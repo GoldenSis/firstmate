@@ -303,8 +303,10 @@ test_a_compromised_rotation_does_not_keep_the_retired_key() {
   assert_not_contains "$(cat "$history" 2>/dev/null)" "$first" \
     "a compromised rotation kept the retired key in the recorded set"
 
-  # And it withdraws a key an earlier ordinary rotation already recorded, which is
-  # the only way to take back a retention made before the exposure was known.
+  # Declining to retain has to mean the outgoing key is absent from the recorded
+  # set afterwards, not merely that this run did not add it. A key an EARLIER
+  # rotation retired is a different key and out of this flag's reach: see
+  # test_forget_key_withdraws_an_already_retired_key for that one.
   printf '%s\n' "$second" >> "$history"
   third=$(run_keypair "$home" --rotate --compromised 2>/dev/null) \
     || fail "second compromised rotation failed"
@@ -325,6 +327,45 @@ test_a_compromised_rotation_does_not_keep_the_retired_key() {
   code=$?
   expect_code 2 "$code" "--compromised without --rotate describes nothing"
   pass "a compromised rotation does not keep the retired key"
+}
+
+test_rotation_stops_when_the_outgoing_public_key_is_unusable() {
+  # data/buzz-keypair.public is a cache, not the authority. A half-written one
+  # holds something that is not a key at all, and retaining that would leave a
+  # history entry no reader can attribute while looking exactly like retention
+  # that worked - the stored private half is what settles it. And when neither
+  # source can name the outgoing key, the rotation must STOP: the very next step
+  # forgets the private half, after which nothing can derive that key again.
+  local home first second history keyfile mangled output code
+  home=$(make_home rotate-unusable)
+  history="$home/data/buzz-keypair.public-history"
+  keyfile=$(key_file "$home" "$home/xdg")
+
+  first=$(run_keypair "$home" 2>/dev/null) || fail "keypair creation failed"
+  printf 'deadbeefdeadbeef\n' > "$home/data/buzz-keypair.public"
+  second=$(run_keypair "$home" --rotate 2>/dev/null) || fail "rotation failed"
+  [ "$first" != "$second" ] || fail "rotation did not replace the key"
+  assert_grep "$first" "$history" \
+    "a truncated recorded file cost the rotation the key it was retiring"
+  assert_no_grep "deadbeefdeadbeef" "$history" \
+    "a truncated recorded file was recorded as though it were a key"
+
+  # An all-zero private key is stored and loadable but has no public half, which
+  # is the shape of any transient derivation failure.
+  mangled=$(sed 's/"private_key"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]*"/"private_key": "0000000000000000000000000000000000000000000000000000000000000000"/' "$keyfile") \
+    || fail "could not rewrite the stored key file"
+  printf '%s\n' "$mangled" > "$keyfile"
+  rm -f "$home/data/buzz-keypair.public"
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "a rotation that cannot name its outgoing key"
+  assert_contains "$output" "public half could not be resolved" \
+    "the rotation failed without saying the outgoing key was the problem"
+  assert_grep "$first" "$history" \
+    "a refused rotation still rewrote the recorded key set"
+  assert_no_grep "0000000000000000000000000000000000000000000000000000000000000000" \
+    "$history" "a private key reached the recorded public key set"
+  pass "rotation stops when the outgoing public key is unusable"
 }
 
 test_public_flag_fails_before_a_keypair_exists() {
@@ -1311,6 +1352,69 @@ EOF
   pass "a rotated home still recognises its own leaked events"
 }
 
+test_forget_key_withdraws_an_already_retired_key() {
+  # The case --compromised cannot reach. Every rotation mints a fresh random key,
+  # so the key a rotation is retiring is never one an earlier rotation recorded:
+  # an exposure that comes to light AFTER the rotation that retired the key has to
+  # name the key it means. Once withdrawn, an event signed by that key is no
+  # longer evidence of anything - anyone holding the leaked private half could
+  # have minted it against a channel id that is not a secret - so the probe must
+  # fall back to INCONCLUSIVE rather than report this home's own leak.
+  local home relay retired rotated history withdrawn after code
+  home=$(make_home forget-key)
+  history="$home/data/buzz-keypair.public-history"
+  retired=$(run_keypair "$home" 2>/dev/null) || fail "keypair setup failed"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"signed-by-the-leaked-key"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  rotated=$(run_keypair "$home" --rotate 2>/dev/null) || fail "rotation failed"
+  assert_grep "$retired" "$history" \
+    "the ordinary rotation did not retain the key the withdrawal is about"
+
+  withdrawn=$(run_keypair "$home" --forget-key "$retired" 2>&1)
+  code=$?
+  expect_code 0 "$code" "--forget-key on a recorded key"
+  assert_contains "$withdrawn" "no longer recorded" \
+    "--forget-key withdrew the key without saying so"
+  assert_not_contains "$(cat "$history" 2>/dev/null)" "$retired" \
+    "--forget-key left the named key in the recorded set"
+  assert_grep "$rotated" "$home/data/buzz-keypair.public" \
+    "--forget-key disturbed this home's current key"
+
+  after=$(run_inspect "$home" "$relay" --anonymous 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$after" "signed-by-the-leaked-key" \
+    "the event was not served, so the check under test was never reached"
+  assert_contains "$after" "NOT this home's publisher" \
+    "an event signed by a withdrawn key was still attributed to this home"
+  assert_not_contains "$after" \
+    "The channel was readable by an identity that is not a member" \
+    "a withdrawn key still carried the verdict it was withdrawn to stop carrying"
+  assert_contains "$after" "INCONCLUSIVE" \
+    "an event signed by a withdrawn key must be reported as inconclusive"
+
+  # Naming a key that is not recorded changes nothing and says so, so a repeat run
+  # is safe; naming this home's CURRENT key says that rotation is what retires it.
+  run_keypair "$home" --forget-key "$retired" >/dev/null 2>&1
+  code=$?
+  expect_code 0 "$code" "--forget-key on a key that is not recorded"
+  assert_contains "$(run_keypair "$home" --forget-key "$rotated" 2>&1)" \
+    "CURRENT publishing key" \
+    "--forget-key on this home's current key implied the key had been withdrawn"
+  run_keypair "$home" --forget-key "not-a-key" >/dev/null 2>&1
+  code=$?
+  expect_code 2 "$code" "--forget-key with a value that is not a public key"
+  # A lost argument must be an error, not a silent fall through into minting.
+  run_keypair "$home" --forget-key >/dev/null 2>&1
+  code=$?
+  expect_code 2 "$code" "--forget-key with no key named"
+  pass "--forget-key withdraws an already-retired key"
+}
+
 test_an_anonymous_read_of_a_foreign_channel_claims_no_verdict() {
   # --channel-label points the read at a channel derived from some other home's
   # label, and the only publishing keys on this disk are this home's own. No served
@@ -1404,6 +1508,7 @@ test_keypair_is_idempotent_and_never_prints_the_private_key
 test_public_flag_fails_before_a_keypair_exists
 test_rotation_replaces_the_key_in_whichever_store_holds_it
 test_a_compromised_rotation_does_not_keep_the_retired_key
+test_rotation_stops_when_the_outgoing_public_key_is_unusable
 test_two_homes_sharing_one_xdg_get_separate_keys
 test_publish_with_relay_down_exits_zero_and_enqueues
 test_publish_without_a_keypair_still_exits_zero
@@ -1430,6 +1535,7 @@ test_an_anonymous_read_that_returns_events_reports_the_breach
 test_an_anonymous_read_of_unverifiable_events_claims_no_breach
 test_an_anonymous_read_of_a_foreign_authors_event_claims_no_breach
 test_a_rotated_home_still_recognises_its_own_leaked_events
+test_forget_key_withdraws_an_already_retired_key
 test_an_anonymous_read_of_a_foreign_channel_claims_no_verdict
 test_an_anonymous_read_of_this_homes_own_label_still_reaches_a_verdict
 test_no_firstmate_path_depends_on_buzz

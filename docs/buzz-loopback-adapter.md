@@ -189,8 +189,12 @@ Without that, rotating would make the probe report this home's own leaked projec
 Retention assumes the retired key was never exposed.
 If retiring due to suspected compromise, use `--compromised` so the key is not retained for verdict-matching.
 A key whose private half somebody else may hold is no longer evidence of authorship at all: the channel id is not a secret, so that holder can mint an event the probe would report as this home's own leaked projection.
-`--rotate --compromised` therefore declines to record the outgoing key and drops it from the history file if an earlier ordinary rotation put it there, at the cost of no longer attributing this home's genuine pre-rotation events.
+`--rotate --compromised` therefore declines to record the key it is retiring in that same run, at the cost of no longer attributing this home's genuine pre-rotation events.
+It governs that key and no other: every rotation mints a fresh random key, so the key being retired is never one an earlier rotation already recorded, and a rotation cannot reach back to withdraw one.
+An exposure that comes to light after the rotation that retired the key names the key instead - `bin/fm-buzz-keypair.sh --forget-key <hex>` drops exactly that public key from `data/buzz-keypair.public-history` and leaves every other recorded key, and this home's current key, alone.
+It is its own operation rather than a rotation flag: nothing is minted, cleared, or re-recorded, and a key that is not in the recorded set is reported as such rather than treated as an error.
 Either way the recorded-key set is settled before the private half is cleared, and the rotation stops rather than proceeding if it cannot be: once the key is forgotten nothing can derive the retired public key a second time, so a write failure at that point would permanently and silently cost the probe its attribution.
+The outgoing key is accepted only as 64 lowercase hex characters, since `data/buzz-keypair.public` is a cache that can be truncated or half-written; anything else falls back to deriving the public half from the still-stored private key, and a rotation that can resolve it from neither source stops rather than retiring a key it cannot name.
 
 Buzz is pre-1.0 with no long-term support branches and a very high release cadence, so `ghcr.io/block/buzz:main` can move under this adapter at any time.
 The relay stack is disposable by design; `down -v` and `up -d` is the whole recovery procedure.

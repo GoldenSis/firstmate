@@ -16,6 +16,7 @@
 #   fm-buzz-keypair.sh --public              print the public key; fail if none exists yet
 #   fm-buzz-keypair.sh --rotate              retire this home's key and mint a new one
 #   fm-buzz-keypair.sh --rotate --compromised  as above, but do not keep the retired key
+#   fm-buzz-keypair.sh --forget-key <hex>    withdraw one already-retired public key
 #   fm-buzz-keypair.sh --help                this text
 #
 # Exit status: 0 when a keypair exists (created or already present), 1 on a real
@@ -52,15 +53,27 @@
 # a key whose private half somebody else may hold is no longer evidence that a
 # served event is this home's own content, and keeping it would let that somebody
 # mint an event the probe reports as this home's leaked projection.
-# --compromised drops the outgoing key from the history file as well as declining
-# to add it, so a key retired by an earlier ordinary rotation can be withdrawn by
-# rotating again with the flag.
+#
+# --compromised governs ONLY the key that rotation is retiring in that same run.
+# It cannot reach a key an earlier ordinary rotation already recorded, because
+# every rotation mints a fresh random key and so retires a different one. When an
+# exposure comes to light after the rotation that retired the key, name the key:
+#   fm-buzz-keypair.sh --forget-key <public key hex>
+# withdraws exactly that key from data/buzz-keypair.public-history, leaving every
+# other recorded key and this home's current key alone. It is its own operation,
+# not a rotation: nothing is minted, cleared, or re-recorded.
 #
 # The recorded-key set is settled BEFORE the private half is cleared, and rotation
 # stops if it cannot be settled. Doing it the other way round makes any write
 # failure permanent: the private key is gone, so nothing can derive the retired
 # public key a second time, and the probe silently loses the very attribution this
 # retention exists to preserve. Stopping first leaves the rotation retryable.
+#
+# The outgoing key is only accepted as 64 lowercase hex characters. data/
+# buzz-keypair.public is the cheap source but not the authority: a truncated or
+# half-written file yields a value that is not a key at all, and recording it
+# would retain nothing while looking like it had. Anything that fails that check
+# falls back to deriving the public half from the still-stored private key.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,12 +89,18 @@ HISTORY_FILE="$DATA/buzz-keypair.public-history"
 PUBLIC_ONLY=0
 ROTATE=0
 COMPROMISED=0
+FORGET_KEY=""
+FORGETTING=0
 
 while [ "$#" -gt 0 ]; do
   case $1 in
     --public) PUBLIC_ONLY=1 ;;
     --rotate) ROTATE=1 ;;
     --compromised) COMPROMISED=1 ;;
+    # Tracked as a flag rather than by its value being non-empty: an operator who
+    # typed the flag and lost its argument must get an error, never a silent fall
+    # through into the default "ensure a keypair exists" behaviour.
+    --forget-key) FORGETTING=1; shift; FORGET_KEY=${1:-} ;;
     --help|-h) awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; exit 0 ;;
     *) printf 'fm-buzz-keypair.sh: unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
@@ -98,9 +117,27 @@ if [ "$COMPROMISED" -eq 1 ] && [ "$ROTATE" -eq 0 ]; then
   exit 2
 fi
 
-command -v node >/dev/null 2>&1 || {
-  printf 'fm-buzz-keypair.sh: node is required to derive the public key\n' >&2
-  exit 1
+if [ "$FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ]; }; then
+  printf 'fm-buzz-keypair.sh: --forget-key is its own operation; run it on its own\n' >&2
+  exit 2
+fi
+
+# A public key is 64 lowercase hex characters and nothing else. Anything else is
+# not a key, however plausible it looks: a half-written or truncated recorded file
+# is exactly the case this rejects.
+is_public_key() {  # <candidate>
+  local key=$1
+  [ "${#key}" -eq 64 ] || return 1
+  case $key in *[!0-9a-f]*) return 1 ;; esac
+}
+
+# Read a recorded public key the way both the recorded file and an operator's
+# argument may spell it, and echo nothing at all when it is not a key.
+normalize_public_key() {  # <candidate>
+  local key
+  key=$(printf '%s' "$1" | tr -d '[:space:]' | tr 'A-F' 'a-f')
+  is_public_key "$key" || return 1
+  printf '%s\n' "$key"
 }
 
 # Derive the public key from the stored private key without the private key ever
@@ -163,17 +200,53 @@ $retired"
   write_history "$merged"
 }
 
-# The mirror of retain_public, for a key retired BECAUSE its private half may have
-# leaked. Such a key is not evidence of anything: whoever holds it can sign an
-# event the probe would otherwise report as this home's own leaked projection. So
-# it must leave the recorded set rather than join it, including when an earlier
-# ordinary rotation already put it there.
-purge_public() {  # <retired public key>
+# The mirror of retain_public, for a key that is not evidence of anything because
+# its private half may have leaked: whoever holds it can sign an event the probe
+# would otherwise report as this home's own leaked projection. Such a key must
+# leave the recorded set rather than join it. Called for the key a --compromised
+# rotation is retiring, and by --forget-key for one named by hand.
+purge_public() {  # <public key to withdraw>
   local retired=$1 merged
   [ -n "$retired" ] || return 0
   [ -f "$HISTORY_FILE" ] || return 0
   merged=$(awk -v drop="$retired" 'NF && $0 != drop && !seen[$0]++' "$HISTORY_FILE") || return 1
   write_history "$merged"
+}
+
+# --forget-key: withdraw one already-retired key from the recorded set. This is
+# what --compromised cannot be, and the reason it is a separate operation: a
+# rotation only ever holds the key it is retiring right now, so an exposure
+# discovered later has to name the key it means. Nothing is minted or cleared
+# here, and no key material is read - it is a rewrite of one public-key list.
+if [ "$FORGETTING" -eq 1 ]; then
+  forget=$(normalize_public_key "$FORGET_KEY") || {
+    printf 'fm-buzz-keypair.sh: --forget-key wants a 64-character hex public key\n' >&2
+    exit 2
+  }
+
+  if [ -f "$HISTORY_FILE" ] && grep -qx -- "$forget" "$HISTORY_FILE" 2>/dev/null; then
+    purge_public "$forget" || {
+      printf 'fm-buzz-keypair.sh: could not withdraw the key from %s; nothing was changed\n' "$HISTORY_FILE" >&2
+      exit 1
+    }
+    printf 'forgotten: %s is no longer recorded as a key of this home\n' "$forget" >&2
+  else
+    printf 'fm-buzz-keypair.sh: %s is not in %s; nothing to withdraw\n' "$forget" "$HISTORY_FILE" >&2
+  fi
+
+  # The current key is not in that list, so withdrawing it there says nothing
+  # about it. Rotation is what retires a current key, and only --compromised
+  # keeps it out of the recorded set.
+  current=$(normalize_public_key "$(sed -n 1p "$PUBLIC_FILE" 2>/dev/null)" 2>/dev/null) || current=""
+  if [ -n "$current" ] && [ "$current" = "$forget" ]; then
+    printf 'fm-buzz-keypair.sh: %s is still this home'"'"'s CURRENT publishing key; retire it with --rotate --compromised\n' "$forget" >&2
+  fi
+  exit 0
+fi
+
+command -v node >/dev/null 2>&1 || {
+  printf 'fm-buzz-keypair.sh: node is required to derive the public key\n' >&2
+  exit 1
 }
 
 # Retire the old key before the lookup below, so rotation falls through into the
@@ -182,9 +255,22 @@ if [ "$ROTATE" -eq 1 ]; then
   # Read the outgoing public key while the private half is still stored: the
   # recorded file is the cheap source, but it can be missing or truncated, and the
   # stored key is the authority for what this home was publishing under. Once
-  # fm_buzz_key_forget runs there is nothing left to derive it from.
-  retiring=$(sed -n 1p "$PUBLIC_FILE" 2>/dev/null | tr -d '[:space:]')
-  [ -n "$retiring" ] || retiring=$(derive_public 2>/dev/null | tr -d '[:space:]')
+  # fm_buzz_key_forget runs there is nothing left to derive it from. A recorded
+  # value that is not 64 hex characters is a damaged file rather than a key, so it
+  # falls through to the stored half exactly as an absent file does - recording it
+  # would leave the history file holding something no reader can attribute.
+  retiring=$(normalize_public_key "$(sed -n 1p "$PUBLIC_FILE" 2>/dev/null)" 2>/dev/null) || retiring=""
+  [ -n "$retiring" ] || retiring=$(normalize_public_key "$(derive_public 2>/dev/null)" 2>/dev/null) || retiring=""
+
+  # A home with no key stored has nothing to retire and rotates into the minting
+  # path; a home that HAS one whose public half will not resolve must stop. Letting
+  # that second case through is the silent loss this ordering exists to prevent:
+  # the next line forgets the private key, and with it the last thing that could
+  # name what this home was publishing under.
+  if [ -z "$retiring" ] && fm_buzz_key_load "$FM_HOME" >/dev/null 2>&1; then
+    printf 'fm-buzz-keypair.sh: a key is stored but its public half could not be resolved; nothing was rotated\n' >&2
+    exit 1
+  fi
 
   # Settle the recorded-key set while the private half is still stored, and stop
   # if it cannot be settled: after fm_buzz_key_forget there is no second chance to
@@ -192,7 +278,7 @@ if [ "$ROTATE" -eq 1 ]; then
   # and permanently cost the probe its attribution. A rotation that stops now is
   # simply retryable - nothing has changed yet.
   if [ -z "$retiring" ]; then
-    printf 'fm-buzz-keypair.sh: the outgoing public key could not be read; the recorded key set is left as it stands\n' >&2
+    printf 'fm-buzz-keypair.sh: no key is stored for this home; there is nothing to retire\n' >&2
   elif [ "$COMPROMISED" -eq 1 ]; then
     purge_public "$retiring" || {
       printf 'fm-buzz-keypair.sh: could not drop the compromised public key from %s; nothing was rotated\n' "$HISTORY_FILE" >&2
