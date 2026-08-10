@@ -79,6 +79,14 @@ fm_buzz_key_sha256() {
   fi
 }
 
+fm_buzz_normalize_public_key() {
+  local key
+  key=$(printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr 'A-F' 'a-f')
+  [ "${#key}" -eq 64 ] || return 1
+  case $key in *[!0-9a-f]*) return 1 ;; esac
+  printf '%s\n' "$key"
+}
+
 # The 0600 fallback file for hosts with no reachable keychain.
 #
 # The filename carries a digest of the home account, not a fixed name: two homes
@@ -148,6 +156,19 @@ fm_buzz_key_load() {
   fm_buzz_key_load_file "$home"
 }
 
+fm_buzz_file_target_replaceable() {
+  local target=${1:?target required}
+  if { [ -e "$target" ] || [ -L "$target" ]; } && [ ! -f "$target" ]; then
+    return 1
+  fi
+}
+
+fm_buzz_replace_file() {
+  local source=${1:?source required} target=${2:?target required}
+  fm_buzz_file_target_replaceable "$target" || return 1
+  mv -f -- "$source" "$target"
+}
+
 # Store a private key. Tries the keychain first and falls back to a 0600 file.
 # Returns 1 if neither store could be written, so the caller can refuse to
 # pretend a key was persisted.
@@ -172,6 +193,7 @@ fm_buzz_key_store() {
   dir=$(dirname "$file")
   mkdir -p "$dir" 2>/dev/null || return 1
   chmod 0700 "$dir" 2>/dev/null || true
+  fm_buzz_file_target_replaceable "$file" || return 1
   # mktemp creates at 0600 regardless of umask, and the mode is tightened again
   # before a single byte of key material is written, so the key is never in a file
   # a second process could open. Doing it this way rather than with `umask 077`
@@ -181,7 +203,7 @@ fm_buzz_key_store() {
   tmp=$(mktemp "$dir/.buzz-keypair.XXXXXX") || return 1
   chmod 0600 "$tmp" || { rm -f -- "$tmp"; return 1; }
   printf '{\n  "private_key": "%s"\n}\n' "$private" > "$tmp" || { rm -f -- "$tmp"; return 1; }
-  mv -f -- "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
+  fm_buzz_replace_file "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
   printf 'file\n'
 }
 

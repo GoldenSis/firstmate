@@ -260,7 +260,7 @@ server.on("upgrade", (req, socket) => {
           continue; // received, stored, never acknowledged
         }
         if (reject) {
-          send(["OK", event.id, false, reject]);
+          send(["OK", event.id, truthyOk ? "false" : false, reject]);
           continue;
         }
         if (computeEventId(event) !== event.id) {
@@ -272,8 +272,9 @@ server.on("upgrade", (req, socket) => {
           continue;
         }
         if (store.has(event.id)) {
-          if (duplicateRefused) send(["OK", event.id, false, "duplicate: event already stored"]);
-          else send(["OK", event.id, true, "duplicate:"]);
+          if (duplicateRefused) {
+            send(["OK", event.id, truthyOk ? "false" : false, "duplicate: event already stored"]);
+          } else send(["OK", event.id, true, "duplicate:"]);
           continue;
         }
         store.set(event.id, event);

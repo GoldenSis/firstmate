@@ -24,13 +24,13 @@
 import {
   channelIdForLabel,
   classifyRefusalReason,
-  computeEventId,
   readStdin,
+  validateSignedEvent,
   withRelay,
   KIND_STREAM_MESSAGE,
   REFUSAL_MEMBERSHIP,
 } from "./fm-buzz-lib.mjs";
-import { generateKeypair, schnorrVerify } from "./fm-buzz-crypto.mjs";
+import { generateKeypair } from "./fm-buzz-crypto.mjs";
 
 const envelope = JSON.parse(await readStdin());
 const relay = envelope.relay ?? "ws://localhost:3000";
@@ -55,24 +55,27 @@ const ownChannel = envelope.ownChannel !== false;
 const anonymous = !envelope.privateKey;
 const privateKey = anonymous ? generateKeypair().privateKey : envelope.privateKey;
 
-const HEX_64 = /^[0-9a-f]{64}$/;
-const HEX_128 = /^[0-9a-f]{128}$/;
-
 function assessEvent(event, index, attributable, expectedAuthors, channelId) {
-  const value = event && typeof event === "object" && !Array.isArray(event) ? event : {};
+  const validation = validateSignedEvent(event);
+  const value = validation.event;
   const invalidReasons = [];
-  const validId = typeof value.id === "string" && HEX_64.test(value.id);
-  const validPubkey = typeof value.pubkey === "string" && HEX_64.test(value.pubkey);
-  const validSignature = typeof value.sig === "string" && HEX_128.test(value.sig);
-  const validKind = Number.isSafeInteger(value.kind);
-  const validTags =
-    Array.isArray(value.tags) &&
-    value.tags.every((tag) => Array.isArray(tag) && tag.every((part) => typeof part === "string"));
-  const validContent = typeof value.content === "string";
-  const date = Number.isSafeInteger(value.created_at) ? new Date(value.created_at * 1000) : null;
+  const {
+    eventObject,
+    validId,
+    validPubkey,
+    validSignature,
+    validKind,
+    validTags,
+    validContent,
+    idMatches,
+    idError,
+    signatureValid,
+    signatureError,
+  } = validation;
+  const date = validation.validTimestamp ? new Date(value.created_at * 1000) : null;
   const validTimestamp = date !== null && !Number.isNaN(date.getTime());
 
-  if (!event || typeof event !== "object" || Array.isArray(event)) invalidReasons.push("event is not an object");
+  if (!eventObject) invalidReasons.push("event is not an object");
   if (!validId) invalidReasons.push("malformed id");
   if (!validPubkey) invalidReasons.push("malformed pubkey");
   if (!validSignature) invalidReasons.push("malformed signature");
@@ -81,24 +84,8 @@ function assessEvent(event, index, attributable, expectedAuthors, channelId) {
   if (!validTags) invalidReasons.push("malformed tags");
   if (!validContent) invalidReasons.push("malformed content");
   if (!validTimestamp) invalidReasons.push("malformed created_at");
-
-  let idMatches = false;
-  if (validPubkey && validKind && validTags && validContent && validTimestamp) {
-    try {
-      idMatches = computeEventId(value) === value.id;
-    } catch {
-      invalidReasons.push("event id could not be computed");
-    }
-  }
-
-  let signed = false;
-  if (validId && validPubkey && validSignature) {
-    try {
-      signed = schnorrVerify(value.id, value.pubkey, value.sig);
-    } catch {
-      invalidReasons.push("signature could not be checked");
-    }
-  }
+  if (idError) invalidReasons.push("event id could not be computed");
+  if (signatureError) invalidReasons.push("signature could not be checked");
 
   const inChannel =
     validTags && value.tags.some((tag) => tag[0] === "h" && tag[1] === channelId);
@@ -115,14 +102,14 @@ function assessEvent(event, index, attributable, expectedAuthors, channelId) {
     validPubkey,
     validTags,
     idMatches,
-    signed,
+    signed: signatureValid,
     inChannel,
     byPublisher,
     authentic:
       invalidReasons.length === 0 &&
       value.kind === KIND_STREAM_MESSAGE &&
       idMatches &&
-      signed &&
+      signatureValid &&
       inChannel &&
       byPublisher,
   };

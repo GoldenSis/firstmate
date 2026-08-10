@@ -687,6 +687,84 @@ test_public_record_failures_are_fatal_and_retryable() {
   pass "public record failures are fatal while retained private material makes retry safe"
 }
 
+test_key_record_targets_reject_non_files() {
+  local fallback_home fallback output code public_home public_target history_home old history_target
+
+  fallback_home=$(make_home fallback-directory-target)
+  fallback=$(key_file "$fallback_home" "$fallback_home/xdg")
+  mkdir -p "$fallback"
+  output=$(
+    XDG_DATA_HOME="$fallback_home/xdg"
+    FM_BUZZ_FORCE_FILE_STORE=1
+    # shellcheck disable=SC1091
+    . "$ROOT/bin/fm-buzz-key-lib.sh"
+    fm_buzz_key_store "$fallback_home" \
+      0000000000000000000000000000000000000000000000000000000000000003
+  )
+  code=$?
+  expect_code 1 "$code" "fallback storage with a directory target"
+  [ -z "$output" ] || fail "fallback storage reported success for a directory target"
+  [ -z "$(find "$fallback" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+    || fail "the fallback writer moved its temporary file into a directory target"
+
+  public_home=$(make_home public-directory-symlink-target)
+  run_keypair "$public_home" >/dev/null 2>&1 || fail "public target fixture setup failed"
+  rm -f "$public_home/data/buzz-keypair.public"
+  public_target="$public_home/data/public-target"
+  mkdir "$public_target"
+  ln -s "$(basename "$public_target")" "$public_home/data/buzz-keypair.public"
+  output=$(run_keypair "$public_home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "key creation with a public-record directory symlink"
+  assert_contains "$output" "could not record" \
+    "a public-record directory symlink was treated as a successful write"
+  [ -z "$(find "$public_target" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+    || fail "the public-record writer moved its temporary file through a directory symlink"
+
+  history_home=$(make_home history-directory-symlink-target)
+  old=$(run_keypair "$history_home" 2>/dev/null) || fail "history target fixture setup failed"
+  history_target="$history_home/data/history-target"
+  mkdir "$history_target"
+  ln -s "$(basename "$history_target")" "$history_home/data/buzz-keypair.public-history"
+  output=$(run_keypair "$history_home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation with a history directory symlink"
+  assert_contains "$output" "history target" \
+    "rotation did not diagnose the invalid public-key history target"
+  [ "$(run_keypair "$history_home" --public 2>/dev/null)" = "$old" ] \
+    || fail "rotation mutated the key before rejecting the history directory symlink"
+  [ -z "$(find "$history_target" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+    || fail "the history writer moved its temporary file through a directory symlink"
+  pass "public, history, and fallback records reject non-file targets"
+}
+
+test_public_key_history_is_normalized_consistently() {
+  local home history first first_upper second second_upper third
+  home=$(make_home normalized-history)
+  history="$home/data/buzz-keypair.public-history"
+  first=$(run_keypair "$home" 2>/dev/null) || fail "normalized history fixture setup failed"
+  first_upper=$(printf '%s' "$first" | tr 'a-f' 'A-F')
+  printf '  %s  \r\n%s\nnot-a-key\n' "$first_upper" "$first" > "$history"
+
+  second=$(run_keypair "$home" --rotate 2>/dev/null) || fail "normalized history rotation failed"
+  [ "$(cat "$history")" = "$first" ] \
+    || fail "ordinary rotation did not normalize and deduplicate public-key history"
+
+  second_upper=$(printf '%s' "$second" | tr 'a-f' 'A-F')
+  printf '\t%s\r\n %s \n' "$first_upper" "$second_upper" > "$history"
+  third=$(run_keypair "$home" --rotate --compromised 2>/dev/null) \
+    || fail "normalized compromised rotation failed"
+  [ "$third" != "$second" ] || fail "compromised rotation did not replace the current key"
+  [ "$(cat "$history")" = "$first" ] \
+    || fail "compromised rotation did not normalize history while purging the outgoing key"
+
+  printf '  %s  \r\n' "$first_upper" > "$history"
+  run_keypair "$home" --forget-key "$first" >/dev/null 2>&1 \
+    || fail "--forget-key did not match a normalized history entry"
+  assert_absent "$history" "--forget-key left a case- or whitespace-variant history entry trusted"
+  pass "public-key history uses one normalization for retention, purge, and withdrawal"
+}
+
 test_public_flag_fails_before_a_keypair_exists() {
   local home output code
   home=$(make_home public-first)
@@ -1149,12 +1227,12 @@ EOF
 }
 
 test_truthy_non_boolean_ok_is_not_accepted() {
-  local home relay output
-  home=$(make_home truthy-ok)
+  local home duplicate_home relay output
+  home=$(make_home truthy-ok-permanent)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
 
   read -r STUB_PID relay <<EOF
-$(start_stub --truthy-ok)
+$(start_stub --truthy-ok --reject "invalid: malformed acknowledgement fixture")
 EOF
   output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"truthy-ok"}' \
     | run_publish "$home" "$relay" 2>&1)
@@ -1163,8 +1241,24 @@ EOF
   assert_contains "$output" "delivered=0 retained=1" \
     "a truthy non-boolean OK field was treated as relay acceptance"
   [ "$(replay_count "$home")" = "1" ] \
-    || fail "a malformed truthy OK acknowledgement evicted the cached event"
-  pass "only the boolean true is accepted as a relay acknowledgement"
+    || fail "a malformed OK field made a permanent-rejection note evict the cached event"
+
+  duplicate_home=$(make_home truthy-ok-duplicate)
+  run_keypair "$duplicate_home" >/dev/null 2>&1 || fail "duplicate fixture keypair setup failed"
+  read -r STUB_PID relay <<EOF
+$(start_stub --truthy-ok --duplicate-refused)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"truthy-duplicate-first"}' \
+    | run_publish "$duplicate_home" "$relay" >/dev/null 2>&1
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"truthy-duplicate-second"}' \
+    | run_publish "$duplicate_home" "$relay" 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$output" "delivered=0 retained=2" \
+    "a malformed OK field made a duplicate note count as delivery"
+  [ "$(replay_count "$duplicate_home")" = "2" ] \
+    || fail "a duplicate note evicted an event without a boolean acknowledgement"
+  pass "relay notes are classified only with a boolean acknowledgement"
 }
 
 # --- (e) the replay cache is capped ----------------------------------------
@@ -1221,22 +1315,28 @@ test_cache_limit_must_be_a_positive_integer() {
 }
 
 test_cache_limit_one_preserves_the_pending_event() {
-  local home relay output
+  local home relay output clock old
   home=$(make_home cache-limit-one)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  clock="$TMP_ROOT/fixed-buzz-clock.mjs"
+  printf '%s\n' 'Date.now = () => 1700000000000;' > "$clock"
+  mkdir -p "$home/state/buzz-replay"
+  old="$home/state/buzz-replay/1700000000-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.json"
+  printf '%s' '["EVENT",{}]' > "$old"
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
 
   output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"limit-one"}' \
-    | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
+    | NODE_OPTIONS="--import=$clock" FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
   assert_contains "$output" "delivered=1 retained=0 discarded=0 cleanup_failed=0" \
-    "a cache limit of one removed the just-signed event before delivery accounting"
+    "a same-second cache tie removed the just-signed event before delivery accounting"
+  assert_absent "$old" "same-second pruning kept an older entry instead of the current event"
   [ "$(replay_count "$home")" = "0" ] \
     || fail "the cache-limit-one event remained after acknowledgement"
-  pass "a cache limit of one preserves and delivers the pending event"
+  pass "a cache limit of one protects the current event across same-second ties"
 }
 
 test_malformed_cache_names_are_discarded_or_accounted_for() {
@@ -1263,8 +1363,6 @@ EOF
     "a failed malformed-entry cleanup was silently ignored"
   assert_contains "$output" "retained=1 discarded=1 cleanup_failed=1" \
     "malformed cache filenames were not truthfully accounted for"
-  assert_contains "$output" "replay cache over 1; dropped 1 oldest event(s)" \
-    "an undeletable malformed cache entry did not consume the configured cap"
   assert_absent "$removable" "a removable malformed cache entry survived cleanup"
   assert_present "$retained" "the failed-cleanup fixture disappeared unexpectedly"
   [ "$(replay_count "$home")" = "1" ] \
@@ -1988,7 +2086,7 @@ test_a_rotated_home_still_recognises_its_own_leaked_events() {
   # only the current key would make the probe answer INCONCLUSIVE over exactly the
   # leak it exists to catch - a false negative created by the home's own key
   # hygiene. The retired PUBLIC key is retained precisely so that cannot happen.
-  local home relay retired rotated leaked
+  local home relay retired retired_upper rotated leaked
   home=$(make_home rotated-breach)
   retired=$(run_keypair "$home" 2>/dev/null) || fail "keypair setup failed"
 
@@ -1999,10 +2097,12 @@ EOF
     | run_publish "$home" "$relay" >/dev/null 2>&1
   rotated=$(run_keypair "$home" --rotate 2>/dev/null) || fail "rotation failed"
   [ "$rotated" != "$retired" ] || fail "rotation did not replace the key, so nothing here is under test"
+  retired_upper=$(printf '%s' "$retired" | tr 'a-f' 'A-F')
+  printf '  %s  \r\n' "$retired_upper" > "$home/data/buzz-keypair.public-history"
   leaked=$(run_inspect "$home" "$relay" --anonymous 2>&1)
   stop_stub "$STUB_PID"
 
-  assert_grep "$retired" "$home/data/buzz-keypair.public-history" \
+  assert_contains "$(tr 'A-F' 'a-f' < "$home/data/buzz-keypair.public-history")" "$retired" \
     "rotation dropped the retired public key instead of retaining it"
   assert_contains "$leaked" "published-before-rotation" \
     "the pre-rotation event was not served, so the check under test was never reached"
@@ -2213,6 +2313,8 @@ test_orphaned_public_record_requires_compromised_recovery
 test_forget_key_refuses_when_history_cannot_be_read
 test_keychain_errors_refuse_rotation_without_minting_a_fallback_key
 test_public_record_failures_are_fatal_and_retryable
+test_key_record_targets_reject_non_files
+test_public_key_history_is_normalized_consistently
 test_two_homes_sharing_one_xdg_get_separate_keys
 test_publish_with_relay_down_exits_zero_and_enqueues
 test_malformed_projection_is_rejected_before_signing

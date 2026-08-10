@@ -69,12 +69,9 @@ That read is bounded (`FM_BUZZ_STDIN_TIMEOUT_S`, default 30) and refuses a termi
 An expired read is discarded rather than published: a truncated projection is malformed JSON, and the `omitted[]` disclosure that makes a bounded projection honest sits at the end of it.
 The rest of the runtime knobs (`FM_BUZZ_RELAY`, `FM_BUZZ_TIMEOUT_MS`, `FM_BUZZ_MAX_CACHE`, `FM_BUZZ_FORCE_FILE_STORE`) are listed with their defaults in [`configuration.md`](configuration.md#environment-variables), and the compose stack itself takes `BUZZ_IMAGE` and `BUZZ_LOOPBACK_PORT`; a non-default port needs a matching `FM_BUZZ_RELAY`.
 
-The keypair is created once per home and stored in the OS keychain, falling back to a `0600` file when no keychain is reachable.
-Both stores key on the resolved `FM_HOME` - the keychain through its account attribute, the fallback file through a digest of that account in its filename - so a secondmate home gets its own key and its own channel rather than publishing under the main home's identity.
-The file store has to derive per-home too, not just the keychain: `XDG_DATA_HOME` follows the user rather than `FM_HOME`, so homes normally share one, and a fixed filename would break the invariant on exactly the hosts with no keychain to enforce it.
-
-No command prints the private key, no keypair material is committed, and the key reaches no process's argv: `security -i` takes the keychain write on stdin, and `jq` receives the key through a file descriptor (`--rawfile`) rather than `--arg`.
-An argv is world-readable through the process table, which is the whole reason for both.
+Each home needs its own low-authority publishing identity so the main home and second mates cannot silently publish as one another when they share host storage.
+Private-key custody keeps that identity out of logs, commits, command-line arguments, and other homes while retaining a fallback for hosts without a reachable keychain.
+The header of `bin/fm-buzz-key-lib.sh` owns the exact store selection, per-home derivation, filename, permissions, and argument-safe read and write mechanics.
 
 ## Two facts about this host that are easy to lose
 
@@ -133,20 +130,9 @@ A NIP-01 event id is a SHA-256 over `[0, pubkey, created_at, kind, tags, content
 The relay dedupes on that id with `INSERT ... ON CONFLICT DO NOTHING`.
 The consequence is sharp: resubmitting the byte-identical signed event is perfectly idempotent, while rebuilding and re-signing the same logical message mints a new id and lands a duplicate.
 
-So the replay cache stores exact signed bytes and replays those bytes.
-It is partitioned by relay host, using the layout in [`configuration.md`](configuration.md#operational-home-layout-and-state), so changing relays cannot expose one relay's queued snapshots to another.
-It is written before any network attempt, which is what makes a kill between signing and delivery lossless.
-An entry is removed when the relay acknowledges it, including a `duplicate:` answer, which means the relay already holds that id.
-An entry is also removed when the rejection is permanent (`invalid:`, `blocked:`, `pow:`), because replaying it could never succeed and would loop forever.
-A provisioning-shaped refusal (`auth-required:`, `restricted:`) is kept, since it can clear once the channel or membership exists.
-The cache is capped at 100 entries, dropping oldest first, because a newer bearings projection supersedes an older one anyway.
-A `.json.tmp` left by a kill between the cache write and its rename is swept once it is a minute old, so an interrupted run leaks neither an invisible file nor an unbounded pile of them.
-
-`auth-required:` is a special case of "it can clear", and it can clear inside the same run.
-The wait for a NIP-42 challenge has to be bounded, because an open relay never sends one and "no challenge yet" is indistinguishable from "no challenge ever" until a deadline passes.
-So a relay that challenges late gets published to before the handshake finishes, and refuses everything for it.
-The client answers that challenge when it lands and then re-offers exactly the events the unauthenticated window refused, which is what stops the same race being lost run after run with nothing published.
-The honest worst case remains: if the challenge arrives after both windows, the run ends unauthenticated, the events stay cached, and the next run races it again.
+The replay cache therefore preserves exact signed bytes so retries keep one event id instead of creating duplicate logical messages.
+Caching before network delivery makes projection failures retryable, while partitioning by relay prevents queued projections from crossing relay boundaries.
+The header and implementation of `bin/fm-buzz-publish.mjs` own the exact cache layout, write ordering, validation, pruning, cleanup, acknowledgement classification, and late-authentication state machine.
 
 ## Verification evidence
 

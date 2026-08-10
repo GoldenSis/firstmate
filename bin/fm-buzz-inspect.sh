@@ -120,10 +120,8 @@ CHANNEL=$(fm_buzz_channel_id "$SCRIPT_DIR" "$CHANNEL_LABEL") || {
 # files.
 EXPECTED_AUTHORS=()
 collect_author() {  # <line>
-  local key=$1
-  key=$(printf '%s' "$key" | tr -d '[:space:]' | tr 'A-F' 'a-f')
-  [ "${#key}" -eq 64 ] || return 0
-  case $key in *[!0-9a-f]*) return 0 ;; esac
+  local key
+  key=$(fm_buzz_normalize_public_key "$1") || return 0
   EXPECTED_AUTHORS+=("$key")
 }
 for author_file in "$DATA/buzz-keypair.public" "$DATA/buzz-keypair.public-history"; do

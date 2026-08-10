@@ -123,22 +123,19 @@ if [ "$FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ];
   exit 2
 fi
 
-# A public key is 64 lowercase hex characters and nothing else. Anything else is
-# not a key, however plausible it looks: a half-written or truncated recorded file
-# is exactly the case this rejects.
-is_public_key() {  # <candidate>
-  local key=$1
-  [ "${#key}" -eq 64 ] || return 1
-  case $key in *[!0-9a-f]*) return 1 ;; esac
-}
-
-# Read a recorded public key the way both the recorded file and an operator's
-# argument may spell it, and echo nothing at all when it is not a key.
-normalize_public_key() {  # <candidate>
-  local key
-  key=$(printf '%s' "$1" | tr -d '[:space:]' | tr 'A-F' 'a-f')
-  is_public_key "$key" || return 1
-  printf '%s\n' "$key"
+read_history() {
+  local raw line normalized
+  if [ ! -e "$HISTORY_FILE" ] && [ ! -L "$HISTORY_FILE" ]; then
+    return 0
+  fi
+  [ -f "$HISTORY_FILE" ] || return 1
+  raw=$(cat -- "$HISTORY_FILE") || return 1
+  printf '%s\n' "$raw" |
+    while IFS= read -r line || [ -n "$line" ]; do
+      normalized=$(fm_buzz_normalize_public_key "$line") || continue
+      printf '%s\n' "$normalized"
+    done |
+    awk '!seen[$0]++'
 }
 
 # Derive the public key from the stored private key without the private key ever
@@ -173,7 +170,7 @@ record_public() {
   tmp=$(mktemp "$DATA/.buzz-keypair-public.XXXXXX") || return 1
   printf '%s\n' "$public" > "$tmp" || { rm -f -- "$tmp"; return 1; }
   chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
-  mv -f -- "$tmp" "$PUBLIC_FILE" || { rm -f -- "$tmp"; return 1; }
+  fm_buzz_replace_file "$tmp" "$PUBLIC_FILE" || { rm -f -- "$tmp"; return 1; }
 }
 
 # Replace the history file's contents. Whole-file rewrite through a temp file and
@@ -184,6 +181,7 @@ record_public() {
 write_history() {  # <whole file contents, possibly empty>
   local content=$1 tmp
   [ -d "$DATA" ] || mkdir -p "$DATA" 2>/dev/null || return 1
+  fm_buzz_file_target_replaceable "$HISTORY_FILE" || return 1
   if [ -z "$content" ]; then
     rm -f -- "$HISTORY_FILE" || return 1
     return 0
@@ -191,7 +189,7 @@ write_history() {  # <whole file contents, possibly empty>
   tmp=$(mktemp "$DATA/.buzz-keypair-public-history.XXXXXX") || return 1
   printf '%s\n' "$content" > "$tmp" || { rm -f -- "$tmp"; return 1; }
   chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
-  mv -f -- "$tmp" "$HISTORY_FILE" || { rm -f -- "$tmp"; return 1; }
+  fm_buzz_replace_file "$tmp" "$HISTORY_FILE" || { rm -f -- "$tmp"; return 1; }
 }
 
 # Carry the outgoing public key into the history file before the rotation drops
@@ -200,13 +198,10 @@ write_history() {  # <whole file contents, possibly empty>
 retain_public() {  # <retired public key>
   local retired=$1 merged
   [ -n "$retired" ] || return 0
-  if [ -f "$HISTORY_FILE" ]; then
-    merged=$(cat -- "$HISTORY_FILE") || return 1
-    merged="$merged
-$retired"
-  else
-    merged=$retired
-  fi
+  retired=$(fm_buzz_normalize_public_key "$retired") || return 1
+  merged=$(read_history) || return 1
+  merged="${merged:+$merged
+}$retired"
   merged=$(printf '%s\n' "$merged" | awk 'NF && !seen[$0]++') || return 1
   write_history "$merged"
 }
@@ -219,8 +214,9 @@ $retired"
 purge_public() {  # <public key to withdraw>
   local retired=$1 merged
   [ -n "$retired" ] || return 0
-  [ -f "$HISTORY_FILE" ] || return 0
-  merged=$(awk -v drop="$retired" 'NF && $0 != drop && !seen[$0]++' "$HISTORY_FILE") || return 1
+  retired=$(fm_buzz_normalize_public_key "$retired") || return 1
+  merged=$(read_history) || return 1
+  merged=$(printf '%s\n' "$merged" | awk -v drop="$retired" 'NF && $0 != drop && !seen[$0]++') || return 1
   write_history "$merged"
 }
 
@@ -230,23 +226,20 @@ purge_public() {  # <public key to withdraw>
 # discovered later has to name the key it means. Nothing is minted or cleared
 # here, and no key material is read - it is a rewrite of one public-key list.
 if [ "$FORGETTING" -eq 1 ]; then
-  forget=$(normalize_public_key "$FORGET_KEY") || {
+  forget=$(fm_buzz_normalize_public_key "$FORGET_KEY") || {
     printf 'fm-buzz-keypair.sh: --forget-key wants a 64-character hex public key\n' >&2
     exit 2
   }
 
-  history_match=1
-  if [ -e "$HISTORY_FILE" ] || [ -L "$HISTORY_FILE" ]; then
-    if [ ! -f "$HISTORY_FILE" ]; then
-      printf 'fm-buzz-keypair.sh: could not read %s; nothing was changed\n' "$HISTORY_FILE" >&2
-      exit 1
-    fi
-    grep -qx -- "$forget" "$HISTORY_FILE" >/dev/null 2>&1
-    history_match=$?
-    if [ "$history_match" -gt 1 ]; then
-      printf 'fm-buzz-keypair.sh: could not read %s; nothing was changed\n' "$HISTORY_FILE" >&2
-      exit 1
-    fi
+  history=$(read_history) || {
+    printf 'fm-buzz-keypair.sh: could not read %s; nothing was changed\n' "$HISTORY_FILE" >&2
+    exit 1
+  }
+  printf '%s\n' "$history" | grep -qx -- "$forget" >/dev/null 2>&1
+  history_match=$?
+  if [ "$history_match" -gt 1 ]; then
+    printf 'fm-buzz-keypair.sh: could not read %s; nothing was changed\n' "$HISTORY_FILE" >&2
+    exit 1
   fi
   if [ "$history_match" -eq 0 ]; then
     purge_public "$forget" || {
@@ -261,7 +254,7 @@ if [ "$FORGETTING" -eq 1 ]; then
   # The current key is not in that list, so withdrawing it there says nothing
   # about it. Rotation is what retires a current key, and only --compromised
   # keeps it out of the recorded set.
-  current=$(normalize_public_key "$(sed -n 1p "$PUBLIC_FILE" 2>/dev/null)" 2>/dev/null) || current=""
+  current=$(fm_buzz_normalize_public_key "$(sed -n 1p "$PUBLIC_FILE" 2>/dev/null)" 2>/dev/null) || current=""
   if [ -n "$current" ] && [ "$current" = "$forget" ]; then
     printf 'fm-buzz-keypair.sh: %s is still this home'"'"'s CURRENT publishing key; retire it with --rotate --compromised\n' "$forget" >&2
   fi
@@ -293,7 +286,15 @@ purge_rotation_key() {  # <public key>
 # Retire the old key before the lookup below, so rotation falls through into the
 # minting path instead of finding the key it was asked to replace.
 if [ "$ROTATE" -eq 1 ]; then
-  recorded=$(normalize_public_key "$(sed -n 1p "$PUBLIC_FILE" 2>/dev/null)" 2>/dev/null) || recorded=""
+  fm_buzz_file_target_replaceable "$PUBLIC_FILE" || {
+    printf 'fm-buzz-keypair.sh: public key record target %s is not a regular file; nothing was rotated\n' "$PUBLIC_FILE" >&2
+    exit 1
+  }
+  fm_buzz_file_target_replaceable "$HISTORY_FILE" || {
+    printf 'fm-buzz-keypair.sh: public key history target %s is not a regular file; nothing was rotated\n' "$HISTORY_FILE" >&2
+    exit 1
+  }
+  recorded=$(fm_buzz_normalize_public_key "$(sed -n 1p "$PUBLIC_FILE" 2>/dev/null)" 2>/dev/null) || recorded=""
   keychain_public=""
   file_public=""
   derived=""
@@ -307,7 +308,7 @@ if [ "$ROTATE" -eq 1 ]; then
 
   case $keychain_status in
     0)
-      keychain_public=$(normalize_public_key "$(derive_public_from_store keychain 2>/dev/null)" 2>/dev/null) || keychain_public=""
+      keychain_public=$(fm_buzz_normalize_public_key "$(derive_public_from_store keychain 2>/dev/null)" 2>/dev/null) || keychain_public=""
       [ -n "$keychain_public" ] || add_recovery_reason "the private key in the login keychain could not be used to derive its public key"
       ;;
     1) ;;
@@ -317,7 +318,7 @@ if [ "$ROTATE" -eq 1 ]; then
 
   case $file_status in
     0)
-      file_public=$(normalize_public_key "$(derive_public_from_store file 2>/dev/null)" 2>/dev/null) || file_public=""
+      file_public=$(fm_buzz_normalize_public_key "$(derive_public_from_store file 2>/dev/null)" 2>/dev/null) || file_public=""
       [ -n "$file_public" ] || add_recovery_reason "publishing key file $key_file could not be used to derive its public key"
       ;;
     1) ;;

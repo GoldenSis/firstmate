@@ -23,7 +23,13 @@
 // compare-and-set, so publishing state into one would silently clobber concurrent
 // captain edits. Append-only messages only.
 
-import { schnorrSign, sha256, bytesToHex, publicKeyFromPrivate } from "./fm-buzz-crypto.mjs";
+import {
+  schnorrSign,
+  schnorrVerify,
+  sha256,
+  bytesToHex,
+  publicKeyFromPrivate,
+} from "./fm-buzz-crypto.mjs";
 
 const LOOPBACK_RELAY_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
 
@@ -45,6 +51,9 @@ export const KIND_STREAM_MESSAGE = 9; // NIP-29 channel chat message (append-onl
 export const KIND_NIP29_CREATE_GROUP = 9007; // creates a channel; creator becomes owner
 export const KIND_NIP42_AUTH = 22242; // NIP-42 challenge response
 
+const HEX_64 = /^[0-9a-f]{64}$/;
+const HEX_128 = /^[0-9a-f]{128}$/;
+
 // NIP-01 canonical serialization. JSON.stringify already produces the required
 // form: no insignificant whitespace, minimal escaping of ", \\ and the C0
 // controls, and raw (unescaped) UTF-8 for everything else.
@@ -61,6 +70,56 @@ export function canonicalSerialization(event) {
 
 export function computeEventId(event) {
   return bytesToHex(sha256(Buffer.from(canonicalSerialization(event), "utf8")));
+}
+
+export function validateSignedEvent(event) {
+  const eventObject = event !== null && typeof event === "object" && !Array.isArray(event);
+  const value = eventObject ? event : {};
+  const validId = typeof value.id === "string" && HEX_64.test(value.id);
+  const validPubkey = typeof value.pubkey === "string" && HEX_64.test(value.pubkey);
+  const validSignature = typeof value.sig === "string" && HEX_128.test(value.sig);
+  const validTimestamp = Number.isSafeInteger(value.created_at) && value.created_at >= 0;
+  const validKind = Number.isSafeInteger(value.kind);
+  const validTags =
+    Array.isArray(value.tags) &&
+    value.tags.every((tag) => Array.isArray(tag) && tag.every((part) => typeof part === "string"));
+  const validContent = typeof value.content === "string";
+
+  let idMatches = false;
+  let idError = null;
+  if (validId && validPubkey && validTimestamp && validKind && validTags && validContent) {
+    try {
+      idMatches = computeEventId(value) === value.id;
+    } catch (error) {
+      idError = error;
+    }
+  }
+
+  let signatureValid = false;
+  let signatureError = null;
+  if (validId && validPubkey && validSignature) {
+    try {
+      signatureValid = schnorrVerify(value.id, value.pubkey, value.sig);
+    } catch (error) {
+      signatureError = error;
+    }
+  }
+
+  return {
+    event: value,
+    eventObject,
+    validId,
+    validPubkey,
+    validSignature,
+    validTimestamp,
+    validKind,
+    validTags,
+    validContent,
+    idMatches,
+    idError,
+    signatureValid,
+    signatureError,
+  };
 }
 
 // Turn an unsigned event into a signed one. Returns a NEW object; the id and sig
@@ -162,6 +221,7 @@ export const RETRYABLE = "retryable";
 export const PERMANENT = "permanent";
 
 export function classifyOkResponse(accepted, message = "") {
+  if (typeof accepted !== "boolean") return RETRYABLE;
   if (accepted === true) return DELIVERED;
   const text = String(message);
   // The relay already has this id; ON CONFLICT DO NOTHING did its job. That is
@@ -292,7 +352,7 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = 
       const waiter = pending.get(id);
       if (waiter) {
         pending.delete(id);
-        waiter.resolve({ id, accepted: accepted === true, message: note ?? "" });
+        waiter.resolve({ id, accepted, message: note ?? "" });
       }
     } else if (type === "AUTH") {
       authChallenge = message[1];
@@ -383,7 +443,7 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = 
         authEvent.id,
         publishTimeoutMs,
       );
-      return response.accepted ? "authenticated" : "refused";
+      return response.accepted === true ? "authenticated" : "refused";
     } catch {
       // A relay that takes the AUTH and says nothing is not a reason to abandon
       // the run: publishing decides delivery, and an `auth-required:` answer

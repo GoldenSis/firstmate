@@ -37,23 +37,19 @@ import {
   buildBearingsEvent,
   buildChannelCreateEvent,
   classifyOkResponse,
-  computeEventId,
   readStdin,
   resolveLoopbackRelayHost,
+  validateSignedEvent,
   withRelay,
   DELIVERED,
   KIND_STREAM_MESSAGE,
   PERMANENT,
   RETRYABLE,
 } from "./fm-buzz-lib.mjs";
-import { schnorrVerify } from "./fm-buzz-crypto.mjs";
 
 function log(message) {
   process.stderr.write(`fm-buzz-publish: ${message}\n`);
 }
-
-const HEX_64 = /^[0-9a-f]{64}$/;
-const HEX_128 = /^[0-9a-f]{128}$/;
 
 function cachedEventFromFrame(raw, entry) {
   let frame;
@@ -66,32 +62,22 @@ function cachedEventFromFrame(raw, entry) {
     throw new Error("not a complete EVENT frame");
   }
   const event = frame[1];
-  if (!event || typeof event !== "object" || Array.isArray(event)) {
-    throw new Error("event is not an object");
-  }
-  if (typeof event.id !== "string" || !HEX_64.test(event.id)) throw new Error("malformed event id");
-  if (typeof event.pubkey !== "string" || !HEX_64.test(event.pubkey)) {
-    throw new Error("malformed event pubkey");
-  }
-  if (typeof event.sig !== "string" || !HEX_128.test(event.sig)) {
-    throw new Error("malformed event signature");
-  }
-  if (!Number.isSafeInteger(event.created_at) || event.created_at < 0) {
-    throw new Error("malformed event timestamp");
-  }
+  const validation = validateSignedEvent(event);
+  if (!validation.eventObject) throw new Error("event is not an object");
+  if (!validation.validId) throw new Error("malformed event id");
+  if (!validation.validPubkey) throw new Error("malformed event pubkey");
+  if (!validation.validSignature) throw new Error("malformed event signature");
+  if (!validation.validTimestamp) throw new Error("malformed event timestamp");
   if (event.kind !== KIND_STREAM_MESSAGE) throw new Error("unexpected event kind");
-  if (
-    !Array.isArray(event.tags) ||
-    !event.tags.every((tag) => Array.isArray(tag) && tag.every((part) => typeof part === "string"))
-  ) {
-    throw new Error("malformed event tags");
-  }
-  if (typeof event.content !== "string") throw new Error("malformed event content");
+  if (!validation.validTags) throw new Error("malformed event tags");
+  if (!validation.validContent) throw new Error("malformed event content");
   if (event.id !== entry.id || event.created_at !== entry.createdAt) {
     throw new Error("cache filename does not match the event");
   }
-  if (computeEventId(event) !== event.id) throw new Error("event id does not match its content");
-  if (!schnorrVerify(event.id, event.pubkey, event.sig)) throw new Error("invalid event signature");
+  if (validation.idError) throw new Error("event id could not be computed");
+  if (!validation.idMatches) throw new Error("event id does not match its content");
+  if (validation.signatureError) throw new Error("event signature could not be checked");
+  if (!validation.signatureValid) throw new Error("invalid event signature");
   return event;
 }
 
@@ -219,7 +205,7 @@ function sweepOrphanTemporaries(replayDir, now) {
 // Keep the cache bounded. An unbounded queue after a long relay outage would grow
 // without limit and replay ancient fleet state; oldest-first is the right thing to
 // drop because a newer bearings projection supersedes an older one anyway.
-function pruneCache(replayDir, maxCache) {
+function pruneCache(replayDir, maxCache, protectedFile) {
   const topology = cacheDirectories(replayDir);
   const directories = topology.directories;
   const now = Date.now();
@@ -255,6 +241,7 @@ function pruneCache(replayDir, maxCache) {
   const pruned = new Set();
   for (const entry of validEntries) {
     if (dropped >= excess) break;
+    if (entry.file === protectedFile) continue;
     const removal = removeCacheFile(entry.file, `prune cache entry ${entry.name}`);
     if (removal.removed) {
       dropped += 1;
@@ -310,8 +297,8 @@ async function main() {
   const event = buildBearingsEvent(channelId, content, privateKey, [
     ["fm-schema", "fm-bearings.v1"],
   ]);
-  cacheEvent(relayCacheDir, event);
-  const cacheMaintenance = pruneCache(replayDir, maxCache);
+  const currentFile = cacheEvent(relayCacheDir, event);
+  const cacheMaintenance = pruneCache(replayDir, maxCache, currentFile);
   let cleanupFailures = cacheMaintenance.failed;
   log(`signed event ${event.id} (${Buffer.byteLength(content, "utf8")} bytes) for channel ${channelId}`);
 
@@ -345,9 +332,9 @@ async function main() {
         );
         const response = await api.publish(create);
         const message = String(response.message);
-        if (!response.accepted && !message.startsWith("duplicate:")) {
+        if (classifyOkResponse(response.accepted, message) !== DELIVERED) {
           log(`channel provisioning refused: ${message}`);
-          return message.startsWith("auth-required:");
+          return response.accepted === false && message.startsWith("auth-required:");
         }
       } catch (error) {
         log(`channel provisioning failed: ${error.message}`);
@@ -401,7 +388,7 @@ async function main() {
           if (verdict === PERMANENT) log(`permanently rejected ${entry.id}: ${message}`);
           if (verdict !== DELIVERED && verdict !== PERMANENT) {
             log(`retryable rejection for ${entry.id}: ${message}`);
-            if (message.startsWith("auth-required:")) {
+            if (response.accepted === false && message.startsWith("auth-required:")) {
               authBlocked = true;
               authRefused.add(entry.id);
             }
