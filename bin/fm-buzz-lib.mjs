@@ -180,14 +180,17 @@ export function classifyOkResponse(accepted, message = "") {
   return RETRYABLE;
 }
 
-// A CLOSED reason refuses a whole subscription, and only one shape of it says
-// anything about the READER: `restricted:` is NIP-01's "you are not permitted to
-// see this", which for a private channel means the reading identity is not a
-// member. Every other prefix describes the request or the relay instead -
-// `auth-required:` means the relay wants NIP-42 before it serves any read at all,
-// `invalid:` faults the filter, `error:`/`rate-limited:` fault the relay - and a
-// relay that refuses every anonymous read refuses one regardless of which channel
-// was asked for, so those reasons cannot carry a membership conclusion.
+// A CLOSED reason refuses a whole subscription, and only one shape of it
+// machine-tags itself as being about the READER: `restricted:` is NIP-01's "you
+// are not permitted to see this", which for a private channel means the reading
+// identity is not a member. Every other prefix describes the request or the relay
+// instead - `auth-required:` means the relay wants NIP-42 before it serves any
+// read at all, `invalid:` faults the filter, `error:`/`rate-limited:` fault the
+// relay - and an untagged reason is free text this code cannot read a policy out
+// of, so none of them can carry a membership conclusion. That cuts one way only:
+// REFUSAL_OTHER means "not tagged as a membership refusal", never "not a
+// membership refusal", because a relay may well turn a non-member away in words
+// no convention covers.
 // classifyOkResponse deliberately collapses `restricted:` and `auth-required:`
 // (both are worth a retry), which is why membership needs its own predicate
 // rather than a reuse of that one.

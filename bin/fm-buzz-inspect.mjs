@@ -56,13 +56,15 @@ try {
   if (refusal) process.stdout.write(`refused:  ${refusal}\n`);
   // An empty anonymous read is not evidence of privacy on its own, and neither is
   // just any refusal. Only a membership-shaped refusal - NIP-01's `restricted:` -
-  // says something about the READER; `auth-required:`, `rate-limited:`, `error:`
-  // and `invalid:` describe the relay or the request, and a relay that turns away
-  // every anonymous read turns this one away no matter which channel was asked
-  // for. So the reassurance is gated on that one shape, and every other outcome
-  // prints the relay's own words and stays inconclusive. Printing the security
-  // conclusion over an ambiguous absence is worse than printing nothing: this is
-  // the one place a human looks for that answer.
+  // machine-tags itself as being about the READER; every other reason is either
+  // about the relay or the request (`auth-required:`, `rate-limited:`, `error:`,
+  // `invalid:`) or untagged free text that this tool cannot read a policy out of.
+  // So the reassurance is gated on that one shape, and every other outcome prints
+  // the relay's own words and states only the limit - the reason is not tagged as
+  // a membership refusal, so it cannot be taken for one - without asserting what
+  // the relay's policy actually is. Printing a security conclusion over an
+  // ambiguous absence is worse than printing nothing, and so is printing the
+  // opposite conclusion: this is the one place a human looks for that answer.
   if (events.length === 0 && anonymous) {
     const ambiguous =
       "An empty read that nobody refused on membership grounds is equally what you\n" +
@@ -71,7 +73,8 @@ try {
       "  - a channel id derived from a different home than the publisher's\n" +
       "  - a publish that never actually landed\n" +
       "  - a channel that is simply empty\n" +
-      "  - privacy enforcement that withholds events silently instead of refusing\n" +
+      "  - privacy enforcement that withholds events silently, or refuses without\n" +
+      "    machine-tagging its reason as a membership refusal\n" +
       "Re-run without --anonymous to read as the publisher and tell these apart.\n";
     if (classifyRefusalReason(refusal) === REFUSAL_MEMBERSHIP) {
       process.stdout.write(
@@ -84,8 +87,8 @@ try {
       process.stdout.write(
         "\nINCONCLUSIVE: the relay refused this subscription, but not on membership\n" +
           `grounds. It said: ${refusal}\n` +
-          "That refusal would have gone to any reader asking for any channel, so it\n" +
-          "says nothing about whether this channel is private.\n" +
+          "That reason is not machine-tagged as a membership refusal, so it cannot be\n" +
+          "read as one.\n" +
           ambiguous,
       );
     } else {

@@ -1037,7 +1037,7 @@ test_an_anonymous_read_only_claims_privacy_when_the_relay_refuses() {
   # refusing the subscription ON MEMBERSHIP GROUNDS separates them, so the
   # assurance is gated on that one refusal shape and everything else - including a
   # refusal for some other reason - must read INCONCLUSIVE.
-  local home relay served refused unrelated
+  local home relay served refused unrelated untagged
   home=$(make_home anonymous-read)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
 
@@ -1073,9 +1073,10 @@ EOF
   assert_not_contains "$refused" "INCONCLUSIVE" \
     "a refused subscription is conclusive and must not be hedged"
 
-  # A relay that refuses every anonymous read, membership or not. It would answer
-  # a request for ANY channel the same way, so its refusal carries no privacy
-  # conclusion even though it is a refusal.
+  # A relay that refuses this read for a reason NIP-01 does not tag as being about
+  # the reader. It carries no privacy conclusion, but the hedge must not swing the
+  # other way either: the tool knows the reason is untagged, not that the relay
+  # would have refused any other channel too.
   read -r STUB_PID relay <<EOF
 $(start_stub --refuse-req "auth-required: we only serve authenticated readers")
 EOF
@@ -1090,6 +1091,28 @@ EOF
     "a non-membership refusal was reported as proof of privacy"
   assert_not_contains "$unrelated" "never added to this private channel" \
     "a non-membership refusal was described as a membership refusal"
+  assert_not_contains "$unrelated" "any reader asking for any channel" \
+    "the hedge asserted a relay policy the refusal reason does not establish"
+
+  # The same branch catches an UNTAGGED membership refusal, which is the case that
+  # makes the strong hedge wrong: this really is the refusal the probe was looking
+  # for, and the tool must say only that it cannot tell.
+  read -r STUB_PID relay <<EOF
+$(start_stub --refuse-req "not a member of this group")
+EOF
+  untagged=$(run_inspect "$home" "$relay" --anonymous 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$untagged" "not a member of this group" \
+    "an untagged refusal must be reported in the relay's own words"
+  assert_contains "$untagged" "INCONCLUSIVE" \
+    "an untagged refusal cannot be read as a membership refusal"
+  assert_contains "$untagged" "not machine-tagged as a membership refusal" \
+    "the hedge must state the limit it actually knows"
+  assert_not_contains "$untagged" "any reader asking for any channel" \
+    "an untagged membership refusal was described as channel-independent"
+  assert_not_contains "$untagged" "That refusal is the assurance" \
+    "an untagged refusal was reported as proof of privacy"
   pass "an anonymous empty read claims privacy only on a membership refusal"
 }
 

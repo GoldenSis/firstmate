@@ -12,9 +12,9 @@
 #                 invisible to non-members. Zero events is only an answer when the
 #                 relay refuses the subscription on MEMBERSHIP grounds, i.e. with
 #                 NIP-01's `restricted:`. Every other outcome is reported
-#                 INCONCLUSIVE and prints the relay's own words: an `auth-required:`
-#                 or `rate-limited:` refusal would be sent to any reader asking for
-#                 any channel, and an unrefused empty read looks identical to a
+#                 INCONCLUSIVE and prints the relay's own words: any other reason
+#                 is not machine-tagged as a membership refusal and so cannot be
+#                 read as one, and an unrefused empty read looks identical to a
 #                 wiped relay, a channel id from another home, a publish that never
 #                 landed, or a channel that is simply empty.
 #
