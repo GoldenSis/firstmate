@@ -33,10 +33,11 @@
 # honest - it states what was dropped and how to reveal it - so it is passed
 # through untouched rather than summarised or stripped.
 #
-# Read-only in both directions that matter: this script only ever reads Firstmate
-# state (via the snapshot's own read-only command) and only ever writes to Buzz.
-# It never reads state back from Buzz. Buzz is a projection target, never a state
-# source; bin/fm-buzz-inspect.mjs is a human diagnostic and is not consumed here.
+# This script reads Firstmate state only through the snapshot's read-only command,
+# writes signed projections to Buzz, and maintains local replay and legacy-
+# quarantine state under state/buzz-replay. It never reads Buzz into Firstmate
+# state. Buzz is a projection target, never a state source;
+# bin/fm-buzz-inspect.mjs is a human diagnostic and is not consumed here.
 #
 # Usage:
 #   fm-buzz-publish.sh                 read the projection JSON on stdin

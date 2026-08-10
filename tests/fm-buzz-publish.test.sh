@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Behavior tests for the loopback Buzz bearings publisher.
 #
-# Covers the five cases the milestone's exit gate names, plus the two properties
-# everything else rests on: that the signing is really BIP-340 (checked against
-# the official 32-byte-message test vectors, not against our own verifier alone)
-# and that the fire-and-forget contract has not been edited away.
+# Covers key custody and rotation, byte-preserving signing, relay delivery and
+# replay, cache and quarantine safety, anonymous privacy diagnostics, official
+# BIP-340 vectors, and the fire-and-forget boundary.
 #
 # These run against tests/fm-buzz-stub-relay.mjs, not the real Buzz stack, so they
 # pass on a CI runner with no Docker. The real relay was exercised by hand for the
@@ -19,14 +18,18 @@ KEYPAIR="$ROOT/bin/fm-buzz-keypair.sh"
 PUBLISH="$ROOT/bin/fm-buzz-publish.sh"
 INSPECT="$ROOT/bin/fm-buzz-inspect.sh"
 STUB="$ROOT/tests/fm-buzz-stub-relay.mjs"
-TMP_ROOT=$(fm_test_tmproot fm-buzz)
+TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-buzz.XXXXXX")
+FM_TEST_CLEANUP_DIRS+=("$TMP_ROOT")
 
 command -v node >/dev/null 2>&1 || { echo "skip: node not found"; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
 
 STUB_PID=""
+ROTATION_GUARD_PID=""
+ROTATION_GUARD_RELAY=""
 cleanup() {
   [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null
+  [ -n "$ROTATION_GUARD_PID" ] && kill "$ROTATION_GUARD_PID" 2>/dev/null
   fm_test_cleanup
 }
 trap cleanup EXIT
@@ -55,6 +58,7 @@ run_keypair() {  # <home> [args...]
   shift
   FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" \
     XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 \
+    FM_BUZZ_RELAY="${FM_BUZZ_KEYPAIR_RELAY:-${ROTATION_GUARD_RELAY:-ws://localhost:3000}}" \
     "$KEYPAIR" "$@"
 }
 
@@ -471,6 +475,49 @@ test_a_compromised_rotation_does_not_keep_the_retired_key() {
   pass "a compromised rotation does not keep the retired key"
 }
 
+test_rotation_refuses_an_existing_private_channel_before_mutation() {
+  local home relay old channel resolved_home private_file private_before history_before output code readback
+  home=$(make_home rotate-existing-private-channel)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "rotation membership fixture setup failed"
+  private_file=$(key_file "$home" "$home/xdg")
+  private_before=$(cat "$private_file")
+  history_before=$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null || true)
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"membership-must-survive"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  resolved_home=$(cd "$home" && pwd -P)
+  channel=$(node -e '
+    import(process.argv[1]).then(({ channelIdForLabel }) => {
+      process.stdout.write(channelIdForLabel(process.argv[2]));
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$resolved_home") || fail "could not derive the rotation fixture channel"
+
+  output=$(FM_BUZZ_KEYPAIR_RELAY="$relay" run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation of an identity owning an existing private channel"
+  assert_contains "$output" "channel $channel already belongs to the outgoing publisher" \
+    "rotation refusal did not name the existing private channel"
+  assert_contains "$output" "Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity." \
+    "rotation refusal omitted the required membership explanation"
+  assert_contains "$output" "https://github.com/block/buzz/blob/main/ARCHITECTURE.md" \
+    "rotation refusal omitted the Buzz architecture reference"
+  assert_contains "$output" "https://github.com/block/buzz/blob/main/NOSTR.md" \
+    "rotation refusal omitted the Nostr reference"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "rotation refusal changed the recorded public key"
+  [ "$(cat "$private_file")" = "$private_before" ] \
+    || fail "rotation refusal changed the stored private key"
+  [ "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null || true)" = "$history_before" ] \
+    || fail "rotation refusal changed public-key history"
+  readback=$(run_inspect "$home" "$relay" 2>&1)
+  stop_stub "$STUB_PID"
+  assert_contains "$readback" "membership-must-survive" \
+    "rotation membership preflight changed the existing channel state"
+  pass "rotation refuses an existing private channel before key mutation"
+}
+
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable() {
   # data/buzz-keypair.public is a cache, not the authority. A half-written one
   # holds something that is not a key at all, and retaining that would leave a
@@ -573,7 +620,8 @@ test_rotation_detects_and_cleans_up_divergent_stores() {
 
   output=$(PATH="$tools:$PATH" FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" \
     XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 \
-    FM_FAKE_SECURITY_STATE_FILE="$keychain_state" "$KEYPAIR" --rotate 2>&1)
+    FM_FAKE_SECURITY_STATE_FILE="$keychain_state" FM_BUZZ_RELAY="$ROTATION_GUARD_RELAY" \
+    "$KEYPAIR" --rotate 2>&1)
   code=$?
   expect_code 1 "$code" "ordinary rotation with divergent private-key stores"
   assert_contains "$output" "$keychain_public" \
@@ -591,7 +639,8 @@ test_rotation_detects_and_cleans_up_divergent_stores() {
 
   output=$(PATH="$tools:$PATH" FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" \
     XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 \
-    FM_FAKE_SECURITY_STATE_FILE="$keychain_state" "$KEYPAIR" --rotate --compromised 2>&1)
+    FM_FAKE_SECURITY_STATE_FILE="$keychain_state" FM_BUZZ_RELAY="$ROTATION_GUARD_RELAY" \
+    "$KEYPAIR" --rotate --compromised 2>&1)
   code=$?
   expect_code 0 "$code" "compromised rotation with divergent private-key stores"
   recovered=$(printf '%s\n' "$output" | tail -1)
@@ -679,7 +728,7 @@ test_keychain_errors_refuse_rotation_without_minting_a_fallback_key() {
   output=$(PATH="$tools:$PATH" FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" \
     XDG_DATA_HOME="$home/xdg" FM_FAKE_SECURITY_FIND=found \
     FM_FAKE_SECURITY_PRIVATE="$private" FM_FAKE_SECURITY_DELETE=error \
-    "$KEYPAIR" --rotate 2>&1)
+    FM_BUZZ_RELAY="$ROTATION_GUARD_RELAY" "$KEYPAIR" --rotate 2>&1)
   code=$?
   expect_code 1 "$code" "rotation when keychain deletion fails"
   assert_contains "$output" "could not verify removal of the old key" \
@@ -693,7 +742,8 @@ test_keychain_errors_refuse_rotation_without_minting_a_fallback_key() {
   printf '%s\n' "$public" > "$lookup_home/data/buzz-keypair.public"
   output=$(PATH="$tools:$PATH" FM_HOME="$lookup_home" FM_DATA_OVERRIDE="$lookup_home/data" \
     XDG_DATA_HOME="$lookup_home/xdg" FM_FAKE_SECURITY_FIND=error \
-    FM_FAKE_SECURITY_DELETE=not-found "$KEYPAIR" --rotate 2>&1)
+    FM_FAKE_SECURITY_DELETE=not-found FM_BUZZ_RELAY="$ROTATION_GUARD_RELAY" \
+    "$KEYPAIR" --rotate 2>&1)
   code=$?
   expect_code 1 "$code" "rotation when the keychain cannot be read"
   assert_contains "$output" "login keychain could not be read" \
@@ -706,7 +756,7 @@ test_keychain_errors_refuse_rotation_without_minting_a_fallback_key() {
   output=$(PATH="$tools:$PATH" FM_HOME="$forced_home" FM_DATA_OVERRIDE="$forced_home/data" \
     XDG_DATA_HOME="$forced_home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 \
     FM_FAKE_SECURITY_FIND=error FM_FAKE_SECURITY_DELETE=not-found \
-    "$KEYPAIR" --rotate 2>&1)
+    FM_BUZZ_RELAY="$ROTATION_GUARD_RELAY" "$KEYPAIR" --rotate 2>&1)
   code=$?
   expect_code 1 "$code" "forced-file rotation when preferred-store absence is unverifiable"
   assert_contains "$output" "login keychain could not be read" \
@@ -1051,6 +1101,25 @@ EOF
   pass "FM_BUZZ_RELAY rejects a non-loopback host before cache or network access"
 }
 
+test_credential_bearing_relays_are_rejected_before_signing_or_caching() {
+  local home relay output code
+  home=$(make_home relay-credentials)
+  run_keypair "$home" >/dev/null 2>&1 || fail "credential-relay keypair setup failed"
+  for relay in 'ws://operator@127.0.0.1:1' 'ws://operator:secret@127.0.0.1:1'; do
+    output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"no-credential-relay"}' \
+      | run_publish "$home" "$relay" 2>&1)
+    code=$?
+    expect_code 0 "$code" "credential-bearing relay through fire-and-forget"
+    assert_contains "$output" "credential-bearing relay URLs are not supported" \
+      "credential-bearing relay $relay was not rejected"
+    assert_not_contains "$output" "signed event" \
+      "credential-bearing relay $relay reached signing"
+    [ "$(replay_count "$home")" = "0" ] \
+      || fail "credential-bearing relay $relay created replay data"
+  done
+  pass "credential-bearing relays are rejected before signing or caching"
+}
+
 # --- (c) relay up ----------------------------------------------------------
 
 test_publish_with_relay_up_delivers_and_lands() {
@@ -1167,7 +1236,7 @@ test_legacy_replay_entries_are_quarantined_with_a_manifest() {
   home=$(make_home legacy-replay-quarantine)
   run_keypair "$home" >/dev/null 2>&1 || fail "legacy quarantine keypair setup failed"
   replay="$home/state/buzz-replay"
-  legacy_dir="$replay/localhost-3000"
+  legacy_dir="$replay/localhost%3A3000"
   legacy_file="$legacy_dir/1700000000-$(printf '%064d' 9).json"
   quarantine="$replay/_legacy-quarantine"
   mkdir -p "$legacy_dir"
@@ -1187,9 +1256,9 @@ EOF
   [ "$(cat "$payload")" = '["EVENT",{"legacy_marker":"must-not-be-delivered"}]' ] \
     || fail "legacy quarantine changed the signed payload bytes"
   jq -e \
-    --arg original "localhost-3000/$(basename "$legacy_file")" \
+    --arg original "localhost%3A3000/$(basename "$legacy_file")" \
     '.original_path == $original and
-     .legacy_host == "localhost-3000" and
+     .legacy_host == "localhost:3000" and
      (.original_timestamps.atime_ms | type) == "number" and
      (.original_timestamps.mtime_ms | type) == "number" and
      (.original_timestamps.ctime_ms | type) == "number" and
@@ -1219,6 +1288,49 @@ EOF
   [ "$(find "$quarantine/payloads" -type f -name '*.json' | wc -l | tr -d ' ')" = "1" ] \
     || fail "legacy quarantine retry duplicated or removed the payload"
   pass "legacy replay entries are quarantined without endpoint inference or delivery"
+}
+
+test_legacy_quarantine_claims_the_source_before_reading() {
+  local home relay replay legacy_dir legacy_file quarantine writer manifests payloads output
+  home=$(make_home legacy-quarantine-source-claim)
+  run_keypair "$home" >/dev/null 2>&1 || fail "legacy source-claim keypair setup failed"
+  replay="$home/state/buzz-replay"
+  legacy_dir="$replay/localhost%3A3000"
+  legacy_file="$legacy_dir/1700000000-$(printf '%064d' 8).json"
+  quarantine="$replay/_legacy-quarantine"
+  mkdir -p "$legacy_dir"
+  printf '%s' 'legacy-old-bytes' > "$legacy_file"
+  (
+    while [ -e "$legacy_file" ]; do sleep 0.01; done
+    printf '%s' 'legacy-new-bytes' > "$legacy_file"
+  ) &
+  writer=$!
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"claim-before-read"}' \
+    | run_publish "$home" "$relay" 2>&1)
+  wait "$writer" || fail "legacy in-place writer fixture failed"
+  assert_present "$legacy_file" \
+    "a newer legacy entry created after the staging rename was deleted"
+  [ "$(cat "$legacy_file")" = "legacy-new-bytes" ] \
+    || fail "legacy quarantine changed the newer source bytes"
+  payloads=$(grep -rl 'legacy-old-bytes' "$quarantine/payloads" 2>/dev/null | wc -l | tr -d ' ')
+  [ "$payloads" = "1" ] || fail "the atomically claimed legacy bytes were not quarantined once"
+
+  printf '%s' '{"schema":"fm-bearings.v1","note":"claim-retry"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  stop_stub "$STUB_PID"
+  assert_absent "$legacy_file" "the replacement legacy entry was not quarantined on retry"
+  manifests=$(find "$quarantine/manifests" -type f -name '*.json' | wc -l | tr -d ' ')
+  [ "$manifests" = "2" ] \
+    || fail "collision-safe legacy retries produced $manifests manifests instead of two"
+  payloads=$(find "$quarantine/payloads" -type f -name '*.json' | wc -l | tr -d ' ')
+  [ "$payloads" = "2" ] \
+    || fail "collision-safe legacy retries produced $payloads payloads instead of two"
+  assert_contains "$output" "legacy replay quarantine: 1 entry(s)" \
+    "the first staged quarantine transaction was not reported"
+  pass "legacy quarantine atomically claims sources and preserves later bytes"
 }
 
 # --- (d) reconnect replays the identical event id --------------------------
@@ -1807,7 +1919,7 @@ EOF
 }
 
 test_replay_cache_rejects_symlink_boundaries() {
-  local root_home relay_home entry_home outside replay relay digest link target output
+  local root_home relay_home entry_home outside replay relay digest link target output manifest payload
   root_home=$(make_home cache-root-symlink)
   run_keypair "$root_home" >/dev/null 2>&1 || fail "root-symlink keypair setup failed"
   outside="$root_home/outside-cache"
@@ -1832,7 +1944,15 @@ test_replay_cache_rejects_symlink_boundaries() {
   ln -s "$outside" "$replay/$digest"
   output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"relay-symlink"}' \
     | run_publish "$relay_home" "$relay" 2>&1)
-  assert_contains "$output" "relay cache path" "a relay-directory symlink was not rejected"
+  assert_contains "$output" "quarantined corrupt cache partition path" \
+    "a relay-directory symlink was not quarantined as corrupt state"
+  [ -d "$replay/$digest" ] && [ ! -L "$replay/$digest" ] \
+    || fail "a quarantined relay-directory symlink still blocked partition creation"
+  manifest=$(grep -l '"corrupt_type": "symbolic-link"' \
+    "$replay/_legacy-quarantine/manifests"/*.json 2>/dev/null | head -1)
+  [ -n "$manifest" ] || fail "a quarantined relay-directory symlink has no manifest"
+  payload="$replay/_legacy-quarantine/$(jq -r '.payload_reference' "$manifest")"
+  [ -L "$payload" ] || fail "the quarantined relay-directory symlink has no payload reference"
   [ -z "$(find "$outside" -mindepth 1 -maxdepth 1 -print -quit)" ] \
     || fail "a relay-directory symlink redirected cache mutation outside the cache"
 
@@ -1856,6 +1976,40 @@ test_replay_cache_rejects_symlink_boundaries() {
   [ "$(cat "$target")" = '{"outside":true}' ] \
     || fail "cache-entry cleanup mutated the symlink target"
   pass "replay cache mutations reject root, relay, and entry symlinks"
+}
+
+test_partition_shaped_special_nodes_are_quarantined_and_unblocked() {
+  local home relay replay digest fifo output manifest payload
+  home=$(make_home corrupt-partition-node)
+  run_keypair "$home" >/dev/null 2>&1 || fail "corrupt-partition keypair setup failed"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  replay="$home/state/buzz-replay"
+  digest=$(node -e '
+    import(process.argv[1]).then(({ relayCacheKey }) => process.stdout.write(relayCacheKey(process.argv[2])));
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay")
+  mkdir -p "$replay"
+  fifo="$replay/$digest"
+  mkfifo "$fifo" || fail "could not create a partition-shaped FIFO"
+
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"after-corrupt-partition"}' \
+    | run_publish "$home" "$relay" 2>&1)
+  stop_stub "$STUB_PID"
+  assert_contains "$output" "quarantined corrupt cache partition path" \
+    "a partition-shaped FIFO was not accounted for as corrupt state"
+  assert_contains "$output" "$digest (fifo)" \
+    "the corrupt-partition diagnosis omitted the FIFO partition identity"
+  [ -d "$replay/$digest" ] && [ ! -L "$replay/$digest" ] \
+    || fail "a partition-shaped FIFO still blocked the active relay partition"
+  manifest=$(grep -l '"corrupt_type": "fifo"' \
+    "$replay/_legacy-quarantine/manifests"/*.json 2>/dev/null | head -1)
+  [ -n "$manifest" ] || fail "a quarantined partition-shaped FIFO has no manifest"
+  payload="$replay/_legacy-quarantine/$(jq -r '.payload_reference' "$manifest")"
+  [ -p "$payload" ] || fail "the corrupt-partition manifest does not reference the quarantined FIFO"
+  assert_contains "$output" "delivered=1" \
+    "a partition-shaped FIFO prevented delivery after quarantine"
+  pass "partition-shaped special nodes are quarantined without blocking delivery"
 }
 
 test_replay_cache_never_reads_non_regular_entries() {
@@ -2931,11 +3085,16 @@ test_no_firstmate_path_depends_on_buzz() {
   pass "no Firstmate path depends on the Buzz adapter"
 }
 
+read -r ROTATION_GUARD_PID ROTATION_GUARD_RELAY <<EOF
+$(start_stub)
+EOF
+
 test_bip340_official_vectors
 test_keypair_is_idempotent_and_never_prints_the_private_key
 test_public_flag_fails_before_a_keypair_exists
 test_rotation_replaces_the_key_in_whichever_store_holds_it
 test_a_compromised_rotation_does_not_keep_the_retired_key
+test_rotation_refuses_an_existing_private_channel_before_mutation
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable
 test_rotation_compares_the_recorded_key_with_stored_private_material
 test_rotation_detects_and_cleans_up_divergent_stores
@@ -2954,10 +3113,12 @@ test_malformed_projection_is_rejected_before_signing
 test_refresh_preserves_the_snapshot_bytes_including_its_trailing_newline
 test_publish_without_a_keypair_still_exits_zero
 test_non_loopback_env_relay_is_rejected_before_network
+test_credential_bearing_relays_are_rejected_before_signing_or_caching
 test_publish_with_relay_up_delivers_and_lands
 test_relay_switch_does_not_replay_another_relays_cache
 test_relay_cache_partition_uses_the_normalized_complete_endpoint
 test_legacy_replay_entries_are_quarantined_with_a_manifest
+test_legacy_quarantine_claims_the_source_before_reading
 test_reconnect_replays_the_identical_event_id
 test_replaying_a_known_event_is_deduped_and_evicted
 test_an_unacknowledged_publish_does_not_starve_the_drain
@@ -2973,6 +3134,7 @@ test_concurrent_publishers_serialize_the_cache_lifecycle
 test_publish_lock_acquisition_is_validated_bounded_and_interruptible
 test_publish_signing_is_serialized_with_compromised_rotation
 test_replay_cache_rejects_symlink_boundaries
+test_partition_shaped_special_nodes_are_quarantined_and_unblocked
 test_replay_cache_never_reads_non_regular_entries
 test_relay_timeout_must_fit_the_node_timer_range
 test_malformed_cache_names_are_discarded_or_accounted_for

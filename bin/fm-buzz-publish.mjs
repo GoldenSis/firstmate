@@ -22,6 +22,23 @@
 // projection - which carries task ids, project names, blockers and PR URLs -
 // appears in a command line or in the process environment. Fields: privateKey,
 // content, relay, channelId, channelName, timeoutMs, replayDir, maxCache.
+//
+// LEGACY QUARANTINE CONTRACT
+// Active replay entries from the former flat and host-keyed layouts are never
+// delivered or deleted because their complete endpoint cannot be recovered.
+// Each source is atomically renamed below _legacy-quarantine/staging before it
+// is read, then copied byte-for-byte to payloads/<content-token>.json and paired
+// with manifests/<content-token>.json.
+// A manifest records original_path, a decoded legacy_host when valid,
+// original_timestamps, content_sha256, quarantine_timestamp, and
+// payload_reference.
+// The staging transaction key depends on the original path, while the final
+// content token depends on path, decoded host, and payload digest; neither uses
+// access time, so interrupted retries converge after reading changes atime.
+// A staged source and origin record are sufficient to finish after a crash, and
+// an existing payload or manifest is accepted only when its identity matches.
+// Partition-shaped non-directories are moved under _legacy-quarantine/corrupt,
+// recorded by the same manifest set, and never opened as replay data.
 
 import {
   closeSync,
@@ -35,6 +52,7 @@ import {
   readdirSync,
   lstatSync,
   realpathSync,
+  rmdirSync,
   unlinkSync,
   renameSync,
 } from "node:fs";
@@ -187,25 +205,39 @@ function quarantineManifestIdentity(manifest) {
   return JSON.stringify({
     original_path: manifest.original_path,
     legacy_host: manifest.legacy_host,
-    original_timestamps: manifest.original_timestamps,
     content_sha256: manifest.content_sha256,
     payload_reference: manifest.payload_reference,
+    corrupt_type: manifest.corrupt_type ?? null,
   });
+}
+
+function metadataTimestamps(metadata) {
+  return {
+    atime_ms: metadata.atimeMs,
+    mtime_ms: metadata.mtimeMs,
+    ctime_ms: metadata.ctimeMs,
+    birthtime_ms: metadata.birthtimeMs,
+  };
+}
+
+function writeJsonAtomically(file, value) {
+  const temporary = `${file}.${process.pid}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+  try {
+    renameSync(temporary, file);
+  } catch (error) {
+    try {
+      unlinkSync(temporary);
+    } catch (cleanupError) {
+      if (cleanupError.code !== "ENOENT") log(`could not remove quarantine temporary ${temporary}: ${cleanupError.message}`);
+    }
+    throw error;
+  }
 }
 
 function readQuarantineManifest(file) {
   const { bytes } = readRegularFile(file);
   return JSON.parse(bytes.toString("utf8"));
-}
-
-function quarantineOriginalStillMatches(file, metadata) {
-  try {
-    const current = lstatSync(file);
-    return current.isFile() && current.dev === metadata.dev && current.ino === metadata.ino;
-  } catch (error) {
-    if (error.code === "ENOENT") return false;
-    throw error;
-  }
 }
 
 function finalizeQuarantineManifest(stage, final, expected) {
@@ -223,6 +255,20 @@ function finalizeQuarantineManifest(stage, final, expected) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
+}
+
+function finalizeQuarantineRecord(final, expected) {
+  try {
+    const existing = readQuarantineManifest(final);
+    if (quarantineManifestIdentity(existing) !== quarantineManifestIdentity(expected)) {
+      throw new Error(`quarantine manifest collision at ${final}`);
+    }
+    return existing;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  writeJsonAtomically(final, expected);
+  return expected;
 }
 
 function recoverQuarantineTransactions(replayDir, manifestsDir, payloadsDir) {
@@ -252,52 +298,27 @@ function recoverQuarantineTransactions(replayDir, manifestsDir, payloadsDir) {
   }
 }
 
-function quarantineLegacyEntry(replayDir, quarantineDir, manifestsDir, payloadsDir, file, legacyHost) {
-  const { bytes, metadata } = readRegularFile(file);
-  const originalPath = path.relative(replayDir, file);
+function completeStagedLegacyEntry(quarantineDir, manifestsDir, payloadsDir, transactionDir) {
+  const originFile = path.join(transactionDir, "origin.json");
+  const stagedFile = path.join(transactionDir, "source");
+  const origin = readQuarantineManifest(originFile);
+  const { bytes } = readRegularFile(stagedFile);
   const contentDigest = sha256(bytes);
-  const identity = {
-    original_path: originalPath,
-    legacy_host: legacyHost,
-    original_timestamps: {
-      atime_ms: metadata.atimeMs,
-      mtime_ms: metadata.mtimeMs,
-      ctime_ms: metadata.ctimeMs,
-      birthtime_ms: metadata.birthtimeMs,
-    },
+  const contentIdentity = {
+    original_path: origin.original_path,
+    legacy_host: origin.legacy_host,
     content_sha256: contentDigest,
   };
-  const token = sha256(JSON.stringify(identity));
+  const token = sha256(JSON.stringify(contentIdentity));
   const payloadReference = path.join("payloads", `${token}.json`);
   const payload = path.join(quarantineDir, payloadReference);
-  const stage = path.join(manifestsDir, `${token}.json.tmp`);
   const final = path.join(manifestsDir, `${token}.json`);
   const manifest = {
-    ...identity,
+    ...contentIdentity,
+    original_timestamps: origin.original_timestamps,
     quarantine_timestamp: new Date().toISOString(),
     payload_reference: payloadReference,
   };
-  let finalized = false;
-
-  try {
-    const existing = readQuarantineManifest(final);
-    if (quarantineManifestIdentity(existing) !== quarantineManifestIdentity(manifest)) {
-      throw new Error(`quarantine manifest collision at ${final}`);
-    }
-    finalized = true;
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    try {
-      writeFileSync(stage, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-    } catch (stageError) {
-      if (stageError.code !== "EEXIST") throw stageError;
-      const existing = readQuarantineManifest(stage);
-      if (quarantineManifestIdentity(existing) !== quarantineManifestIdentity(manifest)) {
-        throw new Error(`quarantine transaction collision at ${stage}`);
-      }
-      manifest.quarantine_timestamp = existing.quarantine_timestamp;
-    }
-  }
 
   try {
     writeFileSync(payload, bytes, { mode: 0o600, flag: "wx" });
@@ -306,17 +327,168 @@ function quarantineLegacyEntry(replayDir, quarantineDir, manifestsDir, payloadsD
     const existing = readRegularFile(payload);
     if (sha256(existing.bytes) !== contentDigest) throw new Error(`quarantine payload collision at ${payload}`);
   }
+  finalizeQuarantineRecord(final, manifest);
+  unlinkSync(stagedFile);
+  unlinkSync(originFile);
+  rmdirSync(transactionDir);
+}
 
-  if (quarantineOriginalStillMatches(file, metadata)) unlinkSync(file);
-  else {
+function recoverStagedLegacyEntries(quarantineDir, manifestsDir, payloadsDir, stagingDir) {
+  for (const name of readdirSync(stagingDir)) {
+    const transactionDir = path.join(stagingDir, name);
     try {
-      lstatSync(file);
-      throw new Error(`legacy cache entry changed while quarantining: ${file}`);
+      const metadata = lstatSync(transactionDir);
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+        throw new Error("staging transaction is not a regular directory");
+      }
+      const stagedFile = path.join(transactionDir, "source");
+      try {
+        lstatSync(stagedFile);
+        completeStagedLegacyEntry(quarantineDir, manifestsDir, payloadsDir, transactionDir);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+        const originFile = path.join(transactionDir, "origin.json");
+        try {
+          unlinkSync(originFile);
+        } catch (cleanupError) {
+          if (cleanupError.code !== "ENOENT") throw cleanupError;
+        }
+        rmdirSync(transactionDir);
+      }
     } catch (error) {
-      if (error.code !== "ENOENT") throw error;
+      log(`could not recover staged legacy cache entry ${transactionDir}: ${error.message}`);
     }
   }
-  if (!finalized) finalizeQuarantineManifest(stage, final, manifest);
+}
+
+function quarantineLegacyEntry(
+  replayDir,
+  quarantineDir,
+  manifestsDir,
+  payloadsDir,
+  stagingDir,
+  file,
+  legacyHost,
+) {
+  const originalPath = path.relative(replayDir, file);
+  if (!containedCachePath(replayDir, file)) throw new Error("legacy cache entry escapes replay cache");
+  const transactionToken = sha256(JSON.stringify({ original_path: originalPath }));
+  const transactionDir = prepareCacheDirectory(stagingDir, transactionToken);
+  const originFile = path.join(transactionDir, "origin.json");
+  const stagedFile = path.join(transactionDir, "source");
+  try {
+    lstatSync(stagedFile);
+    completeStagedLegacyEntry(quarantineDir, manifestsDir, payloadsDir, transactionDir);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  prepareCacheDirectory(stagingDir, transactionToken);
+  const metadata = lstatSync(file);
+  if (!metadata.isFile()) throw new Error("legacy cache entry is not a regular file");
+  writeJsonAtomically(originFile, {
+    original_path: originalPath,
+    legacy_host: legacyHost,
+    original_timestamps: metadataTimestamps(metadata),
+  });
+  renameSync(file, stagedFile);
+  completeStagedLegacyEntry(quarantineDir, manifestsDir, payloadsDir, transactionDir);
+}
+
+function decodeLegacyHost(name) {
+  try {
+    const decoded = decodeURIComponent(name);
+    if (encodeURIComponent(decoded) !== name) throw new Error("non-canonical encoding");
+    const relay = `ws://${decoded}`;
+    const host = resolveLoopbackRelayHost(relay);
+    const parsed = new URL(relay);
+    if (parsed.pathname !== "/" || parsed.search !== "" || parsed.hash !== "") {
+      throw new Error("not a host-only relay identity");
+    }
+    return host;
+  } catch (error) {
+    log(`legacy cache directory ${name} has no valid encoded loopback host identity: ${error.message}`);
+    return null;
+  }
+}
+
+function corruptNodeType(metadata) {
+  if (metadata.isSymbolicLink()) return "symbolic-link";
+  if (metadata.isFIFO()) return "fifo";
+  if (metadata.isSocket()) return "socket";
+  if (metadata.isCharacterDevice()) return "character-device";
+  if (metadata.isBlockDevice()) return "block-device";
+  if (metadata.isFile()) return "regular-file";
+  return "non-directory";
+}
+
+function finalizeCorruptPartitionRecord(manifestsDir, transactionDir) {
+  const originFile = path.join(transactionDir, "origin.json");
+  const record = readQuarantineManifest(originFile);
+  const final = path.join(manifestsDir, `${record.token}.json`);
+  finalizeQuarantineRecord(final, record.manifest);
+  try {
+    unlinkSync(originFile);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+}
+
+function recoverCorruptPartitionNodes(corruptDir, manifestsDir) {
+  for (const name of readdirSync(corruptDir)) {
+    const transactionDir = path.join(corruptDir, name);
+    try {
+      const metadata = lstatSync(transactionDir);
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) continue;
+      const originFile = path.join(transactionDir, "origin.json");
+      const entry = path.join(transactionDir, "entry");
+      lstatSync(originFile);
+      lstatSync(entry);
+      finalizeCorruptPartitionRecord(manifestsDir, transactionDir);
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        log(`could not recover corrupt cache partition ${transactionDir}: ${error.message}`);
+      }
+    }
+  }
+}
+
+function quarantineCorruptPartitionNode(replayDir, quarantineDir, corruptDir, manifestsDir, file, metadata) {
+  const originalPath = path.relative(replayDir, file);
+  const type = corruptNodeType(metadata);
+  const token = sha256(JSON.stringify({
+    original_path: originalPath,
+    device: metadata.dev,
+    inode: metadata.ino,
+    mode: metadata.mode,
+  }));
+  const transactionDir = prepareCacheDirectory(corruptDir, token);
+  const entry = path.join(transactionDir, "entry");
+  const originFile = path.join(transactionDir, "origin.json");
+  const payloadReference = path.join("corrupt", token, "entry");
+  const manifest = {
+    original_path: originalPath,
+    legacy_host: null,
+    original_timestamps: metadataTimestamps(metadata),
+    content_sha256: null,
+    quarantine_timestamp: new Date().toISOString(),
+    payload_reference: payloadReference,
+    corrupt_type: type,
+  };
+  try {
+    const existing = lstatSync(entry);
+    if (existing.dev !== metadata.dev || existing.ino !== metadata.ino) {
+      throw new Error(`corrupt partition quarantine collision at ${entry}`);
+    }
+    unlinkSync(file);
+    finalizeCorruptPartitionRecord(manifestsDir, transactionDir);
+    return;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  writeJsonAtomically(originFile, { token, manifest });
+  renameSync(file, entry);
+  finalizeCorruptPartitionRecord(manifestsDir, transactionDir);
+  log(`quarantined corrupt cache partition path ${file} (${type}) at ${path.join(quarantineDir, payloadReference)}`);
 }
 
 function quarantineManifestCount(manifestsDir) {
@@ -336,7 +508,11 @@ function quarantineLegacyEntries(replayDir) {
   const quarantineDir = prepareCacheDirectory(replayDir, LEGACY_QUARANTINE);
   const manifestsDir = prepareCacheDirectory(quarantineDir, "manifests");
   const payloadsDir = prepareCacheDirectory(quarantineDir, "payloads");
+  const stagingDir = prepareCacheDirectory(quarantineDir, "staging");
+  const corruptDir = prepareCacheDirectory(quarantineDir, "corrupt");
   recoverQuarantineTransactions(replayDir, manifestsDir, payloadsDir);
+  recoverStagedLegacyEntries(quarantineDir, manifestsDir, payloadsDir, stagingDir);
+  recoverCorruptPartitionNodes(corruptDir, manifestsDir);
   const failures = [];
   let names;
   try {
@@ -367,7 +543,23 @@ function quarantineLegacyEntries(replayDir) {
       }
       continue;
     }
-    if (CACHE_PARTITION.test(name)) continue;
+    if (CACHE_PARTITION.test(name)) {
+      if (metadata.isDirectory() && !metadata.isSymbolicLink()) continue;
+      try {
+        quarantineCorruptPartitionNode(
+          replayDir,
+          quarantineDir,
+          corruptDir,
+          manifestsDir,
+          candidate,
+          metadata,
+        );
+      } catch (error) {
+        log(`could not quarantine corrupt cache partition path ${candidate}: ${error.message}`);
+        failures.push(candidate);
+      }
+      continue;
+    }
     if (metadata.isSymbolicLink()) {
       log(`rejected cache directory symlink ${candidate}`);
       failures.push(candidate);
@@ -388,10 +580,11 @@ function quarantineLegacyEntries(replayDir) {
       failures.push(candidate);
       continue;
     }
+    const legacyHost = decodeLegacyHost(name);
     for (const legacyName of legacyNames.filter((entry) => entry.endsWith(".json"))) {
       const legacyFile = path.join(candidate, legacyName);
       try {
-        if (lstatSync(legacyFile).isFile()) candidates.push({ file: legacyFile, legacyHost: name });
+        if (lstatSync(legacyFile).isFile()) candidates.push({ file: legacyFile, legacyHost });
         else {
           log(`legacy cache entry ${legacyFile} is not a regular file; left in place`);
           failures.push(legacyFile);
@@ -411,6 +604,7 @@ function quarantineLegacyEntries(replayDir) {
         quarantineDir,
         manifestsDir,
         payloadsDir,
+        stagingDir,
         candidate.file,
         candidate.legacyHost,
       );

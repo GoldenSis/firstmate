@@ -52,6 +52,9 @@ export function normalizeRelayEndpoint(relay) {
   if (url.protocol !== "ws:" && url.protocol !== "wss:") {
     throw new Error(`invalid relay protocol: ${url.protocol}`);
   }
+  if (url.username !== "" || url.password !== "") {
+    throw new Error("credential-bearing relay URLs are not supported");
+  }
   url.hash = "";
   const rootPath = url.pathname === "/" ? "" : url.pathname;
   return `${url.protocol}//${url.host}${rootPath}${url.search}`;
@@ -220,6 +223,35 @@ export function buildBearingsEvent(channelId, content, privateKeyHex, extraTags 
     { created_at: nowSeconds(), kind: KIND_STREAM_MESSAGE, tags, content },
     privateKeyHex,
   );
+}
+
+export async function publisherOwnsPrivateChannel(relay, privateKeyHex, channelId, timeoutMs) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) {
+    throw new Error(`invalid relay timeout ${JSON.stringify(timeoutMs)}: expected an integer from 1 to 2147483647`);
+  }
+  const publisher = publicKeyFromPrivate(privateKeyHex);
+  const { events, refusal } = await withRelay(relay, privateKeyHex, timeoutMs, async (api) => {
+    await api.authenticateIfChallenged();
+    return api.query({
+      kinds: [KIND_NIP29_CREATE_GROUP],
+      authors: [publisher],
+      "#h": [channelId],
+      limit: 20,
+    }, "fm-rotation-check");
+  });
+  if (refusal) throw new Error(`relay refused the channel check: ${refusal}`);
+  return events.some((event) => {
+    const validation = validateSignedEvent(event);
+    return validation.eventObject &&
+      validation.validKind &&
+      event.kind === KIND_NIP29_CREATE_GROUP &&
+      validation.idMatches &&
+      validation.signatureValid &&
+      event.pubkey === publisher &&
+      validation.validTags &&
+      event.tags.some((tag) => tag[0] === "h" && tag[1] === channelId) &&
+      event.tags.some((tag) => tag[0] === "visibility" && tag[1] === "private");
+  });
 }
 
 // --- relay response classification ------------------------------------------

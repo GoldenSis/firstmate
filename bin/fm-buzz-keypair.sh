@@ -31,7 +31,10 @@
 # Rotation: Buzz documents no key-rotation procedure, so `--rotate` is this
 # adapter's. It clears BOTH stores - the keychain entry and the 0600 fallback
 # file - plus data/buzz-keypair.public, then mints a fresh keypair and prints the
-# new public key. It never prints the private key, old or new.
+# new public key. Before mutation it checks the configured relay and refuses when
+# the outgoing publisher owns this home's existing private channel, because M1
+# has no membership-transfer operation. It never prints the private key, old or
+# new.
 #
 # The retired PUBLIC key is appended to data/buzz-keypair.public-history first, so
 # events this home signed before the rotation stay attributable to it.
@@ -191,6 +194,60 @@ derive_public_from_store() {  # <keychain|file|selected>
 
 derive_public() {
   derive_public_from_store selected
+}
+
+publisher_owns_private_channel() {  # <keychain|file> <relay> <channel> <timeout-ms>
+  local store=$1 relay=$2 channel=$3 timeout_ms=$4
+  case $store in
+    keychain) fm_buzz_key_load_keychain "$FM_HOME" ;;
+    file) fm_buzz_key_load_file "$FM_HOME" ;;
+    *) return 1 ;;
+  esac | node -e '
+    let input = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { input += chunk; });
+    process.stdin.on("end", async () => {
+      try {
+        const { publisherOwnsPrivateChannel } = await import(process.argv[1]);
+        const privateKey = input.trim();
+        if (!privateKey) throw new Error("stored publishing key is empty");
+        const owned = await publisherOwnsPrivateChannel(
+          process.argv[2],
+          privateKey,
+          process.argv[3],
+          Number(process.argv[4]),
+        );
+        process.stdout.write(owned ? "owned\n" : "absent\n");
+      } catch (error) {
+        process.stderr.write(String(error.message) + "\n");
+        process.exitCode = 1;
+      }
+    });
+  ' "$SCRIPT_DIR/fm-buzz-lib.mjs" "$relay" "$channel" "$timeout_ms"
+}
+
+refuse_rotation_for_owned_channel() {  # <keychain|file> <public-key>
+  local store=$1 public=$2 check
+  [ -n "$public" ] || return 0
+  case ",${checked_rotation_publishers:-}," in
+    *,"$public",*) return 0 ;;
+  esac
+  checked_rotation_publishers="${checked_rotation_publishers:+$checked_rotation_publishers,}$public"
+  check=$(publisher_owns_private_channel \
+    "$store" "$rotation_relay" "$rotation_channel" "$rotation_timeout" 2>&1)
+  check_status=$?
+  if [ "$check_status" -ne 0 ]; then
+    printf 'fm-buzz-keypair.sh: could not verify whether channel %s exists on %s: %s; nothing was rotated\n' \
+      "$rotation_channel" "$rotation_relay" "$check" >&2
+    return 1
+  fi
+  [ "$check" = "owned" ] || return 0
+  printf 'fm-buzz-keypair.sh: channel %s already belongs to the outgoing publisher; nothing was rotated\n' \
+    "$rotation_channel" >&2
+  printf '%s\n' 'Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity.' >&2
+  printf '%s\n' 'Reference: https://github.com/block/buzz/blob/main/ARCHITECTURE.md' >&2
+  printf '%s\n' 'Reference: https://github.com/block/buzz/blob/main/NOSTR.md' >&2
+  return 1
 }
 
 record_public() {
@@ -381,6 +438,21 @@ if [ "$ROTATE" -eq 1 ]; then
       exit 1
     fi
     printf 'rotating compromised key: %s; no outgoing public key will be retained\n' "$recovery_reason" >&2
+  fi
+
+  rotation_relay=${FM_BUZZ_RELAY:-ws://localhost:3000}
+  rotation_timeout=${FM_BUZZ_TIMEOUT_MS:-15000}
+  rotation_label=$(fm_buzz_key_account "$FM_HOME")
+  rotation_channel=$(fm_buzz_channel_id "$SCRIPT_DIR" "$rotation_label") || {
+    printf 'fm-buzz-keypair.sh: could not derive the channel id; nothing was rotated\n' >&2
+    exit 1
+  }
+  checked_rotation_publishers=""
+  if [ -n "$keychain_public" ]; then
+    refuse_rotation_for_owned_channel keychain "$keychain_public" || exit 1
+  fi
+  if [ -n "$file_public" ]; then
+    refuse_rotation_for_owned_channel file "$file_public" || exit 1
   fi
 
   # Settle the recorded-key set while the private half is still stored, and stop
