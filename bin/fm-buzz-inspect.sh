@@ -18,7 +18,11 @@
 #                 alters, replays or fabricates frames says nothing about who may
 #                 read this channel - and the channel id is not a secret, so a
 #                 correctly signed event tagged for it can come from any stranger
-#                 who can publish to the relay.
+#                 who can publish to the relay. Authorship is checked against this
+#                 home's current AND retired publishing keys, so a rotation does
+#                 not blind the probe to pre-rotation events the relay still holds.
+#                 Combining it with --channel-label rules the conclusive answer out
+#                 entirely: see that flag below.
 #                 Zero events is only an answer the other way when the relay
 #                 refuses the subscription on MEMBERSHIP grounds, i.e. with
 #                 NIP-01's `restricted:`. Every other outcome is reported
@@ -27,6 +31,14 @@
 #                 read as one, and an unrefused empty read looks identical to a
 #                 wiped relay, a channel id from another home, a publish that never
 #                 landed, or a channel that is simply empty.
+#
+# --channel-label points the read at a channel derived from some other label than
+# this home's, and the only publishing keys on disk here are this home's own. So
+# --anonymous cannot reach the conclusive answer for such a channel: it reports
+# INCONCLUSIVE with "cannot verify authorship for a channel not derived from this
+# home; use --anonymous only on this home's own channel". Reading another home's
+# recorded keys is not the answer - firstmate does not reach into another home's
+# files - so probe a channel from the home that owns it.
 #
 # Unlike bin/fm-buzz-publish.sh this is NOT fire-and-forget: it is a diagnostic run
 # by hand, and a failure to reach the relay should be visible in its exit status.
@@ -66,23 +78,48 @@ done
 command -v node >/dev/null 2>&1 || { printf 'fm-buzz-inspect.sh: node is required\n' >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { printf 'fm-buzz-inspect.sh: jq is required\n' >&2; exit 1; }
 
-[ -n "$CHANNEL_LABEL" ] || CHANNEL_LABEL=$(fm_buzz_key_account "$FM_HOME")
+if [ -n "$CHANNEL_LABEL" ]; then
+  OWN_CHANNEL=false
+else
+  OWN_CHANNEL=true
+  CHANNEL_LABEL=$(fm_buzz_key_account "$FM_HOME")
+fi
 
 CHANNEL=$(fm_buzz_channel_id "$SCRIPT_DIR" "$CHANNEL_LABEL") || {
   printf 'fm-buzz-inspect.sh: could not derive the channel id\n' >&2
   exit 1
 }
 
-# The PUBLIC half of this home's publishing key, so the engine can tell an event
+# The PUBLIC halves of this home's publishing keys, so the engine can tell an event
 # this home actually wrote from one any stranger could have signed against the
-# same (non-secret) channel id. bin/fm-buzz-keypair.sh records it here precisely so
-# it is readable without touching the keychain, which matters under --anonymous:
-# no private key is loaded on that path. An absent file is not an error - the
-# engine then declines to attribute any event rather than guessing.
-EXPECTED_AUTHOR=""
-if [ -r "$DATA/buzz-keypair.public" ]; then
-  EXPECTED_AUTHOR=$(sed -n 1p "$DATA/buzz-keypair.public" | tr -d '[:space:]')
-fi
+# same (non-secret) channel id. bin/fm-buzz-keypair.sh records them here precisely
+# so they are readable without touching the keychain, which matters under
+# --anonymous: no private key is loaded on that path.
+#
+# Retired keys count too. Rotation mints a new key but leaves the channel id and
+# the relay's stored events untouched, so this home's own pre-rotation projections
+# are still on the relay signed by the old key; attributing only the current key
+# would make the probe report this home's own leaked content as somebody else's.
+# A retired key is still evidence, because only this home ever held it.
+#
+# An absent file is not an error - the engine then declines to attribute any event
+# rather than guessing. These are read for THIS home only: a channel derived from
+# another label is handled by declining a verdict, never by reading another home's
+# files.
+EXPECTED_AUTHORS=()
+collect_author() {  # <line>
+  local key=$1
+  key=$(printf '%s' "$key" | tr -d '[:space:]' | tr 'A-F' 'a-f')
+  [ "${#key}" -eq 64 ] || return 0
+  case $key in *[!0-9a-f]*) return 0 ;; esac
+  EXPECTED_AUTHORS+=("$key")
+}
+for author_file in "$DATA/buzz-keypair.public" "$DATA/buzz-keypair.public-history"; do
+  [ -r "$author_file" ] || continue
+  while IFS= read -r author_line || [ -n "$author_line" ]; do
+    collect_author "$author_line"
+  done < "$author_file"
+done
 
 KEY=""
 if [ "$ANONYMOUS" -eq 0 ]; then
@@ -99,9 +136,12 @@ jq -n \
   --rawfile privateKey <(printf '%s' "$KEY") \
   --arg relay "$RELAY" \
   --arg channelId "$CHANNEL" \
-  --arg expectedAuthor "$EXPECTED_AUTHOR" \
   --argjson limit "$LIMIT" \
   --argjson full "$FULL" \
+  --argjson ownChannel "$OWN_CHANNEL" \
+  --args \
   '{privateKey:$privateKey, relay:$relay, channelId:$channelId,
-    expectedAuthor:$expectedAuthor, limit:$limit, full:$full}' \
+    expectedAuthors:$ARGS.positional, ownChannel:$ownChannel,
+    limit:$limit, full:$full}' \
+  ${EXPECTED_AUTHORS[@]+"${EXPECTED_AUTHORS[@]}"} \
   | node "$SCRIPT_DIR/fm-buzz-inspect.mjs"

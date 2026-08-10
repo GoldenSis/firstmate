@@ -181,7 +181,10 @@ That is acceptable for exactly this key: it signs fleet-status projections on a 
 Buzz documents no key-rotation procedure, so `bin/fm-buzz-keypair.sh --rotate` is this adapter's.
 It clears both stores - the keychain entry and the `0600` fallback file - plus `data/buzz-keypair.public`, then mints a fresh keypair and prints the new public key, and it refuses to report success if the old key is still loadable afterwards.
 Rotating by hand is not offered because it does not work reliably: which store holds the key depends on the host, and the fallback file's name carries a digest of the home path, so deleting "the keychain entry" on a machine whose key lives in the file clears nothing and the next run re-prints the same public key.
-Historical events stay signed by the retired key, which is acceptable precisely because the key grants nothing.
+Historical events stay signed by the retired key, which grants nothing and so needs no revocation.
+The retired PUBLIC key is still evidence, though, because only this home ever held it: `bin/fm-buzz-inspect.sh --anonymous` decides whether a served event is this home's own content by its author, and the relay keeps serving pre-rotation events under a channel id that rotation does not change.
+So rotation retains the retired public key in `data/buzz-keypair.public-history` before recording the new one, and the inspector attributes an event to this home if it was signed by any recorded key, current or retired.
+Without that, rotating would make the probe report this home's own leaked projections as somebody else's content.
 
 Buzz is pre-1.0 with no long-term support branches and a very high release cadence, so `ghcr.io/block/buzz:main` can move under this adapter at any time.
 The relay stack is disposable by design; `down -v` and `up -d` is the whole recovery procedure.

@@ -1222,6 +1222,91 @@ EOF
   pass "an anonymous read of a foreign author's event claims no breach"
 }
 
+test_a_rotated_home_still_recognises_its_own_leaked_events() {
+  # Rotation mints a new key but changes neither the channel id (a digest of the
+  # home path) nor the relay's stored events, so this home's pre-rotation
+  # projections keep sitting on the relay signed by the retired key. Attributing
+  # only the current key would make the probe answer INCONCLUSIVE over exactly the
+  # leak it exists to catch - a false negative created by the home's own key
+  # hygiene. The retired PUBLIC key is retained precisely so that cannot happen.
+  local home relay retired rotated leaked
+  home=$(make_home rotated-breach)
+  retired=$(run_keypair "$home" 2>/dev/null) || fail "keypair setup failed"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"published-before-rotation"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  rotated=$(run_keypair "$home" --rotate 2>/dev/null) || fail "rotation failed"
+  [ "$rotated" != "$retired" ] || fail "rotation did not replace the key, so nothing here is under test"
+  leaked=$(run_inspect "$home" "$relay" --anonymous 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_grep "$retired" "$home/data/buzz-keypair.public-history" \
+    "rotation dropped the retired public key instead of retaining it"
+  assert_contains "$leaked" "published-before-rotation" \
+    "the pre-rotation event was not served, so the check under test was never reached"
+  assert_contains "$leaked" "this home's publisher" \
+    "an event signed by a retired key of this home was not attributed to it"
+  assert_contains "$leaked" \
+    "The channel was readable by an identity that is not a member — this is a definite negative privacy result." \
+    "rotation blinded the probe to this home's own leaked content"
+  assert_not_contains "$leaked" "INCONCLUSIVE" \
+    "a leak of this home's own pre-rotation content is conclusive, not inconclusive"
+
+  # The recorded file is the cheap source of the outgoing key, not the only one:
+  # once it is gone the stored private half is the last thing that can name what
+  # this home was publishing under, and rotation clears that. So a second rotation
+  # with no recorded file must still retain the key it is retiring.
+  rm -f "$home/data/buzz-keypair.public"
+  run_keypair "$home" --rotate >/dev/null 2>&1 || fail "second rotation failed"
+  assert_grep "$rotated" "$home/data/buzz-keypair.public-history" \
+    "a rotation with no recorded public key lost the key it retired"
+  assert_grep "$retired" "$home/data/buzz-keypair.public-history" \
+    "a later rotation dropped an earlier retired key"
+  pass "a rotated home still recognises its own leaked events"
+}
+
+test_an_anonymous_read_of_a_foreign_channel_claims_no_verdict() {
+  # --channel-label points the read at a channel derived from some other home's
+  # label, and the only publishing keys on this disk are this home's own. No served
+  # event can be attributed either way, so the conclusive answer is unreachable and
+  # must not be printed - and the fix is to say so, not to go reading another
+  # home's files.
+  local home other relay label foreign
+  home=$(make_home foreign-channel-reader)
+  other=$(make_home foreign-channel-owner)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  run_keypair "$other" >/dev/null 2>&1 || fail "other home keypair setup failed"
+
+  label=$(cd "$other" && pwd -P)
+
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"another-homes-projection"}' \
+    | run_publish "$other" "$relay" >/dev/null 2>&1
+  foreign=$(run_inspect "$home" "$relay" --anonymous --channel-label "$label" 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$foreign" "events:   1" \
+    "the other home's event was not served, so the check under test was never reached"
+  assert_contains "$foreign" "signature verified" \
+    "the served event must verify, or it fails an earlier gate and proves nothing"
+  assert_not_contains "$foreign" \
+    "The channel was readable by an identity that is not a member" \
+    "a definite verdict was declared for a channel this home cannot attribute"
+  assert_contains "$foreign" "INCONCLUSIVE" \
+    "a channel not derived from this home must be reported as inconclusive"
+  assert_contains "$foreign" \
+    "cannot verify authorship for a channel not derived from this home" \
+    "the reason the verdict is unreachable was not stated"
+  assert_contains "$foreign" "unattributable (channel not derived from this home)" \
+    "the served event was reported as if this home could judge its author"
+  pass "an anonymous read of a foreign channel claims no verdict"
+}
+
 test_no_firstmate_path_depends_on_buzz() {
   # Invariant: Buzz is additive. If any other Firstmate script, skill, workflow or
   # AGENTS.md instruction ever calls the adapter, a stopped relay could reach a
@@ -1264,4 +1349,6 @@ test_an_anonymous_read_only_claims_privacy_when_the_relay_refuses
 test_an_anonymous_read_that_returns_events_reports_the_breach
 test_an_anonymous_read_of_unverifiable_events_claims_no_breach
 test_an_anonymous_read_of_a_foreign_authors_event_claims_no_breach
+test_a_rotated_home_still_recognises_its_own_leaked_events
+test_an_anonymous_read_of_a_foreign_channel_claims_no_verdict
 test_no_firstmate_path_depends_on_buzz

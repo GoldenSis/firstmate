@@ -7,8 +7,9 @@
 # owns custody and explains the reasoning.
 #
 # The public key is recorded in <FM_HOME>/data/buzz-keypair.public so the value is
-# readable without touching the keychain. That path is gitignored: no keypair
-# material, public or private, is ever committed.
+# readable without touching the keychain. Retired public keys are kept alongside
+# it in <FM_HOME>/data/buzz-keypair.public-history, one per line. Both paths are
+# gitignored: no keypair material, public or private, is ever committed.
 #
 # Usage:
 #   fm-buzz-keypair.sh             ensure a keypair exists; print the public key
@@ -27,6 +28,9 @@
 # file - plus data/buzz-keypair.public, then mints a fresh keypair and prints the
 # new public key. It never prints the private key, old or new.
 #
+# The retired PUBLIC key is appended to data/buzz-keypair.public-history first, so
+# events this home signed before the rotation stay attributable to it.
+#
 # It is a flag rather than instructions to run by hand because the two stores are
 # not interchangeable: which one holds the key depends on the host, and the
 # fallback file's name carries a digest of the home path, so hand-deleting "the
@@ -34,8 +38,13 @@
 # next run re-prints the SAME public key. A rotation that silently does not rotate
 # is worse than no rotation procedure at all.
 #
-# Historical events stay signed by the retired key, which is acceptable precisely
-# because this key grants no authority.
+# Historical events stay signed by the retired key, which grants no authority and
+# so needs no revocation. It is still evidence, though: it is a key only this home
+# ever held, and bin/fm-buzz-inspect.sh --anonymous decides whether a served event
+# is this home's own content by its author. So rotation retains the retired PUBLIC
+# key in data/buzz-keypair.public-history rather than dropping it - a relay that
+# still holds pre-rotation events would otherwise serve this home's own projections
+# to a stranger and have the probe report it as somebody else's content.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,6 +56,7 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-buzz-key-lib.sh"
 
 PUBLIC_FILE="$DATA/buzz-keypair.public"
+HISTORY_FILE="$DATA/buzz-keypair.public-history"
 PUBLIC_ONLY=0
 ROTATE=0
 
@@ -95,9 +105,38 @@ record_public() {
   mv -f -- "$tmp" "$PUBLIC_FILE" || { rm -f -- "$tmp"; return 1; }
 }
 
+# Carry the outgoing public key into the history file before the rotation drops
+# it. Whole-file rewrite through a temp file and one `mv`, for the same reason
+# record_public does it: a rotation interrupted midway must leave either the old
+# history or the new one, never a half-written one. Duplicates and blank lines are
+# collapsed, so re-running a rotation cannot grow the file without bound.
+retain_public() {  # <retired public key>
+  local retired=$1 merged tmp
+  [ -n "$retired" ] || return 0
+  if [ -f "$HISTORY_FILE" ]; then
+    merged=$(cat -- "$HISTORY_FILE") || return 1
+    merged="$merged
+$retired"
+  else
+    merged=$retired
+  fi
+  merged=$(printf '%s\n' "$merged" | awk 'NF && !seen[$0]++') || return 1
+  [ -d "$DATA" ] || mkdir -p "$DATA" 2>/dev/null || return 1
+  tmp=$(mktemp "$DATA/.buzz-keypair-public-history.XXXXXX") || return 1
+  printf '%s\n' "$merged" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$HISTORY_FILE" || { rm -f -- "$tmp"; return 1; }
+}
+
 # Retire the old key before the lookup below, so rotation falls through into the
 # minting path instead of finding the key it was asked to replace.
 if [ "$ROTATE" -eq 1 ]; then
+  # Read the outgoing public key while the private half is still stored: the
+  # recorded file is the cheap source, but it can be missing or truncated, and the
+  # stored key is the authority for what this home was publishing under. Once
+  # fm_buzz_key_forget runs there is nothing left to derive it from.
+  retiring=$(sed -n 1p "$PUBLIC_FILE" 2>/dev/null | tr -d '[:space:]')
+  [ -n "$retiring" ] || retiring=$(derive_public 2>/dev/null | tr -d '[:space:]')
   cleared=$(fm_buzz_key_forget "$FM_HOME") || {
     printf 'fm-buzz-keypair.sh: the old key is still readable after rotation; nothing was replaced\n' >&2
     exit 1
@@ -107,6 +146,8 @@ if [ "$ROTATE" -eq 1 ]; then
   else
     printf 'fm-buzz-keypair.sh: no previous key was stored for this home; minting one\n' >&2
   fi
+  retain_public "$retiring" \
+    || printf 'fm-buzz-keypair.sh: could not retain the retired public key in %s\n' "$HISTORY_FILE" >&2
   rm -f -- "$PUBLIC_FILE"
 fi
 
