@@ -211,7 +211,8 @@ fm_buzz_key_store() {
 }
 
 # Remove this home's private key from EVERY store, printing one line per store
-# actually cleared. Returns 1 when a key is still loadable afterwards.
+# actually cleared. Returns 0 only after every store is verified absent; deletion,
+# lookup, derivation, or absence-verification failures return nonzero.
 #
 # Rotation is the only caller, and it is why this cannot be keychain-only: on a
 # non-Darwin host, or under FM_BUZZ_FORCE_FILE_STORE=1, the key lives in the

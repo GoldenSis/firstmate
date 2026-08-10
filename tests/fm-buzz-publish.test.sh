@@ -108,7 +108,16 @@ stop_stub() {  # <pid>
 
 replay_count() {  # <home>
   local home=$1
-  find "$home/state/buzz-replay" -name '*.json' 2>/dev/null | wc -l | tr -d ' '
+  find "$home/state/buzz-replay" -path '*/_legacy-quarantine' -prune -o \
+    -name '*.json' -print 2>/dev/null | wc -l | tr -d ' '
+}
+
+relay_cache_dir() {  # <home> <relay>
+  local home=$1 relay=$2 digest
+  digest=$(node -e '
+    import(process.argv[1]).then(({ relayCacheKey }) => process.stdout.write(relayCacheKey(process.argv[2])));
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay") || return 1
+  printf '%s/state/buzz-replay/%s\n' "$home" "$digest"
 }
 
 # Ask the custody library itself where a home's key file is, rather than hardcoding
@@ -218,6 +227,32 @@ for arg in "\$@"; do
         waited=\$((waited + 1))
       done
       [ -e "\$FM_DELAY_BUZZ_DERIVE_RELEASE" ] || exit 70
+      break
+      ;;
+  esac
+done
+exec "$real_node" "\$@"
+EOF
+  chmod +x "$tools/node"
+  printf '%s\n' "$tools"
+}
+
+make_delayed_publish_tools() {
+  local tools="$TMP_ROOT/delayed-publish-tools" real_node
+  mkdir -p "$tools"
+  real_node=$(command -v node)
+  cat > "$tools/node" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  case \$arg in
+    */fm-buzz-publish.mjs)
+      : > "\$FM_DELAY_BUZZ_PUBLISH_READY"
+      waited=0
+      while [ ! -e "\$FM_DELAY_BUZZ_PUBLISH_RELEASE" ] && [ "\$waited" -lt 1000 ]; do
+        sleep 0.01
+        waited=\$((waited + 1))
+      done
+      [ -e "\$FM_DELAY_BUZZ_PUBLISH_RELEASE" ] || exit 70
       break
       ;;
   esac
@@ -1127,6 +1162,65 @@ test_relay_cache_partition_uses_the_normalized_complete_endpoint() {
   pass "relay caches key the normalized complete endpoint"
 }
 
+test_legacy_replay_entries_are_quarantined_with_a_manifest() {
+  local home relay replay legacy_dir legacy_file quarantine manifest payload output readback second
+  home=$(make_home legacy-replay-quarantine)
+  run_keypair "$home" >/dev/null 2>&1 || fail "legacy quarantine keypair setup failed"
+  replay="$home/state/buzz-replay"
+  legacy_dir="$replay/localhost-3000"
+  legacy_file="$legacy_dir/1700000000-$(printf '%064d' 9).json"
+  quarantine="$replay/_legacy-quarantine"
+  mkdir -p "$legacy_dir"
+  printf '%s' '["EVENT",{"legacy_marker":"must-not-be-delivered"}]' > "$legacy_file"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"fresh-after-legacy"}' \
+    | run_publish "$home" "$relay" 2>&1)
+
+  assert_absent "$legacy_file" "a legacy replay entry remained in its active queue"
+  manifest=$(find "$quarantine/manifests" -type f -name '*.json' | head -1)
+  [ -n "$manifest" ] || fail "a quarantined legacy entry has no manifest"
+  payload="$quarantine/$(jq -r '.payload_reference' "$manifest")"
+  assert_present "$payload" "a quarantined legacy entry has no payload"
+  [ "$(cat "$payload")" = '["EVENT",{"legacy_marker":"must-not-be-delivered"}]' ] \
+    || fail "legacy quarantine changed the signed payload bytes"
+  jq -e \
+    --arg original "localhost-3000/$(basename "$legacy_file")" \
+    '.original_path == $original and
+     .legacy_host == "localhost-3000" and
+     (.original_timestamps.atime_ms | type) == "number" and
+     (.original_timestamps.mtime_ms | type) == "number" and
+     (.original_timestamps.ctime_ms | type) == "number" and
+     (.original_timestamps.birthtime_ms | type) == "number" and
+     (.quarantine_timestamp | type) == "string" and
+     (.payload_reference | type) == "string"' "$manifest" >/dev/null \
+    || fail "legacy quarantine manifest omitted required provenance"
+  assert_contains "$output" "legacy replay quarantine: 1 entry(s) at " \
+    "publish startup did not report the legacy quarantine"
+  assert_contains "$output" "/_legacy-quarantine" \
+    "publish startup did not name the legacy quarantine directory"
+
+  readback=$(run_inspect "$home" "$relay" 2>&1)
+  assert_contains "$readback" "fresh-after-legacy" "the fresh projection did not land"
+  assert_not_contains "$readback" "must-not-be-delivered" \
+    "a legacy entry was delivered despite its unknown endpoint"
+  second=$(printf '%s' '{"schema":"fm-bearings.v1","note":"quarantine-retry"}' \
+    | run_publish "$home" "$relay" 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$second" "legacy replay quarantine: 1 entry(s) at " \
+    "a later startup stopped reporting existing quarantined entries"
+  assert_contains "$second" "/_legacy-quarantine" \
+    "a later startup did not name the legacy quarantine directory"
+  [ "$(find "$quarantine/manifests" -type f -name '*.json' | wc -l | tr -d ' ')" = "1" ] \
+    || fail "legacy quarantine retry duplicated the manifest"
+  [ "$(find "$quarantine/payloads" -type f -name '*.json' | wc -l | tr -d ' ')" = "1" ] \
+    || fail "legacy quarantine retry duplicated or removed the payload"
+  pass "legacy replay entries are quarantined without endpoint inference or delivery"
+}
+
 # --- (d) reconnect replays the identical event id --------------------------
 
 test_reconnect_replays_the_identical_event_id() {
@@ -1415,10 +1509,12 @@ EOF
 # --- (e) the replay cache is capped ----------------------------------------
 
 test_replay_cache_is_capped_at_100() {
-  local home count i
+  local home relay cache_dir count i
   home=$(make_home cap)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
-  mkdir -p "$home/state/buzz-replay"
+  relay="ws://127.0.0.1:1"
+  cache_dir=$(relay_cache_dir "$home" "$relay") || fail "could not derive cache partition"
+  mkdir -p "$cache_dir"
 
   # Seed 120 plausible cache entries with increasing timestamps, then publish
   # once against a dead relay: the prune must bring the cache to the cap,
@@ -1426,21 +1522,21 @@ test_replay_cache_is_capped_at_100() {
   i=1
   while [ "$i" -le 120 ]; do
     printf '["EVENT",{"id":"%060d","created_at":%d}]' "$i" "$((1700000000 + i))" \
-      > "$home/state/buzz-replay/$((1700000000 + i))-$(printf '%064d' "$i").json"
+      > "$cache_dir/$((1700000000 + i))-$(printf '%064d' "$i").json"
     i=$((i + 1))
   done
   [ "$(replay_count "$home")" = "120" ] || fail "cache seeding failed"
 
   printf '%s' '{"schema":"fm-bearings.v1"}' \
-    | run_publish "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
+    | run_publish "$home" "$relay" >/dev/null 2>&1
 
   count=$(replay_count "$home")
   [ "$count" = "100" ] || fail "the replay cache is not capped at 100 (found $count)"
 
   # The newest must survive and the oldest must be gone.
-  assert_present "$home/state/buzz-replay/$((1700000000 + 120))-$(printf '%064d' 120).json" \
+  assert_present "$cache_dir/$((1700000000 + 120))-$(printf '%064d' 120).json" \
     "the cap dropped a newer event instead of an older one"
-  assert_absent "$home/state/buzz-replay/$((1700000000 + 1))-$(printf '%064d' 1).json" \
+  assert_absent "$cache_dir/$((1700000000 + 1))-$(printf '%064d' 1).json" \
     "the cap did not drop the oldest event"
   pass "the replay cache is capped at 100, dropping oldest first"
 }
@@ -1466,17 +1562,18 @@ test_cache_limit_must_be_a_positive_integer() {
 }
 
 test_cache_limit_one_preserves_the_pending_event() {
-  local home relay output clock old
+  local home relay output clock cache_dir old
   home=$(make_home cache-limit-one)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
   clock="$TMP_ROOT/fixed-buzz-clock.mjs"
   printf '%s\n' 'Date.now = () => 1700000000000;' > "$clock"
-  mkdir -p "$home/state/buzz-replay"
-  old="$home/state/buzz-replay/1700000000-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.json"
-  printf '%s' '["EVENT",{}]' > "$old"
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
+  cache_dir=$(relay_cache_dir "$home" "$relay") || fail "could not derive cache partition"
+  mkdir -p "$cache_dir"
+  old="$cache_dir/1700000000-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.json"
+  printf '%s' '["EVENT",{}]' > "$old"
 
   output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"limit-one"}' \
     | NODE_OPTIONS="--import=$clock" FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
@@ -1652,6 +1749,63 @@ test_publish_lock_acquisition_is_validated_bounded_and_interruptible() {
   pass "publish-lock waits validate deadlines, time out, and honor signals"
 }
 
+test_publish_signing_is_serialized_with_compromised_rotation() {
+  local home tools ready release publish_output rotate_output old publisher rotation waited relay new
+  home=$(make_home publish-rotation-serialization)
+  tools=$(make_delayed_publish_tools)
+  ready="$home/publish-engine-ready"
+  release="$home/publish-engine-release"
+  publish_output="$home/publish-engine.out"
+  rotate_output="$home/rotation.out"
+  old=$(run_keypair "$home" 2>/dev/null) || fail "publish-rotation keypair setup failed"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+
+  (printf '%s' '{"schema":"fm-bearings.v1","note":"signed-before-compromised-rotation"}' \
+    | PATH="$tools:$PATH" FM_DELAY_BUZZ_PUBLISH_READY="$ready" \
+      FM_DELAY_BUZZ_PUBLISH_RELEASE="$release" run_publish "$home" "$relay") \
+    > "$publish_output" 2>&1 &
+  publisher=$!
+  waited=0
+  while [ ! -e "$ready" ] && [ "$waited" -lt 100 ]; do
+    sleep 0.01
+    waited=$((waited + 1))
+  done
+  [ -e "$ready" ] || {
+    kill "$publisher" 2>/dev/null
+    stop_stub "$STUB_PID"
+    fail "the publisher did not pause at the signing boundary"
+  }
+
+  run_keypair "$home" --rotate --compromised > "$rotate_output" 2>&1 &
+  rotation=$!
+  sleep 0.1
+  kill -0 "$rotation" 2>/dev/null || {
+    : > "$release"
+    wait "$publisher" "$rotation" 2>/dev/null
+    stop_stub "$STUB_PID"
+    fail "compromised rotation did not wait for in-flight signing"
+  }
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "compromised rotation withdrew the key before the delayed publisher signed"
+
+  : > "$release"
+  wait "$publisher" || fail "the serialized publisher violated fire-and-forget"
+  wait "$rotation" || fail "compromised rotation failed after publishing released the key"
+  stop_stub "$STUB_PID"
+  new=$(tail -1 "$rotate_output")
+
+  assert_contains "$(cat "$publish_output")" "signed event" \
+    "the delayed projection was not signed under the protected transaction"
+  assert_contains "$(cat "$publish_output")" "delivered=1" \
+    "the delayed projection did not complete before rotation"
+  [ "$new" != "$old" ] || fail "compromised rotation did not replace the publishing identity"
+  assert_not_contains "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null)" "$old" \
+    "compromised rotation retained the protected outgoing identity"
+  pass "publishing signs before compromised rotation can withdraw its key"
+}
+
 test_replay_cache_rejects_symlink_boundaries() {
   local root_home relay_home entry_home outside replay relay digest link target output
   root_home=$(make_home cache-root-symlink)
@@ -1704,6 +1858,44 @@ test_replay_cache_rejects_symlink_boundaries() {
   pass "replay cache mutations reject root, relay, and entry symlinks"
 }
 
+test_replay_cache_never_reads_non_regular_entries() {
+  local home relay cache_dir fifo output_file publisher waited
+  home=$(make_home cache-special-file)
+  run_keypair "$home" >/dev/null 2>&1 || fail "special-file keypair setup failed"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  cache_dir=$(relay_cache_dir "$home" "$relay") || fail "could not derive cache partition"
+  mkdir -p "$cache_dir"
+  fifo="$cache_dir/1700000000-$(printf '%064d' 8).json"
+  mkfifo "$fifo" || fail "could not create cache FIFO fixture"
+  output_file="$home/cache-special-file.out"
+
+  (printf '%s' '{"schema":"fm-bearings.v1","note":"regular-after-fifo"}' \
+    | run_publish "$home" "$relay") > "$output_file" 2>&1 &
+  publisher=$!
+  waited=0
+  while kill -0 "$publisher" 2>/dev/null && [ "$waited" -lt 100 ]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  if kill -0 "$publisher" 2>/dev/null; then
+    kill -KILL "$publisher" 2>/dev/null
+    wait "$publisher" 2>/dev/null
+    stop_stub "$STUB_PID"
+    fail "a cache FIFO blocked publishing past the relay deadline"
+  fi
+  wait "$publisher" || fail "a rejected cache FIFO broke fire-and-forget"
+  stop_stub "$STUB_PID"
+
+  assert_contains "$(cat "$output_file")" "cache entry is not a regular file" \
+    "a cache FIFO was not rejected before reading"
+  assert_absent "$fifo" "a safely removable cache FIFO remained active"
+  assert_contains "$(cat "$output_file")" "delivered=1" \
+    "a cache FIFO prevented the regular projection from delivery"
+  pass "replay reads accept only regular cache files"
+}
+
 test_relay_timeout_must_fit_the_node_timer_range() {
   local home invalid output code
   home=$(make_home invalid-relay-timeout)
@@ -1724,15 +1916,15 @@ test_malformed_cache_names_are_discarded_or_accounted_for() {
   local home relay replay removable retained output
   home=$(make_home malformed-cache-names)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
-  replay="$home/state/buzz-replay"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  replay=$(relay_cache_dir "$home" "$relay") || fail "could not derive cache partition"
   mkdir -p "$replay"
   removable="$replay/not-an-event.json"
   retained="$replay/still-not-an-event.json"
   printf '%s' '{"malformed":true}' > "$removable"
   mkdir "$retained"
-  read -r STUB_PID relay <<EOF
-$(start_stub)
-EOF
 
   output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"malformed-cache-name"}' \
     | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
@@ -1785,19 +1977,21 @@ test_an_interrupted_cache_write_is_swept_not_leaked() {
   # never counted, never removed, one leaked signed projection per interrupted
   # run. An in-flight write from a concurrent run must survive, though, so the
   # sweep is age-gated and this checks both halves.
-  local home stale fresh count
+  local home relay cache_dir stale fresh count
   home=$(make_home orphan-tmp)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
-  mkdir -p "$home/state/buzz-replay"
+  relay="ws://127.0.0.1:1"
+  cache_dir=$(relay_cache_dir "$home" "$relay") || fail "could not derive cache partition"
+  mkdir -p "$cache_dir"
 
-  stale="$home/state/buzz-replay/1700000001-$(printf '%064d' 1).json.tmp"
-  fresh="$home/state/buzz-replay/1700000002-$(printf '%064d' 2).json.tmp"
+  stale="$cache_dir/1700000001-$(printf '%064d' 1).json.tmp"
+  fresh="$cache_dir/1700000002-$(printf '%064d' 2).json.tmp"
   printf '["EVENT",{"id":"%064d","created_at":1700000001}]' 1 > "$stale"
   printf '["EVENT",{"id":"%064d","created_at":1700000002}]' 2 > "$fresh"
   touch -t 202001010000 "$stale" || fail "could not age the stale temp file"
 
   printf '%s' '{"schema":"fm-bearings.v1","note":"orphan"}' \
-    | run_publish "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
+    | run_publish "$home" "$relay" >/dev/null 2>&1
 
   assert_absent "$stale" "an interrupted cache write was left behind forever"
   assert_present "$fresh" "the sweep deleted a concurrent run's in-flight write"
@@ -1818,8 +2012,8 @@ $(start_stub)
 EOF
   printf '%s' '{"schema":"fm-bearings.v1","note":"prime-cache"}' \
     | run_publish "$home" "$relay" >/dev/null 2>&1
-  cache_dir=$(find "$home/state/buzz-replay" -mindepth 1 -maxdepth 1 -type d | head -1)
-  [ -n "$cache_dir" ] || fail "relay-specific cache directory was not created"
+  cache_dir=$(relay_cache_dir "$home" "$relay") || fail "could not derive cache partition"
+  [ -d "$cache_dir" ] || fail "relay-specific cache directory was not created"
   unreadable="$cache_dir/1700000000-$(printf '%064d' 7).json"
   mkdir "$unreadable"
 
@@ -1827,8 +2021,8 @@ EOF
     | run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
-  assert_contains "$output" "could not read cache entry" \
-    "non-ENOENT cache read failure was mistaken for concurrent deletion"
+  assert_contains "$output" "cache entry is not a regular file" \
+    "a non-regular cache entry reached the replay reader"
   assert_contains "$output" "retained=1" \
     "unreadable cache entry was omitted from retained outcome accounting"
   assert_present "$unreadable" "unreadable cache entry was discarded instead of retained"
@@ -1878,21 +2072,20 @@ test_cache_prune_failures_are_reported_and_accounted_for() {
   local home relay replay first second output count
   home=$(make_home cache-prune-failure)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
-  replay="$home/state/buzz-replay"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  replay=$(relay_cache_dir "$home" "$relay") || fail "could not derive cache partition"
   mkdir -p "$replay"
   first="$replay/1700000001-$(printf '%064d' 1).json"
   second="$replay/1700000002-$(printf '%064d' 2).json"
   mkdir "$first" "$second"
-
-  read -r STUB_PID relay <<EOF
-$(start_stub)
-EOF
   output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"prune-failure"}' \
     | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
-  assert_contains "$output" "could not prune cache entry" \
-    "a non-ENOENT prune failure was silently ignored"
+  assert_contains "$output" "could not drop invalid cache entry" \
+    "a non-ENOENT cache cleanup failure was silently ignored"
   assert_contains "$output" "cleanup_failed=2" \
     "prune failures were omitted from outcome accounting"
   assert_contains "$output" "publish did not complete; Firstmate is unaffected" \
@@ -2356,6 +2549,34 @@ EOF
   pass "an anonymous read that returns events reports the breach"
 }
 
+test_multiline_current_key_record_cannot_expand_authorship() {
+  local home other relay current appended inspected
+  home=$(make_home multiline-current-key)
+  other=$(make_home multiline-current-key-other)
+  current=$(run_keypair "$home" 2>/dev/null) || fail "multiline current-key setup failed"
+  appended=$(run_keypair "$other" 2>/dev/null) || fail "multiline current-key second identity setup failed"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"authorship-needs-singular-record"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  printf '%s\n%s\n' "$current" "$appended" > "$home/data/buzz-keypair.public"
+
+  inspected=$(run_inspect "$home" "$relay" --anonymous 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$inspected" "authorship-needs-singular-record" \
+    "the multiline current-key fixture did not return its event"
+  assert_contains "$inspected" "unknown (no publisher public key recorded for this home)" \
+    "a multiline current-key record still established authorship"
+  assert_contains "$inspected" "INCONCLUSIVE" \
+    "malformed current-key attribution produced a definite privacy verdict"
+  assert_not_contains "$inspected" \
+    "The channel was readable by an identity that is not a member" \
+    "an appended current key expanded trust for the anonymous verdict"
+  pass "current-key attribution requires exactly one normalized record"
+}
+
 test_an_anonymous_read_of_unverifiable_events_claims_no_breach() {
   # The accusation is only as good as the frames it rests on. A relay that serves
   # altered content is the same relay the verdict would be quoting, so events that
@@ -2736,6 +2957,7 @@ test_non_loopback_env_relay_is_rejected_before_network
 test_publish_with_relay_up_delivers_and_lands
 test_relay_switch_does_not_replay_another_relays_cache
 test_relay_cache_partition_uses_the_normalized_complete_endpoint
+test_legacy_replay_entries_are_quarantined_with_a_manifest
 test_reconnect_replays_the_identical_event_id
 test_replaying_a_known_event_is_deduped_and_evicted
 test_an_unacknowledged_publish_does_not_starve_the_drain
@@ -2749,7 +2971,9 @@ test_cache_limit_must_be_a_positive_integer
 test_cache_limit_one_preserves_the_pending_event
 test_concurrent_publishers_serialize_the_cache_lifecycle
 test_publish_lock_acquisition_is_validated_bounded_and_interruptible
+test_publish_signing_is_serialized_with_compromised_rotation
 test_replay_cache_rejects_symlink_boundaries
+test_replay_cache_never_reads_non_regular_entries
 test_relay_timeout_must_fit_the_node_timer_range
 test_malformed_cache_names_are_discarded_or_accounted_for
 test_cache_directory_stat_failures_are_accounted_for
@@ -2767,6 +2991,7 @@ test_nothing_private_reaches_a_command_line
 test_the_inspector_rejects_a_tampered_event
 test_an_anonymous_read_only_claims_privacy_when_the_relay_refuses
 test_an_anonymous_read_that_returns_events_reports_the_breach
+test_multiline_current_key_record_cannot_expand_authorship
 test_an_anonymous_read_of_unverifiable_events_claims_no_breach
 test_malformed_relay_events_are_assessed_independently
 test_wrong_kind_event_cannot_produce_a_privacy_breach_verdict

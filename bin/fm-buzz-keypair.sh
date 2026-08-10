@@ -240,13 +240,30 @@ retain_public() {  # <retired public key>
 # would otherwise report as this home's own leaked projection. Such a key must
 # leave the recorded set rather than join it. Called for the key a --compromised
 # rotation is retiring, and by --forget-key for one named by hand.
-purge_public() {  # <public key to withdraw>
-  local retired=$1 merged
-  [ -n "$retired" ] || return 0
-  retired=$(fm_buzz_normalize_public_key "$retired") || return 1
+purge_public_set() {  # <public keys to withdraw...>
+  local public normalized drops="" merged
+  for public in "$@"; do
+    [ -n "$public" ] || continue
+    normalized=$(fm_buzz_normalize_public_key "$public") || return 1
+    case ",$drops," in
+      *,"$normalized",*) ;;
+      *) drops="${drops:+$drops,}$normalized" ;;
+    esac
+  done
+  [ -n "$drops" ] || return 0
   merged=$(read_history) || return 1
-  merged=$(printf '%s\n' "$merged" | awk -v drop="$retired" 'NF && $0 != drop && !seen[$0]++') || return 1
+  merged=$(printf '%s\n' "$merged" | awk -v drops="$drops" '
+    BEGIN {
+      count = split(drops, keys, ",")
+      for (i = 1; i <= count; i++) drop[keys[i]] = 1
+    }
+    NF && !drop[$0] && !seen[$0]++
+  ') || return 1
   write_history "$merged"
+}
+
+purge_public() {  # <public key to withdraw>
+  purge_public_set "$1"
 }
 
 # --forget-key: withdraw one already-retired key from the recorded set. This is
@@ -296,15 +313,6 @@ add_recovery_reason() {  # <reason>
   else
     recovery_reason=$1
   fi
-}
-
-purge_rotation_key() {  # <public key>
-  local public=$1
-  [ -n "$public" ] || return 0
-  purge_public "$public" || {
-    printf 'fm-buzz-keypair.sh: could not drop the compromised public key from %s; nothing was rotated\n' "$HISTORY_FILE" >&2
-    return 1
-  }
 }
 
 # Retire the old key before the lookup below, so rotation falls through into the
@@ -381,11 +389,10 @@ if [ "$ROTATE" -eq 1 ]; then
   # and permanently cost the probe its attribution. A rotation that stops now is
   # simply retryable - nothing has changed yet.
   if [ "$COMPROMISED" -eq 1 ]; then
-    purge_rotation_key "$recorded" || exit 1
-    [ "$keychain_public" = "$recorded" ] || { purge_rotation_key "$keychain_public" || exit 1; }
-    if [ "$file_public" != "$recorded" ] && [ "$file_public" != "$keychain_public" ]; then
-      purge_rotation_key "$file_public" || exit 1
-    fi
+    purge_public_set "$recorded" "$keychain_public" "$file_public" || {
+      printf 'fm-buzz-keypair.sh: could not drop the compromised public keys from %s; nothing was rotated\n' "$HISTORY_FILE" >&2
+      exit 1
+    }
     if [ -n "$retiring" ]; then
       printf 'rotating: the retired public key is treated as compromised and is not kept in %s\n' "$HISTORY_FILE" >&2
     fi

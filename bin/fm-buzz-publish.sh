@@ -50,6 +50,8 @@
 # Cache ownership waits at most FM_BUZZ_LOCK_TIMEOUT_S seconds (default 30).
 # Invalid deadlines, acquisition timeouts, and interrupted waits are logged and
 # converted to the same exit-0 non-event as every other publishing failure.
+# Lock ordering is replay-cache ownership first and the per-home key transaction
+# second; the publishing key is loaded and spent while both are held.
 #
 # Relay host note: the default is ws://localhost:3000, not ws://127.0.0.1:3000.
 # Buzz resolves its tenant from the HTTP Host header and the bundled deployment
@@ -62,6 +64,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 # shellcheck source=bin/fm-buzz-key-lib.sh
 . "$SCRIPT_DIR/fm-buzz-key-lib.sh"
@@ -103,6 +106,7 @@ log() {
 STDIN_SPOOL=""
 STDIN_READER=""
 PUBLISH_LOCK=""
+KEYPAIR_LOCK=""
 PUBLISH_INTERRUPTED=0
 drop_stdin_spool() {
   if [ -n "$STDIN_READER" ]; then
@@ -112,6 +116,10 @@ drop_stdin_spool() {
   if [ -n "$STDIN_SPOOL" ]; then
     rm -f -- "$STDIN_SPOOL"
     STDIN_SPOOL=""
+  fi
+  if [ -n "$KEYPAIR_LOCK" ]; then
+    fm_lock_release "$KEYPAIR_LOCK"
+    KEYPAIR_LOCK=""
   fi
   if [ -n "$PUBLISH_LOCK" ]; then
     fm_lock_release "$PUBLISH_LOCK"
@@ -203,7 +211,7 @@ validate_publish_lock_timeout() {
   PUBLISH_LOCK_TIMEOUT_S=$(normalize_shell_timeout "$PUBLISH_LOCK_TIMEOUT_S") || return 1
 }
 
-acquire_publish_lock() {  # <lock>
+acquire_bounded_lock() {  # <lock>
   local lock=$1 attempts=0 max_attempts
   max_attempts=$((PUBLISH_LOCK_TIMEOUT_S * 10))
   while [ "$attempts" -lt "$max_attempts" ]; do
@@ -277,20 +285,6 @@ publish() {
     return 1
   }
 
-  local key load_status rc lock_status
-  key=$(fm_buzz_key_load "$FM_HOME")
-  load_status=$?
-  if [ "$load_status" -ne 0 ]; then
-    if [ "$load_status" -eq 1 ]; then
-      log "no publishing keypair for this home; run bin/fm-buzz-keypair.sh first"
-    else
-      log "the stored publishing key could not be read; skipping publish"
-    fi
-    drop_stdin_spool
-    return 1
-  fi
-  [ -n "$key" ] || { drop_stdin_spool; log "the stored publishing key is empty"; return 1; }
-
   local label=$CHANNEL_LABEL
   if [ -z "$label" ]; then
     label=$(fm_buzz_key_account "$FM_HOME")
@@ -311,7 +305,7 @@ publish() {
     || { log "replay cache path $REPLAY_DIR is not a regular directory"; return 1; }
   chmod 0700 "$REPLAY_DIR" 2>/dev/null || true
   PUBLISH_LOCK="$STATE/.buzz-replay-publish.lock"
-  acquire_publish_lock "$PUBLISH_LOCK"
+  acquire_bounded_lock "$PUBLISH_LOCK"
   lock_status=$?
   if [ "$lock_status" -ne 0 ]; then
     if [ "$lock_status" -eq 2 ]; then
@@ -322,6 +316,38 @@ publish() {
     drop_stdin_spool
     return 1
   fi
+
+  mkdir -p "$DATA" 2>/dev/null || {
+    log "could not create $DATA"
+    drop_stdin_spool
+    return 1
+  }
+  KEYPAIR_LOCK="$DATA/.buzz-keypair.lock"
+  acquire_bounded_lock "$KEYPAIR_LOCK"
+  keypair_lock_status=$?
+  if [ "$keypair_lock_status" -ne 0 ]; then
+    if [ "$keypair_lock_status" -eq 2 ]; then
+      log "interrupted while waiting for publishing key ownership"
+    else
+      log "could not acquire publishing key ownership within ${PUBLISH_LOCK_TIMEOUT_S}s"
+    fi
+    drop_stdin_spool
+    return 1
+  fi
+
+  local key load_status rc
+  key=$(fm_buzz_key_load "$FM_HOME")
+  load_status=$?
+  if [ "$load_status" -ne 0 ]; then
+    if [ "$load_status" -eq 1 ]; then
+      log "no publishing keypair for this home; run bin/fm-buzz-keypair.sh first"
+    else
+      log "the stored publishing key could not be read; skipping publish"
+    fi
+    drop_stdin_spool
+    return 1
+  fi
+  [ -n "$key" ] || { drop_stdin_spool; log "the stored publishing key is empty"; return 1; }
 
   # The envelope goes down a pipe, and neither private value is passed with `--arg`,
   # which would put it in jq's world-readable argv. The key reaches jq through a
@@ -339,6 +365,8 @@ publish() {
       replayDir:$replayDir, timeoutMs:$timeoutMs, maxCache:$maxCache}' \
     | node "$SCRIPT_DIR/fm-buzz-publish.mjs"
   rc=$?
+  fm_lock_release "$KEYPAIR_LOCK"
+  KEYPAIR_LOCK=""
   fm_lock_release "$PUBLISH_LOCK"
   PUBLISH_LOCK=""
   drop_stdin_spool

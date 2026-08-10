@@ -5,44 +5,11 @@
 # its output: Buzz is a projection target, never a state source. The engine's
 # header (bin/fm-buzz-inspect.mjs) states the full reasoning.
 #
-# It answers two different questions depending on the identity it reads with:
-#   default       read as the publisher (a channel member) - proves the projection
-#                 is legible, and verifies each event's signature
-#   --anonymous   read as a stranger - probes whether the private channel is
-#                 invisible to non-members. An event that recomputes to its own id,
-#                 verifies under its author's signature, carries this channel's
-#                 `h` tag AND was signed by this home's recorded publishing key is
-#                 the conclusive answer, and it is a negative one: a non-member read
-#                 the channel. Events the relay served but that fail any of those
-#                 checks are reported INCONCLUSIVE instead, since a relay that
-#                 alters, replays or fabricates frames says nothing about who may
-#                 read this channel - and the channel id is not a secret, so a
-#                 correctly signed event tagged for it can come from any stranger
-#                 who can publish to the relay. Authorship is checked against this
-#                 home's current AND retired publishing keys, so a rotation does
-#                 not blind the probe to pre-rotation events the relay still holds.
-#                 Pointing it with --channel-label at a channel derived from some
-#                 other label than this home's rules the conclusive answer out
-#                 entirely: see that flag below.
-#                 Zero events is only an answer the other way when the relay
-#                 refuses the subscription on MEMBERSHIP grounds, i.e. with
-#                 NIP-01's `restricted:`. Every other outcome is reported
-#                 INCONCLUSIVE and prints the relay's own words: any other reason
-#                 is not machine-tagged as a membership refusal and so cannot be
-#                 read as one, and an unrefused empty read looks identical to a
-#                 wiped relay, a channel id from another home, a publish that never
-#                 landed, or a channel that is simply empty.
-#
-# --channel-label points the read at whatever channel the given label derives to.
-# When that label is a DIFFERENT one than this home's, the only publishing keys on
-# disk here are still this home's own, so --anonymous cannot reach the conclusive
-# answer for such a channel: it reports INCONCLUSIVE with "cannot verify authorship
-# for a channel not derived from this home; use --anonymous only on this home's own
-# channel". Reading another home's recorded keys is not the answer - firstmate does
-# not reach into another home's files - so probe a channel from the home that owns
-# it. Passing this home's own resolved path is not that case and keeps the
-# conclusive answer available: what rules it out is the label differing from this
-# home's, not the flag being present.
+# This wrapper selects the reading identity, resolves the channel, and supplies
+# this home's recorded authors; bin/fm-buzz-inspect.mjs owns assessment and verdict
+# mechanics.
+# --channel-label may select another channel, but this wrapper never reads another
+# home's author records to attribute it.
 #
 # Unlike bin/fm-buzz-publish.sh this is NOT fire-and-forget: it is a diagnostic run
 # by hand, and a failure to reach the relay should be visible in its exit status.
@@ -140,12 +107,30 @@ collect_author() {  # <line>
   key=$(fm_buzz_normalize_public_key "$1") || return 0
   EXPECTED_AUTHORS+=("$key")
 }
-for author_file in "$DATA/buzz-keypair.public" "$DATA/buzz-keypair.public-history"; do
-  [ -r "$author_file" ] || continue
+current_file="$DATA/buzz-keypair.public"
+if [ -r "$current_file" ]; then
+  current_count=0
+  current_valid=1
+  current_key=""
+  while IFS= read -r author_line || [ -n "$author_line" ]; do
+    current_count=$((current_count + 1))
+    normalized=$(fm_buzz_normalize_public_key "$author_line") || {
+      current_valid=0
+      continue
+    }
+    current_key=$normalized
+  done < "$current_file"
+  if [ "$current_count" -eq 1 ] && [ "$current_valid" -eq 1 ]; then
+    collect_author "$current_key"
+  fi
+fi
+
+history_file="$DATA/buzz-keypair.public-history"
+if [ -r "$history_file" ]; then
   while IFS= read -r author_line || [ -n "$author_line" ]; do
     collect_author "$author_line"
-  done < "$author_file"
-done
+  done < "$history_file"
+fi
 
 KEY=""
 if [ "$ANONYMOUS" -eq 0 ]; then
