@@ -1,0 +1,15 @@
+id: reconcile-secondmate-liveness
+contexts: 3
+durable-lines: 14
+trigger-clear: true
+intents: 1
+target-owner: secondmate-provisioning
+harnesses: claude,codex,opencode,pi,grok
+backends: tmux,herdr,zellij,orca,cmux
+name-kind: job
+readable: true
+non-triviality-override: the short procedure still branches on captain authority a script cannot express
+route: internal-skill
+files-created: 0
+expected: skill-worthy
+expected-reason: gates-passed

@@ -69,7 +69,8 @@ Firstmate adds this skill's load instruction to firstmate-repo briefs by hand in
 ## Skill-admission rubric
 
 Skill creation is fail-closed: the default answer is "not a skill" until every admission gate passes.
-Apply all six gates before creating a directory or editing a live skill file.
+Apply all six gates before creating a new skill directory, and again before materially expanding an existing skill's scope.
+Routine edits inside a skill's already-admitted scope - a correction, a clarification, a structural fix - do not reopen admission.
 
 1. **Recurrence.**
    The behavior must have been requested or expected at least twice in distinct contexts.
@@ -101,7 +102,19 @@ Multi-intent proposals are split first, then each proposed skill starts again at
 End-of-task pattern extraction may create a `skillify-candidate` backlog note for a separate future ship task.
 It must never write a live skill from `/stow` or from a task-completion path.
 
-The seeded decisions in `tests/fixtures/skill-admission/` and their assertions in `tests/fm-skill-contract.test.sh` pin the expected routing for a one-off helper, a recurring coherent capability, and a refused multi-intent proposal.
+The seeded decisions in `tests/fixtures/skill-admission/` and their assertions in `tests/fm-skill-contract.test.sh` pin the expected routing for a one-off helper, a recurring coherent capability, a recorded gate-2 override, and a refused multi-intent proposal.
+That same test anchors the gate headings, the fail-closed default, and the routing rules above, so weakening this section fails the suite rather than passing silently.
+
+### Declared audit escapes
+
+`tests/fm-skill-contract.test.sh` honors three frontmatter keys, each a recorded decision rather than a way to silence a receipt.
+
+- `trigger:` declares the load condition explicitly, and when present it replaces the description-derived phrases the SC005 overlap check compares for that skill.
+- `trigger-owner:` names the single skill that owns a trigger phrase claimed by more than one skill; SC005 clears the overlap only when every claimant names the same owner.
+- `standalone: true` records that a skill is deliberately reachable without an `AGENTS.md` pointer or an inbound reference from another skill, which is the only thing that clears the SC004 orphan check.
+
+Reach for one only when the collision or the standalone posture is genuine.
+Deleting content or narrowing a real trigger to quiet a receipt is never the remedy.
 
 ## Compatibility and enforcement
 

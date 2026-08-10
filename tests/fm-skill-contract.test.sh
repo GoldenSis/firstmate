@@ -9,6 +9,11 @@ set -u
 
 ADMISSION_FIXTURES="$ROOT/tests/fixtures/skill-admission"
 CONTRACT_FIXTURES="$ROOT/tests/fixtures/skill-contract"
+CODING_GUIDELINES="$ROOT/.agents/skills/firstmate-coding-guidelines/SKILL.md"
+REFERENCE_CHECKER="$ROOT/tests/fm-instruction-reference-integrity.test.sh"
+# Single owner of the evidence label both reporters emit and SC008 validates.
+RECEIPT_LABEL='structural presence'
+CONTRACT_CHECKS='SC001 SC002 SC003 SC004 SC005 SC006 SC007 SC008'
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-skill-contract.XXXXXX")
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
@@ -93,11 +98,15 @@ tracked_skill_files() {
 }
 
 structural_ok() {
-  printf 'ok - [structural presence] %s\n' "$1"
+  printf 'ok - [%s] %s\n' "$RECEIPT_LABEL" "$1"
 }
 
 structural_error() {
-  printf 'not ok - [structural presence] %s\n' "$1"
+  printf 'not ok - [%s] %s\n' "$RECEIPT_LABEL" "$1"
+}
+
+emitted_receipt_labels() {
+  printf '%s\n' "$1" | awk -F '[][]' '/^(not )?ok - \[/ { print $2 }' | LC_ALL=C sort -u
 }
 
 precise_trigger_count() {
@@ -108,20 +117,6 @@ precise_trigger_count() {
     section && index($0, needle) == 1 &&
       $0 ~ / - (load|use) (before|when|whenever|on|after) / { count++ }
     END { print count + 0 }
-  ' "$agents"
-}
-
-agent_trigger_names() {
-  local agents=$1
-  awk '
-    /^## 13\. Agent-only reference skills$/ { section = 1; next }
-    section && /^## / { exit }
-    section && /^- `[^`]+` -/ {
-      line = $0
-      sub(/^- `/, "", line)
-      sub(/`.*/, "", line)
-      print line
-    }
   ' "$agents"
 }
 
@@ -154,50 +149,74 @@ frontmatter_triggers() {
     return
   fi
   description=$(frontmatter_description "$file")
-  printf '%s\n' "$description" | awk '{
-    text = tolower($0)
-    gsub(/[[:space:]]+/, " ", text)
-    while (match(text, /(use|load) (before|whenever|when|on|after) [^.]+/)) {
-      phrase = substr(text, RSTART, RLENGTH)
-      sub(/[[:space:].;:]+$/, "", phrase)
-      print phrase
-      text = substr(text, RSTART + RLENGTH)
+  printf '%s\n' "$description" | awk '
+    # A trigger clause runs to the end of its sentence. Only a period that
+    # actually ends a sentence may cut it: periods inside an abbreviation
+    # ("e.g.") or a filename ("bin/fm-autonudge.sh") are shielded first, so a
+    # clause is never truncated mid-word into a prefix that can collide with an
+    # unrelated skill.
+    function shield(text,   i, size, char, following, out) {
+      size = length(text)
+      out = ""
+      for (i = 1; i <= size; i++) {
+        char = substr(text, i, 1)
+        if (char == ".") {
+          following = (i < size) ? substr(text, i + 1, 1) : ""
+          if (following ~ /[[:alnum:]]/) {
+            out = out MARK
+            continue
+          }
+          if (length(out) >= 2 &&
+              substr(out, length(out) - 1, 1) == MARK &&
+              substr(out, length(out), 1) ~ /[[:alpha:]]/) {
+            out = out MARK
+            continue
+          }
+        }
+        out = out char
+      }
+      return out
     }
-  }'
+    BEGIN { MARK = "\001" }
+    {
+      text = shield(tolower($0))
+      gsub(/[[:space:]]+/, " ", text)
+      while (match(text, /(use|load) (before|whenever|when|on|after) [^.]+/)) {
+        phrase = substr(text, RSTART, RLENGTH)
+        sub(/[[:space:].;:]+$/, "", phrase)
+        gsub(MARK, ".", phrase)
+        print phrase
+        text = substr(text, RSTART + RLENGTH)
+      }
+    }'
 }
 
-extract_local_references() {
-  local file=$1
-  grep -Eo '(^|[[:space:](`"])(bin|docs|tests|\.agents/skills|skills)/[[:alnum:]_./*?<>-]*' "$file" |
-    sed -E 's/^[[:space:](`"]+//' |
-    LC_ALL=C sort -u
-}
-
-local_reference_exists() {
-  local root=$1 reference=$2
-  case "$reference" in
-    *'<'*|*'>'*) return 0 ;;
-    *'*'*|*'?'*) compgen -G "$root/$reference" >/dev/null ;;
-    */) [ -d "$root/$reference" ] ;;
-    *) [ -e "$root/$reference" ] ;;
-  esac
+# Literal-reference resolution is owned by tests/fm-instruction-reference-integrity.test.sh
+# (fenced-code, example-line, placeholder, glob, and case handling included).
+# SC006 delegates to it and only translates its diagnostics into audit receipts.
+skill_reference_diagnostics() {
+  local root=$1
+  shift
+  /bin/bash "$REFERENCE_CHECKER" --check-files "$root" "$@" 2>&1
 }
 
 validate_receipt_label() {
   local label=$1
-  if [ "$label" = "structural presence" ]; then
-    structural_ok "SC008 evidence-label: audit receipts identify structural presence and do not claim executed behavior"
+  if [ "$label" = "$RECEIPT_LABEL" ]; then
+    structural_ok "SC008 evidence-label: audit receipts identify $RECEIPT_LABEL and do not claim executed behavior"
     return 0
   fi
-  structural_error "SC008 evidence-label: contract audit receipts must say 'structural presence', not '$label'"
+  structural_error "SC008 evidence-label: contract audit receipts must say '$RECEIPT_LABEL', not '$label'"
   return 1
 }
 
 audit_skill_tree() {
   local root=$1 agents="$1/AGENTS.md" failed=0 check_failed=0
   local relative file directory_name declared_name user_invocable internal name
-  local count referenced standalone entry trigger owner reference marker
+  local count referenced standalone trigger owner marker
   local trigger_rows trigger_groups phrase names
+  local diagnostic_line reference_file reference_literal reference_message
+  local -a skill_files=()
   local skill_count=0 internal_count=0 public_count=0
 
   while IFS= read -r relative; do
@@ -269,14 +288,6 @@ audit_skill_tree() {
         failed=1
       fi
     done < <(tracked_skill_files "$root")
-    while IFS= read -r entry; do
-      [ -n "$entry" ] || continue
-      if [ ! -f "$root/.agents/skills/$entry/SKILL.md" ]; then
-        structural_error "SC003 trigger-pointer: AGENTS.md trigger '$entry' has no tracked internal skill"
-        check_failed=1
-        failed=1
-      fi
-    done < <(agent_trigger_names "$agents")
   fi
   [ "$check_failed" -ne 0 ] || structural_ok "SC003 trigger-pointer: every referenced agent-only skill has one precise AGENTS.md pointer"
 
@@ -340,21 +351,32 @@ audit_skill_tree() {
     check_failed=1
     failed=1
   done < "$trigger_groups"
-  [ "$check_failed" -ne 0 ] || structural_ok "SC005 trigger-overlap: explicit frontmatter triggers have no unresolved collisions"
+  [ "$check_failed" -ne 0 ] || structural_ok "SC005 trigger-overlap: declared and description-derived triggers have no unresolved collisions"
 
   check_failed=0
+  skill_files=()
   while IFS= read -r relative; do
     [ -n "$relative" ] || continue
-    file="$root/$relative"
-    while IFS= read -r reference; do
-      [ -n "$reference" ] || continue
-      if ! local_reference_exists "$root" "$reference"; then
-        structural_error "SC006 artifact-reachability: $relative references missing local target '$reference'"
-        check_failed=1
-        failed=1
-      fi
-    done < <(extract_local_references "$file")
+    skill_files+=("$relative")
   done < <(tracked_skill_files "$root")
+  if [ "${#skill_files[@]}" -gt 0 ]; then
+    while IFS= read -r diagnostic_line; do
+      [ -n "$diagnostic_line" ] || continue
+      IFS=: read -r reference_file _ reference_literal reference_message <<< "$diagnostic_line"
+      reference_literal=${reference_literal# }
+      reference_message=${reference_message# }
+      case "$reference_message" in
+        *'case does not match'*)
+          structural_error "SC006 artifact-reachability: $reference_file references local target '$reference_literal' with a different tracked case"
+          ;;
+        *)
+          structural_error "SC006 artifact-reachability: $reference_file references missing local target '$reference_literal'"
+          ;;
+      esac
+      check_failed=1
+      failed=1
+    done < <(skill_reference_diagnostics "$root" "${skill_files[@]}")
+  fi
   [ "$check_failed" -ne 0 ] || structural_ok "SC006 artifact-reachability: local script, doc, test, fixture, and skill references resolve"
 
   check_failed=0
@@ -414,6 +436,7 @@ make_contract_fixture() {
   write_fixture_agents "$repo/AGENTS.md" alpha
 
   case "$mutation" in
+    none) ;;
     mismatched-name)
       write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" beta yes \
         'load when the alpha fixture runs' 'Use `bin/fixture.sh`.'
@@ -484,13 +507,50 @@ classify_admission_fixture() {
 }
 
 test_current_skill_contract() {
-  local output status=0 label_output label_status=0
+  local output status=0 label_output label_status=0 emitted
   output=$(audit_skill_tree "$ROOT") || status=$?
   printf '%s\n' "$output"
   expect_code 0 "$status" "current tracked skill contract audit"
-  label_output=$(validate_receipt_label 'structural presence') || label_status=$?
+  assert_contains "$output" "ok - [$RECEIPT_LABEL] SC001 name-parity:" \
+    "audit receipts no longer carry the structural-presence evidence label"
+  # SC008 validates the label the reporters actually emitted, not a literal.
+  emitted=$(emitted_receipt_labels "$output")
+  [ -n "$emitted" ] || fail "current audit emitted no labelled receipts"
+  label_output=$(validate_receipt_label "$emitted") || label_status=$?
   printf '%s\n' "$label_output"
   expect_code 0 "$label_status" "current audit evidence label"
+}
+
+# The fixtures below only pin routing decisions. This test pins the prose the
+# fixtures encode, so weakening, reordering, or deleting the rubric fails here
+# instead of passing silently against a shell reimplementation of itself.
+test_admission_rubric_owner() {
+  local phrase
+  for phrase in \
+    'Skill creation is fail-closed: the default answer is "not a skill" until every admission gate passes.' \
+    '1. **Recurrence.**' \
+    '2. **Non-triviality.**' \
+    '3. **Clear trigger phrase.**' \
+    '4. **One coherent capability.**' \
+    '5. **Named target.**' \
+    '6. **Job-not-tool naming.**' \
+    'Only after gates 1 through 6 pass, ask whether a smart intern can follow the procedure without hidden context.' \
+    'it never supplies authority, safety, permissions, tests, or failure paths and never substitutes for any of them.' \
+    'One-off mechanics go to an existing script under `bin/` or to a brief section, not to a new skill.' \
+    'Reusable procedures with no clear trigger go to `docs/`, not to a skill.' \
+    'Multi-intent proposals are split first, then each proposed skill starts again at gate 1.' \
+    'It must never write a live skill from `/stow` or from a task-completion path.'; do
+    assert_grep "$phrase" "$CODING_GUIDELINES" "skill-admission rubric lost '$phrase'"
+  done
+  for phrase in \
+    '`trigger:` declares the load condition' \
+    '`trigger-owner:` names the single skill that owns a trigger phrase' \
+    '`standalone: true` records that a skill is deliberately reachable'; do
+    assert_grep "$phrase" "$CODING_GUIDELINES" "skill-admission rubric does not document the audit escape '$phrase'"
+  done
+  assert_grep 'materially expanding an existing skill' "$CODING_GUIDELINES" \
+    "skill-admission rubric no longer scopes the gates to creation and scope expansion"
+  pass "skill-admission rubric owns six gates, the fail-closed default, its routes, and its declared escapes"
 }
 
 test_admission_fixtures() {
@@ -504,6 +564,7 @@ test_admission_fixtures() {
     case "$(basename "$fixture"):$route" in
       one-off-helper.fixture:existing-script-or-brief) ;;
       recurring-coherent-capability.fixture:internal-skill) ;;
+      recorded-non-triviality-override.fixture:internal-skill) ;;
       multi-intent-proposal.fixture:split-and-reapply) ;;
       *) fail "$(basename "$fixture") has an unexpected admission route '$route'" ;;
     esac
@@ -511,14 +572,37 @@ test_admission_fixtures() {
     [ "$files_created" = "0" ] || fail "$(basename "$fixture") created a skill before admission completed"
     pass "[rubric fixture] $(basename "$fixture") => $actual via $route"
   done
-  [ "$count" -eq 3 ] || fail "expected exactly 3 skill-admission fixtures, found $count"
+  [ "$count" -eq 4 ] || fail "expected exactly 4 skill-admission fixtures, found $count"
+
+  # The override fixture is only meaningful while it stays under the gate-2
+  # line-count threshold it is exempting itself from.
+  fixture="$ADMISSION_FIXTURES/recorded-non-triviality-override.fixture"
+  [ "$(fixture_value "$fixture" durable-lines)" -lt 20 ] ||
+    fail "recorded-non-triviality-override.fixture no longer exercises the gate-2 override"
+  [ -n "$(fixture_value "$fixture" non-triviality-override)" ] ||
+    fail "recorded-non-triviality-override.fixture records no override reason"
+}
+
+# Control for the shared fixture builders: an unmutated fixture repo must be
+# fully clean. Without it, drift in write_fixture_skill / write_fixture_agents
+# would add a spurious receipt to every seeded case and still look green.
+test_clean_contract_fixture() {
+  local repo="$TMP_ROOT/clean-baseline" output status=0
+  make_contract_fixture "$repo" none
+  output=$(audit_skill_tree "$repo") || status=$?
+  printf '%s\n' "$output"
+  expect_code 0 "$status" "unmutated skill-contract fixture"
+  assert_not_contains "$output" "not ok - [$RECEIPT_LABEL] " \
+    "unmutated skill-contract fixture emitted a structural failure receipt"
+  pass "[clean control] unmutated skill-contract fixture emits only passing receipts"
 }
 
 test_contract_failure_fixtures() {
-  local fixture mutation expected label repo output status
+  local fixture check mutation expected label repo output status other
   local count=0
   for fixture in "$CONTRACT_FIXTURES"/*.fixture; do
     count=$((count + 1))
+    check=$(fixture_value "$fixture" check)
     mutation=$(fixture_value "$fixture" mutation)
     expected=$(fixture_value "$fixture" expected-receipt)
     status=0
@@ -531,13 +615,21 @@ test_contract_failure_fixtures() {
       output=$(audit_skill_tree "$repo") || status=$?
     fi
     [ "$status" -ne 0 ] || fail "$(basename "$fixture") did not fail"
-    assert_contains "$output" "not ok - [structural presence] $expected" \
+    assert_contains "$output" "not ok - [$RECEIPT_LABEL] $expected" \
       "$(basename "$fixture") did not emit its specific structural error receipt"
+    # One seeded defect must produce exactly one failing check.
+    for other in $CONTRACT_CHECKS; do
+      [ "$other" = "$check" ] && continue
+      assert_not_contains "$output" "not ok - [$RECEIPT_LABEL] $other " \
+        "$(basename "$fixture") also failed $other, so its receipt is not isolated"
+    done
     pass "[seeded failure] $(basename "$fixture") => $expected"
   done
   [ "$count" -eq 8 ] || fail "expected exactly 8 skill-contract failure fixtures, found $count"
 }
 
 test_current_skill_contract
+test_admission_rubric_owner
 test_admission_fixtures
+test_clean_contract_fixture
 test_contract_failure_fixtures
