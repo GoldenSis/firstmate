@@ -1,0 +1,14 @@
+id: resume-exited-worker
+contexts: 3
+durable-lines: 31
+trigger-clear: true
+intents: 1
+target-owner: harness-adapters
+harnesses:
+backends: tmux,herdr,zellij,orca,cmux
+name-kind: job
+readable: true
+route: name-target-and-reapply
+files-created: 0
+expected: non-skill
+expected-reason: named-target

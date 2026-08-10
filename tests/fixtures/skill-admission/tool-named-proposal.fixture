@@ -1,0 +1,14 @@
+id: run-shellcheck-verbose
+contexts: 3
+durable-lines: 27
+trigger-clear: true
+intents: 1
+target-owner: firstmate-coding-guidelines
+harnesses: claude,codex,opencode,pi,grok
+backends: tmux,herdr,zellij,orca,cmux
+name-kind: tool
+readable: true
+route: rename-and-reapply
+files-created: 0
+expected: non-skill
+expected-reason: job-not-tool

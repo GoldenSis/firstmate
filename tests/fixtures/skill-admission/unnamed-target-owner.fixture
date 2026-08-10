@@ -1,0 +1,14 @@
+id: reconcile-wake-queue
+contexts: 3
+durable-lines: 34
+trigger-clear: true
+intents: 1
+target-owner:
+harnesses: claude,codex,opencode,pi,grok
+backends: tmux,herdr,zellij,orca,cmux
+name-kind: job
+readable: true
+route: name-target-and-reapply
+files-created: 0
+expected: non-skill
+expected-reason: named-target

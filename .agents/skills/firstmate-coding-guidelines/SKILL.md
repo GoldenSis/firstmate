@@ -102,7 +102,7 @@ Multi-intent proposals are split first, then each proposed skill starts again at
 End-of-task pattern extraction may create a `skillify-candidate` backlog note for a separate future ship task.
 It must never write a live skill from `/stow` or from a task-completion path.
 
-The seeded decisions in `tests/fixtures/skill-admission/` and their assertions in `tests/fm-skill-contract.test.sh` pin the expected routing for a one-off helper, a recurring coherent capability, a recorded gate-2 override, and a refused multi-intent proposal.
+The seeded decisions in `tests/fixtures/skill-admission/` and their assertions in `tests/fm-skill-contract.test.sh` pin one routing decision per gate outcome, so every gate above has a fixture that fails when the gate is weakened or dropped.
 That same test anchors the gate headings, the fail-closed default, and the routing rules above, so weakening this section fails the suite rather than passing silently.
 
 ### Declared audit escapes
@@ -113,6 +113,7 @@ That same test anchors the gate headings, the fail-closed default, and the routi
 - `trigger-owner:` names the single skill that owns a trigger phrase claimed by more than one skill; SC005 clears the overlap only when every claimant names the same owner.
 - `standalone: true` records that a skill is deliberately reachable without an `AGENTS.md` pointer or an inbound reference from another skill, which is the only thing that clears the SC004 orphan check.
 
+Declare any of the three at the top level of the frontmatter or nested under `metadata:`; the audit reads both placements, so the repo's usual `metadata:` nesting for private keys stays valid.
 Reach for one only when the collision or the standalone posture is genuine.
 Deleting content or narrowing a real trigger to quiet a receipt is never the remedy.
 

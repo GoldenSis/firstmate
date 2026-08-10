@@ -122,12 +122,13 @@ precise_trigger_count() {
 
 skill_has_inbound_reference() {
   local root=$1 name=$2 current=$3 other
-  while IFS= read -r other; do
+  shift 3
+  for other in "$@"; do
     [ "$other" = "$current" ] && continue
     if grep -F -- "\`$name\`" "$root/$other" >/dev/null; then
       return 0
     fi
-  done < <(tracked_skill_files "$root")
+  done
   return 1
 }
 
@@ -144,6 +145,7 @@ normalize_trigger() {
 frontmatter_triggers() {
   local file=$1 explicit description
   explicit=$(frontmatter_scalar "$file" trigger)
+  [ -n "$explicit" ] || explicit=$(frontmatter_metadata_scalar "$file" trigger)
   if [ -n "$explicit" ]; then
     normalize_trigger "$explicit"
     return
@@ -152,9 +154,9 @@ frontmatter_triggers() {
   printf '%s\n' "$description" | awk '
     # A trigger clause runs to the end of its sentence. Only a period that
     # actually ends a sentence may cut it: periods inside an abbreviation
-    # ("e.g.") or a filename ("bin/fm-autonudge.sh") are shielded first, so a
-    # clause is never truncated mid-word into a prefix that can collide with an
-    # unrelated skill.
+    # ("e.g."), a filename ("bin/fm-autonudge.sh"), or an ellipsis ("...") are
+    # shielded first, so a clause is never truncated mid-word into a prefix that
+    # can collide with an unrelated skill.
     function shield(text,   i, size, char, following, out) {
       size = length(text)
       out = ""
@@ -162,7 +164,13 @@ frontmatter_triggers() {
         char = substr(text, i, 1)
         if (char == ".") {
           following = (i < size) ? substr(text, i + 1, 1) : ""
-          if (following ~ /[[:alnum:]]/) {
+          if (following ~ /[[:alnum:]]/ || following == ".") {
+            out = out MARK
+            continue
+          }
+          # A period closing a run already shielded as an abbreviation
+          # ("e.g.") or as an ellipsis ("...") belongs to that run too.
+          if (length(out) >= 1 && substr(out, length(out), 1) == MARK) {
             out = out MARK
             continue
           }
@@ -194,10 +202,12 @@ frontmatter_triggers() {
 # Literal-reference resolution is owned by tests/fm-instruction-reference-integrity.test.sh
 # (fenced-code, example-line, placeholder, glob, and case handling included).
 # SC006 delegates to it and only translates its diagnostics into audit receipts.
+# The delegate exits 0 when clean and 1 when it reported diagnostics; any other
+# status means the delegation itself is broken and must not be read as findings.
 skill_reference_diagnostics() {
-  local root=$1
-  shift
-  /bin/bash "$REFERENCE_CHECKER" --check-files "$root" "$@" 2>&1
+  local root=$1 destination=$2
+  shift 2
+  /bin/bash "$REFERENCE_CHECKER" --check-files "$root" "$@" > "$destination" 2>&1
 }
 
 validate_receipt_label() {
@@ -216,12 +226,19 @@ audit_skill_tree() {
   local count referenced standalone trigger owner marker
   local trigger_rows trigger_groups phrase names
   local diagnostic_line reference_file reference_literal reference_message
+  local reference_output reference_status
   local -a skill_files=()
   local skill_count=0 internal_count=0 public_count=0
 
+  # The tracked skill list cannot change mid-audit, so resolve it once and let
+  # every check iterate the same materialized set.
   while IFS= read -r relative; do
     [ -n "$relative" ] || continue
-    skill_count=$((skill_count + 1))
+    skill_files+=("$relative")
+  done < <(tracked_skill_files "$root")
+  skill_count=${#skill_files[@]}
+
+  for relative in "${skill_files[@]+"${skill_files[@]}"}"; do
     file="$root/$relative"
     directory_name=$(basename "$(dirname "$relative")")
     declared_name=$(frontmatter_scalar "$file" name)
@@ -234,7 +251,7 @@ audit_skill_tree() {
       .agents/skills/*) internal_count=$((internal_count + 1)) ;;
       skills/*) public_count=$((public_count + 1)) ;;
     esac
-  done < <(tracked_skill_files "$root")
+  done
   [ "$skill_count" -gt 0 ] || {
     structural_error "SC001 name-parity: no tracked skill files were found"
     check_failed=1
@@ -243,8 +260,7 @@ audit_skill_tree() {
   [ "$check_failed" -ne 0 ] || structural_ok "SC001 name-parity: $skill_count tracked skill directory names match frontmatter"
 
   check_failed=0
-  while IFS= read -r relative; do
-    [ -n "$relative" ] || continue
+  for relative in "${skill_files[@]+"${skill_files[@]}"}"; do
     case "$relative" in .agents/skills/*) ;; *) continue ;; esac
     file="$root/$relative"
     user_invocable=$(frontmatter_scalar "$file" user-invocable)
@@ -262,7 +278,7 @@ audit_skill_tree() {
       check_failed=1
       failed=1
     fi
-  done < <(tracked_skill_files "$root")
+  done
   [ "$check_failed" -ne 0 ] || structural_ok "SC002 frontmatter-posture: $internal_count internal skills declare invocability and metadata.internal"
 
   check_failed=0
@@ -271,8 +287,7 @@ audit_skill_tree() {
     check_failed=1
     failed=1
   else
-    while IFS= read -r relative; do
-      [ -n "$relative" ] || continue
+    for relative in "${skill_files[@]+"${skill_files[@]}"}"; do
       case "$relative" in .agents/skills/*) ;; *) continue ;; esac
       file="$root/$relative"
       user_invocable=$(frontmatter_scalar "$file" user-invocable)
@@ -287,13 +302,12 @@ audit_skill_tree() {
         check_failed=1
         failed=1
       fi
-    done < <(tracked_skill_files "$root")
+    done
   fi
   [ "$check_failed" -ne 0 ] || structural_ok "SC003 trigger-pointer: every referenced agent-only skill has one precise AGENTS.md pointer"
 
   check_failed=0
-  while IFS= read -r relative; do
-    [ -n "$relative" ] || continue
+  for relative in "${skill_files[@]+"${skill_files[@]}"}"; do
     case "$relative" in .agents/skills/*) ;; *) continue ;; esac
     file="$root/$relative"
     name=$(basename "$(dirname "$relative")")
@@ -302,20 +316,20 @@ audit_skill_tree() {
     [ -n "$standalone" ] || standalone=$(frontmatter_metadata_scalar "$file" standalone)
     referenced=0
     [ -f "$agents" ] && grep -F -- "\`$name\`" "$agents" >/dev/null && referenced=1
-    if [ "$referenced" -eq 0 ] && ! skill_has_inbound_reference "$root" "$name" "$relative" &&
+    if [ "$referenced" -eq 0 ] &&
+      ! skill_has_inbound_reference "$root" "$name" "$relative" "${skill_files[@]}" &&
       [ "$user_invocable" != "true" ] && [ "$standalone" != "true" ]; then
       structural_error "SC004 orphan: agent-only skill '$name' has no AGENTS.md reference, inbound skill reference, or standalone posture"
       check_failed=1
       failed=1
     fi
-  done < <(tracked_skill_files "$root")
+  done
   [ "$check_failed" -ne 0 ] || structural_ok "SC004 orphan: internal skills are reachable or explicitly standalone"
 
   check_failed=0
   trigger_rows=$(mktemp "$TMP_ROOT/triggers.XXXXXX")
   trigger_groups=$(mktemp "$TMP_ROOT/trigger-groups.XXXXXX")
-  while IFS= read -r relative; do
-    [ -n "$relative" ] || continue
+  for relative in "${skill_files[@]+"${skill_files[@]}"}"; do
     file="$root/$relative"
     name=$(basename "$(dirname "$relative")")
     owner=$(frontmatter_scalar "$file" trigger-owner)
@@ -324,7 +338,7 @@ audit_skill_tree() {
       [ -n "$trigger" ] || continue
       printf '%s|%s|%s\n' "$trigger" "$name" "$owner" >> "$trigger_rows"
     done < <(frontmatter_triggers "$file")
-  done < <(tracked_skill_files "$root")
+  done
   LC_ALL=C sort -u "$trigger_rows" | awk -F '|' '
     function flush() {
       if (count > 1 && !resolved) print phrase "|" names
@@ -354,34 +368,47 @@ audit_skill_tree() {
   [ "$check_failed" -ne 0 ] || structural_ok "SC005 trigger-overlap: declared and description-derived triggers have no unresolved collisions"
 
   check_failed=0
-  skill_files=()
-  while IFS= read -r relative; do
-    [ -n "$relative" ] || continue
-    skill_files+=("$relative")
-  done < <(tracked_skill_files "$root")
-  if [ "${#skill_files[@]}" -gt 0 ]; then
-    while IFS= read -r diagnostic_line; do
-      [ -n "$diagnostic_line" ] || continue
-      IFS=: read -r reference_file _ reference_literal reference_message <<< "$diagnostic_line"
-      reference_literal=${reference_literal# }
-      reference_message=${reference_message# }
-      case "$reference_message" in
-        *'case does not match'*)
-          structural_error "SC006 artifact-reachability: $reference_file references local target '$reference_literal' with a different tracked case"
-          ;;
-        *)
-          structural_error "SC006 artifact-reachability: $reference_file references missing local target '$reference_literal'"
-          ;;
-      esac
+  if [ "$skill_count" -gt 0 ]; then
+    reference_output=$(mktemp "$TMP_ROOT/references.XXXXXX")
+    reference_status=0
+    skill_reference_diagnostics "$root" "$reference_output" "${skill_files[@]}" ||
+      reference_status=$?
+    if [ "$reference_status" -gt 1 ]; then
+      structural_error "SC006 artifact-reachability: the reference resolver could not run (exit $reference_status): $(tr '\n' ' ' < "$reference_output")"
       check_failed=1
       failed=1
-    done < <(skill_reference_diagnostics "$root" "${skill_files[@]}")
+    else
+      while IFS= read -r diagnostic_line; do
+        [ -n "$diagnostic_line" ] || continue
+        IFS=: read -r reference_file _ reference_literal reference_message <<< "$diagnostic_line"
+        reference_literal=${reference_literal# }
+        reference_message=${reference_message# }
+        case "$reference_message" in
+          'case does not match'*)
+            structural_error "SC006 artifact-reachability: $reference_file references local target '$reference_literal' with a different tracked case"
+            ;;
+          'no exact tracked target')
+            structural_error "SC006 artifact-reachability: $reference_file references missing local target '$reference_literal'"
+            ;;
+          'missing file')
+            structural_error "SC006 artifact-reachability: tracked skill file $reference_file is absent from the working tree"
+            ;;
+          'cannot read the tracked-file index')
+            structural_error "SC006 artifact-reachability: the reference resolver could not read the tracked-file index"
+            ;;
+          *)
+            structural_error "SC006 artifact-reachability: the reference resolver emitted an unrecognized diagnostic '$diagnostic_line'"
+            ;;
+        esac
+        check_failed=1
+        failed=1
+      done < "$reference_output"
+    fi
   fi
   [ "$check_failed" -ne 0 ] || structural_ok "SC006 artifact-reachability: local script, doc, test, fixture, and skill references resolve"
 
   check_failed=0
-  while IFS= read -r relative; do
-    [ -n "$relative" ] || continue
+  for relative in "${skill_files[@]+"${skill_files[@]}"}"; do
     file="$root/$relative"
     marker=$(grep -Eo 'SKILLIFY(_[A-Z0-9]+)*_STUB|SKILL_CONTRACT_STUB|FM_SKILL_STUB' "$file" | head -n 1)
     if [ -n "$marker" ]; then
@@ -389,23 +416,30 @@ audit_skill_tree() {
       check_failed=1
       failed=1
     fi
-  done < <(tracked_skill_files "$root")
+  done
   [ "$check_failed" -ne 0 ] || structural_ok "SC007 stub-sentinel: no tracked skill contains a forbidden placeholder marker"
 
   return "$failed"
 }
 
+# `placement` selects where the explicit trigger is declared. Both placements
+# are documented escapes, so the fixtures exercise each one.
 write_fixture_skill() {
-  local file=$1 name=$2 include_internal=$3 trigger=$4 body=${5:-}
+  local file=$1 name=$2 include_internal=$3 trigger=$4 body=${5:-} placement=${6:-frontmatter}
   mkdir -p "$(dirname "$file")"
   {
     printf '%s\n' '---'
     printf 'name: %s\n' "$name"
     printf '%s\n' 'description: Fixture capability.'
-    printf 'trigger: %s\n' "$trigger"
+    if [ "$placement" = "frontmatter" ]; then
+      printf 'trigger: %s\n' "$trigger"
+    fi
     printf '%s\n' 'user-invocable: false'
     if [ "$include_internal" = "yes" ]; then
       printf '%s\n' 'metadata:' '  internal: true'
+      if [ "$placement" = "metadata" ]; then
+        printf '  trigger: %s\n' "$trigger"
+      fi
     fi
     printf '%s\n\n# %s\n\n%s\n' '---' "$name" "$body"
   } > "$file"
@@ -454,8 +488,10 @@ make_contract_fixture() {
     duplicate-trigger)
       write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
         'load when the fixture alarm fires' 'Use `bin/fixture.sh`.'
+      # beta declares the same trigger under `metadata:`, so the collision only
+      # surfaces while both declared placements are honored.
       write_fixture_skill "$repo/.agents/skills/beta/SKILL.md" beta yes \
-        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.'
+        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' metadata
       write_fixture_agents "$repo/AGENTS.md" alpha beta
       ;;
     stale-artifact)
@@ -554,7 +590,7 @@ test_admission_rubric_owner() {
 }
 
 test_admission_fixtures() {
-  local fixture count=0 actual expected route files_created
+  local fixture count=0 actual expected route files_created reason
   for fixture in "$ADMISSION_FIXTURES"/*.fixture; do
     count=$((count + 1))
     actual=$(classify_admission_fixture "$fixture")
@@ -563,16 +599,23 @@ test_admission_fixtures() {
     route=$(fixture_value "$fixture" route)
     case "$(basename "$fixture"):$route" in
       one-off-helper.fixture:existing-script-or-brief) ;;
+      trivial-recurring-helper.fixture:existing-script-or-brief) ;;
       recurring-coherent-capability.fixture:internal-skill) ;;
       recorded-non-triviality-override.fixture:internal-skill) ;;
+      triggerless-reusable-procedure.fixture:docs-procedure) ;;
       multi-intent-proposal.fixture:split-and-reapply) ;;
+      unnamed-target-owner.fixture:name-target-and-reapply) ;;
+      unnamed-harness-axis.fixture:name-target-and-reapply) ;;
+      unnamed-backend-axis.fixture:name-target-and-reapply) ;;
+      tool-named-proposal.fixture:rename-and-reapply) ;;
+      hidden-context-procedure.fixture:revise-and-reapply) ;;
       *) fail "$(basename "$fixture") has an unexpected admission route '$route'" ;;
     esac
     files_created=$(fixture_value "$fixture" files-created)
     [ "$files_created" = "0" ] || fail "$(basename "$fixture") created a skill before admission completed"
     pass "[rubric fixture] $(basename "$fixture") => $actual via $route"
   done
-  [ "$count" -eq 4 ] || fail "expected exactly 4 skill-admission fixtures, found $count"
+  [ "$count" -eq 11 ] || fail "expected exactly 11 skill-admission fixtures, found $count"
 
   # The override fixture is only meaningful while it stays under the gate-2
   # line-count threshold it is exempting itself from.
@@ -581,6 +624,14 @@ test_admission_fixtures() {
     fail "recorded-non-triviality-override.fixture no longer exercises the gate-2 override"
   [ -n "$(fixture_value "$fixture" non-triviality-override)" ] ||
     fail "recorded-non-triviality-override.fixture records no override reason"
+
+  # Every classifier outcome must be reachable, so a deleted or inverted gate
+  # fails here instead of leaving a branch nothing exercises.
+  for reason in recurrence non-triviality clear-trigger one-coherent-capability \
+    named-target job-not-tool smart-intern-readability gates-passed; do
+    grep -Fqx "expected-reason: $reason" "$ADMISSION_FIXTURES"/*.fixture ||
+      fail "no skill-admission fixture exercises the '$reason' gate outcome"
+  done
 }
 
 # Control for the shared fixture builders: an unmutated fixture repo must be

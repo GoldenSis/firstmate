@@ -119,9 +119,26 @@ extract_internal_skill_triggers() {
   ' "$agents"
 }
 
+resolve_literals() {
+  local tracked=$1 label=$2 path=$3 line literal failed=0
+  while IFS=$'\t' read -r line literal; do
+    [ -n "$literal" ] || continue
+    if tracked_resolves_exactly "$tracked" "$literal"; then
+      continue
+    fi
+    if tracked_resolves_ignoring_case "$tracked" "$literal"; then
+      diagnostic "$label" "$line" "$literal" "case does not match the tracked target"
+    else
+      diagnostic "$label" "$line" "$literal" "no exact tracked target"
+    fi
+    failed=1
+  done < <(extract_literal_references "$path")
+  return "$failed"
+}
+
 check_instruction_references() {
   local repo=$1 agents="$1/AGENTS.md" claude="$1/CLAUDE.md"
-  local tracked line literal skill target failed=0
+  local tracked line skill target failed=0
 
   tracked=$(git -C "$repo" ls-files 2>/dev/null) || {
     diagnostic "AGENTS.md" 1 "AGENTS.md" "cannot read the tracked-file index"
@@ -152,18 +169,7 @@ check_instruction_references() {
   fi
 
   if [ -f "$agents" ]; then
-    while IFS=$'\t' read -r line literal; do
-      [ -n "$literal" ] || continue
-      if tracked_resolves_exactly "$tracked" "$literal"; then
-        continue
-      fi
-      if tracked_resolves_ignoring_case "$tracked" "$literal"; then
-        diagnostic "AGENTS.md" "$line" "$literal" "case does not match the tracked target"
-      else
-        diagnostic "AGENTS.md" "$line" "$literal" "no exact tracked target"
-      fi
-      failed=1
-    done < <(extract_literal_references "$agents")
+    resolve_literals "$tracked" "AGENTS.md" "$agents" || failed=1
 
     while IFS=$'\t' read -r line skill; do
       [ -n "$skill" ] || continue
@@ -186,7 +192,7 @@ check_instruction_references() {
 check_file_references() {
   local repo=$1
   shift
-  local tracked relative line literal failed=0
+  local tracked relative failed=0
 
   tracked=$(git -C "$repo" ls-files 2>/dev/null) || {
     diagnostic "$1" 1 "$1" "cannot read the tracked-file index"
@@ -199,18 +205,7 @@ check_file_references() {
       failed=1
       continue
     fi
-    while IFS=$'\t' read -r line literal; do
-      [ -n "$literal" ] || continue
-      if tracked_resolves_exactly "$tracked" "$literal"; then
-        continue
-      fi
-      if tracked_resolves_ignoring_case "$tracked" "$literal"; then
-        diagnostic "$relative" "$line" "$literal" "case does not match the tracked target"
-      else
-        diagnostic "$relative" "$line" "$literal" "no exact tracked target"
-      fi
-      failed=1
-    done < <(extract_literal_references "$repo/$relative")
+    resolve_literals "$tracked" "$relative" "$repo/$relative" || failed=1
   done
 
   return "$failed"

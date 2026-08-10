@@ -1,0 +1,14 @@
+id: reconcile-worker-endpoint
+contexts: 3
+durable-lines: 29
+trigger-clear: true
+intents: 1
+target-owner: stuck-crewmate-recovery
+harnesses: claude,codex,opencode,pi,grok
+backends:
+name-kind: job
+readable: true
+route: name-target-and-reapply
+files-created: 0
+expected: non-skill
+expected-reason: named-target
