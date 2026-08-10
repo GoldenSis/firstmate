@@ -35,6 +35,10 @@ Each one is the reason a specific failure mode cannot occur, and breaching any o
    A local process that created the group first would own it and could read the bearings projections published into it.
    That is an accepted risk for a proof of concept on a single-user laptop with a disposable stack; the boundary actually being relied on is "no other local user", not "no remote party".
    Closing it means enforcing membership, which belongs to Milestone 2 along with the rest of channel membership management.
+
+   Disposable has to mean the exposure ends when the operator stops using the stack, so the relay carries `restart: "no"` and does not come back by itself after a reboot.
+   The datastores do restart, because they only serve the internal compose network, and they self-resume across a host reboot still holding every published bearings projection.
+   `docker compose -f docker-compose.buzz-loopback.yml down -v` is what ends the exposure for good, volumes included.
 3. **Publishing is fire-and-forget.**
    `bin/fm-buzz-publish.sh` always exits 0.
    A non-zero exit from it is a bug, and `tests/fm-buzz-publish.test.sh` asserts both the behavior and the structure that produces it.

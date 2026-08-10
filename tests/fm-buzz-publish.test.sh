@@ -1116,6 +1116,37 @@ EOF
   pass "an anonymous empty read claims privacy only on a membership refusal"
 }
 
+test_an_anonymous_read_that_returns_events_reports_the_breach() {
+  # The one conclusive answer --anonymous can give, and it is the negative one: a
+  # relay that serves the events to a stranger has no privacy to report. It has to
+  # be stated, because every event below it prints `signature verified` and a
+  # successful breach otherwise looks exactly like a successful legibility check.
+  # This is not a hypothetical shape either - it is what the bundled stack does,
+  # since it ships with membership enforcement off.
+  local home relay breached
+  home=$(make_home anonymous-readable)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"readable-by-a-stranger"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  breached=$(run_inspect "$home" "$relay" --anonymous 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$breached" "identity: ephemeral non-member" \
+    "the read was not performed as a non-member, so nothing here is under test"
+  assert_contains "$breached" "readable-by-a-stranger" \
+    "the stranger did not actually receive the projection"
+  assert_contains "$breached" \
+    "The channel was readable by an identity that is not a member — this is a definite negative privacy result." \
+    "a non-member read the private channel and the tool said nothing about it"
+  assert_not_contains "$breached" "INCONCLUSIVE" \
+    "a non-member reading the channel is conclusive, not inconclusive"
+  pass "an anonymous read that returns events reports the breach"
+}
+
 test_no_firstmate_path_depends_on_buzz() {
   # Invariant: Buzz is additive. If any other Firstmate script, skill, workflow or
   # AGENTS.md instruction ever calls the adapter, a stopped relay could reach a
@@ -1155,4 +1186,5 @@ test_fire_and_forget_contract_is_intact
 test_nothing_private_reaches_a_command_line
 test_the_inspector_rejects_a_tampered_event
 test_an_anonymous_read_only_claims_privacy_when_the_relay_refuses
+test_an_anonymous_read_that_returns_events_reports_the_breach
 test_no_firstmate_path_depends_on_buzz

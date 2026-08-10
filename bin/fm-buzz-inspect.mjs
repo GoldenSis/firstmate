@@ -33,9 +33,9 @@ const limit = envelope.limit ?? 3;
 const full = Boolean(envelope.full);
 const channelId = envelope.channelId || channelIdForLabel(envelope.channelLabel ?? "");
 // A blank key means read as a stranger. That is the useful shape for probing
-// whether a private channel is invisible to non-members, but only the relay
-// refusing the subscription ON MEMBERSHIP GROUNDS can settle the question - see
-// the empty-read branch.
+// whether a private channel is invisible to non-members. Events coming back
+// settles it negatively outright; an absence settles it positively only when the
+// relay refused the subscription ON MEMBERSHIP GROUNDS - see the branches below.
 const anonymous = !envelope.privateKey;
 const privateKey = anonymous ? generateKeypair().privateKey : envelope.privateKey;
 
@@ -54,6 +54,16 @@ try {
     `relay:    ${relay}\nchannel:  ${channelId}\nidentity: ${anonymous ? "ephemeral non-member" : "channel member"}\nevents:   ${events.length}\n`,
   );
   if (refusal) process.stdout.write(`refused:  ${refusal}\n`);
+  // An anonymous read that RETURNS events is the one unambiguous answer this probe
+  // can produce, and it is the negative one: a non-member read the private channel.
+  // It has to be said out loud, because everything below prints `signature
+  // verified` beside each event and a successful breach otherwise reads exactly
+  // like a successful legibility check.
+  if (events.length > 0 && anonymous) {
+    process.stdout.write(
+      "\nThe channel was readable by an identity that is not a member — this is a definite negative privacy result.\n",
+    );
+  }
   // An empty anonymous read is not evidence of privacy on its own, and neither is
   // just any refusal. Only a membership-shaped refusal - NIP-01's `restricted:` -
   // machine-tags itself as being about the READER; every other reason is either

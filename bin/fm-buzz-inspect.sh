@@ -9,8 +9,10 @@
 #   default       read as the publisher (a channel member) - proves the projection
 #                 is legible, and verifies each event's signature
 #   --anonymous   read as a stranger - probes whether the private channel is
-#                 invisible to non-members. Zero events is only an answer when the
-#                 relay refuses the subscription on MEMBERSHIP grounds, i.e. with
+#                 invisible to non-members. Events coming back is the conclusive
+#                 answer, and it is a negative one: a non-member read the channel.
+#                 Zero events is only an answer the other way when the relay
+#                 refuses the subscription on MEMBERSHIP grounds, i.e. with
 #                 NIP-01's `restricted:`. Every other outcome is reported
 #                 INCONCLUSIVE and prints the relay's own words: any other reason
 #                 is not machine-tagged as a membership refusal and so cannot be

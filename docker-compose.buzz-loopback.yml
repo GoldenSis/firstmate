@@ -32,6 +32,11 @@
 # not "no remote party". Enforcing membership so the boundary matches the claim
 # belongs to Milestone 2, which already owns channel membership management.
 #
+# The relay does not restart itself, so a reboot ends the exposure. The datastores
+# do, and they self-resume across a host reboot still holding every published
+# bearings projection; only `docker compose -f docker-compose.buzz-loopback.yml
+# down -v` ends the exposure for good, volumes included.
+#
 # THE ONE PUBLISHED PORT, AND WHY IT READS AS IT DOES
 # Only the relay is published, and only to 127.0.0.1. Postgres, Redis and MinIO are
 # deliberately NOT published at all - they are reachable only over the internal
@@ -117,7 +122,12 @@ services:
       timeout: 3s
       retries: 12
       start_period: 30s
-    restart: unless-stopped
+    # Deliberately NOT unless-stopped, unlike the datastores below. This is the one
+    # service that accepts connections from the host, so a relay that came back by
+    # itself after a reboot would silently resume the local-process exposure above
+    # long after the operator finished with the PoC. The datastores keep restarting
+    # because they only serve the internal compose network.
+    restart: "no"
     networks:
       - buzz-loopback-net
 
