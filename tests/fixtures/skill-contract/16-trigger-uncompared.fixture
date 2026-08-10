@@ -1,0 +1,3 @@
+check: SC005
+mutation: triggerless-skill
+expected-receipt: SC005 trigger-overlap: .agents/skills/alpha/SKILL.md declares no trigger and its description yields no comparable trigger clause

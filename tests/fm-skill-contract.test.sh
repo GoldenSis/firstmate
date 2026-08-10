@@ -252,10 +252,10 @@ audit_skill_tree() {
   local root=$1 agents="$1/AGENTS.md" failed=0 check_failed=0
   local relative file directory_name declared_name user_invocable internal name
   local count referenced standalone trigger owner marker
-  local trigger_rows trigger_groups kind phrase names
+  local trigger_rows trigger_groups kind phrase names trigger_count
   local diagnostic_line reference_output reference_status
   local -a skill_files=() internal_skill_files=()
-  local skill_count=0 internal_count=0 public_count=0
+  local skill_count=0
 
   # The tracked skill list cannot change mid-audit, so resolve it once and let
   # every check iterate the same materialized set. Only `.agents/skills/` is
@@ -277,10 +277,6 @@ audit_skill_tree() {
       check_failed=1
       failed=1
     fi
-    case "$relative" in
-      .agents/skills/*) internal_count=$((internal_count + 1)) ;;
-      skills/*) public_count=$((public_count + 1)) ;;
-    esac
   done
   [ "$skill_count" -gt 0 ] || {
     structural_error "SC001 name-parity: no tracked skill files were found"
@@ -309,7 +305,7 @@ audit_skill_tree() {
       failed=1
     fi
   done
-  [ "$check_failed" -ne 0 ] || structural_ok "SC002 frontmatter-posture: $internal_count internal skills declare invocability and metadata.internal"
+  [ "$check_failed" -ne 0 ] || structural_ok "SC002 frontmatter-posture: ${#internal_skill_files[@]} internal skills declare invocability and metadata.internal"
 
   check_failed=0
   if [ ! -f "$agents" ]; then
@@ -344,17 +340,24 @@ audit_skill_tree() {
     user_invocable=$(frontmatter_scalar "$file" user-invocable)
     standalone=$(frontmatter_scalar "$file" standalone)
     [ -n "$standalone" ] || standalone=$(frontmatter_metadata_scalar "$file" standalone)
+    if [ "$user_invocable" = "true" ] || [ "$standalone" = "true" ]; then
+      continue
+    fi
     referenced=0
     [ -f "$agents" ] && grep -F -- "\`$name\`" "$agents" >/dev/null && referenced=1
-    if [ "$referenced" -eq 0 ] &&
-      ! skill_has_inbound_reference "$root" "$name" "$relative" "${internal_skill_files[@]}" &&
-      [ "$user_invocable" != "true" ] && [ "$standalone" != "true" ]; then
-      structural_error "SC004 orphan: agent-only skill '$name' has no AGENTS.md reference, inbound skill reference, or standalone posture"
-      check_failed=1
-      failed=1
+    [ "$referenced" -eq 0 ] || continue
+    # A mention inside another skill file is not a discovery path: an agent
+    # reaches it only after already loading that heavier skill, so a skill whose
+    # sole inbound evidence is skill prose must declare the standalone posture.
+    if skill_has_inbound_reference "$root" "$name" "$relative" "${internal_skill_files[@]}"; then
+      structural_error "SC004 orphan: agent-only skill '$name' is reachable only from another skill file and must declare standalone: true"
+    else
+      structural_error "SC004 orphan: agent-only skill '$name' has no AGENTS.md reference and no standalone posture"
     fi
+    check_failed=1
+    failed=1
   done
-  [ "$check_failed" -ne 0 ] || structural_ok "SC004 orphan: internal skills are reachable or explicitly standalone"
+  [ "$check_failed" -ne 0 ] || structural_ok "SC004 orphan: internal skills are reachable from AGENTS.md or explicitly standalone"
 
   check_failed=0
   trigger_rows=$(mktemp "$TMP_ROOT/triggers.XXXXXX")
@@ -364,10 +367,19 @@ audit_skill_tree() {
     name=$(basename "$(dirname "$relative")")
     owner=$(frontmatter_scalar "$file" trigger-owner)
     [ -n "$owner" ] || owner=$(frontmatter_metadata_scalar "$file" trigger-owner)
+    trigger_count=0
     while IFS= read -r trigger; do
       [ -n "$trigger" ] || continue
+      trigger_count=$((trigger_count + 1))
       printf '%s|%s|%s\n' "$trigger" "$name" "$owner" >> "$trigger_rows"
     done < <(frontmatter_triggers "$file")
+    # A skill that contributes no phrase silently drops out of the comparison
+    # below, so the passing receipt would cover a skill nothing was compared.
+    if [ "$trigger_count" -eq 0 ]; then
+      structural_error "SC005 trigger-overlap: $relative declares no trigger and its description yields no comparable trigger clause"
+      check_failed=1
+      failed=1
+    fi
   done
   LC_ALL=C sort -u "$trigger_rows" | awk -F '|' '
     function claims(candidate, list,   parts, total, i) {
@@ -454,11 +466,17 @@ audit_skill_tree() {
   return "$failed"
 }
 
-# `placement` selects where the explicit trigger is declared. Both placements
-# are documented escapes, so the fixtures exercise each one.
+# `placement` selects where the explicit trigger is declared. `frontmatter` and
+# `metadata` are the two documented escapes, so the fixtures exercise each one;
+# `none` deliberately omits the declaration so a fixture can pin a skill the
+# description heuristic derives nothing from.
 write_fixture_skill() {
   local file=$1 name=$2 include_internal=$3 trigger=$4 body=${5:-} placement=${6:-frontmatter}
   local owner=${7:-}
+  case "$placement" in
+    frontmatter|metadata|none) ;;
+    *) fail "write_fixture_skill got unsupported trigger placement '$placement'" ;;
+  esac
   # The metadata placement needs the metadata block, so refuse the combination
   # that would silently emit a skill with no trigger at either placement.
   if [ "$placement" = "metadata" ] && [ "$include_internal" != "yes" ]; then
@@ -523,6 +541,17 @@ make_contract_fixture() {
       ;;
     orphan-skill)
       printf '# Fixture instructions\n' > "$repo/AGENTS.md"
+      ;;
+    inbound-reference-only)
+      # alpha's only inbound evidence is prose inside beta, which an agent can
+      # only read after loading beta.
+      write_fixture_skill "$repo/.agents/skills/beta/SKILL.md" beta yes \
+        'load when the beta fixture runs' 'The `alpha` skill owns the cheap rung.'
+      write_fixture_agents "$repo/AGENTS.md" beta
+      ;;
+    triggerless-skill)
+      write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
+        '' 'Use `bin/fixture.sh`.' none
       ;;
     duplicate-trigger)
       write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
@@ -645,6 +674,8 @@ test_admission_rubric_owner() {
   done
   assert_grep 'materially expanding an existing skill' "$CODING_GUIDELINES" \
     "skill-admission rubric no longer scopes the gates to creation and scope expansion"
+  assert_grep 'Declare any of the three nested under `metadata:`' "$CODING_GUIDELINES" \
+    "skill-admission rubric no longer recommends the verified metadata placement for its escapes"
   pass "skill-admission rubric owns six gates, the fail-closed default, its routes, and its declared escapes"
 }
 
@@ -759,7 +790,7 @@ test_contract_failure_fixtures() {
     done
     pass "[seeded failure] $(basename "$fixture") => $expected"
   done
-  [ "$count" -eq 14 ] || fail "expected exactly 14 skill-contract failure fixtures, found $count"
+  [ "$count" -eq 16 ] || fail "expected exactly 16 skill-contract failure fixtures, found $count"
 }
 
 test_current_skill_contract

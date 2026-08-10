@@ -111,9 +111,10 @@ That same test anchors the gate headings, the fail-closed default, and the routi
 
 - `trigger:` declares the load condition explicitly, and when present it replaces the description-derived phrases the SC005 overlap check compares for that skill.
 - `trigger-owner:` names the single skill that owns a trigger phrase claimed by more than one skill; SC005 clears the overlap only when every claimant names the same owner.
-- `standalone: true` records that a skill is deliberately reachable without an `AGENTS.md` pointer or an inbound reference from another skill, which is the only thing that clears the SC004 orphan check.
+- `standalone: true` records that a skill is deliberately reachable without an `AGENTS.md` pointer, and it is the only thing that clears the SC004 orphan check for a skill whose sole inbound evidence is prose inside another skill.
 
-Declare any of the three at the top level of the frontmatter or nested under `metadata:`; the audit reads both placements, so the repo's usual `metadata:` nesting for private keys stays valid.
+Declare any of the three nested under `metadata:`, which is where every tracked skill already keeps its private frontmatter keys and the only placement this repo has verified across its supported harnesses.
+The audit also tolerates a top-level declaration, so an inherited skill that spells one at the top level still reads correctly.
 Reach for one only when the collision or the standalone posture is genuine.
 Deleting content or narrowing a real trigger to quiet a receipt is never the remedy.
 
