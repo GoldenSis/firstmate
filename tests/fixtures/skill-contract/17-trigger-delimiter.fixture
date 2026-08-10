@@ -1,0 +1,3 @@
+check: SC005
+mutation: delimiter-trigger
+expected-receipt: SC005 trigger-overlap: trigger 'load when the captain answers yes|no' is claimed by alpha,beta without one shared trigger-owner

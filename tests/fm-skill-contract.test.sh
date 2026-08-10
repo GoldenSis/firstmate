@@ -288,8 +288,7 @@ audit_skill_tree() {
   [ "$check_failed" -ne 0 ] || structural_ok "SC001 name-parity: $skill_count tracked skill directory names match frontmatter"
 
   check_failed=0
-  for relative in "${skill_files[@]+"${skill_files[@]}"}"; do
-    case "$relative" in .agents/skills/*) ;; *) continue ;; esac
+  for relative in "${internal_skill_files[@]+"${internal_skill_files[@]}"}"; do
     file="$root/$relative"
     user_invocable=$(frontmatter_scalar "$file" user-invocable)
     internal=$(frontmatter_metadata_scalar "$file" internal)
@@ -315,8 +314,7 @@ audit_skill_tree() {
     check_failed=1
     failed=1
   else
-    for relative in "${skill_files[@]+"${skill_files[@]}"}"; do
-      case "$relative" in .agents/skills/*) ;; *) continue ;; esac
+    for relative in "${internal_skill_files[@]+"${internal_skill_files[@]}"}"; do
       file="$root/$relative"
       user_invocable=$(frontmatter_scalar "$file" user-invocable)
       [ "$user_invocable" = "false" ] || continue
@@ -335,8 +333,7 @@ audit_skill_tree() {
   [ "$check_failed" -ne 0 ] || structural_ok "SC003 trigger-pointer: every referenced agent-only skill has one precise AGENTS.md pointer"
 
   check_failed=0
-  for relative in "${skill_files[@]+"${skill_files[@]}"}"; do
-    case "$relative" in .agents/skills/*) ;; *) continue ;; esac
+  for relative in "${internal_skill_files[@]+"${internal_skill_files[@]}"}"; do
     file="$root/$relative"
     name=$(basename "$(dirname "$relative")")
     user_invocable=$(frontmatter_scalar "$file" user-invocable)
@@ -369,11 +366,16 @@ audit_skill_tree() {
     name=$(basename "$(dirname "$relative")")
     owner=$(frontmatter_scalar "$file" trigger-owner)
     [ -n "$owner" ] || owner=$(frontmatter_metadata_scalar "$file" trigger-owner)
+    # A trigger phrase is free text and may contain any punctuation, so the row
+    # is tab-delimited: frontmatter_triggers and normalize_trigger both collapse
+    # every run of whitespace to a single space, which is the one character
+    # class a phrase can never carry through.
+    owner=${owner//$'\t'/ }
     trigger_count=0
     while IFS= read -r trigger; do
       [ -n "$trigger" ] || continue
       trigger_count=$((trigger_count + 1))
-      printf '%s|%s|%s\n' "$trigger" "$name" "$owner" >> "$trigger_rows"
+      printf '%s\t%s\t%s\n' "$trigger" "$name" "$owner" >> "$trigger_rows"
     done < <(frontmatter_triggers "$file")
     # A skill that contributes no phrase silently drops out of the comparison
     # below, so the passing receipt would cover a skill nothing was compared.
@@ -383,7 +385,7 @@ audit_skill_tree() {
       failed=1
     fi
   done
-  LC_ALL=C sort -u "$trigger_rows" | awk -F '|' '
+  LC_ALL=C sort -u "$trigger_rows" | awk -F '\t' -v OFS='\t' '
     function claims(candidate, list,   parts, total, i) {
       total = split(list, parts, ",")
       for (i = 1; i <= total; i++) if (parts[i] == candidate) return 1
@@ -392,13 +394,13 @@ audit_skill_tree() {
     function flush() {
       if (count <= 1) return
       if (!resolved) {
-        print "collision|" phrase "|" names "|"
+        print "collision", phrase, names, ""
         return
       }
       # A recorded owner is a decision about which claimant wins, so it only
       # resolves the collision when it names one of them.
       if (!claims(shared_owner, names)) {
-        print "unknown-owner|" phrase "|" names "|" shared_owner
+        print "unknown-owner", phrase, names, shared_owner
       }
     }
     {
@@ -417,7 +419,7 @@ audit_skill_tree() {
     }
     END { if (NR > 0) flush() }
   ' > "$trigger_groups"
-  while IFS='|' read -r kind phrase names owner; do
+  while IFS=$'\t' read -r kind phrase names owner; do
     [ -n "$phrase" ] || continue
     case "$kind" in
       unknown-owner)
@@ -475,10 +477,28 @@ audit_skill_tree() {
 # placements; the trigger additionally accepts `none`, which deliberately omits
 # the declaration so a fixture can pin a skill the description heuristic derives
 # nothing from.
+#
+# The five escape settings are named `key=value` arguments rather than a run of
+# interchangeable positional selectors, so a caller cannot silently swap two
+# placements drawn from the same two-value vocabulary.
 write_fixture_skill() {
-  local file=$1 name=$2 include_internal=$3 trigger=$4 body=${5:-} placement=${6:-frontmatter}
-  local owner=${7:-} standalone=${8:-}
-  local owner_placement=${9:-frontmatter} standalone_placement=${10:-metadata}
+  [ "$#" -ge 5 ] ||
+    fail "write_fixture_skill needs file, name, include_internal, trigger, and body"
+  local file=$1 name=$2 include_internal=$3 trigger=$4 body=$5
+  shift 5
+  local placement=frontmatter owner='' standalone=''
+  local owner_placement=frontmatter standalone_placement=metadata
+  local option
+  for option in "$@"; do
+    case "$option" in
+      trigger-placement=*) placement=${option#*=} ;;
+      owner=*) owner=${option#*=} ;;
+      owner-placement=*) owner_placement=${option#*=} ;;
+      standalone=*) standalone=${option#*=} ;;
+      standalone-placement=*) standalone_placement=${option#*=} ;;
+      *) fail "write_fixture_skill got unsupported option '$option'" ;;
+    esac
+  done
   case "$placement" in
     frontmatter|metadata|none) ;;
     *) fail "write_fixture_skill got unsupported trigger placement '$placement'" ;;
@@ -552,6 +572,20 @@ write_fixture_agents() {
   } > "$file"
 }
 
+# The audit's verdict is placement-blind by design, so a fixture that claims to
+# pin one honored spelling must prove the frontmatter it generated carries that
+# spelling and not the other one.
+assert_declared_at() {
+  local file=$1 placement=$2 key=$3 value=$4 declaration
+  case "$placement" in
+    frontmatter) declaration="$key: $value" ;;
+    metadata) declaration="  $key: $value" ;;
+    *) fail "assert_declared_at got unsupported placement '$placement'" ;;
+  esac
+  grep -Fqx -- "$declaration" "$file" ||
+    fail "$file does not declare '$key: $value' at the $placement placement"
+}
+
 make_contract_fixture() {
   local repo=$1 mutation=$2 standalone_placement
   mkdir -p "$repo/bin" "$repo/docs" "$repo/tests"
@@ -592,15 +626,17 @@ make_contract_fixture() {
       standalone_placement=metadata
       [ "$mutation" = "standalone-orphan" ] || standalone_placement=frontmatter
       write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
-        'load when the alpha fixture runs' 'Use `bin/fixture.sh`.' frontmatter '' true \
-        frontmatter "$standalone_placement"
+        'load when the alpha fixture runs' 'Use `bin/fixture.sh`.' \
+        standalone=true "standalone-placement=$standalone_placement"
+      assert_declared_at "$repo/.agents/skills/alpha/SKILL.md" \
+        "$standalone_placement" standalone true
       write_fixture_skill "$repo/.agents/skills/beta/SKILL.md" beta yes \
         'load when the beta fixture runs' 'The `alpha` skill owns the cheap rung.'
       write_fixture_agents "$repo/AGENTS.md" beta
       ;;
     triggerless-skill)
       write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
-        '' 'Use `bin/fixture.sh`.' none
+        '' 'Use `bin/fixture.sh`.' trigger-placement=none
       ;;
     duplicate-trigger)
       write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
@@ -608,7 +644,20 @@ make_contract_fixture() {
       # beta declares the same trigger under `metadata:`, so the collision only
       # surfaces while both declared placements are honored.
       write_fixture_skill "$repo/.agents/skills/beta/SKILL.md" beta yes \
-        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' metadata
+        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' trigger-placement=metadata
+      assert_declared_at "$repo/.agents/skills/alpha/SKILL.md" \
+        frontmatter trigger 'load when the fixture alarm fires'
+      assert_declared_at "$repo/.agents/skills/beta/SKILL.md" \
+        metadata trigger 'load when the fixture alarm fires'
+      write_fixture_agents "$repo/AGENTS.md" alpha beta
+      ;;
+    delimiter-trigger)
+      # A phrase carrying the audit's former row delimiter must still be
+      # compared whole rather than split into a fragment that drops out.
+      write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
+        'load when the captain answers yes|no' 'Use `bin/fixture.sh`.'
+      write_fixture_skill "$repo/.agents/skills/beta/SKILL.md" beta yes \
+        'load when the captain answers yes|no' 'Use `bin/fixture.sh`.'
       write_fixture_agents "$repo/AGENTS.md" alpha beta
       ;;
     shared-trigger-owner)
@@ -616,16 +665,21 @@ make_contract_fixture() {
       # recommended `metadata:` placement, so dropping either read turns this
       # resolved collision back into a failing one.
       write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
-        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' frontmatter alpha
+        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' owner=alpha
       write_fixture_skill "$repo/.agents/skills/beta/SKILL.md" beta yes \
-        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' frontmatter alpha '' metadata
+        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' \
+        owner=alpha owner-placement=metadata
+      assert_declared_at "$repo/.agents/skills/alpha/SKILL.md" \
+        frontmatter trigger-owner alpha
+      assert_declared_at "$repo/.agents/skills/beta/SKILL.md" \
+        metadata trigger-owner alpha
       write_fixture_agents "$repo/AGENTS.md" alpha beta
       ;;
     unknown-trigger-owner)
       write_fixture_skill "$repo/.agents/skills/alpha/SKILL.md" alpha yes \
-        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' frontmatter gamma
+        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' owner=gamma
       write_fixture_skill "$repo/.agents/skills/beta/SKILL.md" beta yes \
-        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' frontmatter gamma
+        'load when the fixture alarm fires' 'Use `bin/fixture.sh`.' owner=gamma
       write_fixture_agents "$repo/AGENTS.md" alpha beta
       ;;
     stale-artifact)
@@ -861,7 +915,7 @@ test_contract_failure_fixtures() {
     done
     pass "[seeded failure] $(basename "$fixture") => $expected"
   done
-  [ "$count" -eq 16 ] || fail "expected exactly 16 skill-contract failure fixtures, found $count"
+  [ "$count" -eq 17 ] || fail "expected exactly 17 skill-contract failure fixtures, found $count"
 }
 
 test_current_skill_contract
