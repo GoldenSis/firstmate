@@ -121,6 +121,38 @@ key_file() {  # <home> <xdg>
     fm_buzz_key_fallback_file "$1" )
 }
 
+make_fake_keychain_tools() {
+  local tools="$TMP_ROOT/fake-keychain-tools"
+  mkdir -p "$tools"
+  cat > "$tools/uname" <<'EOF'
+#!/usr/bin/env bash
+printf 'Darwin\n'
+EOF
+  cat > "$tools/security" <<'EOF'
+#!/usr/bin/env bash
+case ${1:-} in
+  find-generic-password)
+    case ${FM_FAKE_SECURITY_FIND:-not-found} in
+      found) printf '%s\n' "${FM_FAKE_SECURITY_PRIVATE:-}"; exit 0 ;;
+      not-found) exit 44 ;;
+      error) exit 51 ;;
+    esac
+    ;;
+  delete-generic-password)
+    case ${FM_FAKE_SECURITY_DELETE:-not-found} in
+      success) exit 0 ;;
+      not-found) exit 44 ;;
+      error) exit 51 ;;
+    esac
+    ;;
+  -i) exit 1 ;;
+esac
+exit 1
+EOF
+  chmod +x "$tools/uname" "$tools/security"
+  printf '%s\n' "$tools"
+}
+
 # --- the signing really is BIP-340 -----------------------------------------
 #
 # Everything else in this suite would still pass if the signer were subtly wrong
@@ -329,14 +361,14 @@ test_a_compromised_rotation_does_not_keep_the_retired_key() {
   pass "a compromised rotation does not keep the retired key"
 }
 
-test_rotation_stops_when_the_outgoing_public_key_is_unusable() {
+test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable() {
   # data/buzz-keypair.public is a cache, not the authority. A half-written one
   # holds something that is not a key at all, and retaining that would leave a
   # history entry no reader can attribute while looking exactly like retention
   # that worked - the stored private half is what settles it. And when neither
   # source can name the outgoing key, the rotation must STOP: the very next step
   # forgets the private half, after which nothing can derive that key again.
-  local home first second history keyfile mangled output code
+  local home first second third history keyfile output code
   home=$(make_home rotate-unusable)
   history="$home/data/buzz-keypair.public-history"
   keyfile=$(key_file "$home" "$home/xdg")
@@ -350,22 +382,102 @@ test_rotation_stops_when_the_outgoing_public_key_is_unusable() {
   assert_no_grep "deadbeefdeadbeef" "$history" \
     "a truncated recorded file was recorded as though it were a key"
 
-  # An all-zero private key is stored and loadable but has no public half, which
-  # is the shape of any transient derivation failure.
-  mangled=$(sed 's/"private_key"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]*"/"private_key": "0000000000000000000000000000000000000000000000000000000000000000"/' "$keyfile") \
-    || fail "could not rewrite the stored key file"
-  printf '%s\n' "$mangled" > "$keyfile"
-  rm -f "$home/data/buzz-keypair.public"
+  printf '{"private_key": "unreadable"}\n' > "$keyfile"
   output=$(run_keypair "$home" --rotate 2>&1)
   code=$?
   expect_code 1 "$code" "a rotation that cannot name its outgoing key"
-  assert_contains "$output" "public half could not be resolved" \
-    "the rotation failed without saying the outgoing key was the problem"
+  assert_contains "$output" "$keyfile" \
+    "the rotation failed without naming the unreadable private key file"
   assert_grep "$first" "$history" \
     "a refused rotation still rewrote the recorded key set"
-  assert_no_grep "0000000000000000000000000000000000000000000000000000000000000000" \
-    "$history" "a private key reached the recorded public key set"
-  pass "rotation stops when the outgoing public key is unusable"
+  assert_grep "$second" "$home/data/buzz-keypair.public" \
+    "a refused rotation disturbed the recorded current public key"
+
+  output=$(run_keypair "$home" --rotate --compromised 2>&1)
+  code=$?
+  expect_code 0 "$code" "a compromised rotation with unreadable private material"
+  assert_contains "$output" "$keyfile" \
+    "the compromised recovery did not name the unreadable private key file"
+  assert_contains "$output" "no outgoing public key will be retained" \
+    "the compromised recovery did not diagnose its no-retention path"
+  third=$(printf '%s\n' "$output" | tail -1)
+  [ "$third" != "$second" ] || fail "compromised recovery did not replace the unreadable key"
+  assert_not_contains "$(cat "$history" 2>/dev/null)" "$second" \
+    "compromised recovery retained the unreadable outgoing key"
+  assert_grep "$first" "$history" \
+    "compromised recovery disturbed an earlier uncompromised retired key"
+  pass "rotation refuses or recovers explicitly when private material is unusable"
+}
+
+test_rotation_compares_the_recorded_key_with_stored_private_material() {
+  local home other first mismatched history output recovered code
+  home=$(make_home rotate-mismatch)
+  other=$(make_home rotate-mismatch-other)
+  history="$home/data/buzz-keypair.public-history"
+  first=$(run_keypair "$home" 2>/dev/null) || fail "keypair creation failed"
+  mismatched=$(run_keypair "$other" 2>/dev/null) || fail "second keypair creation failed"
+  printf '%s\n' "$mismatched" > "$home/data/buzz-keypair.public"
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "a rotation whose recorded and derived public keys disagree"
+  assert_contains "$output" "does not match the stored private key" \
+    "the mismatch refusal did not identify the conflicting sources"
+  assert_grep "$mismatched" "$home/data/buzz-keypair.public" \
+    "the refused mismatch rotation changed the recorded key"
+  assert_not_contains "$(cat "$history" 2>/dev/null)" "$first" \
+    "the refused mismatch rotation retained a key before validation completed"
+
+  output=$(run_keypair "$home" --rotate --compromised 2>&1)
+  code=$?
+  expect_code 0 "$code" "a compromised rotation whose key records disagree"
+  assert_contains "$output" "does not match the stored private key" \
+    "the compromised mismatch recovery did not diagnose the mismatch"
+  assert_contains "$output" "no outgoing public key will be retained" \
+    "the compromised mismatch recovery did not use the no-retention path"
+  recovered=$(printf '%s\n' "$output" | tail -1)
+  [ "$recovered" != "$first" ] || fail "compromised mismatch recovery kept the stored key"
+  [ "$recovered" != "$mismatched" ] || fail "compromised mismatch recovery adopted the bad record"
+  assert_not_contains "$(cat "$history" 2>/dev/null)" "$first" \
+    "compromised mismatch recovery retained the derived outgoing key"
+  assert_not_contains "$(cat "$history" 2>/dev/null)" "$mismatched" \
+    "compromised mismatch recovery retained the mismatched recorded key"
+  pass "rotation compares recorded and derived public keys before retiring either"
+}
+
+test_keychain_errors_refuse_rotation_without_minting_a_fallback_key() {
+  local tools private public home lookup_home output code fallback
+  tools=$(make_fake_keychain_tools)
+  private=0000000000000000000000000000000000000000000000000000000000000003
+  public=f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9
+
+  home=$(make_home keychain-delete-error)
+  printf '%s\n' "$public" > "$home/data/buzz-keypair.public"
+  output=$(PATH="$tools:$PATH" FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" \
+    XDG_DATA_HOME="$home/xdg" FM_FAKE_SECURITY_FIND=found \
+    FM_FAKE_SECURITY_PRIVATE="$private" FM_FAKE_SECURITY_DELETE=error \
+    "$KEYPAIR" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation when keychain deletion fails"
+  assert_contains "$output" "could not verify removal of the old key" \
+    "keychain deletion failure was mistaken for successful absence"
+  fallback=$(key_file "$home" "$home/xdg")
+  assert_absent "$fallback" "rotation minted a fallback key while the keychain entry remained"
+  assert_grep "$public" "$home/data/buzz-keypair.public" \
+    "failed keychain deletion disturbed the current public key record"
+
+  lookup_home=$(make_home keychain-lookup-error)
+  printf '%s\n' "$public" > "$lookup_home/data/buzz-keypair.public"
+  output=$(PATH="$tools:$PATH" FM_HOME="$lookup_home" FM_DATA_OVERRIDE="$lookup_home/data" \
+    XDG_DATA_HOME="$lookup_home/xdg" FM_FAKE_SECURITY_FIND=error \
+    FM_FAKE_SECURITY_DELETE=not-found "$KEYPAIR" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation when the keychain cannot be read"
+  assert_contains "$output" "login keychain could not be read" \
+    "keychain lookup failure was mistaken for an absent key"
+  fallback=$(key_file "$lookup_home" "$lookup_home/xdg")
+  assert_absent "$fallback" "lookup failure minted a fallback key that could shadow the keychain entry"
+  pass "keychain lookup and deletion errors refuse rotation without fallback minting"
 }
 
 test_public_flag_fails_before_a_keypair_exists() {
@@ -397,6 +509,37 @@ test_publish_with_relay_down_exits_zero_and_enqueues() {
   [ "$(replay_count "$home")" = "1" ] \
     || fail "the signed event was not enqueued in the replay cache"
   pass "publish with the relay down exits 0 and enqueues the signed event"
+}
+
+test_refresh_preserves_the_snapshot_bytes_including_its_trailing_newline() {
+  local home expected event result
+  home=$(make_home refresh-verbatim)
+  expected="$home/expected-snapshot.json"
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$home/state" \
+    FM_BEARINGS_NOW=2026-08-10T00:00:00Z \
+    "$ROOT/bin/fm-bearings-snapshot.sh" --json > "$expected" 2>/dev/null \
+    || fail "could not capture the expected bearings snapshot"
+
+  FM_BEARINGS_NOW=2026-08-10T00:00:00Z \
+    run_publish "$home" "ws://127.0.0.1:1" --refresh >/dev/null 2>&1
+  event=$(find "$home/state/buzz-replay" -name '*.json' -type f | head -1)
+  [ -n "$event" ] || fail "refresh did not cache a signed event"
+  result=$(node -e '
+    const fs = require("node:fs");
+    Promise.all([import(process.argv[1]), import(process.argv[2])]).then(([lib, crypto]) => {
+      const expected = fs.readFileSync(process.argv[3], "utf8");
+      const frame = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
+      const event = frame[1];
+      if (!expected.endsWith("\n")) return process.stdout.write("fixture-lost-newline");
+      if (event.content !== expected) return process.stdout.write("content-changed");
+      if (lib.computeEventId(event) !== event.id) return process.stdout.write("id-mismatch");
+      if (!crypto.schnorrVerify(event.id, event.pubkey, event.sig)) return process.stdout.write("bad-signature");
+      process.stdout.write("ok");
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$ROOT/bin/fm-buzz-crypto.mjs" "$expected" "$event")
+  [ "$result" = "ok" ] || fail "refresh did not sign the snapshot bytes verbatim: $result"
+  pass "refresh preserves the snapshot bytes including its trailing newline"
 }
 
 test_publish_without_a_keypair_still_exits_zero() {
@@ -1263,6 +1406,37 @@ EOF
   pass "an anonymous read of unverifiable events claims no breach"
 }
 
+test_malformed_relay_events_are_assessed_independently() {
+  local home relay malformed code
+  home=$(make_home malformed-read)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub --malform-on-read)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"malformed-on-read"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  malformed=$(run_inspect "$home" "$relay" --anonymous 2>&1)
+  code=$?
+  stop_stub "$STUB_PID"
+
+  expect_code 0 "$code" "inspection of malformed relay events"
+  assert_contains "$malformed" "events:   4" \
+    "the stub did not serve every independently malformed event"
+  assert_contains "$malformed" "malformed id" "a malformed id was not classified as invalid"
+  assert_contains "$malformed" "malformed tags" "malformed tags were not classified as invalid"
+  assert_contains "$malformed" "malformed created_at" \
+    "a malformed timestamp was not classified as invalid"
+  assert_contains "$malformed" "malformed content" \
+    "malformed content was not classified as invalid"
+  assert_contains "$malformed" "INCONCLUSIVE" \
+    "malformed served events did not leave the privacy result inconclusive"
+  assert_not_contains "$malformed" \
+    "The channel was readable by an identity that is not a member" \
+    "malformed events produced a definite privacy verdict"
+  pass "malformed relay events are invalidated independently without aborting inspection"
+}
+
 test_an_anonymous_read_of_a_foreign_authors_event_claims_no_breach() {
   # id, signature and `h` tag are all satisfiable by a stranger: the channel id is
   # a digest of the home path, printed by this very tool and sent to the relay in
@@ -1454,6 +1628,29 @@ EOF
   pass "an anonymous read of a foreign channel claims no verdict"
 }
 
+test_a_membership_refusal_for_an_empty_foreign_channel_is_inconclusive() {
+  local home other relay label foreign
+  home=$(make_home foreign-empty-reader)
+  other=$(make_home foreign-empty-owner)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  label=$(cd "$other" && pwd -P)
+
+  read -r STUB_PID relay <<EOF
+$(start_stub --refuse-req "restricted: not a channel member")
+EOF
+  foreign=$(run_inspect "$home" "$relay" --anonymous --channel-label "$label" 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$foreign" "events:   0" "the empty foreign read did not occur"
+  assert_contains "$foreign" "INCONCLUSIVE" \
+    "a foreign channel received a positive privacy verdict"
+  assert_contains "$foreign" "not derived from this home" \
+    "the inspector did not explain why a foreign-channel refusal is inconclusive"
+  assert_not_contains "$foreign" "That refusal is the assurance" \
+    "a membership refusal reassured the reader about a foreign channel"
+  pass "membership refusals for empty foreign channels remain inconclusive"
+}
+
 test_an_anonymous_read_of_this_homes_own_label_still_reaches_a_verdict() {
   # What rules the conclusive answer out is the channel belonging to another home,
   # not --channel-label being typed. Spelling this home's own resolved path out is
@@ -1508,9 +1705,12 @@ test_keypair_is_idempotent_and_never_prints_the_private_key
 test_public_flag_fails_before_a_keypair_exists
 test_rotation_replaces_the_key_in_whichever_store_holds_it
 test_a_compromised_rotation_does_not_keep_the_retired_key
-test_rotation_stops_when_the_outgoing_public_key_is_unusable
+test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable
+test_rotation_compares_the_recorded_key_with_stored_private_material
+test_keychain_errors_refuse_rotation_without_minting_a_fallback_key
 test_two_homes_sharing_one_xdg_get_separate_keys
 test_publish_with_relay_down_exits_zero_and_enqueues
+test_refresh_preserves_the_snapshot_bytes_including_its_trailing_newline
 test_publish_without_a_keypair_still_exits_zero
 test_non_loopback_env_relay_is_rejected_before_network
 test_publish_with_relay_up_delivers_and_lands
@@ -1533,9 +1733,11 @@ test_the_inspector_rejects_a_tampered_event
 test_an_anonymous_read_only_claims_privacy_when_the_relay_refuses
 test_an_anonymous_read_that_returns_events_reports_the_breach
 test_an_anonymous_read_of_unverifiable_events_claims_no_breach
+test_malformed_relay_events_are_assessed_independently
 test_an_anonymous_read_of_a_foreign_authors_event_claims_no_breach
 test_a_rotated_home_still_recognises_its_own_leaked_events
 test_forget_key_withdraws_an_already_retired_key
 test_an_anonymous_read_of_a_foreign_channel_claims_no_verdict
+test_a_membership_refusal_for_an_empty_foreign_channel_is_inconclusive
 test_an_anonymous_read_of_this_homes_own_label_still_reaches_a_verdict
 test_no_firstmate_path_depends_on_buzz

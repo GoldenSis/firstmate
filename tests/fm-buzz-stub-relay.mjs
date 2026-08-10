@@ -23,7 +23,8 @@
 //                                          [--drop-after-event] [--challenge]
 //                                          [--challenge-delay-ms N]
 //                                          [--duplicate-refused] [--silent-ok]
-//                                          [--tamper-on-read] [--refuse-req <msg>]
+//                                          [--tamper-on-read] [--malform-on-read]
+//                                          [--refuse-req <msg>]
 // Prints "listening <port>" on stdout once ready, so a caller can use port 0 and
 // learn the ephemeral port.
 
@@ -66,6 +67,7 @@ let silentOk = false;
 // a signature-only check cannot see: the signature over that id is still valid, so
 // the only thing that can catch it is recomputing the id from what was served.
 let tamperOnRead = false;
+let malformOnRead = false;
 // A relay that enforces channel membership on reads: it answers a REQ with a
 // subscription-scoped CLOSED and no EOSE, which is how a real private channel
 // tells a non-member it may not see the events. Without this the stub serves every
@@ -82,6 +84,7 @@ for (let i = 0; i < argv.length; i += 1) {
   else if (argv[i] === "--duplicate-refused") duplicateRefused = true;
   else if (argv[i] === "--silent-ok") silentOk = true;
   else if (argv[i] === "--tamper-on-read") tamperOnRead = true;
+  else if (argv[i] === "--malform-on-read") malformOnRead = true;
   else if (argv[i] === "--refuse-req") refuseReq = argv[++i];
 }
 
@@ -281,7 +284,14 @@ server.on("upgrade", (req, socket) => {
           .filter((event) => matches(event, filter))
           .sort((a, b) => a.created_at - b.created_at);
         for (const event of found) {
-          send(["EVENT", subId, tamperOnRead ? { ...event, content: "TAMPERED" } : event]);
+          if (malformOnRead) {
+            send(["EVENT", subId, { ...event, id: { malformed: true } }]);
+            send(["EVENT", subId, { ...event, tags: { malformed: true } }]);
+            send(["EVENT", subId, { ...event, created_at: "not-a-timestamp" }]);
+            send(["EVENT", subId, { ...event, content: { malformed: true } }]);
+          } else {
+            send(["EVENT", subId, tamperOnRead ? { ...event, content: "TAMPERED" } : event]);
+          }
         }
         send(["EOSE", subId]);
       } else if (type === "CLOSE") {

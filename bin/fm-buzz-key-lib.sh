@@ -99,28 +99,30 @@ fm_buzz_security_word() {
   printf '"%s"' "$(printf '%s' "$1" | sed 's/[\\"]/\\&/g')"
 }
 
-# Print the stored private key, or return 1 when none is stored. Read the header
-# before adding a caller: the output must go into a pipe.
+# Print the stored private key. Return 1 when none is stored, 2 when the keychain
+# cannot be read, and 3 when the fallback file exists but cannot be read as a key.
+# Read the header before adding a caller: the output must go into a pipe.
 fm_buzz_key_load() {
-  local home=${1:?home required} account file
+  local home=${1:?home required} account file rc value
   account=$(fm_buzz_key_account "$home")
   if fm_buzz_keychain_available; then
     if security find-generic-password -s "$FM_BUZZ_KEYCHAIN_SERVICE" -a "$account" -w 2>/dev/null; then
       return 0
+    else
+      rc=$?
     fi
+    [ "$rc" -eq 44 ] || return 2
   fi
   file=$(fm_buzz_key_fallback_file "$home") || return 1
-  if [ -f "$file" ]; then
-    # Single-key file; a missing/blank field means the file is unusable rather
-    # than that no key exists, so fail closed instead of returning an empty key.
-    local value
-    value=$(sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p' "$file" | head -1)
-    if [ -n "$value" ]; then
-      printf '%s\n' "$value"
-      return 0
-    fi
+  if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+    return 1
   fi
-  return 1
+  [ -f "$file" ] || return 3
+  value=$(sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p' "$file") || return 3
+  [ -n "$value" ] || return 3
+  [ "${#value}" -eq 64 ] || return 3
+  case $value in *[!0-9a-fA-F]*) return 3 ;; esac
+  printf '%s\n' "$value"
 }
 
 # Store a private key. Tries the keychain first and falls back to a 0600 file.
@@ -170,24 +172,39 @@ fm_buzz_key_store() {
 # leaves fm_buzz_key_load finding the old key and re-printing the same public key -
 # a rotation that silently does not rotate, which is worse than none at all.
 fm_buzz_key_forget() {
-  local home=${1:?home required} account file attempts
+  local home=${1:?home required} account file attempts rc cleared_keychain
   account=$(fm_buzz_key_account "$home")
   if fm_buzz_keychain_available; then
     # Loop, bounded: `-U` keeps this to one entry, but a keychain that somehow
     # holds several would otherwise hand the next load a key we thought was gone.
     attempts=0
-    while [ "$attempts" -lt 10 ] \
-      && security delete-generic-password -s "$FM_BUZZ_KEYCHAIN_SERVICE" -a "$account" >/dev/null 2>&1; do
-      attempts=$((attempts + 1))
+    cleared_keychain=0
+    while [ "$attempts" -lt 10 ]; do
+      security delete-generic-password -s "$FM_BUZZ_KEYCHAIN_SERVICE" -a "$account" >/dev/null 2>&1
+      rc=$?
+      if [ "$rc" -eq 0 ]; then
+        attempts=$((attempts + 1))
+        cleared_keychain=1
+        continue
+      fi
+      [ "$rc" -eq 44 ] || return 1
+      break
     done
-    [ "$attempts" -gt 0 ] && printf 'keychain\n'
+    if [ "$attempts" -eq 10 ]; then
+      security find-generic-password -s "$FM_BUZZ_KEYCHAIN_SERVICE" -a "$account" -w >/dev/null 2>&1
+      rc=$?
+      [ "$rc" -eq 44 ] || return 1
+    fi
+    [ "$cleared_keychain" -eq 1 ] && printf 'keychain\n'
   fi
   file=$(fm_buzz_key_fallback_file "$home") || return 1
-  if [ -f "$file" ]; then
+  if [ -e "$file" ] || [ -L "$file" ]; then
     rm -f -- "$file" || return 1
     printf 'file\n'
   fi
-  ! fm_buzz_key_load "$home" >/dev/null 2>&1
+  fm_buzz_key_load "$home" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 1 ]
 }
 
 # --- shared helpers ----------------------------------------------------------

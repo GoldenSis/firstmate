@@ -75,7 +75,7 @@ log() {
   printf 'fm-buzz-publish: %s\n' "$1" >&2
 }
 
-# The stdin spool holds the bearings projection - task ids, project names,
+# The projection spool holds the bearings projection - task ids, project names,
 # blockers, PR URLs - in a shared temp directory, so it must not outlive the run
 # that created it. The in-line `rm` covers the ordinary returns; this covers the
 # signalled ones, which is exactly the case the read watchdog exists for.
@@ -167,9 +167,13 @@ publish() {
   command -v node >/dev/null 2>&1 || { log "node is unavailable; skipping publish"; return 1; }
   command -v jq >/dev/null 2>&1 || { log "jq is unavailable; skipping publish"; return 1; }
 
-  local content
+  STDIN_SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-stdin.XXXXXX") || {
+    log "could not create a temporary file for the projection"
+    return 1
+  }
   if [ "$REFRESH" -eq 1 ]; then
-    content=$("$SCRIPT_DIR/fm-bearings-snapshot.sh" --json 2>/dev/null) || {
+    "$SCRIPT_DIR/fm-bearings-snapshot.sh" --json > "$STDIN_SPOOL" 2>/dev/null || {
+      drop_stdin_spool
       log "bearings snapshot failed; skipping publish"
       return 1
     }
@@ -180,26 +184,31 @@ publish() {
       log "stdin is a terminal; pipe the projection in or use --refresh"
       return 1
     fi
-    STDIN_SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-stdin.XXXXXX") || {
-      log "could not create a temporary file for the projection"
-      return 1
-    }
     if ! read_stdin_bounded "$STDIN_SPOOL"; then
       drop_stdin_spool
       log "could not read the projection from stdin within ${STDIN_TIMEOUT_S}s"
       return 1
     fi
-    content=$(cat "$STDIN_SPOOL")
-    drop_stdin_spool
   fi
-  [ -n "$content" ] || { log "the projection is empty; skipping publish"; return 1; }
-
-  local key
-  key=$(fm_buzz_key_load "$FM_HOME") || {
-    log "no publishing keypair for this home; run bin/fm-buzz-keypair.sh first"
+  [ -s "$STDIN_SPOOL" ] || {
+    drop_stdin_spool
+    log "the projection is empty; skipping publish"
     return 1
   }
-  [ -n "$key" ] || { log "the stored publishing key is empty"; return 1; }
+
+  local key load_status rc
+  key=$(fm_buzz_key_load "$FM_HOME")
+  load_status=$?
+  if [ "$load_status" -ne 0 ]; then
+    if [ "$load_status" -eq 1 ]; then
+      log "no publishing keypair for this home; run bin/fm-buzz-keypair.sh first"
+    else
+      log "the stored publishing key could not be read; skipping publish"
+    fi
+    drop_stdin_spool
+    return 1
+  fi
+  [ -n "$key" ] || { drop_stdin_spool; log "the stored publishing key is empty"; return 1; }
 
   local label=$CHANNEL_LABEL
   if [ -z "$label" ]; then
@@ -215,17 +224,13 @@ publish() {
   mkdir -p "$REPLAY_DIR" 2>/dev/null || { log "could not create $REPLAY_DIR"; return 1; }
   chmod 0700 "$REPLAY_DIR" 2>/dev/null || true
 
-  # The envelope goes down a pipe, and both of its private parts reach jq the same
-  # way: through a file descriptor, never `--arg` (which would put them in jq's
-  # own argv, world-readable through the process table) and never the environment.
-  # The key is one of them; the projection is the other, and it is private for the
-  # same reason the spool above is - it carries task ids, project names, blockers
-  # and PR URLs. --rawfile takes the fd's bytes verbatim, and the writing printf is
-  # a bash builtin, so neither is an argument to any process at any point. The
-  # remaining --arg values - relay URL, channel id, cache path - are not secrets.
+  # The envelope goes down a pipe, and neither private value is passed with `--arg`,
+  # which would put it in jq's world-readable argv. The key reaches jq through a
+  # file descriptor, while --rawfile reads the projection spool's bytes verbatim.
+  # The remaining --arg values - relay URL, channel id, cache path - are not secrets.
   jq -n \
     --rawfile privateKey <(printf '%s' "$key") \
-    --rawfile content <(printf '%s' "$content") \
+    --rawfile content "$STDIN_SPOOL" \
     --arg relay "$RELAY" \
     --arg channelId "$channel" \
     --arg replayDir "$REPLAY_DIR" \
@@ -234,6 +239,9 @@ publish() {
     '{privateKey:$privateKey, content:$content, relay:$relay, channelId:$channelId,
       replayDir:$replayDir, timeoutMs:$timeoutMs, maxCache:$maxCache}' \
     | node "$SCRIPT_DIR/fm-buzz-publish.mjs"
+  rc=$?
+  drop_stdin_spool
+  return "$rc"
 }
 
 while [ "$#" -gt 0 ]; do

@@ -135,10 +135,16 @@ done
 
 KEY=""
 if [ "$ANONYMOUS" -eq 0 ]; then
-  KEY=$(fm_buzz_key_load "$FM_HOME") || {
-    printf 'fm-buzz-inspect.sh: no publishing keypair for this home; use --anonymous or run bin/fm-buzz-keypair.sh\n' >&2
+  KEY=$(fm_buzz_key_load "$FM_HOME")
+  load_status=$?
+  if [ "$load_status" -ne 0 ]; then
+    if [ "$load_status" -eq 1 ]; then
+      printf 'fm-buzz-inspect.sh: no publishing keypair for this home; use --anonymous or run bin/fm-buzz-keypair.sh\n' >&2
+    else
+      printf 'fm-buzz-inspect.sh: the stored publishing key could not be read\n' >&2
+    fi
     exit 1
-  }
+  fi
 fi
 
 # The key travels down file descriptors only - never a command line, never the

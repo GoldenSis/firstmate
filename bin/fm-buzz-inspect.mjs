@@ -55,6 +55,72 @@ const ownChannel = envelope.ownChannel !== false;
 const anonymous = !envelope.privateKey;
 const privateKey = anonymous ? generateKeypair().privateKey : envelope.privateKey;
 
+const HEX_64 = /^[0-9a-f]{64}$/;
+const HEX_128 = /^[0-9a-f]{128}$/;
+
+function assessEvent(event, index, attributable, expectedAuthors, channelId) {
+  const value = event && typeof event === "object" && !Array.isArray(event) ? event : {};
+  const invalidReasons = [];
+  const validId = typeof value.id === "string" && HEX_64.test(value.id);
+  const validPubkey = typeof value.pubkey === "string" && HEX_64.test(value.pubkey);
+  const validSignature = typeof value.sig === "string" && HEX_128.test(value.sig);
+  const validKind = Number.isSafeInteger(value.kind);
+  const validTags =
+    Array.isArray(value.tags) &&
+    value.tags.every((tag) => Array.isArray(tag) && tag.every((part) => typeof part === "string"));
+  const validContent = typeof value.content === "string";
+  const date = Number.isSafeInteger(value.created_at) ? new Date(value.created_at * 1000) : null;
+  const validTimestamp = date !== null && !Number.isNaN(date.getTime());
+
+  if (!event || typeof event !== "object" || Array.isArray(event)) invalidReasons.push("event is not an object");
+  if (!validId) invalidReasons.push("malformed id");
+  if (!validPubkey) invalidReasons.push("malformed pubkey");
+  if (!validSignature) invalidReasons.push("malformed signature");
+  if (!validKind) invalidReasons.push("malformed kind");
+  if (!validTags) invalidReasons.push("malformed tags");
+  if (!validContent) invalidReasons.push("malformed content");
+  if (!validTimestamp) invalidReasons.push("malformed created_at");
+
+  let idMatches = false;
+  if (validPubkey && validKind && validTags && validContent && validTimestamp) {
+    try {
+      idMatches = computeEventId(value) === value.id;
+    } catch {
+      invalidReasons.push("event id could not be computed");
+    }
+  }
+
+  let signed = false;
+  if (validId && validPubkey && validSignature) {
+    try {
+      signed = schnorrVerify(value.id, value.pubkey, value.sig);
+    } catch {
+      invalidReasons.push("signature could not be checked");
+    }
+  }
+
+  const inChannel =
+    validTags && value.tags.some((tag) => tag[0] === "h" && tag[1] === channelId);
+  const byPublisher = attributable && validPubkey && expectedAuthors.has(value.pubkey);
+  return {
+    event: value,
+    index,
+    sortTime: validTimestamp ? value.created_at : Number.POSITIVE_INFINITY,
+    when: validTimestamp ? date.toISOString() : "INVALID (malformed created_at)",
+    idDisplay: validId ? value.id : "<invalid id>",
+    authorDisplay: validPubkey ? value.pubkey : "<invalid public key>",
+    contentDisplay: validContent ? value.content : "[INVALID content: expected a string]",
+    invalidReasons,
+    validPubkey,
+    validTags,
+    idMatches,
+    signed,
+    inChannel,
+    byPublisher,
+    authentic: invalidReasons.length === 0 && idMatches && signed && inChannel && byPublisher,
+  };
+}
+
 try {
   const { events, refusal } = await withRelay(
     relay,
@@ -93,21 +159,8 @@ try {
   // relay".
   const attributable = ownChannel && expectedAuthors.size > 0;
   const assessed = events
-    .sort((a, b) => a.created_at - b.created_at)
-    .map((event) => {
-      const idMatches = computeEventId(event) === event.id;
-      const signed = schnorrVerify(event.id, event.pubkey, event.sig);
-      const inChannel = (event.tags ?? []).some((tag) => tag[0] === "h" && tag[1] === channelId);
-      const byPublisher = attributable && expectedAuthors.has((event.pubkey ?? "").toLowerCase());
-      return {
-        event,
-        idMatches,
-        signed,
-        inChannel,
-        byPublisher,
-        authentic: idMatches && signed && inChannel && byPublisher,
-      };
-    });
+    .map((event, index) => assessEvent(event, index, attributable, expectedAuthors, channelId))
+    .sort((a, b) => a.sortTime - b.sortTime || a.index - b.index);
   const authentic = assessed.filter((entry) => entry.authentic);
 
   // An anonymous read that RETURNS events is the one unambiguous answer this probe
@@ -172,7 +225,13 @@ try {
       "  - privacy enforcement that withholds events silently, or refuses without\n" +
       "    machine-tagging its reason as a membership refusal\n" +
       "Re-run without --anonymous to read as the publisher and tell these apart.\n";
-    if (classifyRefusalReason(refusal) === REFUSAL_MEMBERSHIP) {
+    if (!ownChannel) {
+      process.stdout.write(
+        "\nINCONCLUSIVE: this channel was not derived from this home, so even a\n" +
+          "membership-tagged refusal cannot establish this other channel's privacy.\n" +
+          ambiguous,
+      );
+    } else if (classifyRefusalReason(refusal) === REFUSAL_MEMBERSHIP) {
       process.stdout.write(
         "\nNothing visible, and the relay said why: the reading identity is ephemeral\n" +
           "and was never added to this private channel, so the subscription was refused\n" +
@@ -195,13 +254,19 @@ try {
       );
     }
   }
-  for (const { event, idMatches, signed, inChannel, byPublisher } of assessed) {
-    const when = new Date(event.created_at * 1000).toISOString();
-    const verdict = !idMatches ? "INVALID (id does not match this content)"
-      : signed ? "verified"
+  for (const entry of assessed) {
+    const verdict = entry.invalidReasons.length > 0
+      ? `INVALID (${entry.invalidReasons.join(", ")})`
+      : !entry.idMatches ? "INVALID (id does not match this content)"
+      : entry.signed ? "verified"
       : "INVALID";
-    const channelVerdict = inChannel ? "this channel" : "NOT tagged for this channel";
-    const authorVerdict = byPublisher
+    const channelVerdict = !entry.validTags
+      ? "INVALID (malformed tags)"
+      : entry.inChannel ? "this channel"
+      : "NOT tagged for this channel";
+    const authorVerdict = !entry.validPubkey
+      ? "unattributable (malformed public key)"
+      : entry.byPublisher
       ? "this home's publisher"
       : !ownChannel
         ? "unattributable (channel not derived from this home)"
@@ -209,11 +274,11 @@ try {
           ? "unknown (no publisher public key recorded for this home)"
           : "NOT this home's publisher";
     process.stdout.write(
-      `\n--- ${event.id}\n    at        ${when}\n` +
-        `    author    ${event.pubkey} (${authorVerdict})\n` +
+      `\n--- ${entry.idDisplay}\n    at        ${entry.when}\n` +
+        `    author    ${entry.authorDisplay} (${authorVerdict})\n` +
         `    signature ${verdict}\n    channel   ${channelVerdict}\n\n`,
     );
-    process.stdout.write(full ? `${event.content}\n` : `${event.content.slice(0, 600)}\n`);
+    process.stdout.write(full ? `${entry.contentDisplay}\n` : `${entry.contentDisplay.slice(0, 600)}\n`);
   }
 } catch (error) {
   process.stderr.write(`fm-buzz-inspect: ${error.message}\n`);

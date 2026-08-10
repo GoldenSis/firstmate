@@ -70,10 +70,9 @@
 # retention exists to preserve. Stopping first leaves the rotation retryable.
 #
 # The outgoing key is only accepted as 64 lowercase hex characters. data/
-# buzz-keypair.public is the cheap source but not the authority: a truncated or
-# half-written file yields a value that is not a key at all, and recording it
-# would retain nothing while looking like it had. Anything that fails that check
-# falls back to deriving the public half from the still-stored private key.
+# buzz-keypair.public is a cache, not the authority: every rotation derives the
+# public half from the still-stored private key and compares the recorded value
+# when one exists.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -252,24 +251,42 @@ command -v node >/dev/null 2>&1 || {
 # Retire the old key before the lookup below, so rotation falls through into the
 # minting path instead of finding the key it was asked to replace.
 if [ "$ROTATE" -eq 1 ]; then
-  # Read the outgoing public key while the private half is still stored: the
-  # recorded file is the cheap source, but it can be missing or truncated, and the
-  # stored key is the authority for what this home was publishing under. Once
-  # fm_buzz_key_forget runs there is nothing left to derive it from. A recorded
-  # value that is not 64 hex characters is a damaged file rather than a key, so it
-  # falls through to the stored half exactly as an absent file does - recording it
-  # would leave the history file holding something no reader can attribute.
-  retiring=$(normalize_public_key "$(sed -n 1p "$PUBLIC_FILE" 2>/dev/null)" 2>/dev/null) || retiring=""
-  [ -n "$retiring" ] || retiring=$(normalize_public_key "$(derive_public 2>/dev/null)" 2>/dev/null) || retiring=""
+  recorded=$(normalize_public_key "$(sed -n 1p "$PUBLIC_FILE" 2>/dev/null)" 2>/dev/null) || recorded=""
+  derived=""
+  retiring=""
+  recovery_reason=""
+  fm_buzz_key_load "$FM_HOME" >/dev/null 2>&1
+  load_status=$?
+  key_file=""
+  if [ "$load_status" -eq 3 ]; then
+    key_file=$(fm_buzz_key_fallback_file "$FM_HOME") || key_file=""
+  fi
 
-  # A home with no key stored has nothing to retire and rotates into the minting
-  # path; a home that HAS one whose public half will not resolve must stop. Letting
-  # that second case through is the silent loss this ordering exists to prevent:
-  # the next line forgets the private key, and with it the last thing that could
-  # name what this home was publishing under.
-  if [ -z "$retiring" ] && fm_buzz_key_load "$FM_HOME" >/dev/null 2>&1; then
-    printf 'fm-buzz-keypair.sh: a key is stored but its public half could not be resolved; nothing was rotated\n' >&2
-    exit 1
+  case $load_status in
+    0)
+      derived=$(normalize_public_key "$(derive_public 2>/dev/null)" 2>/dev/null) || derived=""
+      if [ -z "$derived" ]; then
+        recovery_reason="the stored private key could not be used to derive its public key"
+      elif [ -n "$recorded" ] && [ "$recorded" != "$derived" ]; then
+        recovery_reason="the recorded public key in $PUBLIC_FILE does not match the stored private key"
+      else
+        retiring=$derived
+      fi
+      ;;
+    1) ;;
+    2) recovery_reason="the publishing key in the login keychain could not be read" ;;
+    3)
+      recovery_reason="publishing key file $key_file could not be read"
+      ;;
+    *) recovery_reason="the stored publishing key could not be read" ;;
+  esac
+
+  if [ -n "$recovery_reason" ]; then
+    if [ "$COMPROMISED" -eq 0 ]; then
+      printf 'fm-buzz-keypair.sh: %s; nothing was rotated\n' "$recovery_reason" >&2
+      exit 1
+    fi
+    printf 'rotating compromised key: %s; no outgoing public key will be retained\n' "$recovery_reason" >&2
   fi
 
   # Settle the recorded-key set while the private half is still stored, and stop
@@ -277,23 +294,31 @@ if [ "$ROTATE" -eq 1 ]; then
   # learn what this home was publishing under, so a failure here would silently
   # and permanently cost the probe its attribution. A rotation that stops now is
   # simply retryable - nothing has changed yet.
-  if [ -z "$retiring" ]; then
-    printf 'fm-buzz-keypair.sh: no key is stored for this home; there is nothing to retire\n' >&2
-  elif [ "$COMPROMISED" -eq 1 ]; then
-    purge_public "$retiring" || {
+  if [ "$COMPROMISED" -eq 1 ]; then
+    purge_public "$recorded" || {
       printf 'fm-buzz-keypair.sh: could not drop the compromised public key from %s; nothing was rotated\n' "$HISTORY_FILE" >&2
       exit 1
     }
-    printf 'rotating: the retired public key is treated as compromised and is not kept in %s\n' "$HISTORY_FILE" >&2
-  else
+    if [ -n "$derived" ] && [ "$derived" != "$recorded" ]; then
+      purge_public "$derived" || {
+        printf 'fm-buzz-keypair.sh: could not drop the compromised public key from %s; nothing was rotated\n' "$HISTORY_FILE" >&2
+        exit 1
+      }
+    fi
+    if [ -n "$retiring" ]; then
+      printf 'rotating: the retired public key is treated as compromised and is not kept in %s\n' "$HISTORY_FILE" >&2
+    fi
+  elif [ -n "$retiring" ]; then
     retain_public "$retiring" || {
       printf 'fm-buzz-keypair.sh: could not retain the retired public key in %s; nothing was rotated\n' "$HISTORY_FILE" >&2
       exit 1
     }
+  elif [ "$load_status" -eq 1 ]; then
+    printf 'fm-buzz-keypair.sh: no key is stored for this home; there is nothing to retire\n' >&2
   fi
 
   cleared=$(fm_buzz_key_forget "$FM_HOME") || {
-    printf 'fm-buzz-keypair.sh: the old key is still readable after rotation; nothing was replaced\n' >&2
+    printf 'fm-buzz-keypair.sh: could not verify removal of the old key from every store; nothing was replaced\n' >&2
     exit 1
   }
   if [ -n "$cleared" ]; then
@@ -304,7 +329,9 @@ if [ "$ROTATE" -eq 1 ]; then
   rm -f -- "$PUBLIC_FILE"
 fi
 
-if fm_buzz_key_load "$FM_HOME" >/dev/null 2>&1; then
+fm_buzz_key_load "$FM_HOME" >/dev/null 2>&1
+load_status=$?
+if [ "$load_status" -eq 0 ]; then
   public=$(derive_public) || {
     printf 'fm-buzz-keypair.sh: a key is stored but its public half could not be derived\n' >&2
     exit 1
@@ -313,6 +340,17 @@ if fm_buzz_key_load "$FM_HOME" >/dev/null 2>&1; then
   record_public "$public" || printf 'fm-buzz-keypair.sh: could not record %s\n' "$PUBLIC_FILE" >&2
   printf '%s\n' "$public"
   exit 0
+fi
+
+if [ "$load_status" -eq 2 ]; then
+  printf 'fm-buzz-keypair.sh: the publishing key in the login keychain could not be read\n' >&2
+  exit 1
+fi
+
+if [ "$load_status" -eq 3 ]; then
+  key_file=$(fm_buzz_key_fallback_file "$FM_HOME") || key_file="the fallback key file"
+  printf 'fm-buzz-keypair.sh: publishing key file %s could not be read\n' "$key_file" >&2
+  exit 1
 fi
 
 if [ "$PUBLIC_ONLY" -eq 1 ]; then
