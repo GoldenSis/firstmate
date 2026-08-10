@@ -178,6 +178,18 @@ publish() {
       return 1
     }
   else
+    case $STDIN_TIMEOUT_S in
+      ''|*[!0-9]*)
+        drop_stdin_spool
+        log "FM_BUZZ_STDIN_TIMEOUT_S must be a positive integer"
+        return 1
+        ;;
+    esac
+    if [ "$STDIN_TIMEOUT_S" -le 0 ]; then
+      drop_stdin_spool
+      log "FM_BUZZ_STDIN_TIMEOUT_S must be a positive integer"
+      return 1
+    fi
     # A terminal on stdin means nobody is piping a projection in at all, so this
     # is answerable without waiting out the deadline below.
     if [ -t 0 ]; then

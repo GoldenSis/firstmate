@@ -37,16 +37,73 @@ import {
   buildBearingsEvent,
   buildChannelCreateEvent,
   classifyOkResponse,
+  computeEventId,
   readStdin,
   resolveLoopbackRelayHost,
   withRelay,
   DELIVERED,
+  KIND_STREAM_MESSAGE,
   PERMANENT,
   RETRYABLE,
 } from "./fm-buzz-lib.mjs";
+import { schnorrVerify } from "./fm-buzz-crypto.mjs";
 
 function log(message) {
   process.stderr.write(`fm-buzz-publish: ${message}\n`);
+}
+
+const HEX_64 = /^[0-9a-f]{64}$/;
+const HEX_128 = /^[0-9a-f]{128}$/;
+
+function cachedEventFromFrame(raw, entry) {
+  let frame;
+  try {
+    frame = JSON.parse(raw);
+  } catch {
+    throw new Error("invalid JSON");
+  }
+  if (!Array.isArray(frame) || frame.length !== 2 || frame[0] !== "EVENT") {
+    throw new Error("not a complete EVENT frame");
+  }
+  const event = frame[1];
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    throw new Error("event is not an object");
+  }
+  if (typeof event.id !== "string" || !HEX_64.test(event.id)) throw new Error("malformed event id");
+  if (typeof event.pubkey !== "string" || !HEX_64.test(event.pubkey)) {
+    throw new Error("malformed event pubkey");
+  }
+  if (typeof event.sig !== "string" || !HEX_128.test(event.sig)) {
+    throw new Error("malformed event signature");
+  }
+  if (!Number.isSafeInteger(event.created_at) || event.created_at < 0) {
+    throw new Error("malformed event timestamp");
+  }
+  if (event.kind !== KIND_STREAM_MESSAGE) throw new Error("unexpected event kind");
+  if (
+    !Array.isArray(event.tags) ||
+    !event.tags.every((tag) => Array.isArray(tag) && tag.every((part) => typeof part === "string"))
+  ) {
+    throw new Error("malformed event tags");
+  }
+  if (typeof event.content !== "string") throw new Error("malformed event content");
+  if (event.id !== entry.id || event.created_at !== entry.createdAt) {
+    throw new Error("cache filename does not match the event");
+  }
+  if (computeEventId(event) !== event.id) throw new Error("event id does not match its content");
+  if (!schnorrVerify(event.id, event.pubkey, event.sig)) throw new Error("invalid event signature");
+  return event;
+}
+
+function removeCacheFile(file, description) {
+  try {
+    unlinkSync(file);
+    return { removed: true, failed: false };
+  } catch (error) {
+    if (error.code === "ENOENT") return { removed: false, failed: false };
+    log(`could not ${description}: ${error.message}`);
+    return { removed: false, failed: true };
+  }
 }
 
 // Each relay host gets its own directory, with entries named
@@ -111,23 +168,33 @@ function sweepOrphanTemporaries(replayDir, now) {
   let names;
   try {
     names = readdirSync(replayDir);
-  } catch {
-    return 0;
+  } catch (error) {
+    if (error.code === "ENOENT") return { swept: 0, failed: 0 };
+    log(`could not inspect cache directory ${replayDir}: ${error.message}`);
+    return { swept: 0, failed: 1 };
   }
   let swept = 0;
+  let failed = 0;
   for (const name of names) {
     if (!name.endsWith(".json.tmp")) continue;
     const file = path.join(replayDir, name);
+    let modified;
     try {
-      if (now - statSync(file).mtimeMs < ORPHAN_TMP_AGE_MS) continue;
-      unlinkSync(file);
-      swept += 1;
-    } catch {
-      // Vanished under us, or never ours to remove.
+      modified = statSync(file).mtimeMs;
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        log(`could not inspect interrupted cache write ${name}: ${error.message}`);
+        failed += 1;
+      }
+      continue;
     }
+    if (now - modified < ORPHAN_TMP_AGE_MS) continue;
+    const removal = removeCacheFile(file, `sweep interrupted cache write ${name}`);
+    if (removal.removed) swept += 1;
+    if (removal.failed) failed += 1;
   }
   if (swept > 0) log(`swept ${swept} interrupted cache write(s)`);
-  return swept;
+  return { swept, failed };
 }
 
 // Keep the cache bounded. An unbounded queue after a long relay outage would grow
@@ -136,23 +203,22 @@ function sweepOrphanTemporaries(replayDir, now) {
 function pruneCache(replayDir, maxCache) {
   const directories = cacheDirectories(replayDir);
   const now = Date.now();
-  for (const directory of directories) sweepOrphanTemporaries(directory, now);
+  let failed = 0;
+  for (const directory of directories) failed += sweepOrphanTemporaries(directory, now).failed;
   const entries = directories
     .flatMap((directory) => cacheEntries(directory))
     .sort((a, b) => (a.createdAt - b.createdAt) || a.id.localeCompare(b.id));
   const excess = entries.length - maxCache;
-  if (excess <= 0) return 0;
+  if (excess <= 0) return { dropped: 0, failed };
   let dropped = 0;
-  for (const entry of entries.slice(0, excess)) {
-    try {
-      unlinkSync(entry.file);
-      dropped += 1;
-    } catch {
-      // A file that vanished under us needs no action.
-    }
+  for (const entry of entries) {
+    if (dropped >= excess) break;
+    const removal = removeCacheFile(entry.file, `prune cache entry ${entry.name}`);
+    if (removal.removed) dropped += 1;
+    if (removal.failed) failed += 1;
   }
   if (dropped > 0) log(`replay cache over ${maxCache}; dropped ${dropped} oldest event(s)`);
-  return dropped;
+  return { dropped, failed };
 }
 
 // Write the frame atomically so a crash mid-write cannot leave a truncated event
@@ -192,7 +258,8 @@ async function main() {
     ["fm-schema", "fm-bearings.v1"],
   ]);
   cacheEvent(relayCacheDir, event);
-  pruneCache(replayDir, maxCache);
+  const cacheMaintenance = pruneCache(replayDir, maxCache);
+  let cleanupFailures = cacheMaintenance.failed;
   log(`signed event ${event.id} (${Buffer.byteLength(content, "utf8")} bytes) for channel ${channelId}`);
 
   const pending = cacheEntries(relayCacheDir);
@@ -254,15 +321,16 @@ async function main() {
         }
         let parsed;
         try {
-          parsed = JSON.parse(raw)[1];
-        } catch {
-          // A corrupt cache entry can never be delivered; drop it rather than
-          // retrying it on every future run.
-          log(`dropping unparseable cache entry ${entry.name}`);
-          try {
-            unlinkSync(entry.file);
-          } catch { /* already gone */ }
-          outcome.set(entry.id, PERMANENT);
+          parsed = cachedEventFromFrame(raw, entry);
+        } catch (error) {
+          log(`dropping invalid cache entry ${entry.name}: ${error.message}`);
+          const removal = removeCacheFile(entry.file, `drop invalid cache entry ${entry.name}`);
+          if (removal.failed) {
+            cleanupFailures += 1;
+            outcome.set(entry.id, RETRYABLE);
+          } else {
+            outcome.set(entry.id, PERMANENT);
+          }
           continue;
         }
         // The relay verdict and the cache eviction are settled separately on
@@ -296,11 +364,8 @@ async function main() {
 
         outcome.set(entry.id, verdict);
         if (verdict !== DELIVERED && verdict !== PERMANENT) continue;
-        try {
-          unlinkSync(entry.file);
-        } catch (error) {
-          log(`could not drop settled cache entry ${entry.name}: ${error.message}`);
-        }
+        const removal = removeCacheFile(entry.file, `drop settled cache entry ${entry.name}`);
+        if (removal.failed) cleanupFailures += 1;
       }
       return authBlocked;
     };
@@ -335,8 +400,10 @@ async function main() {
     else kept += 1;
   }
 
-  log(`delivered=${delivered} retained=${kept} discarded=${discarded} relay=${relay}`);
-  return kept === 0 ? 0 : 1;
+  log(
+    `delivered=${delivered} retained=${kept} discarded=${discarded} cleanup_failed=${cleanupFailures} relay=${relay}`,
+  );
+  return kept === 0 && cleanupFailures === 0 ? 0 : 1;
 }
 
 main().then(

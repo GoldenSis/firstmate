@@ -23,6 +23,7 @@
 //                                          [--drop-after-event] [--challenge]
 //                                          [--challenge-delay-ms N]
 //                                          [--duplicate-refused] [--silent-ok]
+//                                          [--truthy-ok]
 //                                          [--tamper-on-read] [--malform-on-read]
 //                                          [--wrong-kind-on-read]
 //                                          [--refuse-req <msg>]
@@ -63,6 +64,7 @@ let duplicateRefused = false;
 // no publish; this is that case, and it is the one that starves a drain if a
 // publish has no deadline of its own.
 let silentOk = false;
+let truthyOk = false;
 // A relay that stores a properly signed event and then serves it back with the
 // content altered, leaving the id and signature untouched. This is the exact shape
 // a signature-only check cannot see: the signature over that id is still valid, so
@@ -85,6 +87,7 @@ for (let i = 0; i < argv.length; i += 1) {
   else if (argv[i] === "--challenge-delay-ms") challengeDelayMs = Number(argv[++i]);
   else if (argv[i] === "--duplicate-refused") duplicateRefused = true;
   else if (argv[i] === "--silent-ok") silentOk = true;
+  else if (argv[i] === "--truthy-ok") truthyOk = true;
   else if (argv[i] === "--tamper-on-read") tamperOnRead = true;
   else if (argv[i] === "--malform-on-read") malformOnRead = true;
   else if (argv[i] === "--wrong-kind-on-read") wrongKindOnRead = true;
@@ -274,7 +277,7 @@ server.on("upgrade", (req, socket) => {
           continue;
         }
         store.set(event.id, event);
-        send(["OK", event.id, true, ""]);
+        send(["OK", event.id, truthyOk ? "false" : true, ""]);
       } else if (type === "REQ") {
         const [, subId, filter = {}] = parsed;
         if (refuseReq) {

@@ -103,20 +103,25 @@ fm_buzz_security_word() {
   printf '"%s"' "$(printf '%s' "$1" | sed 's/[\\"]/\\&/g')"
 }
 
-# Print the stored private key. Return 1 when none is stored, 2 when the keychain
-# cannot be read, and 3 when the fallback file exists but cannot be read as a key.
-# Read the header before adding a caller: the output must go into a pipe.
-fm_buzz_key_load() {
-  local home=${1:?home required} account file rc value
+# Print the keychain private key. Return 1 when the keychain or entry is absent,
+# and 2 when the keychain exists but cannot be read.
+fm_buzz_key_load_keychain() {
+  local home=${1:?home required} account rc
+  fm_buzz_keychain_present || return 1
   account=$(fm_buzz_key_account "$home")
-  if fm_buzz_keychain_available; then
-    if security find-generic-password -s "$FM_BUZZ_KEYCHAIN_SERVICE" -a "$account" -w 2>/dev/null; then
-      return 0
-    else
-      rc=$?
-    fi
-    [ "$rc" -eq 44 ] || return 2
+  if security find-generic-password -s "$FM_BUZZ_KEYCHAIN_SERVICE" -a "$account" -w 2>/dev/null; then
+    return 0
+  else
+    rc=$?
   fi
+  [ "$rc" -eq 44 ] && return 1
+  return 2
+}
+
+# Print the fallback private key. Return 1 when the file is absent, and 3 when it
+# exists but cannot be read as a key.
+fm_buzz_key_load_file() {
+  local home=${1:?home required} file value
   file=$(fm_buzz_key_fallback_file "$home") || return 1
   if [ ! -e "$file" ] && [ ! -L "$file" ]; then
     return 1
@@ -127,6 +132,20 @@ fm_buzz_key_load() {
   [ "${#value}" -eq 64 ] || return 3
   case $value in *[!0-9a-fA-F]*) return 3 ;; esac
   printf '%s\n' "$value"
+}
+
+# Print the preferred stored private key. Return 1 when none is stored, 2 when
+# the keychain cannot be read, and 3 when the fallback file exists but cannot be
+# read as a key. Read the header before adding a caller: the output must go into a
+# pipe.
+fm_buzz_key_load() {
+  local home=${1:?home required} rc
+  if fm_buzz_keychain_available; then
+    fm_buzz_key_load_keychain "$home"
+    rc=$?
+    [ "$rc" -eq 1 ] || return "$rc"
+  fi
+  fm_buzz_key_load_file "$home"
 }
 
 # Store a private key. Tries the keychain first and falls back to a 0600 file.

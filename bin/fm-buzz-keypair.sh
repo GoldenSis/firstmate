@@ -19,9 +19,11 @@
 #   fm-buzz-keypair.sh --forget-key <hex>    withdraw one already-retired public key
 #   fm-buzz-keypair.sh --help                this text
 #
-# Exit status: 0 when a keypair exists (created or already present), 1 on a real
-# failure (no key material could be stored, or --public with no keypair). Unlike
-# bin/fm-buzz-publish.sh this script is NOT fire-and-forget: it is run
+# Exit status: 0 when ensure, --public, or --rotate leaves a recorded keypair, or
+# when --forget-key completes even if the named key was not recorded.
+# Exit status 1 reports an operational or inconsistent-state failure, and 2
+# reports invalid or contradictory arguments.
+# Unlike bin/fm-buzz-publish.sh this script is NOT fire-and-forget: it is run
 # deliberately, by a human, and a silent failure to create a key would be worse
 # than a loud one.
 #
@@ -142,8 +144,14 @@ normalize_public_key() {  # <candidate>
 # Derive the public key from the stored private key without the private key ever
 # reaching a command line or this script's own output: it goes straight down a
 # pipe into node's stdin.
-derive_public() {
-  fm_buzz_key_load "$FM_HOME" | node -e '
+derive_public_from_store() {  # <keychain|file|selected>
+  local store=$1
+  case $store in
+    keychain) fm_buzz_key_load_keychain "$FM_HOME" ;;
+    file) fm_buzz_key_load_file "$FM_HOME" ;;
+    selected) fm_buzz_key_load "$FM_HOME" ;;
+    *) return 1 ;;
+  esac | node -e '
     let input = "";
     process.stdin.on("data", (c) => { input += c; });
     process.stdin.on("end", async () => {
@@ -153,6 +161,10 @@ derive_public() {
       process.stdout.write(publicKeyFromPrivate(key) + "\n");
     });
   ' "$SCRIPT_DIR/fm-buzz-crypto.mjs"
+}
+
+derive_public() {
+  derive_public_from_store selected
 }
 
 record_public() {
@@ -223,7 +235,20 @@ if [ "$FORGETTING" -eq 1 ]; then
     exit 2
   }
 
-  if [ -f "$HISTORY_FILE" ] && grep -qx -- "$forget" "$HISTORY_FILE" 2>/dev/null; then
+  history_match=1
+  if [ -e "$HISTORY_FILE" ] || [ -L "$HISTORY_FILE" ]; then
+    if [ ! -f "$HISTORY_FILE" ]; then
+      printf 'fm-buzz-keypair.sh: could not read %s; nothing was changed\n' "$HISTORY_FILE" >&2
+      exit 1
+    fi
+    grep -qx -- "$forget" "$HISTORY_FILE" >/dev/null 2>&1
+    history_match=$?
+    if [ "$history_match" -gt 1 ]; then
+      printf 'fm-buzz-keypair.sh: could not read %s; nothing was changed\n' "$HISTORY_FILE" >&2
+      exit 1
+    fi
+  fi
+  if [ "$history_match" -eq 0 ]; then
     purge_public "$forget" || {
       printf 'fm-buzz-keypair.sh: could not withdraw the key from %s; nothing was changed\n' "$HISTORY_FILE" >&2
       exit 1
@@ -248,42 +273,74 @@ command -v node >/dev/null 2>&1 || {
   exit 1
 }
 
+add_recovery_reason() {  # <reason>
+  if [ -n "$recovery_reason" ]; then
+    recovery_reason="$recovery_reason; $1"
+  else
+    recovery_reason=$1
+  fi
+}
+
+purge_rotation_key() {  # <public key>
+  local public=$1
+  [ -n "$public" ] || return 0
+  purge_public "$public" || {
+    printf 'fm-buzz-keypair.sh: could not drop the compromised public key from %s; nothing was rotated\n' "$HISTORY_FILE" >&2
+    return 1
+  }
+}
+
 # Retire the old key before the lookup below, so rotation falls through into the
 # minting path instead of finding the key it was asked to replace.
 if [ "$ROTATE" -eq 1 ]; then
   recorded=$(normalize_public_key "$(sed -n 1p "$PUBLIC_FILE" 2>/dev/null)" 2>/dev/null) || recorded=""
+  keychain_public=""
+  file_public=""
   derived=""
   retiring=""
   recovery_reason=""
-  fm_buzz_key_load "$FM_HOME" >/dev/null 2>&1
-  load_status=$?
-  key_file=""
-  if [ "$load_status" -eq 3 ]; then
-    key_file=$(fm_buzz_key_fallback_file "$FM_HOME") || key_file=""
+  fm_buzz_key_load_keychain "$FM_HOME" >/dev/null 2>&1
+  keychain_status=$?
+  fm_buzz_key_load_file "$FM_HOME" >/dev/null 2>&1
+  file_status=$?
+  key_file=$(fm_buzz_key_fallback_file "$FM_HOME") || key_file="the fallback key file"
+
+  case $keychain_status in
+    0)
+      keychain_public=$(normalize_public_key "$(derive_public_from_store keychain 2>/dev/null)" 2>/dev/null) || keychain_public=""
+      [ -n "$keychain_public" ] || add_recovery_reason "the private key in the login keychain could not be used to derive its public key"
+      ;;
+    1) ;;
+    2) add_recovery_reason "the publishing key in the login keychain could not be read" ;;
+    *) add_recovery_reason "the publishing key in the login keychain could not be inspected" ;;
+  esac
+
+  case $file_status in
+    0)
+      file_public=$(normalize_public_key "$(derive_public_from_store file 2>/dev/null)" 2>/dev/null) || file_public=""
+      [ -n "$file_public" ] || add_recovery_reason "publishing key file $key_file could not be used to derive its public key"
+      ;;
+    1) ;;
+    3) add_recovery_reason "publishing key file $key_file could not be read" ;;
+    *) add_recovery_reason "publishing key file $key_file could not be inspected" ;;
+  esac
+
+  if [ -n "$keychain_public" ] && [ -n "$file_public" ] && [ "$keychain_public" != "$file_public" ]; then
+    add_recovery_reason "stored keys diverge: keychain public key $keychain_public, fallback public key $file_public"
+  elif [ -n "$keychain_public" ]; then
+    derived=$keychain_public
+  elif [ -n "$file_public" ]; then
+    derived=$file_public
   fi
 
-  case $load_status in
-    0)
-      derived=$(normalize_public_key "$(derive_public 2>/dev/null)" 2>/dev/null) || derived=""
-      if [ -z "$derived" ]; then
-        recovery_reason="the stored private key could not be used to derive its public key"
-      elif [ -n "$recorded" ] && [ "$recorded" != "$derived" ]; then
-        recovery_reason="the recorded public key in $PUBLIC_FILE does not match the stored private key"
-      else
-        retiring=$derived
-      fi
-      ;;
-    1)
-      if [ -e "$PUBLIC_FILE" ] || [ -L "$PUBLIC_FILE" ]; then
-        recovery_reason="the recorded public key in $PUBLIC_FILE has no stored private key"
-      fi
-      ;;
-    2) recovery_reason="the publishing key in the login keychain could not be read" ;;
-    3)
-      recovery_reason="publishing key file $key_file could not be read"
-      ;;
-    *) recovery_reason="the stored publishing key could not be read" ;;
-  esac
+  if [ -n "$derived" ] && [ -n "$recorded" ] && [ "$recorded" != "$derived" ]; then
+    add_recovery_reason "the recorded public key in $PUBLIC_FILE does not match the stored private key"
+  elif [ -n "$derived" ] && [ -z "$recovery_reason" ]; then
+    retiring=$derived
+  elif [ "$keychain_status" -eq 1 ] && [ "$file_status" -eq 1 ] \
+    && { [ -e "$PUBLIC_FILE" ] || [ -L "$PUBLIC_FILE" ]; }; then
+    add_recovery_reason "the recorded public key in $PUBLIC_FILE has no stored private key"
+  fi
 
   if [ -n "$recovery_reason" ]; then
     if [ "$COMPROMISED" -eq 0 ]; then
@@ -299,15 +356,10 @@ if [ "$ROTATE" -eq 1 ]; then
   # and permanently cost the probe its attribution. A rotation that stops now is
   # simply retryable - nothing has changed yet.
   if [ "$COMPROMISED" -eq 1 ]; then
-    purge_public "$recorded" || {
-      printf 'fm-buzz-keypair.sh: could not drop the compromised public key from %s; nothing was rotated\n' "$HISTORY_FILE" >&2
-      exit 1
-    }
-    if [ -n "$derived" ] && [ "$derived" != "$recorded" ]; then
-      purge_public "$derived" || {
-        printf 'fm-buzz-keypair.sh: could not drop the compromised public key from %s; nothing was rotated\n' "$HISTORY_FILE" >&2
-        exit 1
-      }
+    purge_rotation_key "$recorded" || exit 1
+    [ "$keychain_public" = "$recorded" ] || { purge_rotation_key "$keychain_public" || exit 1; }
+    if [ "$file_public" != "$recorded" ] && [ "$file_public" != "$keychain_public" ]; then
+      purge_rotation_key "$file_public" || exit 1
     fi
     if [ -n "$retiring" ]; then
       printf 'rotating: the retired public key is treated as compromised and is not kept in %s\n' "$HISTORY_FILE" >&2
@@ -317,7 +369,7 @@ if [ "$ROTATE" -eq 1 ]; then
       printf 'fm-buzz-keypair.sh: could not retain the retired public key in %s; nothing was rotated\n' "$HISTORY_FILE" >&2
       exit 1
     }
-  elif [ "$load_status" -eq 1 ]; then
+  elif [ "$keychain_status" -eq 1 ] && [ "$file_status" -eq 1 ]; then
     printf 'fm-buzz-keypair.sh: no key is stored for this home; there is nothing to retire\n' >&2
   fi
 
@@ -360,6 +412,11 @@ fi
 if [ "$load_status" -eq 3 ]; then
   key_file=$(fm_buzz_key_fallback_file "$FM_HOME") || key_file="the fallback key file"
   printf 'fm-buzz-keypair.sh: publishing key file %s could not be read\n' "$key_file" >&2
+  exit 1
+fi
+
+if [ -e "$PUBLIC_FILE" ] || [ -L "$PUBLIC_FILE" ]; then
+  printf 'fm-buzz-keypair.sh: the recorded public key in %s has no stored private key; recover with --rotate --compromised\n' "$PUBLIC_FILE" >&2
   exit 1
 fi
 

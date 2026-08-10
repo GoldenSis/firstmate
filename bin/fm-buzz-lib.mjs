@@ -162,7 +162,7 @@ export const RETRYABLE = "retryable";
 export const PERMANENT = "permanent";
 
 export function classifyOkResponse(accepted, message = "") {
-  if (accepted) return DELIVERED;
+  if (accepted === true) return DELIVERED;
   const text = String(message);
   // The relay already has this id; ON CONFLICT DO NOTHING did its job. That is
   // the success case for a replayed event, not a failure.
@@ -292,7 +292,7 @@ async function withRelay(relayUrl, privateKeyHex, timeoutMs, handler, options = 
       const waiter = pending.get(id);
       if (waiter) {
         pending.delete(id);
-        waiter.resolve({ id, accepted: Boolean(accepted), message: note ?? "" });
+        waiter.resolve({ id, accepted: accepted === true, message: note ?? "" });
       }
     } else if (type === "AUTH") {
       authChallenge = message[1];

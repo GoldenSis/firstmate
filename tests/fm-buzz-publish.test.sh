@@ -132,6 +132,11 @@ EOF
 #!/usr/bin/env bash
 case ${1:-} in
   find-generic-password)
+    if [ -n "${FM_FAKE_SECURITY_STATE_FILE:-}" ]; then
+      [ -f "$FM_FAKE_SECURITY_STATE_FILE" ] || exit 44
+      cat "$FM_FAKE_SECURITY_STATE_FILE"
+      exit 0
+    fi
     case ${FM_FAKE_SECURITY_FIND:-not-found} in
       found) printf '%s\n' "${FM_FAKE_SECURITY_PRIVATE:-}"; exit 0 ;;
       not-found) exit 44 ;;
@@ -139,6 +144,11 @@ case ${1:-} in
     esac
     ;;
   delete-generic-password)
+    if [ -n "${FM_FAKE_SECURITY_STATE_FILE:-}" ]; then
+      [ -f "$FM_FAKE_SECURITY_STATE_FILE" ] || exit 44
+      rm -f "$FM_FAKE_SECURITY_STATE_FILE"
+      exit 0
+    fi
     case ${FM_FAKE_SECURITY_DELETE:-not-found} in
       success) exit 0 ;;
       not-found) exit 44 ;;
@@ -150,6 +160,17 @@ esac
 exit 1
 EOF
   chmod +x "$tools/uname" "$tools/security"
+  printf '%s\n' "$tools"
+}
+
+make_forget_read_failure_tools() {
+  local tools="$TMP_ROOT/forget-read-failure-tools"
+  mkdir -p "$tools"
+  cat > "$tools/grep" <<'EOF'
+#!/usr/bin/env bash
+exit 2
+EOF
+  chmod +x "$tools/grep"
   printf '%s\n' "$tools"
 }
 
@@ -463,6 +484,62 @@ test_rotation_compares_the_recorded_key_with_stored_private_material() {
   pass "rotation compares recorded and derived public keys before retiring either"
 }
 
+test_rotation_detects_and_cleans_up_divergent_stores() {
+  local tools home keyfile keychain_state keychain_private keychain_public file_public
+  local file_before history_before output recovered code
+  tools=$(make_fake_keychain_tools)
+  home=$(make_home rotate-divergent-stores)
+  keyfile=$(key_file "$home" "$home/xdg")
+  keychain_state="$home/keychain-private"
+  keychain_private=0000000000000000000000000000000000000000000000000000000000000003
+  keychain_public=f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9
+  file_public=$(run_keypair "$home" 2>/dev/null) || fail "fallback keypair setup failed"
+  printf '%s\n' "$keychain_private" > "$keychain_state"
+  printf '%s\n%s\n' "$file_public" "$keychain_public" \
+    > "$home/data/buzz-keypair.public-history"
+  file_before=$(cat "$keyfile")
+  history_before=$(cat "$home/data/buzz-keypair.public-history")
+
+  output=$(PATH="$tools:$PATH" FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" \
+    XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 \
+    FM_FAKE_SECURITY_STATE_FILE="$keychain_state" "$KEYPAIR" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "ordinary rotation with divergent private-key stores"
+  assert_contains "$output" "$keychain_public" \
+    "the divergence refusal did not identify the keychain public key"
+  assert_contains "$output" "$file_public" \
+    "the divergence refusal did not identify the fallback public key"
+  [ "$(cat "$keychain_state")" = "$keychain_private" ] \
+    || fail "ordinary divergence refusal changed the keychain private key"
+  [ "$(cat "$keyfile")" = "$file_before" ] \
+    || fail "ordinary divergence refusal changed the fallback private key"
+  [ "$(cat "$home/data/buzz-keypair.public-history")" = "$history_before" ] \
+    || fail "ordinary divergence refusal changed public-key history"
+  assert_grep "$file_public" "$home/data/buzz-keypair.public" \
+    "ordinary divergence refusal changed the current public record"
+
+  output=$(PATH="$tools:$PATH" FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" \
+    XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 \
+    FM_FAKE_SECURITY_STATE_FILE="$keychain_state" "$KEYPAIR" --rotate --compromised 2>&1)
+  code=$?
+  expect_code 0 "$code" "compromised rotation with divergent private-key stores"
+  recovered=$(printf '%s\n' "$output" | tail -1)
+  [ "$recovered" != "$keychain_public" ] || fail "compromised divergence recovery reused the keychain identity"
+  [ "$recovered" != "$file_public" ] || fail "compromised divergence recovery reused the fallback identity"
+  assert_absent "$keychain_state" "compromised divergence recovery left the keychain private key"
+  [ "$(cat "$keyfile")" != "$file_before" ] \
+    || fail "compromised divergence recovery left the fallback private key unchanged"
+  assert_not_contains "$(cat "$keyfile" 2>/dev/null)" "$keychain_private" \
+    "compromised divergence recovery copied the old keychain key into the fallback store"
+  assert_not_contains "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null)" "$keychain_public" \
+    "compromised divergence recovery retained the keychain identity"
+  assert_not_contains "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null)" "$file_public" \
+    "compromised divergence recovery retained the fallback identity"
+  assert_grep "$recovered" "$home/data/buzz-keypair.public" \
+    "compromised divergence recovery did not record the replacement identity"
+  pass "rotation refuses divergent stores or purges both through compromised recovery"
+}
+
 test_orphaned_public_record_requires_compromised_recovery() {
   local home orphan history keyfile output recovered code
   home=$(make_home rotate-orphan)
@@ -480,6 +557,14 @@ test_orphaned_public_record_requires_compromised_recovery() {
   assert_grep "$orphan" "$home/data/buzz-keypair.public" \
     "ordinary rotation removed the orphaned record instead of refusing"
 
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default key creation with an orphaned public record"
+  assert_contains "$output" "recover with --rotate --compromised" \
+    "default key creation did not preserve the explicit orphan recovery path"
+  assert_grep "$orphan" "$home/data/buzz-keypair.public" \
+    "default key creation overwrote the orphaned public record"
+
   output=$(run_keypair "$home" --rotate --compromised 2>&1)
   code=$?
   expect_code 0 "$code" "compromised rotation with an orphaned public record"
@@ -492,6 +577,24 @@ test_orphaned_public_record_requires_compromised_recovery() {
   assert_not_contains "$(cat "$history" 2>/dev/null)" "$orphan" \
     "compromised orphan recovery retained the orphaned key"
   pass "orphaned public records require explicit compromised recovery"
+}
+
+test_forget_key_refuses_when_history_cannot_be_read() {
+  local tools home retired history before output code
+  tools=$(make_forget_read_failure_tools)
+  home=$(make_home forget-key-read-error)
+  history="$home/data/buzz-keypair.public-history"
+  retired=$(run_keypair "$home" 2>/dev/null) || fail "keypair setup failed"
+  run_keypair "$home" --rotate >/dev/null 2>&1 || fail "rotation fixture setup failed"
+  before=$(cat "$history")
+
+  output=$(PATH="$tools:$PATH" run_keypair "$home" --forget-key "$retired" 2>&1)
+  code=$?
+  expect_code 1 "$code" "--forget-key when public-key history cannot be read"
+  assert_contains "$output" "could not read $history" \
+    "--forget-key treated a history read error as an absent key"
+  [ "$(cat "$history")" = "$before" ] || fail "failed --forget-key changed public-key history"
+  pass "--forget-key refuses when public-key history cannot be read"
 }
 
 test_keychain_errors_refuse_rotation_without_minting_a_fallback_key() {
@@ -535,8 +638,8 @@ test_keychain_errors_refuse_rotation_without_minting_a_fallback_key() {
     "$KEYPAIR" --rotate 2>&1)
   code=$?
   expect_code 1 "$code" "forced-file rotation when preferred-store absence is unverifiable"
-  assert_contains "$output" "could not verify removal of the old key" \
-    "forced-file rotation skipped verification of the preferred keychain store"
+  assert_contains "$output" "login keychain could not be read" \
+    "forced-file rotation skipped inspection of the preferred keychain store"
   assert_grep "$forced_public" "$forced_home/data/buzz-keypair.public" \
     "failed forced-file rotation disturbed the current public key record"
   pass "keychain lookup and deletion errors refuse rotation without fallback minting"
@@ -1045,6 +1148,25 @@ EOF
   pass "a retryable rejection keeps the event cached"
 }
 
+test_truthy_non_boolean_ok_is_not_accepted() {
+  local home relay output
+  home=$(make_home truthy-ok)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub --truthy-ok)
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"truthy-ok"}' \
+    | run_publish "$home" "$relay" 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$output" "delivered=0 retained=1" \
+    "a truthy non-boolean OK field was treated as relay acceptance"
+  [ "$(replay_count "$home")" = "1" ] \
+    || fail "a malformed truthy OK acknowledgement evicted the cached event"
+  pass "only the boolean true is accepted as a relay acknowledgement"
+}
+
 # --- (e) the replay cache is capped ----------------------------------------
 
 test_replay_cache_is_capped_at_100() {
@@ -1135,6 +1257,73 @@ EOF
   pass "non-ENOENT cache read failures remain retryable and accounted for"
 }
 
+test_parseable_cache_corruption_is_discarded_without_replay() {
+  local home relay port cached cache_dir wrong_frame empty_frame notice_frame output
+  home=$(make_home parseable-cache-corruption)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  port=${relay##*:}
+  stop_stub "$STUB_PID"
+  printf '%s' '{"schema":"fm-bearings.v1","note":"valid-frame"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  cached=$(find "$home/state/buzz-replay" -type f -name '*.json' | head -1)
+  [ -n "$cached" ] || fail "valid cache fixture was not created"
+  cache_dir=$(dirname "$cached")
+  wrong_frame="$cache_dir/1700000001-$(printf '%064d' 1).json"
+  empty_frame="$cache_dir/1700000002-$(printf '%064d' 2).json"
+  notice_frame="$cache_dir/1700000003-$(printf '%064d' 3).json"
+  mv "$cached" "$wrong_frame"
+  printf '{}' > "$empty_frame"
+  printf '["NOTICE","not an event"]' > "$notice_frame"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub --port "$port")
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"fresh-event"}' \
+    | run_publish "$home" "$relay" 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$output" "dropping invalid cache entry" \
+    "parseable corrupt cache entries were not diagnosed"
+  assert_contains "$output" "delivered=1 retained=0 discarded=3 cleanup_failed=0" \
+    "parseable corrupt cache entries were not truthfully discarded"
+  assert_absent "$wrong_frame" "a cache frame whose filename disagreed with its event was replayed"
+  assert_absent "$empty_frame" "an object-only cache entry was retained"
+  assert_absent "$notice_frame" "a non-EVENT cache frame was retained"
+  [ "$(replay_count "$home")" = "0" ] || fail "corrupt cache entries remained after cleanup"
+  pass "cached replay validates complete EVENT frames and their filenames"
+}
+
+test_cache_prune_failures_are_reported_and_accounted_for() {
+  local home relay replay first second output count
+  home=$(make_home cache-prune-failure)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  replay="$home/state/buzz-replay"
+  mkdir -p "$replay"
+  first="$replay/1700000001-$(printf '%064d' 1).json"
+  second="$replay/1700000002-$(printf '%064d' 2).json"
+  mkdir "$first" "$second"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"prune-failure"}' \
+    | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$output" "could not prune cache entry" \
+    "a non-ENOENT prune failure was silently ignored"
+  assert_contains "$output" "cleanup_failed=2" \
+    "prune failures were omitted from outcome accounting"
+  assert_contains "$output" "publish did not complete; Firstmate is unaffected" \
+    "cache cleanup failure did not reach the fire-and-forget conversion"
+  count=$(replay_count "$home")
+  [ "$count" = "2" ] || fail "the prune failure fixture changed unexpectedly (found $count entries)"
+  pass "cache prune failures remain visible in cleanup outcome accounting"
+}
+
 # --- the contract means TERMINATING, not just exiting 0 --------------------
 
 test_a_writer_that_never_closes_does_not_hang_the_publish() {
@@ -1187,6 +1376,48 @@ test_a_writer_that_never_closes_does_not_hang_the_publish() {
   [ "$(replay_count "$home")" = "0" ] \
     || fail "a truncated projection must never be signed and enqueued"
   pass "a writer that never closes stdin cannot hang the publish"
+}
+
+test_invalid_stdin_timeouts_are_rejected_before_reading() {
+  local home invalid fifo spool pid waited output code
+  home=$(make_home invalid-stdin-timeout)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  for invalid in 0 -1 nope; do
+    fifo="$TMP_ROOT/invalid-timeout-$invalid.fifo"
+    spool="$TMP_ROOT/invalid-timeout-$invalid.out"
+    rm -f "$fifo"
+    mkfifo "$fifo" || fail "could not create invalid-timeout fifo"
+    exec 7<>"$fifo"
+    printf '%s' '{"schema":"fm-bearings.v1","note":"partial' >&7
+    env FM_BUZZ_STDIN_TIMEOUT_S="$invalid" FM_HOME="$home" \
+      FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$home/state" \
+      XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 FM_BUZZ_TIMEOUT_MS=8000 \
+      "$PUBLISH" --relay "ws://127.0.0.1:1" < "$fifo" > "$spool" 2>&1 &
+    pid=$!
+    waited=0
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null
+      exec 7>&-
+      rm -f "$fifo"
+      fail "invalid stdin timeout $invalid left the publisher blocked on its reader"
+    fi
+    wait "$pid"
+    code=$?
+    output=$(cat "$spool")
+    exec 7>&-
+    rm -f "$fifo"
+    expect_code 0 "$code" "invalid stdin timeout $invalid must still exit 0"
+    assert_contains "$output" "FM_BUZZ_STDIN_TIMEOUT_S must be a positive integer" \
+      "invalid stdin timeout $invalid was not rejected"
+  done
+  [ "$(replay_count "$home")" = "0" ] \
+    || fail "an invalid stdin timeout allowed a partial projection into the replay cache"
+  pass "invalid stdin timeout values are rejected before starting a reader"
 }
 
 test_a_signalled_read_leaves_no_projection_in_temp() {
@@ -1878,7 +2109,9 @@ test_rotation_replaces_the_key_in_whichever_store_holds_it
 test_a_compromised_rotation_does_not_keep_the_retired_key
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable
 test_rotation_compares_the_recorded_key_with_stored_private_material
+test_rotation_detects_and_cleans_up_divergent_stores
 test_orphaned_public_record_requires_compromised_recovery
+test_forget_key_refuses_when_history_cannot_be_read
 test_keychain_errors_refuse_rotation_without_minting_a_fallback_key
 test_public_record_failures_are_fatal_and_retryable
 test_two_homes_sharing_one_xdg_get_separate_keys
@@ -1896,10 +2129,14 @@ test_a_late_auth_challenge_is_still_answered
 test_a_challenge_past_the_handshake_window_still_lands_the_event
 test_permanent_rejection_is_not_replayed_forever
 test_retryable_rejection_is_kept
+test_truthy_non_boolean_ok_is_not_accepted
 test_replay_cache_is_capped_at_100
 test_an_interrupted_cache_write_is_swept_not_leaked
 test_unreadable_cache_entry_is_retained_as_retryable
+test_parseable_cache_corruption_is_discarded_without_replay
+test_cache_prune_failures_are_reported_and_accounted_for
 test_a_writer_that_never_closes_does_not_hang_the_publish
+test_invalid_stdin_timeouts_are_rejected_before_reading
 test_a_signalled_read_leaves_no_projection_in_temp
 test_a_signalled_read_releases_the_callers_output
 test_fire_and_forget_contract_is_intact

@@ -194,7 +194,8 @@ It governs that key and no other: every rotation mints a fresh random key, so th
 An exposure that comes to light after the rotation that retired the key names the key instead - `bin/fm-buzz-keypair.sh --forget-key <hex>` drops exactly that public key from `data/buzz-keypair.public-history` and leaves every other recorded key, and this home's current key, alone.
 It is its own operation rather than a rotation flag: nothing is minted, cleared, or re-recorded, and a key that is not in the recorded set is reported as such rather than treated as an error.
 Either way the recorded-key set is settled before the private half is cleared, and the rotation stops rather than proceeding if it cannot be: once the key is forgotten nothing can derive the retired public key a second time, so a write failure at that point would permanently and silently cost the probe its attribution.
-The outgoing key is accepted only as 64 lowercase hex characters, since `data/buzz-keypair.public` is a cache that can be truncated or half-written; anything else falls back to deriving the public half from the still-stored private key, and a rotation that can resolve it from neither source stops rather than retiring a key it cannot name.
+The outgoing key is accepted only as 64 lowercase hex characters, since `data/buzz-keypair.public` is a cache that can be truncated or half-written; anything else falls back to deriving the public half from the still-stored private key.
+Ordinary rotation stops when the stored identity is unreadable, divergent, or inconsistent with that record, while `--rotate --compromised` is the explicit no-retention recovery path for removing every identifiable outgoing identity before minting a replacement.
 
 Buzz is pre-1.0 with no long-term support branches and a very high release cadence, so `ghcr.io/block/buzz:main` can move under this adapter at any time.
 The relay stack is disposable by design; `down -v` and `up -d` is the whole recovery procedure.
