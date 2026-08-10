@@ -1147,6 +1147,38 @@ EOF
   pass "an anonymous read that returns events reports the breach"
 }
 
+test_an_anonymous_read_of_unverifiable_events_claims_no_breach() {
+  # The accusation is only as good as the frames it rests on. A relay that serves
+  # altered content is the same relay the verdict would be quoting, so events that
+  # do not recompute to their own id - or that are not tagged for this channel -
+  # cannot establish that a non-member read THIS channel. Same anti-overclaim rule
+  # as the reassurance and the hedge, applied to the accusation.
+  local home relay tampered
+  home=$(make_home anonymous-tampered)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub --tamper-on-read)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"readable-by-a-stranger"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  tampered=$(run_inspect "$home" "$relay" --anonymous 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$tampered" "TAMPERED" \
+    "the stub did not serve altered content, so the check under test was never reached"
+  assert_contains "$tampered" "INVALID" \
+    "altered content was not reported as invalid"
+  assert_not_contains "$tampered" \
+    "The channel was readable by an identity that is not a member" \
+    "a definite breach was declared over content the tool itself reports as forged"
+  assert_contains "$tampered" "INCONCLUSIVE" \
+    "unverifiable served events must be reported as inconclusive"
+  assert_contains "$tampered" "served by relay but not" \
+    "the served-but-unverifiable events were not reported separately"
+  pass "an anonymous read of unverifiable events claims no breach"
+}
+
 test_no_firstmate_path_depends_on_buzz() {
   # Invariant: Buzz is additive. If any other Firstmate script, skill, workflow or
   # AGENTS.md instruction ever calls the adapter, a stopped relay could reach a
@@ -1187,4 +1219,5 @@ test_nothing_private_reaches_a_command_line
 test_the_inspector_rejects_a_tampered_event
 test_an_anonymous_read_only_claims_privacy_when_the_relay_refuses
 test_an_anonymous_read_that_returns_events_reports_the_breach
+test_an_anonymous_read_of_unverifiable_events_claims_no_breach
 test_no_firstmate_path_depends_on_buzz

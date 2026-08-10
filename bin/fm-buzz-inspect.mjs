@@ -33,9 +33,10 @@ const limit = envelope.limit ?? 3;
 const full = Boolean(envelope.full);
 const channelId = envelope.channelId || channelIdForLabel(envelope.channelLabel ?? "");
 // A blank key means read as a stranger. That is the useful shape for probing
-// whether a private channel is invisible to non-members. Events coming back
-// settles it negatively outright; an absence settles it positively only when the
-// relay refused the subscription ON MEMBERSHIP GROUNDS - see the branches below.
+// whether a private channel is invisible to non-members. Events that verify as
+// this channel's own content settle it negatively outright; an absence settles it
+// positively only when the relay refused the subscription ON MEMBERSHIP GROUNDS -
+// see the branches below.
 const anonymous = !envelope.privateKey;
 const privateKey = anonymous ? generateKeypair().privateKey : envelope.privateKey;
 
@@ -54,14 +55,47 @@ try {
     `relay:    ${relay}\nchannel:  ${channelId}\nidentity: ${anonymous ? "ephemeral non-member" : "channel member"}\nevents:   ${events.length}\n`,
   );
   if (refusal) process.stdout.write(`refused:  ${refusal}\n`);
+
+  // Both halves, and neither on its own is worth anything here. The signature
+  // proves the author committed to this ID; recomputing the id proves the ID is
+  // the hash of the CONTENT printed below it. Checking only the signature would
+  // let a relay serve a validly-signed id beside altered content, tags, or
+  // timestamp and have this tool - the one place a human looks for that
+  // assurance - print "verified" over text the author never wrote. The `h` tag is
+  // the third half: the `#h` filter went out on the wire, but a relay is free to
+  // ignore it, so what came back is only this channel's content if the events
+  // themselves say so under a signature.
+  const assessed = events
+    .sort((a, b) => a.created_at - b.created_at)
+    .map((event) => {
+      const idMatches = computeEventId(event) === event.id;
+      const signed = schnorrVerify(event.id, event.pubkey, event.sig);
+      const inChannel = (event.tags ?? []).some((tag) => tag[0] === "h" && tag[1] === channelId);
+      return { event, idMatches, signed, inChannel, authentic: idMatches && signed && inChannel };
+    });
+  const authentic = assessed.filter((entry) => entry.authentic);
+
   // An anonymous read that RETURNS events is the one unambiguous answer this probe
   // can produce, and it is the negative one: a non-member read the private channel.
   // It has to be said out loud, because everything below prints `signature
   // verified` beside each event and a successful breach otherwise reads exactly
-  // like a successful legibility check.
-  if (events.length > 0 && anonymous) {
+  // like a successful legibility check. But the accusation earns no more trust in
+  // the relay than the reassurance does: the evidence for "a non-member read THIS
+  // channel" is an event that recomputes to its own id, verifies under its
+  // author's signature, and carries this channel's `h` tag. A relay that serves
+  // altered, replayed or fabricated frames would otherwise have this tool report a
+  // definite breach of a channel that never leaked.
+  if (anonymous && authentic.length > 0) {
     process.stdout.write(
       "\nThe channel was readable by an identity that is not a member — this is a definite negative privacy result.\n",
+    );
+  } else if (anonymous && events.length > 0) {
+    process.stdout.write(
+      `\nINCONCLUSIVE: the relay served ${events.length} event(s) to this non-member, but\n` +
+        "none of them are this channel's content: they are served by relay but not\n" +
+        "verifiable / not tagged for this channel. A relay that alters, replays or\n" +
+        "fabricates what it serves proves nothing about who may read this channel.\n" +
+        "See the per-event verdicts below.\n",
     );
   }
   // An empty anonymous read is not evidence of privacy on its own, and neither is
@@ -109,22 +143,15 @@ try {
       );
     }
   }
-  for (const event of events.sort((a, b) => a.created_at - b.created_at)) {
+  for (const { event, idMatches, signed, inChannel } of assessed) {
     const when = new Date(event.created_at * 1000).toISOString();
-    // Both halves, and neither on its own is worth anything here. The signature
-    // proves the author committed to this ID; recomputing the id proves the ID is
-    // the hash of the CONTENT printed below it. Checking only the signature would
-    // let a relay serve a validly-signed id beside altered content, tags, or
-    // timestamp and have this tool - the one place a human looks for that
-    // assurance - print "verified" over text the author never wrote.
-    const idMatches = computeEventId(event) === event.id;
-    const signed = schnorrVerify(event.id, event.pubkey, event.sig);
     const verdict = !idMatches ? "INVALID (id does not match this content)"
       : signed ? "verified"
       : "INVALID";
+    const channelVerdict = inChannel ? "this channel" : "NOT tagged for this channel";
     process.stdout.write(
       `\n--- ${event.id}\n    at        ${when}\n    author    ${event.pubkey}\n` +
-        `    signature ${verdict}\n\n`,
+        `    signature ${verdict}\n    channel   ${channelVerdict}\n\n`,
     );
     process.stdout.write(full ? `${event.content}\n` : `${event.content.slice(0, 600)}\n`);
   }

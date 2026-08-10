@@ -9,8 +9,13 @@
 #   default       read as the publisher (a channel member) - proves the projection
 #                 is legible, and verifies each event's signature
 #   --anonymous   read as a stranger - probes whether the private channel is
-#                 invisible to non-members. Events coming back is the conclusive
-#                 answer, and it is a negative one: a non-member read the channel.
+#                 invisible to non-members. An event that recomputes to its own id,
+#                 verifies under its author's signature and carries this channel's
+#                 `h` tag is the conclusive answer, and it is a negative one: a
+#                 non-member read the channel. Events the relay served but that
+#                 fail any of those checks are reported INCONCLUSIVE instead, since
+#                 a relay that alters, replays or fabricates frames says nothing
+#                 about who may read this channel.
 #                 Zero events is only an answer the other way when the relay
 #                 refuses the subscription on MEMBERSHIP grounds, i.e. with
 #                 NIP-01's `restricted:`. Every other outcome is reported
