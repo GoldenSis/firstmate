@@ -59,9 +59,13 @@ fm_buzz_key_account() {
 # FM_BUZZ_FORCE_FILE_STORE=1 forces the file fallback. That exists for the test
 # suite, which must not write into the developer's real login keychain, and for
 # headless runs where a keychain exists but is locked.
+fm_buzz_keychain_present() {
+  [ "$(uname -s)" = "Darwin" ] && command -v security >/dev/null 2>&1
+}
+
 fm_buzz_keychain_available() {
   [ "${FM_BUZZ_FORCE_FILE_STORE:-0}" = "1" ] && return 1
-  [ "$(uname -s)" = "Darwin" ] && command -v security >/dev/null 2>&1
+  fm_buzz_keychain_present
 }
 
 # SHA-256 of stdin, hex. Same shape as bin/fm-prototype.sh and bin/fm-fusion-gate.sh.
@@ -174,7 +178,7 @@ fm_buzz_key_store() {
 fm_buzz_key_forget() {
   local home=${1:?home required} account file attempts rc cleared_keychain
   account=$(fm_buzz_key_account "$home")
-  if fm_buzz_keychain_available; then
+  if fm_buzz_keychain_present; then
     # Loop, bounded: `-U` keeps this to one entry, but a keychain that somehow
     # holds several would otherwise hand the next load a key we thought was gone.
     attempts=0
@@ -190,11 +194,9 @@ fm_buzz_key_forget() {
       [ "$rc" -eq 44 ] || return 1
       break
     done
-    if [ "$attempts" -eq 10 ]; then
-      security find-generic-password -s "$FM_BUZZ_KEYCHAIN_SERVICE" -a "$account" -w >/dev/null 2>&1
-      rc=$?
-      [ "$rc" -eq 44 ] || return 1
-    fi
+    security find-generic-password -s "$FM_BUZZ_KEYCHAIN_SERVICE" -a "$account" -w >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 44 ] || return 1
     [ "$cleared_keychain" -eq 1 ] && printf 'keychain\n'
   fi
   file=$(fm_buzz_key_fallback_file "$home") || return 1
@@ -202,9 +204,12 @@ fm_buzz_key_forget() {
     rm -f -- "$file" || return 1
     printf 'file\n'
   fi
-  fm_buzz_key_load "$home" >/dev/null 2>&1
-  rc=$?
-  [ "$rc" -eq 1 ]
+  if fm_buzz_keychain_present; then
+    security find-generic-password -s "$FM_BUZZ_KEYCHAIN_SERVICE" -a "$account" -w >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 44 ] || return 1
+  fi
+  [ ! -e "$file" ] && [ ! -L "$file" ]
 }
 
 # --- shared helpers ----------------------------------------------------------

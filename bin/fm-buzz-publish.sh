@@ -195,6 +195,11 @@ publish() {
     log "the projection is empty; skipping publish"
     return 1
   }
+  jq -s -e 'length == 1' "$STDIN_SPOOL" >/dev/null 2>&1 || {
+    drop_stdin_spool
+    log "the projection is not one valid JSON value; skipping publish"
+    return 1
+  }
 
   local key load_status rc
   key=$(fm_buzz_key_load "$FM_HOME")

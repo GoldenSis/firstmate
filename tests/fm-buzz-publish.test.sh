@@ -153,6 +153,24 @@ EOF
   printf '%s\n' "$tools"
 }
 
+make_public_record_failure_tools() {
+  local tools="$TMP_ROOT/public-record-failure-tools"
+  mkdir -p "$tools"
+  cat > "$tools/mv" <<'EOF'
+#!/usr/bin/env bash
+if [ "${FM_FAIL_BUZZ_PUBLIC_MV:-0}" = "1" ]; then
+  for arg in "$@"; do
+    case $arg in
+      */buzz-keypair.public) exit 1 ;;
+    esac
+  done
+fi
+exec /bin/mv "$@"
+EOF
+  chmod +x "$tools/mv"
+  printf '%s\n' "$tools"
+}
+
 # --- the signing really is BIP-340 -----------------------------------------
 #
 # Everything else in this suite would still pass if the signer were subtly wrong
@@ -445,8 +463,39 @@ test_rotation_compares_the_recorded_key_with_stored_private_material() {
   pass "rotation compares recorded and derived public keys before retiring either"
 }
 
+test_orphaned_public_record_requires_compromised_recovery() {
+  local home orphan history keyfile output recovered code
+  home=$(make_home rotate-orphan)
+  history="$home/data/buzz-keypair.public-history"
+  keyfile=$(key_file "$home" "$home/xdg")
+  orphan=$(run_keypair "$home" 2>/dev/null) || fail "keypair creation failed"
+  rm -f "$keyfile"
+  printf '%s\n' "$orphan" > "$history"
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "ordinary rotation with an orphaned public record"
+  assert_contains "$output" "has no stored private key" \
+    "ordinary rotation did not diagnose the inconsistent recorded-key state"
+  assert_grep "$orphan" "$home/data/buzz-keypair.public" \
+    "ordinary rotation removed the orphaned record instead of refusing"
+
+  output=$(run_keypair "$home" --rotate --compromised 2>&1)
+  code=$?
+  expect_code 0 "$code" "compromised rotation with an orphaned public record"
+  assert_contains "$output" "no outgoing public key will be retained" \
+    "compromised orphan recovery did not identify its no-retention path"
+  recovered=$(printf '%s\n' "$output" | tail -1)
+  [ "$recovered" != "$orphan" ] || fail "compromised orphan recovery reused the orphaned key"
+  assert_grep "$recovered" "$home/data/buzz-keypair.public" \
+    "compromised orphan recovery did not record the replacement key"
+  assert_not_contains "$(cat "$history" 2>/dev/null)" "$orphan" \
+    "compromised orphan recovery retained the orphaned key"
+  pass "orphaned public records require explicit compromised recovery"
+}
+
 test_keychain_errors_refuse_rotation_without_minting_a_fallback_key() {
-  local tools private public home lookup_home output code fallback
+  local tools private public home lookup_home forced_home forced_public output code fallback
   tools=$(make_fake_keychain_tools)
   private=0000000000000000000000000000000000000000000000000000000000000003
   public=f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9
@@ -477,7 +526,62 @@ test_keychain_errors_refuse_rotation_without_minting_a_fallback_key() {
     "keychain lookup failure was mistaken for an absent key"
   fallback=$(key_file "$lookup_home" "$lookup_home/xdg")
   assert_absent "$fallback" "lookup failure minted a fallback key that could shadow the keychain entry"
+
+  forced_home=$(make_home force-file-keychain-error)
+  forced_public=$(run_keypair "$forced_home" 2>/dev/null) || fail "forced-file keypair setup failed"
+  output=$(PATH="$tools:$PATH" FM_HOME="$forced_home" FM_DATA_OVERRIDE="$forced_home/data" \
+    XDG_DATA_HOME="$forced_home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 \
+    FM_FAKE_SECURITY_FIND=error FM_FAKE_SECURITY_DELETE=not-found \
+    "$KEYPAIR" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "forced-file rotation when preferred-store absence is unverifiable"
+  assert_contains "$output" "could not verify removal of the old key" \
+    "forced-file rotation skipped verification of the preferred keychain store"
+  assert_grep "$forced_public" "$forced_home/data/buzz-keypair.public" \
+    "failed forced-file rotation disturbed the current public key record"
   pass "keychain lookup and deletion errors refuse rotation without fallback minting"
+}
+
+test_public_record_failures_are_fatal_and_retryable() {
+  local tools create_home create_file create_output create_private retry_private created code
+  local rotate_home rotate_file old rotate_output rotated_private retry_rotated replacement
+  tools=$(make_public_record_failure_tools)
+
+  create_home=$(make_home public-record-create-failure)
+  create_file=$(key_file "$create_home" "$create_home/xdg")
+  create_output=$(PATH="$tools:$PATH" FM_FAIL_BUZZ_PUBLIC_MV=1 run_keypair "$create_home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "key creation when the public record cannot be persisted"
+  assert_contains "$create_output" "private key remains stored for a safe retry" \
+    "creation did not diagnose its retryable public-record failure"
+  assert_absent "$create_home/data/buzz-keypair.public" \
+    "creation reported a failed public record but left one behind"
+  create_private=$(sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$create_file")
+  created=$(PATH="$tools:$PATH" run_keypair "$create_home" 2>/dev/null) \
+    || fail "creation retry did not repair the public record"
+  retry_private=$(sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$create_file")
+  [ "$create_private" = "$retry_private" ] || fail "creation retry replaced retained private material"
+  assert_grep "$created" "$create_home/data/buzz-keypair.public" \
+    "creation retry did not persist the retained key's public record"
+
+  rotate_home=$(make_home public-record-rotate-failure)
+  rotate_file=$(key_file "$rotate_home" "$rotate_home/xdg")
+  old=$(run_keypair "$rotate_home" 2>/dev/null) || fail "rotation fixture setup failed"
+  rotate_output=$(PATH="$tools:$PATH" FM_FAIL_BUZZ_PUBLIC_MV=1 \
+    run_keypair "$rotate_home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation when the replacement public record cannot be persisted"
+  assert_contains "$rotate_output" "private key remains stored for a safe retry" \
+    "rotation did not diagnose its retryable public-record failure"
+  rotated_private=$(sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$rotate_file")
+  replacement=$(PATH="$tools:$PATH" run_keypair "$rotate_home" 2>/dev/null) \
+    || fail "rotation retry did not repair the public record"
+  retry_rotated=$(sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$rotate_file")
+  [ "$rotated_private" = "$retry_rotated" ] || fail "rotation retry replaced retained private material"
+  [ "$replacement" != "$old" ] || fail "rotation failure did not retain the replacement private key"
+  assert_grep "$old" "$rotate_home/data/buzz-keypair.public-history" \
+    "failed public-record persistence lost the ordinarily retired key"
+  pass "public record failures are fatal while retained private material makes retry safe"
 }
 
 test_public_flag_fails_before_a_keypair_exists() {
@@ -509,6 +613,21 @@ test_publish_with_relay_down_exits_zero_and_enqueues() {
   [ "$(replay_count "$home")" = "1" ] \
     || fail "the signed event was not enqueued in the replay cache"
   pass "publish with the relay down exits 0 and enqueues the signed event"
+}
+
+test_malformed_projection_is_rejected_before_signing() {
+  local home output code
+  home=$(make_home malformed-projection)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  output=$(printf '%s' '{"schema":"fm-bearings.v1"' \
+    | run_publish "$home" "ws://127.0.0.1:1" 2>&1)
+  code=$?
+  expect_code 0 "$code" "malformed projection through the fire-and-forget wrapper"
+  assert_contains "$output" "not one valid JSON value" \
+    "malformed projection did not take the explicit rejection path"
+  assert_not_contains "$output" "signed event" "malformed projection was signed"
+  [ "$(replay_count "$home")" = "0" ] || fail "malformed projection entered the replay cache"
+  pass "malformed projections are rejected before signing"
 }
 
 test_refresh_preserves_the_snapshot_bytes_including_its_trailing_newline() {
@@ -990,6 +1109,32 @@ test_an_interrupted_cache_write_is_swept_not_leaked() {
   pass "an interrupted cache write is swept, and a fresh one is not"
 }
 
+test_unreadable_cache_entry_is_retained_as_retryable() {
+  local home relay cache_dir unreadable output
+  home=$(make_home unreadable-cache)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"prime-cache"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  cache_dir=$(find "$home/state/buzz-replay" -mindepth 1 -maxdepth 1 -type d | head -1)
+  [ -n "$cache_dir" ] || fail "relay-specific cache directory was not created"
+  unreadable="$cache_dir/1700000000-$(printf '%064d' 7).json"
+  mkdir "$unreadable"
+
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"read-error"}' \
+    | run_publish "$home" "$relay" 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$output" "could not read cache entry" \
+    "non-ENOENT cache read failure was mistaken for concurrent deletion"
+  assert_contains "$output" "retained=1" \
+    "unreadable cache entry was omitted from retained outcome accounting"
+  assert_present "$unreadable" "unreadable cache entry was discarded instead of retained"
+  pass "non-ENOENT cache read failures remain retryable and accounted for"
+}
+
 # --- the contract means TERMINATING, not just exiting 0 --------------------
 
 test_a_writer_that_never_closes_does_not_hang_the_publish() {
@@ -1437,6 +1582,32 @@ EOF
   pass "malformed relay events are invalidated independently without aborting inspection"
 }
 
+test_wrong_kind_event_cannot_produce_a_privacy_breach_verdict() {
+  local home relay inspected
+  home=$(make_home wrong-kind-read)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  read -r STUB_PID relay <<EOF
+$(start_stub --wrong-kind-on-read)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"wrong-kind"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  inspected=$(run_inspect "$home" "$relay" --anonymous 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_contains "$inspected" "events:   1" \
+    "stub did not serve the signed wrong-kind channel event"
+  assert_contains "$inspected" "unexpected event kind" \
+    "wrong-kind event was not classified as invalid"
+  assert_contains "$inspected" "this home's publisher" \
+    "wrong-kind fixture did not pass publisher attribution"
+  assert_contains "$inspected" "INCONCLUSIVE" \
+    "wrong-kind event did not leave the privacy result inconclusive"
+  assert_not_contains "$inspected" \
+    "The channel was readable by an identity that is not a member" \
+    "wrong-kind event produced a definite negative privacy verdict"
+  pass "wrong-kind events cannot produce a privacy-breach verdict"
+}
+
 test_an_anonymous_read_of_a_foreign_authors_event_claims_no_breach() {
   # id, signature and `h` tag are all satisfiable by a stranger: the channel id is
   # a digest of the home path, printed by this very tool and sent to the relay in
@@ -1707,9 +1878,12 @@ test_rotation_replaces_the_key_in_whichever_store_holds_it
 test_a_compromised_rotation_does_not_keep_the_retired_key
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable
 test_rotation_compares_the_recorded_key_with_stored_private_material
+test_orphaned_public_record_requires_compromised_recovery
 test_keychain_errors_refuse_rotation_without_minting_a_fallback_key
+test_public_record_failures_are_fatal_and_retryable
 test_two_homes_sharing_one_xdg_get_separate_keys
 test_publish_with_relay_down_exits_zero_and_enqueues
+test_malformed_projection_is_rejected_before_signing
 test_refresh_preserves_the_snapshot_bytes_including_its_trailing_newline
 test_publish_without_a_keypair_still_exits_zero
 test_non_loopback_env_relay_is_rejected_before_network
@@ -1724,6 +1898,7 @@ test_permanent_rejection_is_not_replayed_forever
 test_retryable_rejection_is_kept
 test_replay_cache_is_capped_at_100
 test_an_interrupted_cache_write_is_swept_not_leaked
+test_unreadable_cache_entry_is_retained_as_retryable
 test_a_writer_that_never_closes_does_not_hang_the_publish
 test_a_signalled_read_leaves_no_projection_in_temp
 test_a_signalled_read_releases_the_callers_output
@@ -1734,6 +1909,7 @@ test_an_anonymous_read_only_claims_privacy_when_the_relay_refuses
 test_an_anonymous_read_that_returns_events_reports_the_breach
 test_an_anonymous_read_of_unverifiable_events_claims_no_breach
 test_malformed_relay_events_are_assessed_independently
+test_wrong_kind_event_cannot_produce_a_privacy_breach_verdict
 test_an_anonymous_read_of_a_foreign_authors_event_claims_no_breach
 test_a_rotated_home_still_recognises_its_own_leaked_events
 test_forget_key_withdraws_an_already_retired_key

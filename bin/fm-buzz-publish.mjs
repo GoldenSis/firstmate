@@ -243,9 +243,14 @@ async function main() {
         let raw;
         try {
           raw = readFileSync(entry.file, "utf8");
-        } catch {
-          outcome.delete(entry.id);
-          continue; // pruned or removed concurrently
+        } catch (error) {
+          if (error.code === "ENOENT") {
+            outcome.delete(entry.id);
+            continue;
+          }
+          log(`could not read cache entry ${entry.name}: ${error.message}`);
+          outcome.set(entry.id, RETRYABLE);
+          continue;
         }
         let parsed;
         try {

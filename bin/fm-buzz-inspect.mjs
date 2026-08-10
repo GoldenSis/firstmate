@@ -77,6 +77,7 @@ function assessEvent(event, index, attributable, expectedAuthors, channelId) {
   if (!validPubkey) invalidReasons.push("malformed pubkey");
   if (!validSignature) invalidReasons.push("malformed signature");
   if (!validKind) invalidReasons.push("malformed kind");
+  if (validKind && value.kind !== KIND_STREAM_MESSAGE) invalidReasons.push("unexpected event kind");
   if (!validTags) invalidReasons.push("malformed tags");
   if (!validContent) invalidReasons.push("malformed content");
   if (!validTimestamp) invalidReasons.push("malformed created_at");
@@ -117,7 +118,13 @@ function assessEvent(event, index, attributable, expectedAuthors, channelId) {
     signed,
     inChannel,
     byPublisher,
-    authentic: invalidReasons.length === 0 && idMatches && signed && inChannel && byPublisher,
+    authentic:
+      invalidReasons.length === 0 &&
+      value.kind === KIND_STREAM_MESSAGE &&
+      idMatches &&
+      signed &&
+      inChannel &&
+      byPublisher,
   };
 }
 

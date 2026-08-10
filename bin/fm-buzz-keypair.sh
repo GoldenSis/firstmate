@@ -273,7 +273,11 @@ if [ "$ROTATE" -eq 1 ]; then
         retiring=$derived
       fi
       ;;
-    1) ;;
+    1)
+      if [ -e "$PUBLIC_FILE" ] || [ -L "$PUBLIC_FILE" ]; then
+        recovery_reason="the recorded public key in $PUBLIC_FILE has no stored private key"
+      fi
+      ;;
     2) recovery_reason="the publishing key in the login keychain could not be read" ;;
     3)
       recovery_reason="publishing key file $key_file could not be read"
@@ -326,7 +330,10 @@ if [ "$ROTATE" -eq 1 ]; then
   else
     printf 'fm-buzz-keypair.sh: no previous key was stored for this home; minting one\n' >&2
   fi
-  rm -f -- "$PUBLIC_FILE"
+  rm -f -- "$PUBLIC_FILE" || {
+    printf 'fm-buzz-keypair.sh: could not remove stale public key record %s; no replacement was minted\n' "$PUBLIC_FILE" >&2
+    exit 1
+  }
 fi
 
 fm_buzz_key_load "$FM_HOME" >/dev/null 2>&1
@@ -337,7 +344,10 @@ if [ "$load_status" -eq 0 ]; then
     exit 1
   }
   # Re-record on every run: cheap, and it self-heals a deleted or truncated file.
-  record_public "$public" || printf 'fm-buzz-keypair.sh: could not record %s\n' "$PUBLIC_FILE" >&2
+  record_public "$public" || {
+    printf 'fm-buzz-keypair.sh: could not record %s; the private key remains stored for a safe retry\n' "$PUBLIC_FILE" >&2
+    exit 1
+  }
   printf '%s\n' "$public"
   exit 0
 fi
@@ -387,6 +397,9 @@ store=$(fm_buzz_key_store "$FM_HOME" "$private") || {
 }
 private=
 
-record_public "$public" || printf 'fm-buzz-keypair.sh: could not record %s\n' "$PUBLIC_FILE" >&2
+record_public "$public" || {
+  printf 'fm-buzz-keypair.sh: could not record %s; the private key remains stored for a safe retry\n' "$PUBLIC_FILE" >&2
+  exit 1
+}
 printf 'created: buzz publishing keypair (private key stored in %s)\n' "$store" >&2
 printf '%s\n' "$public"

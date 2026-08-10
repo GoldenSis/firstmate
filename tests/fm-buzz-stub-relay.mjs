@@ -24,6 +24,7 @@
 //                                          [--challenge-delay-ms N]
 //                                          [--duplicate-refused] [--silent-ok]
 //                                          [--tamper-on-read] [--malform-on-read]
+//                                          [--wrong-kind-on-read]
 //                                          [--refuse-req <msg>]
 // Prints "listening <port>" on stdout once ready, so a caller can use port 0 and
 // learn the ephemeral port.
@@ -68,6 +69,7 @@ let silentOk = false;
 // the only thing that can catch it is recomputing the id from what was served.
 let tamperOnRead = false;
 let malformOnRead = false;
+let wrongKindOnRead = false;
 // A relay that enforces channel membership on reads: it answers a REQ with a
 // subscription-scoped CLOSED and no EOSE, which is how a real private channel
 // tells a non-member it may not see the events. Without this the stub serves every
@@ -85,6 +87,7 @@ for (let i = 0; i < argv.length; i += 1) {
   else if (argv[i] === "--silent-ok") silentOk = true;
   else if (argv[i] === "--tamper-on-read") tamperOnRead = true;
   else if (argv[i] === "--malform-on-read") malformOnRead = true;
+  else if (argv[i] === "--wrong-kind-on-read") wrongKindOnRead = true;
   else if (argv[i] === "--refuse-req") refuseReq = argv[++i];
 }
 
@@ -157,8 +160,8 @@ function decodeFrames(buffer) {
   return { messages, rest: buffer.subarray(offset) };
 }
 
-function matches(event, filter) {
-  if (filter.kinds && !filter.kinds.includes(event.kind)) return false;
+function matches(event, filter, ignoreKinds = false) {
+  if (!ignoreKinds && filter.kinds && !filter.kinds.includes(event.kind)) return false;
   for (const [key, values] of Object.entries(filter)) {
     if (!key.startsWith("#")) continue;
     const tagName = key.slice(1);
@@ -281,7 +284,13 @@ server.on("upgrade", (req, socket) => {
           continue;
         }
         const found = [...store.values()]
-          .filter((event) => matches(event, filter))
+          .filter((event) =>
+            wrongKindOnRead
+              ? Array.isArray(filter.kinds) &&
+                !filter.kinds.includes(event.kind) &&
+                matches(event, filter, true)
+              : matches(event, filter),
+          )
           .sort((a, b) => a.created_at - b.created_at);
         for (const event of found) {
           if (malformOnRead) {
