@@ -50,6 +50,14 @@ fm_path_age() {
   echo $(( $(date +%s) - m ))
 }
 
+fm_path_identity() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%d:%i' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i' "$1" 2>/dev/null
+  fi
+}
+
 fm_watcher_lock_matches_pid() {
   local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity current_identity
   lockdir="$state/.watch.lock"
@@ -249,14 +257,25 @@ fm_lock_recheck_stale_owner() {
 }
 
 fm_lock_reclaim_stale_owner() {
-  local lockdir=$1 expected_owner=$2 expected_pid=$3
+  local lockdir=$1 expected_owner=$2 expected_pid=$3 expected_identity claimed_identity claim
   fm_lock_recheck_stale_owner "$lockdir" "$expected_owner" "$expected_pid" || return 1
   if [ -n "$expected_owner" ]; then
+    expected_identity=$(fm_path_identity "$lockdir") || return 1
     fm_lock_clean_known_files "$expected_owner"
     rmdir "$expected_owner" 2>/dev/null || return 1
-    fm_lock_points_to_owner "$lockdir" "$expected_owner" || return 1
-    rm -f "$lockdir" 2>/dev/null
-    return
+    claim="${expected_owner}.reclaimed-link"
+    [ ! -e "$claim" ] && [ ! -L "$claim" ] || return 1
+    mv "$lockdir" "$claim" 2>/dev/null || return 1
+    claimed_identity=$(fm_path_identity "$claim" 2>/dev/null || true)
+    if [ "$claimed_identity" != "$expected_identity" ] \
+      || ! fm_lock_points_to_owner "$claim" "$expected_owner"; then
+      if [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ]; then
+        mv "$claim" "$lockdir" 2>/dev/null || true
+      fi
+      return 1
+    fi
+    rm -f "$claim" 2>/dev/null
+    return $?
   fi
   fm_lock_clean_known_files "$lockdir"
   rmdir "$lockdir" 2>/dev/null

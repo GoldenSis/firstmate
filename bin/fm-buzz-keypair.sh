@@ -130,67 +130,70 @@ TARGETS_FILE="$DATA/buzz-publisher-targets.jsonl"
 AUTHORITIES_FILE="$DATA/buzz-relay-authorities.jsonl"
 UNVERIFIABLE_FILE="$DATA/buzz-compromised-unverifiable-pairs.jsonl"
 ROTATION_STAGE_FILE=$(fm_buzz_key_stage_file "$DATA")
-PUBLIC_ONLY=0
-ROTATE=0
+OPERATION=ensure
 COMPROMISED=0
 DISCARD_PENDING_CACHE=0
 FORGET_KEY=""
-FORGETTING=0
 FORGET_TARGET=""
-TARGET_FORGETTING=0
 FORGET_RELAY_IDENTITY=""
-RELAY_IDENTITY_FORGETTING=0
 STRICT_RELAY_AUTHORITY=${FM_BUZZ_REQUIRE_PINNED_RELAY_AUTHORITY:-0}
+
+select_operation() {
+  local requested=$1
+  if [ "$OPERATION" = ensure ] || [ "$OPERATION" = "$requested" ]; then
+    OPERATION=$requested
+    return 0
+  fi
+  case "$OPERATION:$requested" in
+    rotate:public|public:rotate)
+      printf 'fm-buzz-keypair.sh: --rotate and --public are mutually exclusive\n' >&2
+      ;;
+    forget-key:*|*:forget-key)
+      printf 'fm-buzz-keypair.sh: --forget-key is its own operation; run it on its own\n' >&2
+      ;;
+    forget-target:*|*:forget-target)
+      printf 'fm-buzz-keypair.sh: --forget-target is its own operation; run it on its own\n' >&2
+      ;;
+    forget-relay-identity:*|*:forget-relay-identity)
+      printf 'fm-buzz-keypair.sh: --forget-relay-identity is its own operation; run it on its own\n' >&2
+      ;;
+    *)
+      printf 'fm-buzz-keypair.sh: operations %s and %s are mutually exclusive\n' \
+        "$OPERATION" "$requested" >&2
+      ;;
+  esac
+  exit 2
+}
 
 while [ "$#" -gt 0 ]; do
   case $1 in
-    --public) PUBLIC_ONLY=1 ;;
-    --rotate) ROTATE=1 ;;
+    --public) select_operation public ;;
+    --rotate) select_operation rotate ;;
     --compromised) COMPROMISED=1 ;;
     --discard-pending-cache) DISCARD_PENDING_CACHE=1 ;;
     # Tracked as a flag rather than by its value being non-empty: an operator who
     # typed the flag and lost its argument must get an error, never a silent fall
     # through into the default "ensure a keypair exists" behaviour.
-    --forget-key) FORGETTING=1; shift; FORGET_KEY=${1:-} ;;
-    --forget-target) TARGET_FORGETTING=1; shift; FORGET_TARGET=${1:-} ;;
-    --forget-relay-identity) RELAY_IDENTITY_FORGETTING=1; shift; FORGET_RELAY_IDENTITY=${1:-} ;;
+    --forget-key) select_operation forget-key; shift; FORGET_KEY=${1:-} ;;
+    --forget-target) select_operation forget-target; shift; FORGET_TARGET=${1:-} ;;
+    --forget-relay-identity) select_operation forget-relay-identity; shift; FORGET_RELAY_IDENTITY=${1:-} ;;
     --help|-h) awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; exit 0 ;;
     *) printf 'fm-buzz-keypair.sh: unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
   shift
 done
 
-if [ "$ROTATE" -eq 1 ] && [ "$PUBLIC_ONLY" -eq 1 ]; then
-  printf 'fm-buzz-keypair.sh: --rotate and --public are mutually exclusive\n' >&2
-  exit 2
-fi
-
-if [ "$COMPROMISED" -eq 1 ] && [ "$ROTATE" -eq 0 ]; then
+if [ "$COMPROMISED" -eq 1 ] && [ "$OPERATION" != rotate ]; then
   printf 'fm-buzz-keypair.sh: --compromised describes a rotation; pass it with --rotate\n' >&2
   exit 2
 fi
 
-if [ "$DISCARD_PENDING_CACHE" -eq 1 ] && [ "$ROTATE" -eq 0 ]; then
+if [ "$DISCARD_PENDING_CACHE" -eq 1 ] && [ "$OPERATION" != rotate ]; then
   printf 'fm-buzz-keypair.sh: --discard-pending-cache describes a rotation; pass it with --rotate\n' >&2
   exit 2
 fi
 
-if [ "$FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ] || [ "$TARGET_FORGETTING" -eq 1 ] || [ "$RELAY_IDENTITY_FORGETTING" -eq 1 ]; }; then
-  printf 'fm-buzz-keypair.sh: --forget-key is its own operation; run it on its own\n' >&2
-  exit 2
-fi
-
-if [ "$TARGET_FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ] || [ "$COMPROMISED" -eq 1 ] || [ "$DISCARD_PENDING_CACHE" -eq 1 ] || [ "$RELAY_IDENTITY_FORGETTING" -eq 1 ]; }; then
-  printf 'fm-buzz-keypair.sh: --forget-target is its own operation; run it on its own\n' >&2
-  exit 2
-fi
-
-if [ "$RELAY_IDENTITY_FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ] || [ "$COMPROMISED" -eq 1 ] || [ "$DISCARD_PENDING_CACHE" -eq 1 ]; }; then
-  printf 'fm-buzz-keypair.sh: --forget-relay-identity is its own operation; run it on its own\n' >&2
-  exit 2
-fi
-
-if [ "$ROTATE" -eq 1 ]; then
+if [ "$OPERATION" = rotate ]; then
   case $STRICT_RELAY_AUTHORITY in
     0|1) ;;
     *)
@@ -229,7 +232,7 @@ release_keypair_lock() {
   fi
 }
 
-if [ "$PUBLIC_ONLY" -eq 0 ]; then
+if [ "$OPERATION" != public ]; then
   mkdir -p "$DATA" 2>/dev/null || {
     printf 'fm-buzz-keypair.sh: could not create %s\n' "$DATA" >&2
     exit 1
@@ -253,7 +256,8 @@ if [ "$PUBLIC_ONLY" -eq 0 ]; then
     exit 1
   }
   fm_lock_acquire_wait "$PUBLISH_LOCK"
-  if [ "$ROTATE" -eq 1 ] || [ "$TARGET_FORGETTING" -eq 1 ] || [ "$RELAY_IDENTITY_FORGETTING" -eq 1 ]; then
+  if [ "$OPERATION" = rotate ] || [ "$OPERATION" = forget-target ] \
+    || [ "$OPERATION" = forget-relay-identity ]; then
     for delivery_intent in "$STATE"/.buzz-replay-intent-*.lock; do
       if [ ! -e "$delivery_intent" ] && [ ! -L "$delivery_intent" ]; then
         continue
@@ -612,7 +616,7 @@ purge_public() {  # <public key to withdraw>
   purge_public_set "$1"
 }
 
-if [ "$RELAY_IDENTITY_FORGETTING" -eq 1 ]; then
+run_forget_relay_identity_operation() {
   if [ -z "$FORGET_RELAY_IDENTITY" ]; then
     printf 'fm-buzz-keypair.sh: --forget-relay-identity wants a relay endpoint\n' >&2
     exit 2
@@ -631,9 +635,9 @@ EOF
   printf 'forgotten relay identity: %s (%s authority record(s))\n' \
     "$forgotten_relay_endpoint" "$forgotten_relay_count" >&2
   exit 0
-fi
+}
 
-if [ "$TARGET_FORGETTING" -eq 1 ]; then
+run_forget_target_operation() {
   case $FORGET_TARGET in
     ""|*[!0-9a-f]*)
       printf 'fm-buzz-keypair.sh: --forget-target wants a canonical 64-character lowercase target hex\n' >&2
@@ -658,14 +662,14 @@ EOF
   printf 'forgotten target: %s publisher %s relay %s channel %s\n' \
     "$forgotten_hex" "$forgotten_public" "$forgotten_relay" "$forgotten_channel" >&2
   exit 0
-fi
+}
 
 # --forget-key: withdraw one already-retired key from the recorded set. This is
 # what --compromised cannot be, and the reason it is a separate operation: a
 # rotation only ever holds the key it is retiring right now, so an exposure
 # discovered later has to name the key it means. Nothing is minted or cleared
 # here, and no key material is read - it is a rewrite of one public-key list.
-if [ "$FORGETTING" -eq 1 ]; then
+run_forget_key_operation() {
   forget=$(fm_buzz_normalize_public_key "$FORGET_KEY") || {
     printf 'fm-buzz-keypair.sh: --forget-key wants a 64-character hex public key\n' >&2
     exit 2
@@ -699,7 +703,13 @@ if [ "$FORGETTING" -eq 1 ]; then
     printf 'fm-buzz-keypair.sh: %s is still this home'"'"'s CURRENT publishing key; retire it with --rotate --compromised\n' "$forget" >&2
   fi
   exit 0
-fi
+}
+
+case $OPERATION in
+  forget-relay-identity) run_forget_relay_identity_operation ;;
+  forget-target) run_forget_target_operation ;;
+  forget-key) run_forget_key_operation ;;
+esac
 
 add_recovery_reason() {  # <reason>
   if [ -n "$recovery_reason" ]; then
@@ -719,7 +729,7 @@ if [ -e "$ROTATION_STAGE_FILE" ] || [ -L "$ROTATION_STAGE_FILE" ]; then
     exit 1
   }
 fi
-if [ "$ROTATION_STAGE_PHASE" = committable ] && [ "$PUBLIC_ONLY" -eq 0 ]; then
+if [ "$ROTATION_STAGE_PHASE" = committable ] && [ "$OPERATION" != public ]; then
   finish_committable_rotation_stage
   stage_finish_status=$?
   if [ "$stage_finish_status" -eq 0 ]; then
@@ -728,14 +738,14 @@ if [ "$ROTATION_STAGE_PHASE" = committable ] && [ "$PUBLIC_ONLY" -eq 0 ]; then
     printf '%s\n' "$ROTATION_STAGE_PUBLIC"
     exit 0
   fi
-  if [ "$stage_finish_status" -ne 3 ] || [ "$ROTATE" -eq 0 ]; then
+  if [ "$stage_finish_status" -ne 3 ] || [ "$OPERATION" != rotate ]; then
     printf 'fm-buzz-keypair.sh: could not complete staged replacement %s; retry with --rotate\n' \
       "$ROTATION_STAGE_FILE" >&2
     exit 1
   fi
 fi
 
-if [ "$ROTATE" -eq 1 ]; then
+run_rotate_operation() {
   fm_buzz_file_target_replaceable "$PUBLIC_FILE" || {
     printf 'fm-buzz-keypair.sh: public key record target %s is not a regular file; nothing was rotated\n' "$PUBLIC_FILE" >&2
     exit 1
@@ -1009,8 +1019,9 @@ EOF
   fi
   printf '%s\n' "$ROTATION_STAGE_PUBLIC"
   exit 0
-fi
+}
 
+run_ensure_or_public_operation() {
 fm_buzz_key_load "$FM_HOME" >/dev/null 2>&1
 load_status=$?
 if [ "$load_status" -eq 0 ]; then
@@ -1018,7 +1029,7 @@ if [ "$load_status" -eq 0 ]; then
     printf 'fm-buzz-keypair.sh: a key is stored but its public half could not be derived\n' >&2
     exit 1
   }
-  if [ "$PUBLIC_ONLY" -eq 1 ]; then
+  if [ "$OPERATION" = public ]; then
     printf '%s\n' "$public"
     exit 0
   fi
@@ -1042,17 +1053,17 @@ if [ "$load_status" -eq 3 ]; then
   exit 1
 fi
 
-if [ "$ROTATE" -eq 0 ] && { [ -e "$PUBLIC_FILE" ] || [ -L "$PUBLIC_FILE" ]; }; then
+if [ -e "$PUBLIC_FILE" ] || [ -L "$PUBLIC_FILE" ]; then
   printf 'fm-buzz-keypair.sh: the recorded public key in %s has no stored private key; recover with --rotate --compromised\n' "$PUBLIC_FILE" >&2
   exit 1
 fi
 
-if [ "$PUBLIC_ONLY" -eq 1 ]; then
+if [ "$OPERATION" = public ]; then
   printf 'fm-buzz-keypair.sh: no keypair exists yet; run without --public to create one\n' >&2
   exit 1
 fi
 
-if [ "$ROTATE" -eq 0 ]; then
+if [ "$OPERATION" = ensure ]; then
   ensure_targets=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" list-with-ids "$TARGETS_FILE" 2>&1)
   ensure_targets_status=$?
   if [ "$ensure_targets_status" -ne 0 ]; then
@@ -1118,3 +1129,13 @@ if [ -n "${unverifiable_pairs:-}" ]; then
     "$UNVERIFIABLE_FILE" "$unverifiable_pairs" >&2
 fi
 printf '%s\n' "$public"
+}
+
+case $OPERATION in
+  rotate) run_rotate_operation ;;
+  ensure|public) run_ensure_or_public_operation ;;
+  *)
+    printf 'fm-buzz-keypair.sh: internal error: unhandled operation %s\n' "$OPERATION" >&2
+    exit 1
+    ;;
+esac

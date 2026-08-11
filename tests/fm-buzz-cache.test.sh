@@ -251,8 +251,16 @@ test_missing_manifest_backed_quarantine_payloads_fail_closed() {
   manifest="$quarantine/manifests/$token.json"
   jq -cn --arg token "$token" '{
     original_path:"legacy.json",
+    legacy_host:"localhost:3000",
+    original_timestamps:{atime_ms:0,mtime_ms:0,ctime_ms:0,birthtime_ms:0},
+    quarantine_timestamp:"1970-01-01T00:00:00.000Z",
     payload_reference:("payloads/" + $token + ".json"),
-    publisher_pubkey:null
+    publisher_pubkey:null,
+    source_device:1,
+    source_inode:1,
+    content_sha256_observed:"0000000000000000000000000000000000000000000000000000000000000000",
+    content_size_observed:0,
+    quarantine_reason:"missing-payload-fixture"
   }' > "$manifest"
   output=$(run_keypair "$home" 2>&1)
   code=$?
@@ -270,8 +278,13 @@ test_missing_manifest_backed_quarantine_payloads_fail_closed() {
   manifest="$quarantine/manifests/$token.json"
   jq -cn --arg token "$token" '{
     original_path:"corrupt-node",
+    legacy_host:null,
+    original_timestamps:{atime_ms:0,mtime_ms:0,ctime_ms:0,birthtime_ms:0},
+    quarantine_timestamp:"1970-01-01T00:00:00.000Z",
     payload_reference:("corrupt/" + $token + "/entry"),
-    publisher_pubkey:null
+    publisher_pubkey:null,
+    corrupt_type:"regular-file",
+    content_sha256:null
   }' > "$manifest"
   output=$(run_keypair "$home" 2>&1)
   code=$?

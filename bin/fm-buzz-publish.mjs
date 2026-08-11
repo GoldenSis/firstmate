@@ -87,6 +87,7 @@ import {
   RETRYABLE,
 } from "./fm-buzz-lib.mjs";
 import { recordPublisherTarget } from "./fm-buzz-targets.mjs";
+import { publicKeyFromPrivate } from "./fm-buzz-crypto.mjs";
 
 const CACHE_PARTITION = /^[0-9a-f]{64}$/;
 const CHANNEL_PARTITION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -900,6 +901,83 @@ function metadataTimestamps(metadata) {
     ctime_ms: metadata.ctimeMs,
     birthtime_ms: metadata.birthtimeMs,
   };
+}
+
+function canonicalIsoTimestamp(value) {
+  if (typeof value !== "string") return false;
+  try {
+    return new Date(value).toISOString() === value;
+  } catch {
+    return false;
+  }
+}
+
+function validQuarantineTimestamps(value) {
+  return value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    ["atime_ms", "mtime_ms", "ctime_ms", "birthtime_ms"]
+      .every((field) => Number.isFinite(value[field]));
+}
+
+function quarantineManifestVariant(manifest, token) {
+  if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)) {
+    throw new Error("quarantine manifest is not an object");
+  }
+  if (typeof manifest.original_path !== "string" || manifest.original_path === "") {
+    throw new Error("quarantine manifest has an invalid original_path");
+  }
+  if (!validQuarantineTimestamps(manifest.original_timestamps)) {
+    throw new Error("quarantine manifest has invalid original_timestamps");
+  }
+  if (!canonicalIsoTimestamp(manifest.quarantine_timestamp)) {
+    throw new Error("quarantine manifest has an invalid quarantine_timestamp");
+  }
+  const regularReference = path.join("payloads", `${token}.json`);
+  const corruptReference = path.join("corrupt", token, "entry");
+  const recoveryReference = path.join("recovery-corrupt", `${token}.invalid`);
+  const recorded = manifest.publisher_pubkey;
+  if (recorded !== null && recorded !== undefined &&
+      (typeof recorded !== "string" || !CACHE_PARTITION.test(recorded))) {
+    throw new Error("quarantine manifest has an invalid publisher identity");
+  }
+  if (manifest.payload_reference === regularReference) {
+    if (
+      !Number.isSafeInteger(manifest.source_device) || manifest.source_device < 0 ||
+      !Number.isSafeInteger(manifest.source_inode) || manifest.source_inode < 0 ||
+      typeof manifest.content_sha256_observed !== "string" ||
+      !CACHE_PARTITION.test(manifest.content_sha256_observed) ||
+      !Number.isSafeInteger(manifest.content_size_observed) || manifest.content_size_observed < 0 ||
+      typeof manifest.quarantine_reason !== "string" || manifest.quarantine_reason === "" ||
+      !(manifest.legacy_host === null || typeof manifest.legacy_host === "string")
+    ) {
+      throw new Error("regular quarantine manifest is malformed");
+    }
+    return "regular";
+  }
+  if (manifest.payload_reference === corruptReference) {
+    if (
+      typeof manifest.corrupt_type !== "string" || manifest.corrupt_type === "" ||
+      !(manifest.content_sha256 === null ||
+        (typeof manifest.content_sha256 === "string" && CACHE_PARTITION.test(manifest.content_sha256)))
+    ) {
+      throw new Error("corrupt-node quarantine manifest is malformed");
+    }
+    return "corrupt";
+  }
+  if (manifest.payload_reference === recoveryReference) {
+    if (
+      !Number.isSafeInteger(manifest.source_device) || manifest.source_device < 0 ||
+      !Number.isSafeInteger(manifest.source_inode) || manifest.source_inode < 0 ||
+      manifest.corrupt_type !== "invalid-quarantine-recovery-residue" ||
+      typeof manifest.recovery_error !== "string" || manifest.recovery_error === "" ||
+      !(recorded === null || recorded === undefined)
+    ) {
+      throw new Error("recovery-residue quarantine manifest is malformed");
+    }
+    return "recovery-residue";
+  }
+  throw new Error("quarantine manifest has an invalid payload_reference");
 }
 
 function writeJsonAtomically(file, value) {
@@ -1949,21 +2027,24 @@ function quarantinedReplayPublisherEntries(cacheRoot) {
     } catch (error) {
       throw new Error(`could not read legacy quarantine manifest ${manifestFile}: ${error.message}`);
     }
-    const recorded = manifest?.publisher_pubkey;
+    let variant;
+    try {
+      variant = quarantineManifestVariant(manifest, match[1]);
+    } catch (error) {
+      throw new Error(`legacy quarantine manifest ${manifestFile} is malformed: ${error.message}`);
+    }
+    const recorded = manifest.publisher_pubkey;
     if (recorded !== null && recorded !== undefined) {
-      if (typeof recorded !== "string" || !CACHE_PARTITION.test(recorded)) {
-        throw new Error(`legacy quarantine manifest ${manifestFile} has an invalid publisher identity`);
-      }
       evidence.push({ path: manifestFile, publisherPubkey: recorded });
       continue;
     }
-    if (typeof manifest?.original_path !== "string" || typeof manifest?.payload_reference !== "string") continue;
     const regularReference = path.join("payloads", `${match[1]}.json`);
     const corruptReference = path.join("corrupt", match[1], "entry");
+    const recoveryReference = path.join("recovery-corrupt", `${match[1]}.invalid`);
     let payloadParent;
-    if (manifest.payload_reference === regularReference) {
+    if (variant === "regular") {
       payloadParent = path.join(quarantineDir, "payloads");
-    } else if (manifest.payload_reference === corruptReference) {
+    } else if (variant === "corrupt") {
       const corruptDir = path.join(quarantineDir, "corrupt");
       try {
         metadata = cacheLstatSync(corruptDir);
@@ -1979,10 +2060,21 @@ function quarantinedReplayPublisherEntries(cacheRoot) {
       pinCacheDirectory(corruptDir);
       payloadParent = path.join(quarantineDir, "corrupt", match[1]);
     } else {
-      continue;
+      payloadParent = path.join(quarantineDir, "recovery-corrupt");
     }
     const payload = path.resolve(path.join(quarantineDir, manifest.payload_reference));
-    if (!containedCachePath(payloadParent, payload) || path.dirname(payload) !== path.resolve(payloadParent)) continue;
+    const expectedReference = variant === "regular"
+      ? regularReference
+      : variant === "corrupt"
+        ? corruptReference
+        : recoveryReference;
+    if (
+      manifest.payload_reference !== expectedReference ||
+      !containedCachePath(payloadParent, payload) ||
+      path.dirname(payload) !== path.resolve(payloadParent)
+    ) {
+      throw new Error(`legacy quarantine manifest ${manifestFile} has an invalid payload path`);
+    }
     try {
       metadata = cacheLstatSync(payloadParent);
     } catch (error) {
@@ -2003,8 +2095,17 @@ function quarantinedReplayPublisherEntries(cacheRoot) {
       }
       throw error;
     }
+    if (variant === "recovery-residue") {
+      if (!metadata.isFile()) {
+        throw new Error(`legacy quarantine recovery residue ${payload} is not a regular file`);
+      }
+      continue;
+    }
+    if (variant === "corrupt" && corruptNodeType(metadata) !== manifest.corrupt_type) {
+      throw new Error(`legacy quarantine payload ${payload} does not match corrupt_type ${manifest.corrupt_type}`);
+    }
     if (!metadata.isFile()) {
-      if (manifest.payload_reference === regularReference) {
+      if (variant === "regular") {
         throw new Error(`legacy quarantine payload ${payload} is not a regular file`);
       }
       continue;
@@ -2568,6 +2669,7 @@ async function main() {
   if (!CHANNEL_PARTITION.test(channelId)) throw new Error("channel id must be a canonical UUID");
   if (phase !== "prepare" && phase !== "deliver") throw new Error("invalid envelope field: phase");
   resolveLoopbackRelayHost(relay);
+  const currentPublisher = publicKeyFromPrivate(privateKey);
   const cacheRoot = prepareCacheRoot(replayDir);
   const relayCacheDir = prepareRelayCacheDirectory(cacheRoot, relay, channelId);
 
@@ -2684,6 +2786,13 @@ async function main() {
           });
         } catch (error) {
           log(`could not record publisher target for cached event ${entry.id}: ${error.message}`);
+          outcome.set(entry.file, RETRYABLE);
+          continue;
+        }
+        if (parsed.pubkey !== currentPublisher) {
+          log(
+            `retaining cached event ${entry.id}: publisher ${parsed.pubkey} differs from authenticated publisher ${currentPublisher}`,
+          );
           outcome.set(entry.file, RETRYABLE);
           continue;
         }

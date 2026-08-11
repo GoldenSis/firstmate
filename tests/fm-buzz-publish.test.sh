@@ -657,6 +657,35 @@ EOF
   pass "a challenge arriving past the handshake window still lands the refused event"
 }
 
+test_foreign_author_cache_entries_are_not_drained_by_the_current_publisher() {
+  local home relay foreign_private foreign_public channel foreign_file output
+  home=$(make_home foreign-author-cache)
+  run_keypair "$home" >/dev/null 2>&1 || fail "foreign-author cache keypair setup failed"
+  foreign_private=$(new_private_key) || fail "could not mint a foreign cache publisher"
+  foreign_public=$(public_from_private "$foreign_private") \
+    || fail "could not derive the foreign cache publisher"
+  channel=$(default_channel_id "$home")
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  foreign_file=$(seed_replay_event \
+    "$home" "$relay" "$foreign_private" 1700000400 "$channel" foreign-author-cache) \
+    || fail "could not seed a foreign-author cache entry"
+
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"current-publisher"}' \
+    | run_publish "$home" "$relay" 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_present "$foreign_file" "the current publisher evicted another author\'s cached event"
+  assert_contains "$output" "publisher $foreign_public differs from authenticated publisher" \
+    "the foreign-author cache entry was not diagnosed"
+  assert_contains "$output" "delivered=1 retained=1" \
+    "the foreign-author cache entry was not retained outside relay outcome classification"
+  [ "$(replay_count "$home")" = "1" ] \
+    || fail "the current publisher changed the foreign-author replay entry"
+  pass "relay drains retain events authored by another publisher identity"
+}
+
 test_permanent_rejection_is_not_replayed_forever() {
   local home relay
   home=$(make_home permanent)
@@ -1226,6 +1255,7 @@ test_replaying_a_known_event_is_deduped_and_evicted
 test_an_unacknowledged_publish_does_not_starve_the_drain
 test_a_late_auth_challenge_is_still_answered
 test_a_challenge_past_the_handshake_window_still_lands_the_event
+test_foreign_author_cache_entries_are_not_drained_by_the_current_publisher
 test_permanent_rejection_is_not_replayed_forever
 test_retryable_rejection_is_kept
 test_truthy_non_boolean_ok_is_not_accepted

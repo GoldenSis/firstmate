@@ -633,7 +633,7 @@ test_publisher_target_updates_are_concurrent_and_fail_closed() {
 }
 
 test_publisher_target_lock_ignores_only_identity_bound_dead_candidates() {
-  local home publisher targets lock relay first second channel_one channel_two dead token
+  local home publisher targets lock relay first second channel_one channel_two channel_three dead token live_token
   home=$(make_home publisher-target-stale-candidate)
   publisher=$(run_keypair "$home" 2>/dev/null) || fail "stale-candidate target setup failed"
   targets="$home/data/buzz-publisher-targets.jsonl"
@@ -668,7 +668,24 @@ test_publisher_target_lock_ignores_only_identity_bound_dead_candidates() {
   [ "$(jq -s 'length' "$targets")" = "2" ] \
     || fail "dead-candidate recovery lost a concurrent target update"
   assert_absent "$lock" "dead-candidate recovery left registry ownership behind"
-  pass "registry ownership ignores dead candidates without replacing live ownership"
+
+  channel_three=$(channel_id_for_label stale-candidate-three)
+  live_token=$(printf '%032d' 8)
+  mkdir "$lock"
+  printf '{"pid":%s,"pid_identity":"reused-pid-owner","token":"%s","choosing":false,"ticket":1}\n' \
+    "$$" "$live_token" > "$lock/$$-$live_token.candidate"
+  node -e '
+    import(process.argv[2]).then(({ recordPublisherTarget }) => {
+      recordPublisherTarget(process.argv[3], {
+        publisher_pubkey: process.argv[4], relay: process.argv[5], channel_id: process.argv[6],
+      });
+    });
+  ' target-lock-test "$ROOT/bin/fm-buzz-targets.mjs" "$targets" "$publisher" "$relay" "$channel_three" \
+    || fail "PID-reused candidate blocked a target registry update"
+  [ "$(jq -s 'length' "$targets")" = "3" ] \
+    || fail "PID-reused candidate recovery lost the target update"
+  assert_absent "$lock" "PID-reused candidate recovery left registry ownership behind"
+  pass "registry ownership verifies process-start identity before trusting live pids"
 }
 
 test_forget_target_attests_exact_retirement() {
@@ -2086,6 +2103,70 @@ EOF
   pass "uninspectable quarantine payloads keep orphan recovery fail closed"
 }
 
+test_orphan_gate_validates_quarantine_manifest_variants() {
+  local home replay quarantine token payload manifest output code recovery_token recovery_payload recovery_manifest
+  home=$(make_home orphan-malformed-quarantine-manifest)
+  replay="$home/state/buzz-replay"
+  quarantine="$replay/_legacy-quarantine"
+  token=$(printf '%064d' 81)
+  payload="$quarantine/payloads/$token.json"
+  manifest="$quarantine/manifests/$token.json"
+  mkdir -p "$quarantine/payloads" "$quarantine/manifests"
+  printf '{}\n' > "$payload"
+  jq -cn --arg token "$token" '{
+    original_path:"legacy.json",
+    payload_reference:("payloads/" + $token + ".json"),
+    publisher_pubkey:null
+  }' > "$manifest"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with a malformed regular quarantine manifest"
+  assert_contains "$output" "quarantine manifest" \
+    "a malformed null-publisher manifest was silently treated as no evidence"
+  assert_contains "$output" "malformed" \
+    "the malformed quarantine manifest was not diagnosed"
+  assert_absent "$home/data/buzz-keypair.public" \
+    "a malformed quarantine manifest allowed a replacement identity"
+
+  home=$(make_home orphan-valid-recovery-residue)
+  replay="$home/state/buzz-replay"
+  quarantine="$replay/_legacy-quarantine"
+  recovery_token=$(printf '%064d' 82)
+  recovery_payload="$quarantine/recovery-corrupt/$recovery_token.invalid"
+  recovery_manifest="$quarantine/manifests/$recovery_token.json"
+  mkdir -p "$quarantine/recovery-corrupt" "$quarantine/manifests"
+  printf 'invalid recovery bytes\n' > "$recovery_payload"
+  node -e '
+    const fs = require("node:fs");
+    const payload = process.argv[1];
+    const manifest = process.argv[2];
+    const token = process.argv[3];
+    const metadata = fs.statSync(payload);
+    fs.writeFileSync(manifest, JSON.stringify({
+      original_path: "recovery-corrupt/" + token + ".invalid",
+      legacy_host: null,
+      original_timestamps: {
+        atime_ms: metadata.atimeMs,
+        mtime_ms: metadata.mtimeMs,
+        ctime_ms: metadata.ctimeMs,
+        birthtime_ms: metadata.birthtimeMs,
+      },
+      quarantine_timestamp: new Date(0).toISOString(),
+      payload_reference: "recovery-corrupt/" + token + ".invalid",
+      source_device: metadata.dev,
+      source_inode: metadata.ino,
+      corrupt_type: "invalid-quarantine-recovery-residue",
+      recovery_error: "fixture",
+    }, null, 2) + "\n");
+  ' "$recovery_payload" "$recovery_manifest" "$recovery_token"
+  run_keypair "$home" >/dev/null 2>&1 \
+    || fail "a valid recovery-residue manifest blocked first key creation"
+  assert_present "$home/data/buzz-keypair.public" \
+    "valid recovery residue was not distinguished from unresolved publisher evidence"
+  pass "orphan inspection validates every null-publisher quarantine manifest variant"
+}
+
 test_orphan_gate_includes_recoverable_quarantine_staging() {
   local home relay private publisher channel seeded replay token transaction origin output code
   home=$(make_home orphan-quarantine-staging)
@@ -2399,6 +2480,7 @@ test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine
 test_orphan_gate_preserves_corrupt_partition_publisher_evidence
 test_orphan_gate_validates_quarantine_payloads_without_filename_trust
 test_orphan_gate_fails_closed_on_unreadable_quarantine_payloads
+test_orphan_gate_validates_quarantine_manifest_variants
 test_orphan_gate_includes_recoverable_quarantine_staging
 test_orphan_identity_inspection_does_not_mutate_endpoint_replay
 test_publish_signing_is_serialized_with_compromised_rotation

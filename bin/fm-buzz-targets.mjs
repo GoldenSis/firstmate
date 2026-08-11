@@ -47,6 +47,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeRelayEndpoint } from "./fm-buzz-lib.mjs";
@@ -61,7 +62,7 @@ function registryLockSleep(milliseconds) {
   Atomics.wait(registryLockWaiter, 0, 0, milliseconds);
 }
 
-function registryLockOwnerAlive(pid) {
+function registryPidAlive(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
@@ -69,6 +70,27 @@ function registryLockOwnerAlive(pid) {
   } catch (error) {
     return error.code === "EPERM";
   }
+}
+
+function registryProcessIdentity(pid) {
+  const result = spawnSync(
+    "ps",
+    ["-p", String(pid), "-o", "lstart=", "-o", "command="],
+    {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C" },
+      stdio: ["ignore", "pipe", "ignore"],
+    },
+  );
+  if (result.error || result.status !== 0 || result.stdout.trim() === "") return null;
+  return result.stdout.replace(/^\s+/, "").trimEnd();
+}
+
+function registryLockOwnerAlive(candidate) {
+  if (!registryPidAlive(candidate.pid)) return false;
+  if (candidate.malformed || typeof candidate.pid_identity !== "string") return true;
+  const identity = registryProcessIdentity(candidate.pid);
+  return identity === null || identity === candidate.pid_identity;
 }
 
 function registryCandidateName(pid, token) {
@@ -79,7 +101,13 @@ function readRegistryCandidate(lock, name) {
   const match = /^([1-9][0-9]*)-([0-9a-f]{32})\.candidate$/.exec(name);
   if (!match) throw new Error(`registry lock ${lock} has an invalid candidate ${name}`);
   const candidate = path.join(lock, name);
-  const metadata = lstatSync(candidate);
+  let metadata;
+  try {
+    metadata = lstatSync(candidate);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
   if (metadata.isSymbolicLink() || !metadata.isFile()) {
     throw new Error(`registry lock candidate ${candidate} is not a regular file`);
   }
@@ -88,7 +116,16 @@ function readRegistryCandidate(lock, name) {
   try {
     value = JSON.parse(readFileSync(candidate, "utf8"));
   } catch {
-    return { candidate, metadata, pid, token: match[2], choosing: true, ticket: 0, malformed: true };
+    return {
+      candidate,
+      metadata,
+      pid,
+      token: match[2],
+      pid_identity: null,
+      choosing: true,
+      ticket: 0,
+      malformed: true,
+    };
   }
   if (
     value === null ||
@@ -96,18 +133,30 @@ function readRegistryCandidate(lock, name) {
     Array.isArray(value) ||
     value.pid !== pid ||
     value.token !== match[2] ||
+    typeof value.pid_identity !== "string" ||
+    value.pid_identity === "" ||
     typeof value.choosing !== "boolean" ||
     !Number.isSafeInteger(value.ticket) ||
     value.ticket < 0
   ) {
-    return { candidate, metadata, pid, token: match[2], choosing: true, ticket: 0, malformed: true };
+    return {
+      candidate,
+      metadata,
+      pid,
+      token: match[2],
+      pid_identity: null,
+      choosing: true,
+      ticket: 0,
+      malformed: true,
+    };
   }
   return { candidate, metadata, ...value, malformed: false };
 }
 
 function registryCandidates(lock) {
   return readdirSync(lock)
-    .map((name) => readRegistryCandidate(lock, name));
+    .map((name) => readRegistryCandidate(lock, name))
+    .filter((candidate) => candidate !== null);
 }
 
 function removeDeadRegistryCandidate(candidate) {
@@ -135,14 +184,22 @@ function acquireRegistryLock(file) {
   }
   const token = randomBytes(16).toString("hex");
   const candidate = path.join(lock, registryCandidateName(process.pid, token));
-  writeFileSync(candidate, `${JSON.stringify({ pid: process.pid, token, choosing: true, ticket: 0 })}\n`, {
+  const pidIdentity = registryProcessIdentity(process.pid);
+  if (pidIdentity === null) throw new Error("could not determine registry lock process identity");
+  writeFileSync(candidate, `${JSON.stringify({
+    pid: process.pid,
+    pid_identity: pidIdentity,
+    token,
+    choosing: true,
+    ticket: 0,
+  })}\n`, {
     mode: 0o600,
     flag: "wx",
   });
   try {
     let maximum = 0;
     for (const other of registryCandidates(lock)) {
-      if (!registryLockOwnerAlive(other.pid)) {
+      if (!registryLockOwnerAlive(other)) {
         removeDeadRegistryCandidate(other);
         continue;
       }
@@ -150,13 +207,19 @@ function acquireRegistryLock(file) {
     }
     if (maximum >= Number.MAX_SAFE_INTEGER) throw new Error(`registry lock ${lock} exhausted its ticket range`);
     const ticket = maximum + 1;
-    writeFileSync(candidate, `${JSON.stringify({ pid: process.pid, token, choosing: false, ticket })}\n`);
+    writeFileSync(candidate, `${JSON.stringify({
+      pid: process.pid,
+      pid_identity: pidIdentity,
+      token,
+      choosing: false,
+      ticket,
+    })}\n`);
     const heldMetadata = lstatSync(candidate);
     for (;;) {
       let blocked = false;
       for (const other of registryCandidates(lock)) {
         if (other.candidate === candidate) continue;
-        if (!registryLockOwnerAlive(other.pid)) {
+        if (!registryLockOwnerAlive(other)) {
           removeDeadRegistryCandidate(other);
           continue;
         }

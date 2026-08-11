@@ -289,7 +289,7 @@ test_lock_live_steal_mutex_is_not_reclaimed() {
 }
 
 test_stale_guard_reclamation_cannot_remove_a_live_replacement() {
-  local dir state fakebin guard stale_owner live_owner dead live started release result worker real_rm
+  local dir state fakebin guard stale_owner live_owner dead live started release result worker real_mv
   dir=$(make_case lock-stale-guard-race)
   state="$dir/state"
   fakebin="$dir/fakebin"
@@ -300,19 +300,19 @@ test_stale_guard_reclamation_cannot_remove_a_live_replacement() {
   release="$dir/remove-release"
   result="$dir/result"
   dead=$(dead_pid)
-  real_rm=$(command -v rm)
+  real_mv=$(command -v mv)
   mkdir -p "$fakebin" "$stale_owner"
   printf '%s\n' "$dead" > "$stale_owner/pid"
   ln -s "$stale_owner" "$guard"
-  cat > "$fakebin/rm" <<EOF
+  cat > "$fakebin/mv" <<EOF
 #!/usr/bin/env bash
 if [ ! -e "$started" ]; then
   : > "$started"
   while [ ! -e "$release" ]; do sleep 0.01; done
 fi
-exec "$real_rm" "\$@"
+exec "$real_mv" "\$@"
 EOF
-  chmod +x "$fakebin/rm"
+  chmod +x "$fakebin/mv"
 
   FM_LOCK_STALE_AFTER=0 PATH="$fakebin:$PATH" bash -c '
     . "$1"
@@ -324,7 +324,7 @@ EOF
 
   sleep 300 &
   live=$!
-  "$real_rm" -f "$guard"
+  rm -f "$guard"
   mkdir "$live_owner"
   printf '%s\n' "$live" > "$live_owner/pid"
   ln -s "$live_owner" "$guard"
