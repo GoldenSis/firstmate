@@ -25,6 +25,8 @@ run/**/*.log
 # uncommittable even if those broad rules are ever narrowed. No keypair material,
 # public or private, is ever committed.
 state/buzz-replay/
+state/buzz-relay-key/
 data/buzz-keypair.*
 data/buzz-publisher-targets.jsonl
 data/buzz-relay-authorities.jsonl
+data/buzz-compromised-unverifiable-pairs.jsonl

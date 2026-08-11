@@ -307,7 +307,11 @@ publish() {
   [ -d "$REPLAY_DIR" ] && [ ! -L "$REPLAY_DIR" ] \
     || { log "replay cache path $REPLAY_DIR is not a regular directory"; return 1; }
   chmod 0700 "$REPLAY_DIR" 2>/dev/null || true
-  PUBLISH_LOCK="$STATE/.buzz-replay-publish.lock"
+  PUBLISH_LOCK=$(fm_buzz_replay_transaction_lock "$STATE") || {
+    log "could not resolve replay cache ownership"
+    drop_stdin_spool
+    return 1
+  }
   acquire_bounded_lock "$PUBLISH_LOCK"
   lock_status=$?
   if [ "$lock_status" -ne 0 ]; then

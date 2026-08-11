@@ -27,9 +27,14 @@ command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
 STUB_PID=""
 ROTATION_GUARD_PID=""
 ROTATION_GUARD_RELAY=""
+BUZZ_DOCKER_PROJECT=""
 cleanup() {
   [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null
   [ -n "$ROTATION_GUARD_PID" ] && kill "$ROTATION_GUARD_PID" 2>/dev/null
+  if [ -n "$BUZZ_DOCKER_PROJECT" ] && command -v docker >/dev/null 2>&1; then
+    docker compose -p "$BUZZ_DOCKER_PROJECT" -f "$ROOT/docker-compose.buzz-loopback.yml" \
+      down -v >/dev/null 2>&1 || true
+  fi
   fm_test_cleanup
 }
 trap cleanup EXIT
@@ -135,6 +140,26 @@ publish_membership_fixture() {  # <relay> <channel> <member-pubkey>
   ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay" "$channel" "$member"
 }
 
+query_membership_signer() {  # <private-key> <relay> <channel>
+  local private=$1 relay=$2 channel=$3
+  # shellcheck disable=SC2016
+  printf '%s' "$private" | node -e '
+    let privateKey = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { privateKey += chunk; });
+    process.stdin.on("end", async () => {
+      const { queryCurrentChannelMembership } = await import(process.argv[1]);
+      const membership = await queryCurrentChannelMembership(
+        process.argv[2],
+        privateKey.trim(),
+        process.argv[3],
+        15000,
+      );
+      process.stdout.write(`${membership.signerPubkey}\n`);
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay" "$channel"
+}
+
 # Start the stub on an ephemeral port and echo "<pid> <url>".
 start_stub() {  # [stub args...]
   local out pid port line
@@ -180,6 +205,32 @@ relay_cache_dir() {  # <home> <relay>
   printf '%s/state/buzz-replay/%s\n' "$home" "$digest"
 }
 
+seed_replay_event() {  # <home> <relay> <private-key> <created-at> <channel> <note>
+  local home=$1 relay=$2 private=$3 created_at=$4 channel=$5 note=$6 directory
+  directory=$(relay_cache_dir "$home" "$relay") || return 1
+  mkdir -p "$directory"
+  # shellcheck disable=SC2016
+  printf '%s' "$private" | node -e '
+    const { writeFileSync } = require("node:fs");
+    const path = require("node:path");
+    let privateKey = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { privateKey += chunk; });
+    process.stdin.on("end", async () => {
+      const { KIND_STREAM_MESSAGE, signEvent } = await import(process.argv[1]);
+      const event = signEvent({
+        created_at: Number(process.argv[3]),
+        kind: KIND_STREAM_MESSAGE,
+        tags: [["h", process.argv[4]]],
+        content: JSON.stringify({ schema: "fm-bearings.v1", note: process.argv[5] }),
+      }, privateKey.trim());
+      const file = path.join(process.argv[2], `${event.created_at}-${event.id}.json`);
+      writeFileSync(file, JSON.stringify(["EVENT", event]), { mode: 0o600, flag: "wx" });
+      process.stdout.write(`${file}\n`);
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$directory" "$created_at" "$channel" "$note"
+}
+
 # Ask the custody library itself where a home's key file is, rather than hardcoding
 # the name here: the per-home derivation is the thing under test, and a test that
 # recomputed it would agree with a broken library by construction.
@@ -191,6 +242,7 @@ key_file() {  # <home> <xdg>
 }
 
 public_from_private() {  # <private-key>
+  # shellcheck disable=SC2016
   printf '%s' "$1" | node -e '
     let privateKey = "";
     process.stdin.setEncoding("utf8");
@@ -551,6 +603,69 @@ test_a_compromised_rotation_does_not_keep_the_retired_key() {
   pass "a compromised rotation does not keep the retired key"
 }
 
+test_rotation_refuses_or_quarantines_outgoing_pending_events() {
+  local home other relay channel old old_private other_private old_file_one old_file_two other_file
+  local keyfile private_before history_before output code rotated quarantine manifests
+  home=$(make_home rotation-pending-cache)
+  other=$(make_home rotation-pending-cache-other)
+  relay="ws://127.0.0.1:1/pending-rotation"
+  channel="11111111-1111-5111-8111-111111111111"
+  old=$(run_keypair "$home" 2>/dev/null) || fail "pending-cache rotation keypair setup failed"
+  run_keypair "$other" >/dev/null 2>&1 || fail "pending-cache other-author setup failed"
+  keyfile=$(key_file "$home" "$home/xdg")
+  old_private=$(jq -r '.private_key' "$keyfile")
+  other_private=$(jq -r '.private_key' "$(key_file "$other" "$other/xdg")")
+  old_file_one=$(seed_replay_event "$home" "$relay" "$old_private" 1700000100 "$channel" pending-one) \
+    || fail "could not seed the first outgoing replay entry"
+  old_file_two=$(seed_replay_event "$home" "$relay" "$old_private" 1700000101 "$channel" pending-two) \
+    || fail "could not seed the second outgoing replay entry"
+  other_file=$(seed_replay_event "$home" "$relay" "$other_private" 1700000102 "$channel" other-author) \
+    || fail "could not seed the other-author replay entry"
+  private_before=$(cat "$keyfile")
+  history_before=$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null || true)
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation with outgoing-authored pending replay entries"
+  assert_contains "$output" "pending replay cache contains 2 outgoing-authored event(s)" \
+    "rotation refusal did not report the exact pending-entry count"
+  assert_contains "$output" "$old_file_one" "rotation refusal omitted the first blocking path"
+  assert_contains "$output" "$old_file_two" "rotation refusal omitted the second blocking path"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "pending-cache refusal changed the recorded public key"
+  [ "$(cat "$keyfile")" = "$private_before" ] \
+    || fail "pending-cache refusal changed the stored private key"
+  [ "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null || true)" = "$history_before" ] \
+    || fail "pending-cache refusal changed public-key history"
+  assert_present "$old_file_one" "pending-cache refusal removed the first outgoing entry"
+  assert_present "$old_file_two" "pending-cache refusal removed the second outgoing entry"
+  assert_present "$other_file" "pending-cache refusal removed another publisher's entry"
+
+  output=$(run_keypair "$home" --rotate --discard-pending-cache 2>&1)
+  code=$?
+  expect_code 0 "$code" "rotation with explicit pending-cache quarantine"
+  assert_contains "$output" "quarantined 2 outgoing-authored pending replay event(s)" \
+    "rotation override did not report the exact quarantined-entry count"
+  rotated=$(printf '%s\n' "$output" | tail -1)
+  [ "$rotated" != "$old" ] || fail "pending-cache override did not replace the publishing identity"
+  assert_absent "$old_file_one" "pending-cache override left the first outgoing entry active"
+  assert_absent "$old_file_two" "pending-cache override left the second outgoing entry active"
+  assert_present "$other_file" "pending-cache override removed another publisher's entry"
+  quarantine="$home/state/buzz-replay/_legacy-quarantine"
+  manifests=$(find "$quarantine/manifests" -type f -name '*.json' -print)
+  [ "$(printf '%s\n' "$manifests" | sed '/^$/d' | wc -l | tr -d ' ')" = "2" ] \
+    || fail "pending-cache override did not retain exactly two quarantine manifests"
+  for manifest in $manifests; do
+    jq -e --arg publisher "$old" \
+      '.quarantine_reason == "pending-key-rotation" and .publisher_pubkey == $publisher' \
+      "$manifest" >/dev/null \
+      || fail "pending-cache quarantine manifest omitted its rotation provenance"
+    assert_present "$quarantine/$(jq -r '.payload_reference' "$manifest")" \
+      "pending-cache quarantine manifest referenced no retained payload"
+  done
+  pass "rotation refuses or explicitly quarantines outgoing pending replay entries"
+}
+
 test_rotation_refuses_an_existing_private_channel_before_mutation() {
   local home relay old channel resolved_home private_file private_before history_before output code readback
   home=$(make_home rotate-existing-private-channel)
@@ -671,6 +786,15 @@ EOF
     "malformed publisher-target state did not fail closed"
   [ "$(cat "$home/data/buzz-keypair.public")" = "$publisher" ] \
     || fail "malformed publisher-target state allowed key mutation"
+
+  : > "$targets"
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation with an empty publisher-target registry"
+  assert_contains "$output" "empty or truncated" \
+    "an empty publisher-target registry was treated as first use"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$publisher" ] \
+    || fail "empty publisher-target state allowed key mutation"
   pass "publisher target updates serialize and malformed state fails closed"
 }
 
@@ -863,6 +987,42 @@ EOF
   pass "rotation pins and verifies relay membership authority"
 }
 
+test_empty_relay_authority_registry_fails_closed() {
+  local home old keyfile private_before channel relay normalized_relay targets authorities output code
+  home=$(make_home empty-relay-authority)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "empty-authority keypair setup failed"
+  keyfile=$(key_file "$home" "$home/xdg")
+  private_before=$(cat "$keyfile")
+  channel="77777777-8888-5999-8aaa-bbbbbbbbbbbb"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  publish_membership_fixture "$relay" "$channel" "$old" \
+    || fail "could not seed empty-authority membership state"
+  normalized_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
+    || fail "could not normalize the empty-authority relay"
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  authorities="$home/data/buzz-relay-authorities.jsonl"
+  jq -cn \
+    --arg relay "$normalized_relay" \
+    --arg channel "$channel" \
+    --arg publisher "$old" \
+    '{relay:$relay,channel_id:$channel,publisher_pubkey:$publisher}' > "$targets"
+  : > "$authorities"
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  stop_stub "$STUB_PID"
+  expect_code 1 "$code" "rotation with an empty relay-authority registry"
+  assert_contains "$output" "empty or truncated" \
+    "an empty relay-authority registry was treated as TOFU first use"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "empty relay-authority state allowed public-key mutation"
+  [ "$(cat "$keyfile")" = "$private_before" ] \
+    || fail "empty relay-authority state allowed private-key mutation"
+  pass "empty security registries are corrupt rather than first use"
+}
+
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable() {
   # data/buzz-keypair.public is a cache, not the authority. A half-written one
   # holds something that is not a key at all, and retaining that would leave a
@@ -909,6 +1069,59 @@ test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable() {
   assert_grep "$first" "$history" \
     "compromised recovery disturbed an earlier uncompromised retired key"
   pass "rotation refuses or recovers explicitly when private material is unusable"
+}
+
+test_compromised_orphan_recovery_records_unverifiable_memberships() {
+  local home old keyfile targets artifact relay normalized_relay channel output code replacement
+  home=$(make_home compromised-unverifiable-membership)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "unverifiable-membership keypair setup failed"
+  keyfile=$(key_file "$home" "$home/xdg")
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  artifact="$home/data/buzz-compromised-unverifiable-pairs.jsonl"
+  relay="ws://localhost:3000/unverifiable"
+  normalized_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
+    || fail "could not normalize the unverifiable-membership relay"
+  channel="66666666-7777-5888-8999-aaaaaaaaaaaa"
+  jq -cn \
+    --arg relay "$normalized_relay" \
+    --arg channel "$channel" \
+    --arg publisher "$old" \
+    '{relay:$relay,channel_id:$channel,publisher_pubkey:$publisher}' > "$targets"
+  rm "$keyfile"
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "plain rotation with an orphaned tracked identity"
+  assert_contains "$output" "has no stored private key" \
+    "plain rotation did not refuse the orphaned identity"
+  assert_absent "$artifact" "plain rotation recorded a compromised-recovery artifact"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "plain orphan refusal changed the recorded identity"
+
+  output=$(run_keypair "$home" --rotate --compromised 2>&1)
+  code=$?
+  expect_code 0 "$code" "compromised recovery with unverifiable tracked memberships"
+  replacement=$(printf '%s\n' "$output" | tail -1)
+  [ "$replacement" != "$old" ] || fail "compromised orphan recovery did not replace the identity"
+  assert_contains "$output" "they may be stranded and are recorded in $artifact" \
+    "compromised recovery omitted the unverifiable-membership warning"
+  assert_contains "$output" "$normalized_relay" \
+    "compromised recovery warning omitted the affected relay"
+  assert_contains "$output" "$channel" \
+    "compromised recovery warning omitted the affected channel"
+  jq -e \
+    --arg publisher "$old" \
+    --arg relay "$normalized_relay" \
+    --arg channel "$channel" \
+    'select(
+      .publisher_pubkey == $publisher and
+      .relay == $relay and
+      .channel_id == $channel and
+      (.recorded_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$")) and
+      (.reason | contains("has no stored private key"))
+    )' "$artifact" >/dev/null \
+    || fail "compromised recovery artifact omitted canonical identity, pair, time, or reason"
+  pass "compromised orphan recovery records every unverifiable tracked membership"
 }
 
 test_rotation_compares_the_recorded_key_with_stored_private_material() {
@@ -1847,6 +2060,50 @@ test_invalid_quarantine_temporaries_are_accounted_for() {
   pass "invalid quarantine temporaries move into accounted corrupt state"
 }
 
+test_quarantine_manifest_inspection_failures_are_accounted_for() {
+  local home replay quarantine manifest preload relay output
+  home=$(make_home quarantine-manifest-inspection)
+  run_keypair "$home" >/dev/null 2>&1 || fail "quarantine-manifest keypair setup failed"
+  replay="$home/state/buzz-replay"
+  quarantine="$replay/_legacy-quarantine"
+  mkdir -p "$quarantine/manifests" "$quarantine/payloads" "$quarantine/staging" \
+    "$quarantine/corrupt" "$quarantine/recovery-corrupt"
+  manifest="$quarantine/manifests/$(printf '%064d' 8).json"
+  printf '%s\n' '{}' > "$manifest"
+  manifest="$(cd "$(dirname "$manifest")" && pwd -P)/$(basename "$manifest")"
+  preload="$home/quarantine-manifest-failure.mjs"
+  cat > "$preload" <<'EOF'
+import path from "node:path";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+
+const fs = createRequire(import.meta.url)("node:fs");
+const originalLstatSync = fs.lstatSync;
+fs.lstatSync = function guardedLstatSync(value, ...args) {
+  if (path.resolve(String(value)) === path.resolve(process.env.FM_TEST_QUARANTINE_MANIFEST)) {
+    const error = new Error("simulated manifest inspection failure");
+    error.code = "EACCES";
+    throw error;
+  }
+  return originalLstatSync.call(fs, value, ...args);
+};
+syncBuiltinESMExports();
+EOF
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"manifest-accounting"}' \
+    | NODE_OPTIONS="--import=$preload" FM_TEST_QUARANTINE_MANIFEST="$manifest" \
+      run_publish "$home" "$relay" 2>&1)
+  stop_stub "$STUB_PID"
+  assert_contains "$output" "could not inspect legacy quarantine manifest" \
+    "a quarantine-manifest inspection failure was not diagnosed"
+  assert_contains "$output" "delivered=1 retained=1 discarded=0 cleanup_failed=1" \
+    "a quarantine-manifest inspection failure was omitted from outcome accounting"
+  assert_contains "$output" "publish did not complete; Firstmate is unaffected" \
+    "a quarantine-manifest inspection failure bypassed the safe wrapper outcome"
+  pass "quarantine manifest inspection failures remain visible in accounting"
+}
+
 # --- (d) reconnect replays the identical event id --------------------------
 
 test_reconnect_replays_the_identical_event_id() {
@@ -2447,7 +2704,7 @@ EOF
     fail "the publisher did not pause at the signing boundary"
   }
 
-  run_keypair "$home" --rotate --compromised > "$rotate_output" 2>&1 &
+  run_keypair "$home" --rotate --compromised --discard-pending-cache > "$rotate_output" 2>&1 &
   rotation=$!
   sleep 0.1
   kill -0 "$rotation" 2>/dev/null || {
@@ -2469,6 +2726,8 @@ EOF
     "the delayed projection was not signed under the protected transaction"
   assert_contains "$(cat "$publish_output")" "retained=1" \
     "the delayed projection was not durably cached before rotation"
+  assert_contains "$(cat "$rotate_output")" "quarantined 1 outgoing-authored pending replay event" \
+    "the explicit rotation override did not quarantine the delayed projection"
   [ "$new" != "$old" ] || fail "compromised rotation did not replace the publishing identity"
   assert_not_contains "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null)" "$old" \
     "compromised rotation retained the protected outgoing identity"
@@ -3822,6 +4081,85 @@ EOF
   pass "an anonymous read of this home's own label still reaches a verdict"
 }
 
+test_compose_relay_signer_survives_restart_but_not_volume_teardown() {
+  local project port home relay old_private channel first second third
+  if [ "${FM_BUZZ_DOCKER_INTEGRATION:-0}" != "1" ]; then
+    pass "compose relay signer lifecycle is available with FM_BUZZ_DOCKER_INTEGRATION=1"
+    return
+  fi
+  command -v docker >/dev/null 2>&1 \
+    || fail "FM_BUZZ_DOCKER_INTEGRATION=1 but docker is unavailable"
+  docker compose version >/dev/null 2>&1 \
+    || fail "FM_BUZZ_DOCKER_INTEGRATION=1 but docker compose is unavailable"
+  docker info >/dev/null 2>&1 \
+    || fail "FM_BUZZ_DOCKER_INTEGRATION=1 but the docker daemon is unavailable"
+  project="buzz-loopback-test-$$"
+  BUZZ_DOCKER_PROJECT=$project
+  # shellcheck disable=SC2016
+  port=$(node -e '
+    const server = require("node:net").createServer();
+    server.listen(0, "127.0.0.1", () => {
+      const port = server.address().port;
+      server.close(() => process.stdout.write(`${port}\n`));
+    });
+  ') || fail "could not reserve a loopback port for the compose integration"
+  home=$(make_home compose-relay-signer)
+  run_keypair "$home" >/dev/null 2>&1 || fail "compose signer keypair setup failed"
+  old_private=$(jq -r '.private_key' "$(key_file "$home" "$home/xdg")")
+  channel=$(node -e '
+    import(process.argv[1]).then(({ channelIdForLabel }) => {
+      process.stdout.write(channelIdForLabel(process.argv[2]));
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$(cd "$home" && pwd -P)") \
+    || fail "could not derive the compose integration channel"
+  relay="ws://localhost:$port"
+
+  BUZZ_LOOPBACK_PORT=$port docker compose -p "$project" \
+    -f "$ROOT/docker-compose.buzz-loopback.yml" up -d --wait --wait-timeout 240 \
+    || fail "could not start the disposable Buzz integration stack"
+  printf '%s' '{"schema":"fm-bearings.v1","note":"signer-before-restart"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  first=$(query_membership_signer "$old_private" "$relay" "$channel") \
+    || fail "could not read the initial compose membership signer"
+
+  BUZZ_LOOPBACK_PORT=$port docker compose -p "$project" \
+    -f "$ROOT/docker-compose.buzz-loopback.yml" restart relay >/dev/null \
+    || fail "could not restart the disposable Buzz relay"
+  BUZZ_LOOPBACK_PORT=$port docker compose -p "$project" \
+    -f "$ROOT/docker-compose.buzz-loopback.yml" up -d --wait --wait-timeout 240 >/dev/null \
+    || fail "the restarted disposable Buzz relay did not become ready"
+  second=$(query_membership_signer "$old_private" "$relay" "$channel") \
+    || fail "could not read the restarted compose membership signer"
+  [ "$second" = "$first" ] || fail "relay restart changed the TOFU membership signer"
+
+  BUZZ_LOOPBACK_PORT=$port docker compose -p "$project" \
+    -f "$ROOT/docker-compose.buzz-loopback.yml" down -v >/dev/null \
+    || fail "could not destroy the disposable Buzz volumes"
+  BUZZ_LOOPBACK_PORT=$port docker compose -p "$project" \
+    -f "$ROOT/docker-compose.buzz-loopback.yml" up -d --wait --wait-timeout 240 >/dev/null \
+    || fail "could not recreate the disposable Buzz integration stack"
+  printf '%s' '{"schema":"fm-bearings.v1","note":"signer-after-volume-teardown"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  third=$(query_membership_signer "$old_private" "$relay" "$channel") \
+    || fail "could not read the recreated compose membership signer"
+  [ "$third" != "$first" ] || fail "down -v retained the disposable relay signing key"
+  docker compose -p "$project" -f "$ROOT/docker-compose.buzz-loopback.yml" \
+    down -v >/dev/null 2>&1 || true
+  BUZZ_DOCKER_PROJECT=""
+  pass "compose relay signer survives restart and changes after down -v"
+}
+
+test_quarantine_lifecycle_has_a_dedicated_owner() {
+  assert_present "$ROOT/bin/fm-buzz-quarantine.mjs" \
+    "the legacy quarantine lifecycle has no dedicated module"
+  assert_grep "export function runLegacyQuarantineLifecycle" \
+    "$ROOT/bin/fm-buzz-quarantine.mjs" \
+    "the quarantine module does not own lifecycle orchestration"
+  assert_grep "runLegacyQuarantineLifecycle" "$ROOT/bin/fm-buzz-publish.mjs" \
+    "the publisher does not delegate legacy quarantine orchestration"
+  pass "legacy quarantine orchestration has one dedicated module owner"
+}
+
 test_no_firstmate_path_depends_on_buzz() {
   # Invariant: Buzz is additive. If any other Firstmate script, skill, workflow or
   # AGENTS.md instruction ever calls the adapter, a stopped relay could reach a
@@ -3844,13 +4182,16 @@ test_keypair_is_idempotent_and_never_prints_the_private_key
 test_public_flag_fails_before_a_keypair_exists
 test_rotation_replaces_the_key_in_whichever_store_holds_it
 test_a_compromised_rotation_does_not_keep_the_retired_key
+test_rotation_refuses_or_quarantines_outgoing_pending_events
 test_rotation_refuses_an_existing_private_channel_before_mutation
 test_publisher_target_overrides_are_recorded_and_guard_rotation
 test_publisher_target_updates_are_concurrent_and_fail_closed
 test_rotation_checks_authoritative_current_membership
 test_rotation_fails_closed_on_unverifiable_membership
 test_rotation_pins_and_verifies_relay_membership_authority
+test_empty_relay_authority_registry_fails_closed
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable
+test_compromised_orphan_recovery_records_unverifiable_memberships
 test_rotation_compares_the_recorded_key_with_stored_private_material
 test_rotation_detects_and_cleans_up_divergent_stores
 test_orphaned_public_record_requires_compromised_recovery
@@ -3879,6 +4220,7 @@ test_legacy_quarantine_retains_open_writer_appends
 test_quarantine_recovers_atomic_manifest_temporaries
 test_quarantine_recovery_rejects_noncanonical_tokens
 test_invalid_quarantine_temporaries_are_accounted_for
+test_quarantine_manifest_inspection_failures_are_accounted_for
 test_reconnect_replays_the_identical_event_id
 test_replaying_a_known_event_is_deduped_and_evicted
 test_an_unacknowledged_publish_does_not_starve_the_drain
@@ -3927,4 +4269,6 @@ test_forget_key_withdraws_an_already_retired_key
 test_an_anonymous_read_of_a_foreign_channel_claims_no_verdict
 test_a_membership_refusal_for_an_empty_foreign_channel_is_inconclusive
 test_an_anonymous_read_of_this_homes_own_label_still_reaches_a_verdict
+test_compose_relay_signer_survives_restart_but_not_volume_teardown
+test_quarantine_lifecycle_has_a_dedicated_owner
 test_no_firstmate_path_depends_on_buzz

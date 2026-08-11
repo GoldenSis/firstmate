@@ -16,6 +16,7 @@
 #   fm-buzz-keypair.sh --public              print the stored identity without changing records
 #   fm-buzz-keypair.sh --rotate              retire this home's key and mint a new one
 #   fm-buzz-keypair.sh --rotate --compromised  as above, but do not keep the retired key
+#   fm-buzz-keypair.sh --rotate --discard-pending-cache  quarantine outgoing pending events first
 #   fm-buzz-keypair.sh --forget-key <hex>    withdraw one already-retired public key
 #   fm-buzz-keypair.sh --help                this text
 #
@@ -37,6 +38,10 @@
 # has no membership-transfer operation. The first valid membership snapshot pins
 # its signer in data/buzz-relay-authorities.jsonl, and later checks require that
 # same signer. It never prints the private key, old or new.
+# Rotation also refuses while any active replay partition contains a valid event
+# authored by an identity being retired, because replay authenticates only as the
+# current publisher. --discard-pending-cache explicitly moves those exact entries
+# into the durable replay quarantine before rotation instead of deleting them.
 #
 # The retired PUBLIC key is appended to data/buzz-keypair.public-history first, so
 # events this home signed before the rotation stay attributable to it.
@@ -83,12 +88,17 @@
 # buzz-keypair.public is a cache, not the authority: every rotation derives the
 # public half from the still-stored private key and compares the recorded value
 # when one exists.
+# Compromised recovery that cannot authenticate a recorded identity's tracked
+# memberships records every affected pair in
+# data/buzz-compromised-unverifiable-pairs.jsonl before replacing the key.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+REPLAY_DIR="${FM_BUZZ_REPLAY_DIR:-$STATE/buzz-replay}"
 
 # shellcheck source=bin/fm-buzz-key-lib.sh
 . "$SCRIPT_DIR/fm-buzz-key-lib.sh"
@@ -97,9 +107,11 @@ PUBLIC_FILE="$DATA/buzz-keypair.public"
 HISTORY_FILE="$DATA/buzz-keypair.public-history"
 TARGETS_FILE="$DATA/buzz-publisher-targets.jsonl"
 AUTHORITIES_FILE="$DATA/buzz-relay-authorities.jsonl"
+UNVERIFIABLE_FILE="$DATA/buzz-compromised-unverifiable-pairs.jsonl"
 PUBLIC_ONLY=0
 ROTATE=0
 COMPROMISED=0
+DISCARD_PENDING_CACHE=0
 FORGET_KEY=""
 FORGETTING=0
 STRICT_RELAY_AUTHORITY=${FM_BUZZ_REQUIRE_PINNED_RELAY_AUTHORITY:-0}
@@ -109,6 +121,7 @@ while [ "$#" -gt 0 ]; do
     --public) PUBLIC_ONLY=1 ;;
     --rotate) ROTATE=1 ;;
     --compromised) COMPROMISED=1 ;;
+    --discard-pending-cache) DISCARD_PENDING_CACHE=1 ;;
     # Tracked as a flag rather than by its value being non-empty: an operator who
     # typed the flag and lost its argument must get an error, never a silent fall
     # through into the default "ensure a keypair exists" behaviour.
@@ -129,6 +142,11 @@ if [ "$COMPROMISED" -eq 1 ] && [ "$ROTATE" -eq 0 ]; then
   exit 2
 fi
 
+if [ "$DISCARD_PENDING_CACHE" -eq 1 ] && [ "$ROTATE" -eq 0 ]; then
+  printf 'fm-buzz-keypair.sh: --discard-pending-cache describes a rotation; pass it with --rotate\n' >&2
+  exit 2
+fi
+
 if [ "$FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ]; }; then
   printf 'fm-buzz-keypair.sh: --forget-key is its own operation; run it on its own\n' >&2
   exit 2
@@ -145,10 +163,15 @@ if [ "$ROTATE" -eq 1 ]; then
 fi
 
 KEYPAIR_LOCK=""
+PUBLISH_LOCK=""
 release_keypair_lock() {
   if [ -n "$KEYPAIR_LOCK" ]; then
     fm_lock_release "$KEYPAIR_LOCK"
     KEYPAIR_LOCK=""
+  fi
+  if [ -n "$PUBLISH_LOCK" ]; then
+    fm_lock_release "$PUBLISH_LOCK"
+    PUBLISH_LOCK=""
   fi
 }
 
@@ -159,13 +182,24 @@ if [ "$PUBLIC_ONLY" -eq 0 ]; then
   }
   # shellcheck source=bin/fm-wake-lib.sh
   . "$SCRIPT_DIR/fm-wake-lib.sh"
+  trap release_keypair_lock EXIT
+  trap 'exit 1' HUP INT TERM
+  if [ "$ROTATE" -eq 1 ]; then
+    mkdir -p "$STATE" 2>/dev/null || {
+      printf 'fm-buzz-keypair.sh: could not create %s\n' "$STATE" >&2
+      exit 1
+    }
+    PUBLISH_LOCK=$(fm_buzz_replay_transaction_lock "$STATE") || {
+      printf 'fm-buzz-keypair.sh: could not resolve the replay cache transaction lock\n' >&2
+      exit 1
+    }
+    fm_lock_acquire_wait "$PUBLISH_LOCK"
+  fi
   KEYPAIR_LOCK=$(fm_buzz_key_transaction_lock "$DATA") || {
     printf 'fm-buzz-keypair.sh: could not resolve the key transaction lock\n' >&2
     exit 1
   }
   fm_lock_acquire_wait "$KEYPAIR_LOCK"
-  trap release_keypair_lock EXIT
-  trap 'exit 1' HUP INT TERM
 fi
 
 command -v node >/dev/null 2>&1 || {
@@ -285,6 +319,27 @@ check_rotation_targets_for_store() {  # <keychain|file> <public-key>
   done <<EOF
 $rotation_targets
 EOF
+}
+
+protect_rotation_replay_cache() {  # <discard:0|1> <public-key>...
+  local discard=$1
+  shift
+  # shellcheck disable=SC2016
+  node -e '
+    const [modulePath, replayDir, discard, ...publishers] = process.argv.slice(1);
+    import(modulePath).then(({ protectOutgoingPublisherCache }) => {
+      const outcome = protectOutgoingPublisherCache(replayDir, publishers, { discard: discard === "1" });
+      if (outcome.count === 0) return;
+      const action = discard === "1"
+        ? `quarantined ${outcome.count} outgoing-authored pending replay event(s):`
+        : `pending replay cache contains ${outcome.count} outgoing-authored event(s):`;
+      process.stdout.write(`${action}\n${outcome.paths.map((file) => `  ${file}`).join("\n")}\n`);
+      if (discard !== "1") process.exitCode = 3;
+    }).catch((error) => {
+      process.stderr.write(`${error.message}\n`);
+      process.exitCode = 1;
+    });
+  ' "$SCRIPT_DIR/fm-buzz-publish.mjs" "$REPLAY_DIR" "$discard" "$@"
 }
 
 record_public() {
@@ -501,6 +556,47 @@ if [ "$ROTATE" -eq 1 ]; then
     check_rotation_targets_for_store file "$file_public" || exit 1
   fi
 
+  rotation_publics=()
+  for candidate_public in "$recorded" "$keychain_public" "$file_public"; do
+    [ -n "$candidate_public" ] || continue
+    seen_public=0
+    if [ "${#rotation_publics[@]}" -gt 0 ]; then
+      for known_public in "${rotation_publics[@]}"; do
+        [ "$known_public" = "$candidate_public" ] && seen_public=1
+      done
+    fi
+    [ "$seen_public" -eq 1 ] || rotation_publics+=("$candidate_public")
+  done
+  if [ "${#rotation_publics[@]}" -gt 0 ]; then
+    cache_preflight=$(protect_rotation_replay_cache \
+      "$DISCARD_PENDING_CACHE" "${rotation_publics[@]}" 2>&1)
+    cache_preflight_status=$?
+    if [ "$cache_preflight_status" -eq 3 ]; then
+      printf 'fm-buzz-keypair.sh: %s\nnothing was rotated; drain the queue or retry with --discard-pending-cache\n' \
+        "$cache_preflight" >&2
+      exit 1
+    fi
+    if [ "$cache_preflight_status" -ne 0 ]; then
+      printf 'fm-buzz-keypair.sh: could not verify outgoing replay cache state: %s; nothing was rotated\n' \
+        "$cache_preflight" >&2
+      exit 1
+    fi
+    [ -n "$cache_preflight" ] && printf '%s\n' "$cache_preflight" >&2
+  fi
+
+  unverifiable_pairs=""
+  if [ "$COMPROMISED" -eq 1 ] && [ -n "$recovery_reason" ] && [ -n "$recorded" ] \
+    && [ "$recorded" != "$keychain_public" ] && [ "$recorded" != "$file_public" ]; then
+    unverifiable_pairs=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" record-unverifiable \
+      "$TARGETS_FILE" "$UNVERIFIABLE_FILE" "$recorded" "$recovery_reason" 2>&1)
+    unverifiable_status=$?
+    if [ "$unverifiable_status" -ne 0 ]; then
+      printf 'fm-buzz-keypair.sh: could not record unverifiable compromised memberships in %s: %s; nothing was rotated\n' \
+        "$UNVERIFIABLE_FILE" "$unverifiable_pairs" >&2
+      exit 1
+    fi
+  fi
+
   # Settle the recorded-key set while the private half is still stored, and stop
   # if it cannot be settled: after fm_buzz_key_forget there is no second chance to
   # learn what this home was publishing under, so a failure here would silently
@@ -613,4 +709,8 @@ record_public "$public" || {
   exit 1
 }
 printf 'created: buzz publishing keypair (private key stored in %s)\n' "$store" >&2
+if [ -n "${unverifiable_pairs:-}" ]; then
+  printf 'WARNING: compromised recovery could not authenticate these memberships for the retired identity; they may be stranded and are recorded in %s:\n%s\n' \
+    "$UNVERIFIABLE_FILE" "$unverifiable_pairs" >&2
+fi
 printf '%s\n' "$public"

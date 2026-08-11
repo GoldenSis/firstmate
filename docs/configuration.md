@@ -501,6 +501,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   buzz-keypair.public-history  public keys this home still trusts for pre-rotation event attribution; LOCAL, gitignored; exact lifecycle owned by fm-buzz-keypair.sh --help
   buzz-publisher-targets.jsonl  used relay/channel/publisher tuples that protect private-channel membership during rotation; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs
   buzz-relay-authorities.jsonl  pinned kind-39002 membership signers by relay/channel pair; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs
+  buzz-compromised-unverifiable-pairs.jsonl  tracked memberships that compromised recovery could not authenticate; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs
 projects/            cloned repos; gitignored; READ-ONLY for you
 state/               volatile runtime signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth
@@ -519,7 +520,7 @@ state/               volatile runtime signals; gitignored
   x-context/         generated X-mode durable per-request reply context (platform/budget), keyed by request_id; survives inbox cleanup so a delayed follow-up recovers the original platform (section 14; bin/fm-x-lib.sh)
   x-outbox/          generated X-mode dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
   x-poll.error       generated X-mode relay diagnostic dedupe marker
-  buzz-replay/       loopback Buzz publisher replay state, including active endpoint queues and legacy-entry quarantine; exact layout and lifecycle owned by bin/fm-buzz-publish.mjs, with rationale in docs/buzz-loopback-adapter.md
+  buzz-replay/       loopback Buzz publisher replay state; active-cache mechanics are owned by bin/fm-buzz-publish.mjs and legacy-quarantine orchestration by bin/fm-buzz-quarantine.mjs, with rationale in docs/buzz-loopback-adapter.md
   .wake-queue        durable queued wakes: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
   .afk               durable away-mode flag; present = sub-supervisor may inject escalations (set by /afk, cleared on user return)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks

@@ -19,8 +19,42 @@
 name: buzz-loopback
 
 services:
+  relay-key-init:
+    image: node:24-alpine
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -euc
+      - |
+        node -e '
+          const { randomBytes } = require("node:crypto");
+          const { chmodSync, chownSync, existsSync, writeFileSync } = require("node:fs");
+          const file = "/relay-key/private-key";
+          const order = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+          if (!existsSync(file)) {
+            let bytes;
+            let scalar;
+            do {
+              bytes = randomBytes(32);
+              scalar = BigInt(`0x${bytes.toString("hex")}`);
+            } while (scalar === 0n || scalar >= order);
+            writeFileSync(file, `${bytes.toString("hex")}\n`, { flag: "wx", mode: 0o400 });
+          }
+          chownSync(file, 1000, 1000);
+          chmodSync(file, 0o400);
+        '
+    volumes:
+      - buzz-relay-key:/relay-key
+    restart: "no"
+
   relay:
     image: ${BUZZ_IMAGE:-ghcr.io/block/buzz:main}
+    entrypoint:
+      - /bin/bash
+      - -euc
+      - |
+        export BUZZ_RELAY_PRIVATE_KEY="$$(cat /run/buzz-relay-key/private-key)"
+        exec /usr/local/bin/buzz-relay
     environment:
       # Container-internal bind; only the host-facing `ports:` mapping controls exposure.
       BUZZ_BIND_ADDR: 0.0.0.0:3000
@@ -49,7 +83,10 @@ services:
       - "127.0.0.1:${BUZZ_LOOPBACK_PORT:-3000}:3000"
     volumes:
       - buzz-git-data:/data/git
+      - buzz-relay-key:/run/buzz-relay-key:ro
     depends_on:
+      relay-key-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -148,6 +185,7 @@ volumes:
   buzz-redis-data:
   buzz-minio-data:
   buzz-git-data:
+  buzz-relay-key:
 
 networks:
   buzz-loopback-net:

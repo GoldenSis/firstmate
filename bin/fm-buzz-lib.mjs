@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // NIP-01 event construction and the loopback Buzz relay client.
 //
-// Layered on bin/fm-buzz-crypto.mjs (BIP-340 signing) and consumed by
-// bin/fm-buzz-publish.sh via bin/fm-buzz-publish.mjs. This module owns the wire
-// format, the relay conversation, and the loopback-only relay policy shared by
-// both entry points. The fire-and-forget contract, the replay cache, and the
+// Layered on bin/fm-buzz-crypto.mjs (BIP-340 signing) and consumed by publishing,
+// inspection, and key rotation. This module owns the wire format, relay
+// conversation, loopback-only relay policy, and authoritative membership query
+// shared by those entry points. The fire-and-forget contract, replay cache, and
 // snapshot plumbing live in the publisher.
 //
 // WHY THE EVENT ID MATTERS MORE THAN USUAL HERE

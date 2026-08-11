@@ -39,6 +39,10 @@ Each one is the reason a specific failure mode cannot occur, and breaching any o
    Disposable has to mean the exposure ends when the operator stops using the stack, so the relay carries `restart: "no"` and does not come back by itself after a reboot.
    The datastores do restart, because they only serve the internal compose network, and they self-resume across a host reboot still holding every published bearings projection.
    `docker compose -f docker-compose.buzz-loopback.yml down -v` is what ends the exposure for good, volumes included.
+   On first startup, `relay-key-init` generates one valid secp256k1 relay signing key inside the compose-managed `buzz-relay-key` volume with mode 0400 and ownership restricted to the relay user.
+   The relay reads that key into `BUZZ_RELAY_PRIVATE_KEY` at process start, and no host bind mount or tracked file holds it.
+   A relay container restart reuses the same volume and therefore the same kind-39002 signer, while `docker compose -f docker-compose.buzz-loopback.yml down -v` destroys the key with the other disposable data.
+   The next `up -d` after that teardown creates a different relay signer and a clean trust boundary.
 3. **Publishing is fire-and-forget.**
    `bin/fm-buzz-publish.sh` always exits 0.
    A non-zero exit from it is a bug, and `tests/fm-buzz-publish.test.sh` asserts both the behavior and the structure that produces it.
@@ -127,7 +131,8 @@ docker run -i --rm -v /var/run/docker.sock:/var/run/docker.sock docker:cli \
 ## Idempotency, and why re-signing is the trap
 
 The header of `bin/fm-buzz-lib.mjs` owns the signed-event identity and byte-preserving replay contract.
-The header and implementation of `bin/fm-buzz-publish.mjs` own the exact cache layout, write ordering, validation, pruning, and cleanup.
+The header and implementation of `bin/fm-buzz-publish.mjs` own active-cache layout, write ordering, validation, pruning, and cleanup.
+The header and implementation of `bin/fm-buzz-quarantine.mjs` own legacy migration discovery, recovery ordering, accounting, and notices.
 The header and implementation of `bin/fm-buzz-lib.mjs` own relay acknowledgement classification and the late-authentication state machine.
 
 ## Verification evidence

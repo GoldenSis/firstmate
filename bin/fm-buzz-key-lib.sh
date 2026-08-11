@@ -55,6 +55,11 @@ fm_buzz_key_transaction_lock() {  # <data directory>
   printf '%s/.buzz-keypair.lock\n' "$data"
 }
 
+fm_buzz_replay_transaction_lock() {  # <state directory>
+  local state=${1:?state directory required}
+  printf '%s/.buzz-replay-publish.lock\n' "$state"
+}
+
 # The account label identifying this home's key inside the keychain.
 fm_buzz_key_account() {
   local home=${1:?home required}

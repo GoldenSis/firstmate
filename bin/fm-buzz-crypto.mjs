@@ -23,12 +23,10 @@
 // information about the private key in principle. That is acceptable for exactly
 // the key this PoC uses and no other: a loopback-only fleet-reporting key that
 // signs nothing of value, holds no funds, grants no authority (merge authority
-// stays in bin/fm-pr-merge.sh per AGENTS.md section 7), and is cheap to re-mint -
-// the scout study recorded that Buzz has no key-rotation procedure, so rotation
-// means generating a new keypair and dropping the old one, which for this key is
-// a non-event. Do not reuse this module for a key that guards anything, and do
-// not promote it to a networked or shared relay without replacing it with an
-// audited binding.
+// stays in bin/fm-pr-merge.sh per AGENTS.md section 7). Do not reuse this module
+// for a key that guards anything, and do not promote it to a networked or shared
+// relay without replacing it with an audited binding. bin/fm-buzz-keypair.sh
+// --help owns the rotation, retention, membership, and recovery procedure.
 //
 // The exported surface is deliberately small: schnorrSign, schnorrVerify,
 // publicKeyFromPrivate, and the hex helpers the event layer needs.

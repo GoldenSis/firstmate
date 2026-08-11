@@ -14,10 +14,17 @@
 // relay/channel pair, with exactly relay, channel_id, and signer_pubkey fields.
 // The first verified kind-39002 snapshot records its signer unless strict mode
 // requires an existing pin, and every later snapshot must match that signer.
+// data/buzz-compromised-unverifiable-pairs.jsonl records relay/channel pairs
+// that a compromised recovery could not authenticate because the recorded
+// publisher identity no longer had matching readable private material.
+// Each canonical object has channel_id, publisher_pubkey, reason, recorded_at,
+// and relay fields, and retries preserve the first timestamp for an identical
+// publisher/pair/reason record.
 //
 // Usage:
 //   node bin/fm-buzz-targets.mjs list FILE
 //   node bin/fm-buzz-targets.mjs normalize-relay URL
+//   node bin/fm-buzz-targets.mjs record-unverifiable TARGETS_FILE OUTPUT_FILE PUBKEY REASON
 
 import {
   lstatSync,
@@ -70,6 +77,10 @@ function relayChannelIdentity(value) {
   return `${value.relay}\u0000${value.channel_id}`;
 }
 
+function unverifiableIdentity(value) {
+  return `${value.publisher_pubkey}\u0000${value.relay}\u0000${value.channel_id}\u0000${value.reason}`;
+}
+
 function canonicalTargets(targets) {
   const unique = new Map();
   for (const target of targets) {
@@ -95,6 +106,7 @@ function readCanonicalRegistry(file, label, normalize, identity) {
     throw new Error(`${label} registry ${file} is not a regular file`);
   }
   const raw = readFileSync(file, "utf8");
+  if (raw.length === 0) throw new Error(`${label} registry ${file} is empty or truncated`);
   const lines = raw.split("\n");
   const records = [];
   for (const [index, line] of lines.entries()) {
@@ -205,8 +217,58 @@ export function verifyOrRecordRelayAuthority(file, value, options = {}) {
   return { authority, recorded: true };
 }
 
+export function normalizeCompromisedUnverifiablePair(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("compromised unverifiable pair must be an object");
+  }
+  const fields = Object.keys(value).sort();
+  if (fields.join(",") !== "channel_id,publisher_pubkey,reason,recorded_at,relay") {
+    throw new Error("compromised unverifiable pair has unexpected fields");
+  }
+  if (typeof value.reason !== "string" || value.reason.trim() === "" || value.reason !== value.reason.trim()) {
+    throw new Error("reason must be a nonempty trimmed string");
+  }
+  if (typeof value.recorded_at !== "string" || new Date(value.recorded_at).toISOString() !== value.recorded_at) {
+    throw new Error("recorded_at must be a canonical ISO timestamp");
+  }
+  return {
+    relay: normalizeRelayEndpoint(value.relay),
+    channel_id: normalizeChannelIdentity(value.channel_id),
+    publisher_pubkey: normalizeHexIdentity(value.publisher_pubkey, "publisher_pubkey"),
+    recorded_at: value.recorded_at,
+    reason: value.reason,
+  };
+}
+
+export function readCompromisedUnverifiablePairs(file) {
+  return readCanonicalRegistry(
+    file,
+    "compromised unverifiable pair",
+    normalizeCompromisedUnverifiablePair,
+    unverifiableIdentity,
+  );
+}
+
+export function recordCompromisedUnverifiablePairs(file, values) {
+  const incoming = values.map(normalizeCompromisedUnverifiablePair);
+  const existing = readCompromisedUnverifiablePairs(file);
+  const merged = new Map(existing.map((value) => [unverifiableIdentity(value), value]));
+  for (const value of incoming) {
+    const identity = unverifiableIdentity(value);
+    if (!merged.has(identity)) merged.set(identity, value);
+  }
+  const records = [...merged.values()].sort((left, right) =>
+    unverifiableIdentity(left).localeCompare(unverifiableIdentity(right)));
+  if (records.length !== existing.length) {
+    replaceRegistry(file, records, "compromised unverifiable pair");
+  }
+  return incoming;
+}
+
 function usage() {
-  process.stderr.write("usage: fm-buzz-targets.mjs <list FILE|normalize-relay URL>\n");
+  process.stderr.write(
+    "usage: fm-buzz-targets.mjs <list FILE|normalize-relay URL|record-unverifiable TARGETS_FILE OUTPUT_FILE PUBKEY REASON>\n",
+  );
 }
 
 async function cli() {
@@ -219,6 +281,17 @@ async function cli() {
   }
   if (operation === "normalize-relay" && value && rest.length === 0) {
     process.stdout.write(`${normalizeRelayEndpoint(value)}\n`);
+    return;
+  }
+  if (operation === "record-unverifiable" && value && rest.length === 3) {
+    const [outputFile, publisherPubkey, reason] = rest;
+    const publisher = normalizeHexIdentity(publisherPubkey, "publisher_pubkey");
+    const recordedAt = new Date().toISOString();
+    const records = readPublisherTargets(value)
+      .filter((target) => target.publisher_pubkey === publisher)
+      .map((target) => ({ ...target, recorded_at: recordedAt, reason }));
+    recordCompromisedUnverifiablePairs(outputFile, records);
+    for (const record of records) process.stdout.write(`${record.relay}\t${record.channel_id}\n`);
     return;
   }
   usage();

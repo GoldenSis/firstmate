@@ -10,8 +10,9 @@
 //
 // REPLAY CACHE LIFECYCLE
 // bin/fm-buzz-lib.mjs owns signed-event identity and byte-preserving replay
-// semantics. This engine owns cache layout, mutation order, validation, pruning,
-// quarantine, and the relay outcomes that retain or remove each entry.
+// semantics. This engine owns active-cache layout, mutation order, validation,
+// pruning, and the relay outcomes that retain or remove each entry.
+// bin/fm-buzz-quarantine.mjs owns legacy migration discovery and recovery order.
 //
 // Reads one JSON envelope on stdin so that neither the private key nor the
 // projection - which carries task ids, project names, blockers and PR URLs -
@@ -19,27 +20,10 @@
 // content, relay, channelId, channelName, timeoutMs, replayDir, targetsFile,
 // maxCache.
 //
-// LEGACY QUARANTINE CONTRACT
-// Active replay entries from the former flat and host-keyed layouts are never
-// delivered or deleted because their complete endpoint cannot be recovered.
-// Each source is claimed before it is read, then regular and special-file inodes
-// move intact to payloads/<source-token>.json and pair with manifests/<source-token>.json.
-// Cross-directory moves hard-link into a pinned destination before unlinking
-// through the pinned source directory, while symlinks are recreated without
-// following their targets, so pathname swaps cannot redirect data.
-// A manifest records original_path, a decoded legacy_host when valid,
-// original_timestamps, the source device and inode, an observed payload digest
-// and size, quarantine_timestamp, and payload_reference.
-// The source token depends on the original path and stable filesystem identity,
-// never access time, so interrupted retries converge after reads or open-writer
-// appends change timestamps and size.
-// A staged source and origin record are sufficient to finish after a crash, and
-// an existing payload or manifest is accepted only when its identity matches.
-// Partition-shaped non-directories are moved under _legacy-quarantine/corrupt,
-// recorded by the same manifest set, and never opened as replay data.
-// Invalid recovery temporaries move intact under recovery-corrupt and receive a
-// manifest from the same set; residue that cannot be quarantined is counted as a
-// cleanup failure.
+// Legacy and explicitly discarded rotation entries are retained under
+// _legacy-quarantine with payloads and manifests rather than silently deleted.
+// The lifecycle owner and the transaction helpers below jointly define that
+// durable quarantine contract.
 
 import {
   closeSync,
@@ -61,6 +45,7 @@ import {
 } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   buildBearingsEvent,
   buildChannelCreateEvent,
@@ -76,6 +61,11 @@ import {
   RETRYABLE,
 } from "./fm-buzz-lib.mjs";
 import { recordPublisherTarget } from "./fm-buzz-targets.mjs";
+import {
+  CACHE_PARTITION,
+  LEGACY_QUARANTINE,
+  runLegacyQuarantineLifecycle,
+} from "./fm-buzz-quarantine.mjs";
 
 function log(message) {
   process.stderr.write(`fm-buzz-publish: ${message}\n`);
@@ -440,8 +430,6 @@ function prepareRelayCacheDirectory(replayDir, relay) {
   return pinCacheDirectory(directory);
 }
 
-const CACHE_PARTITION = /^[0-9a-f]{64}$/;
-const LEGACY_QUARANTINE = "_legacy-quarantine";
 const QUARANTINE_TOKEN = /^[0-9a-f]{64}$/;
 
 function requireQuarantineToken(value) {
@@ -506,6 +494,8 @@ function quarantineManifestIdentity(manifest) {
     source_device: manifest.source_device ?? null,
     source_inode: manifest.source_inode ?? null,
     corrupt_type: manifest.corrupt_type ?? null,
+    quarantine_reason: manifest.quarantine_reason ?? "legacy-cache-migration",
+    publisher_pubkey: manifest.publisher_pubkey ?? null,
   });
 }
 
@@ -801,6 +791,8 @@ function completeStagedLegacyEntry(quarantineDir, manifestsDir, payloadsDir, tra
     source_inode: origin.source_inode,
     content_sha256_observed: sha256(bytes),
     content_size_observed: bytes.length,
+    quarantine_reason: origin.quarantine_reason ?? "legacy-cache-migration",
+    publisher_pubkey: origin.publisher_pubkey ?? null,
   };
   finalizeQuarantineRecord(final, manifest);
   cacheUnlinkSync(originFile);
@@ -871,6 +863,7 @@ function quarantineLegacyEntry(
   stagingDir,
   file,
   legacyHost,
+  options = {},
 ) {
   const originalPath = path.relative(replayDir, file);
   if (!containedCachePath(replayDir, file)) throw new Error("legacy cache entry escapes replay cache");
@@ -895,6 +888,8 @@ function quarantineLegacyEntry(
     payload_reference: payloadReference,
     source_device: metadata.dev,
     source_inode: metadata.ino,
+    quarantine_reason: options.reason ?? "legacy-cache-migration",
+    publisher_pubkey: options.publisherPubkey ?? null,
   });
   cacheRenameSync(file, stagedFile);
   completeStagedLegacyEntry(quarantineDir, manifestsDir, payloadsDir, transactionDir);
@@ -1000,141 +995,114 @@ function quarantineCorruptPartitionNode(replayDir, quarantineDir, corruptDir, ma
   log(`quarantined corrupt cache partition path ${file} (${type}) at ${path.join(quarantineDir, payloadReference)}`);
 }
 
-function quarantineManifestCount(manifestsDir) {
+function quarantineManifestCount(manifestsDir, failures = []) {
   let count = 0;
   for (const name of cacheReaddirSync(manifestsDir)) {
     if (!name.endsWith(".json")) continue;
     try {
       if (cacheLstatSync(path.join(manifestsDir, name)).isFile()) count += 1;
     } catch (error) {
-      if (error.code !== "ENOENT") log(`could not inspect legacy quarantine manifest ${name}: ${error.message}`);
+      if (error.code !== "ENOENT") {
+        const file = path.join(manifestsDir, name);
+        log(`could not inspect legacy quarantine manifest ${name}: ${error.message}`);
+        failures.push(file);
+      }
     }
   }
   return count;
 }
 
 function quarantineLegacyEntries(replayDir) {
-  const failures = [];
-  const quarantineDir = prepareCacheDirectory(replayDir, LEGACY_QUARANTINE);
+  return runLegacyQuarantineLifecycle({
+    replayDir,
+    log,
+    prepareCacheDirectory,
+    recoverInvalidRecoveryResidues,
+    recoverQuarantineTransactions,
+    recoverStagedLegacyEntries,
+    recoverCorruptPartitionNodes,
+    cacheReaddirSync,
+    cacheLstatSync,
+    pinCacheDirectory,
+    decodeLegacyHost,
+    quarantineCorruptPartitionNode,
+    quarantineLegacyEntry,
+    quarantineManifestCount,
+  });
+}
+
+export function protectOutgoingPublisherCache(replayDir, publisherPubkeys, options = {}) {
+  const publishers = Array.isArray(publisherPubkeys) ? publisherPubkeys : [publisherPubkeys];
+  if (publishers.length === 0 || publishers.some((value) => !/^[0-9a-f]{64}$/.test(value))) {
+    throw new Error("outgoing publishers must be 64 lowercase hexadecimal characters");
+  }
+  const publisherSet = new Set(publishers);
+  if (typeof options.discard !== "boolean") {
+    throw new Error("pending-cache discard mode must be boolean");
+  }
+  const cacheRoot = prepareCacheRoot(replayDir);
+  const legacyMigration = quarantineLegacyEntries(cacheRoot);
+  if (legacyMigration.failures.length > 0) {
+    throw new Error(
+      `could not settle replay quarantine:\n${legacyMigration.failures.map((file) => `  ${file}`).join("\n")}`,
+    );
+  }
+  const topology = cacheDirectories(cacheRoot);
+  if (topology.failures.length > 0) {
+    throw new Error(`could not inspect active replay partitions:\n${topology.failures.map((file) => `  ${file}`).join("\n")}`);
+  }
+  const blocking = [];
+  for (const directory of topology.directories) {
+    const inventory = cacheEntries(directory);
+    if (inventory.failures.length > 0) {
+      throw new Error(`could not inspect active replay entries:\n${inventory.failures.map((file) => `  ${file}`).join("\n")}`);
+    }
+    for (const entry of inventory.entries) {
+      if (entry.malformed) throw new Error(`active replay entry ${entry.file} is invalid: ${entry.reason}`);
+      let raw;
+      try {
+        raw = readRegularFile(entry.file).bytes.toString("utf8");
+      } catch (error) {
+        throw new Error(`could not read active replay entry ${entry.file}: ${error.message}`);
+      }
+      let event;
+      try {
+        event = cachedEventFromFrame(raw, entry);
+      } catch (error) {
+        throw new Error(`active replay entry ${entry.file} is invalid: ${error.message}`);
+      }
+      if (publisherSet.has(event.pubkey)) blocking.push({ path: entry.file, publisherPubkey: event.pubkey });
+    }
+  }
+  blocking.sort((left, right) => left.path.localeCompare(right.path));
+  const paths = blocking.map((entry) => entry.path);
+  if (!options.discard || blocking.length === 0) {
+    return { count: blocking.length, paths, quarantined: [] };
+  }
+  const quarantineDir = prepareCacheDirectory(cacheRoot, LEGACY_QUARANTINE);
   const manifestsDir = prepareCacheDirectory(quarantineDir, "manifests");
   const payloadsDir = prepareCacheDirectory(quarantineDir, "payloads");
   const stagingDir = prepareCacheDirectory(quarantineDir, "staging");
-  const corruptDir = prepareCacheDirectory(quarantineDir, "corrupt");
-  const recoveryCorruptDir = prepareCacheDirectory(quarantineDir, "recovery-corrupt");
-  recoverInvalidRecoveryResidues(quarantineDir, manifestsDir, recoveryCorruptDir, failures);
-  recoverQuarantineTransactions(
-    quarantineDir,
-    manifestsDir,
-    payloadsDir,
-    recoveryCorruptDir,
-    failures,
-  );
-  recoverStagedLegacyEntries(
-    quarantineDir,
-    manifestsDir,
-    payloadsDir,
-    stagingDir,
-    recoveryCorruptDir,
-    failures,
-  );
-  recoverCorruptPartitionNodes(quarantineDir, corruptDir, manifestsDir, failures);
-  let names;
-  try {
-    names = cacheReaddirSync(replayDir);
-  } catch (error) {
-    log(`could not inspect replay cache for legacy entries: ${error.message}`);
-    return { failures: [replayDir], count: quarantineManifestCount(manifestsDir) };
+  const quarantined = [];
+  for (const entry of blocking) {
+    quarantineLegacyEntry(
+      cacheRoot,
+      quarantineDir,
+      manifestsDir,
+      payloadsDir,
+      stagingDir,
+      entry.path,
+      null,
+      { reason: "pending-key-rotation", publisherPubkey: entry.publisherPubkey },
+    );
+    quarantined.push(entry.path);
   }
-
-  const candidates = [];
-  for (const name of names) {
-    if (name === LEGACY_QUARANTINE) continue;
-    const candidate = path.join(replayDir, name);
-    let metadata;
-    try {
-      metadata = cacheLstatSync(candidate);
-    } catch (error) {
-      if (error.code === "ENOENT") continue;
-      log(`could not inspect cache path ${candidate}: ${error.message}`);
-      failures.push(candidate);
-      continue;
-    }
-    if (name.endsWith(".json")) {
-      if (metadata.isFile()) candidates.push({ file: candidate, legacyHost: null });
-      else {
-        log(`legacy cache entry ${candidate} is not a regular file; left in place`);
-        failures.push(candidate);
-      }
-      continue;
-    }
-    if (CACHE_PARTITION.test(name)) {
-      if (metadata.isDirectory() && !metadata.isSymbolicLink()) continue;
-      try {
-        quarantineCorruptPartitionNode(
-          replayDir,
-          quarantineDir,
-          corruptDir,
-          manifestsDir,
-          candidate,
-          metadata,
-        );
-      } catch (error) {
-        log(`could not quarantine corrupt cache partition path ${candidate}: ${error.message}`);
-        failures.push(candidate);
-      }
-      continue;
-    }
-    if (metadata.isSymbolicLink()) {
-      log(`rejected cache directory symlink ${candidate}`);
-      failures.push(candidate);
-      continue;
-    }
-    if (!metadata.isDirectory()) continue;
-    pinCacheDirectory(candidate);
-    let legacyNames;
-    try {
-      legacyNames = cacheReaddirSync(candidate);
-    } catch (error) {
-      log(`could not inspect legacy cache directory ${candidate}: ${error.message}`);
-      failures.push(candidate);
-      continue;
-    }
-    const legacyHost = decodeLegacyHost(name);
-    for (const legacyName of legacyNames.filter((entry) => entry.endsWith(".json"))) {
-      const legacyFile = path.join(candidate, legacyName);
-      try {
-        if (cacheLstatSync(legacyFile).isFile()) candidates.push({ file: legacyFile, legacyHost });
-        else {
-          log(`legacy cache entry ${legacyFile} is not a regular file; left in place`);
-          failures.push(legacyFile);
-        }
-      } catch (error) {
-        if (error.code === "ENOENT") continue;
-        log(`could not inspect legacy cache entry ${legacyFile}: ${error.message}`);
-        failures.push(legacyFile);
-      }
-    }
+  const failures = [];
+  quarantineManifestCount(manifestsDir, failures);
+  if (failures.length > 0) {
+    throw new Error(`could not verify replay quarantine manifests:\n${failures.map((file) => `  ${file}`).join("\n")}`);
   }
-
-  for (const candidate of candidates) {
-    try {
-      quarantineLegacyEntry(
-        replayDir,
-        quarantineDir,
-        manifestsDir,
-        payloadsDir,
-        stagingDir,
-        candidate.file,
-        candidate.legacyHost,
-      );
-    } catch (error) {
-      log(`could not quarantine legacy cache entry ${candidate.file}: ${error.message}`);
-      failures.push(candidate.file);
-    }
-  }
-  const count = quarantineManifestCount(manifestsDir);
-  if (count > 0) log(`legacy replay quarantine: ${count} entry(s) at ${quarantineDir}`);
-  return { failures, count };
+  return { count: blocking.length, paths, quarantined };
 }
 
 function cacheEntries(replayDir) {
@@ -1536,10 +1504,16 @@ async function main() {
   return kept === 0 && cleanupFailures === 0 ? 0 : 1;
 }
 
-main().then(
-  (code) => process.exit(code),
-  (error) => {
-    log(`failed: ${error.message}`);
-    process.exit(1);
-  },
-);
+if (
+  !process.execArgv.some((argument) => argument === "-e" || argument === "--eval") &&
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+  main().then(
+    (code) => process.exit(code),
+    (error) => {
+      log(`failed: ${error.message}`);
+      process.exit(1);
+    },
+  );
+}
