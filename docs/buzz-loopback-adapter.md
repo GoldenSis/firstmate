@@ -76,6 +76,7 @@ docker compose -f docker-compose.buzz-loopback.yml down -v         # clean slate
 Bounded input and safe non-events keep optional publication from delaying or weakening Firstmate.
 The header of `bin/fm-buzz-publish.sh` owns input, option, default, and termination mechanics.
 [`configuration.md`](configuration.md#environment-variables) owns the runtime environment contract.
+Its Buzz block also documents the Compose-only image and host-port overrides, including the required coupling between a custom host port and `FM_BUZZ_RELAY`.
 
 Each home needs its own low-authority publishing identity so the main home and second mates cannot silently publish as one another when they share host storage.
 Private-key custody keeps that identity out of logs, commits, command-line arguments, and other homes while retaining a fallback for hosts without a reachable keychain.
@@ -132,7 +133,7 @@ docker run -i --rm -v /var/run/docker.sock:/var/run/docker.sock docker:cli \
   compose -p buzz-loopback -f - up -d < docker-compose.buzz-loopback.yml
 ```
 
-## Idempotency, and why re-signing is the trap
+## Idempotency, and why rebuilding a replay is the trap
 
 The header of `bin/fm-buzz-lib.mjs` owns the signed-event identity and byte-preserving replay contract.
 The header and implementation of `bin/fm-buzz-publish.mjs` own active-cache and quarantine layout, write and recovery ordering, validation, pruning, accounting, notices, and cleanup.

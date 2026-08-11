@@ -51,7 +51,8 @@
 #   fm-buzz-publish.sh --timeout <ms>  relay timeout (default 15000)
 #   fm-buzz-publish.sh --help          this text
 #
-# Cache ownership waits at most FM_BUZZ_LOCK_TIMEOUT_S seconds (default 30).
+# Each publisher lock acquisition waits at most FM_BUZZ_LOCK_TIMEOUT_S seconds
+# (default 30).
 # Invalid deadlines, acquisition timeouts, and interrupted waits are logged and
 # converted to the same exit-0 non-event as every other publishing failure.
 # bin/fm-buzz-key-lib.sh owns the lock ordering and phase-boundary contract used

@@ -23,6 +23,10 @@
 // an endpoint partition may hold are canonical channel directories, entries
 // awaiting migration, and the `.json.tmp` half of an interrupted write; every
 // other child is quarantined as a corrupt partition node rather than skipped.
+// Before submission, the drain derives the current publisher from the private
+// key in its input envelope and retains any cached event signed by a different
+// publisher. It never submits an old or foreign event while authenticating as
+// the current publisher.
 //
 // The whole-tree half of a run - quarantine and endpoint-to-channel migration -
 // is migrateReplayCache, a separate entry point so its caller can hold the

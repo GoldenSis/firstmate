@@ -6,17 +6,33 @@
 # header (bin/fm-buzz-inspect.mjs) states the full reasoning.
 #
 # This wrapper selects the reading identity, resolves the channel, and supplies
-# this home's recorded authors; bin/fm-buzz-inspect.mjs owns assessment and verdict
-# mechanics.
+# this home's recorded authors. This header owns the user-facing verdict contract;
+# bin/fm-buzz-inspect.mjs owns its assessment mechanics and rationale.
 # --channel-label may select another channel, but this wrapper never reads another
 # home's author records to attribute it.
 #
 # Unlike bin/fm-buzz-publish.sh this is NOT fire-and-forget: it is a diagnostic run
 # by hand, and a failure to reach the relay should be visible in its exit status.
 #
+# With no flags, the diagnostic reads up to three events from this home's channel
+# with this home's publishing identity and prints at most 600 content characters
+# per event. --full prints complete event content, and --limit changes the relay
+# query limit.
+#
+# --anonymous reads with a throwaway non-member identity without loading the
+# publishing private key. It reports a definite negative privacy result only for
+# a returned event whose shape, recomputed id, signature, exact channel tag, and
+# author all verify, with the author matching this home's current or retained
+# historical publishing keys. It reports positive assurance only for an empty
+# read that the relay rejects with a membership-tagged `restricted:` reason on
+# this home's own channel. Empty reads without that refusal, other refusal
+# reasons, unverifiable events, and channels derived from another home are
+# inconclusive.
+#
 # Usage:
 #   fm-buzz-inspect.sh [--limit N] [--full] [--anonymous]
 #                      [--relay <url>] [--channel-label <s>]
+#   fm-buzz-inspect.sh --help
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

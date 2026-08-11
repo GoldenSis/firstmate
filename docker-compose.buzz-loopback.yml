@@ -7,8 +7,8 @@
 # reboot-persistence contract.
 #
 # Reference: upstream deploy/compose/compose.yml at github.com/block/buzz
-# commit 7fb008f9 (Apache-2.0), reduced to the four services M1 needs and
-# re-pointed at loopback.
+# commit 7fb008f9 (Apache-2.0), reduced to four runtime services plus two
+# one-shot initialization jobs and re-pointed at loopback.
 #
 # Usage:
 #   colima start                                                        # if needed

@@ -413,11 +413,13 @@ FM_SEND_RETRIES=3       # fm-send Enter-retry attempts after typing the line onc
 FM_SEND_SLEEP=0.4       # seconds between fm-send submit checks
 FM_SEND_SETTLE=1        # seconds fm-send waits after a successful text submit; 0 disables
 # loopback Buzz bearings publisher (docs/buzz-loopback-adapter.md); additive, and nothing in firstmate reads it
+BUZZ_IMAGE=ghcr.io/block/buzz:main  # Compose-only relay image override; pin an immutable compatible digest when reproducible infrastructure matters
+BUZZ_LOOPBACK_PORT=3000             # Compose-only host loopback port; when changed, set FM_BUZZ_RELAY=ws://localhost:<port> so publishing, inspection, and rotation address the same relay
 FM_BUZZ_RELAY=ws://localhost:3000   # loopback Buzz relay URL; only 127.0.0.1, localhost, and [::1] hosts are accepted, and the `localhost` spelling is load-bearing for the bundled relay's HTTP Host routing
-FM_BUZZ_TIMEOUT_MS=15000            # whole-connection budget for one publish run; `fm-buzz-publish.sh --timeout` overrides it
-FM_BUZZ_MAX_CACHE=100               # positive-integer replay-cache cap before the oldest signed events are dropped
+FM_BUZZ_TIMEOUT_MS=15000            # relay budget for each publish connection and rotation membership query; `fm-buzz-publish.sh --timeout` overrides it for publishing
+FM_BUZZ_MAX_CACHE=100               # positive-integer cap per relay/channel replay partition before its oldest signed events are dropped
 FM_BUZZ_STDIN_TIMEOUT_S=30          # deadline for reading the projection on stdin; an expired read is discarded rather than published
-FM_BUZZ_LOCK_TIMEOUT_S=30           # deadline for acquiring replay-cache ownership; timeout and interruption remain logged exit-0 non-events
+FM_BUZZ_LOCK_TIMEOUT_S=30           # deadline for each publisher lock acquisition; timeout and interruption remain logged exit-0 non-events
 FM_BUZZ_FORCE_FILE_STORE=           # set to 1 to select the 0600 fallback for normal loads and stores; rotation still inspects and clears every store per `fm-buzz-keypair.sh --help`
 FM_BUZZ_REQUIRE_PINNED_RELAY_AUTHORITY=0 # set to 1 to refuse rotation membership checks until the relay/channel signer is already pinned
 # sub-supervisor (bin/fm-supervise-daemon.sh); presence-gated via /afk

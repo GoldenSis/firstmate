@@ -9,12 +9,14 @@
 //
 // WHY THE EVENT ID MATTERS MORE THAN USUAL HERE
 // A NIP-01 event id is SHA-256 over [0, pubkey, created_at, kind, tags, content],
-// so `created_at` is part of the identity. Buzz's relay dedupes on that id
-// (`INSERT ... ON CONFLICT DO NOTHING`), which makes resubmitting the
-// byte-identical signed event perfectly idempotent - and makes re-signing the
-// same logical message a DUPLICATE, because a new `created_at` yields a new id.
-// Everything downstream of signEvent must therefore move signed bytes around, not
-// rebuild events. The publisher's replay cache stores exact bytes for this reason.
+// so both `created_at` and every tag are part of the identity. A fresh publisher
+// invocation deliberately includes a random nonce tag, giving even identical
+// content signed in the same second a distinct id. Buzz's relay dedupes on that
+// id (`INSERT ... ON CONFLICT DO NOTHING`), which makes resubmitting one cached,
+// byte-identical signed event perfectly idempotent. Rebuilding a cached logical
+// projection as a fresh event would instead create a second projection. Everything
+// downstream of signEvent must therefore move signed bytes around, not rebuild
+// events. The publisher's replay cache stores exact bytes for this reason.
 //
 // Scope note: this speaks only the subset of the protocol M1 needs - create a
 // private channel idempotently, publish append-only channel messages, read events
