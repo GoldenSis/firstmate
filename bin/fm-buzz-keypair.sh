@@ -399,7 +399,7 @@ EOF
 $(printf '%s\n' "$retirement_targets" | awk 'NF && !seen[$0]++')
 EOF
   while IFS= read -r relay; do
-    [ -n "$relay" ] && printf '  fm-buzz-keypair.sh --forget-relay-identity %s\n' "$relay" >&2
+    [ -n "$relay" ] && printf '  fm-buzz-keypair.sh --forget-relay-identity %q\n' "$relay" >&2
   done <<EOF
 $affected_relays
 EOF

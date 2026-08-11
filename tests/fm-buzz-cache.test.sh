@@ -757,7 +757,29 @@ EOF
 }
 
 test_replay_cache_rejects_symlink_boundaries() {
-  local root_home relay_home entry_home outside replay relay digest link target output manifest payload
+  local ancestor_home root_home relay_home entry_home outside replay relay digest link target output manifest payload code
+  ancestor_home=$(make_home cache-ancestor-symlink)
+  run_keypair "$ancestor_home" >/dev/null 2>&1 || fail "ancestor-symlink keypair setup failed"
+  outside="$ancestor_home/outside-state"
+  rmdir "$ancestor_home/state"
+  mkdir "$outside"
+  ln -s "$outside" "$ancestor_home/state"
+  output=$(node -e '
+    import(process.argv[1]).then(({ migrateReplayCache }) => {
+      migrateReplayCache(process.argv[2]);
+    });
+  ' "$ROOT/bin/fm-buzz-publish.mjs" "$ancestor_home/state/buzz-replay" 2>&1)
+  code=$?
+  expect_code 1 "$code" "direct replay migration through a symlinked ancestor"
+  assert_contains "$output" "replay cache ancestor" \
+    "the replay engine accepted a symlinked ancestor"
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"ancestor-symlink"}' \
+    | run_publish "$ancestor_home" "ws://127.0.0.1:1" 2>&1)
+  assert_contains "$output" "replay cache ancestor" \
+    "a replay-root ancestor symlink was not rejected"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "a replay-root ancestor symlink redirected mutation outside the cache"
+
   root_home=$(make_home cache-root-symlink)
   run_keypair "$root_home" >/dev/null 2>&1 || fail "root-symlink keypair setup failed"
   outside="$root_home/outside-cache"

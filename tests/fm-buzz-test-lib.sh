@@ -12,6 +12,7 @@ PUBLISH="$ROOT/bin/fm-buzz-publish.sh"
 INSPECT="$ROOT/bin/fm-buzz-inspect.sh"
 STUB="$ROOT/tests/fm-buzz-stub-relay.mjs"
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-buzz.XXXXXX")
+TMP_ROOT=$(cd "$TMP_ROOT" && pwd -P)
 FM_TEST_CLEANUP_DIRS+=("$TMP_ROOT")
 
 command -v node >/dev/null 2>&1 || { echo "skip: node not found"; exit 0; }
@@ -467,4 +468,3 @@ EOF
 # Everything else in this suite would still pass if the signer were subtly wrong
 # and the stub's verifier were wrong in the same way, because both call the same
 # module. The official vectors are the independent check that closes that gap.
-

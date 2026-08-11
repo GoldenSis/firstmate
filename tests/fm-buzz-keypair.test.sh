@@ -416,6 +416,33 @@ test_rotation_query_errors_report_every_target_on_the_endpoint() {
   pass "membership query errors report every target needed to retire the endpoint"
 }
 
+test_retirement_commands_quote_special_relay_endpoints() {
+  local home publisher relay normalized quoted channel targets output code
+  home=$(make_home quoted-retirement-endpoint)
+  publisher=$(run_keypair "$home" 2>/dev/null) || fail "quoted retirement setup failed"
+  relay='ws://127.0.0.1:1/retired?first=1&second=2'
+  normalized=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
+    || fail "could not normalize the quoted retirement endpoint"
+  printf -v quoted '%q' "$normalized"
+  channel=$(channel_id_for_label quoted-retirement-endpoint)
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  node -e '
+    import(process.argv[2]).then(({ recordPublisherTarget }) => {
+      recordPublisherTarget(process.argv[3], {
+        relay: process.argv[4], channel_id: process.argv[5], publisher_pubkey: process.argv[6],
+      });
+    });
+  ' target-fixture "$ROOT/bin/fm-buzz-targets.mjs" "$targets" "$relay" "$channel" "$publisher" \
+    || fail "could not seed the quoted retirement target"
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation with a special-character relay endpoint"
+  assert_contains "$output" "--forget-relay-identity $quoted" \
+    "relay retirement output did not shell-quote its endpoint"
+  pass "relay retirement commands shell-quote complete endpoints"
+}
+
 test_publisher_target_overrides_are_recorded_and_guard_rotation() {
   local home relay label channel old keyfile private_before targets targets_before output code normalized_relay
   home=$(make_home tracked-rotation-target)
@@ -513,6 +540,45 @@ test_publisher_target_updates_are_concurrent_and_fail_closed() {
   [ "$(cat "$home/data/buzz-keypair.public")" = "$publisher" ] \
     || fail "empty publisher-target state allowed key mutation"
   pass "publisher target updates serialize and malformed state fails closed"
+}
+
+test_publisher_target_lock_ignores_only_identity_bound_dead_candidates() {
+  local home publisher targets lock relay first second channel_one channel_two dead token
+  home=$(make_home publisher-target-stale-candidate)
+  publisher=$(run_keypair "$home" 2>/dev/null) || fail "stale-candidate target setup failed"
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  lock="$targets.registry-lock"
+  relay="ws://127.0.0.1:3001/stale-candidate"
+  channel_one=$(channel_id_for_label stale-candidate-one)
+  channel_two=$(channel_id_for_label stale-candidate-two)
+  dead=2147483647
+  token=00000000000000000000000000000000
+  mkdir "$lock"
+  printf '%s\n' "{\"pid\":$dead,\"token\":\"$token\",\"choosing\":false,\"ticket\":1}" \
+    > "$lock/$dead-$token.candidate"
+
+  (FM_TEST_BUZZ_TARGET_UPDATE_DELAY_MS=300 node -e '
+    import(process.argv[2]).then(({ recordPublisherTarget }) => {
+      recordPublisherTarget(process.argv[3], {
+        publisher_pubkey: process.argv[4], relay: process.argv[5], channel_id: process.argv[6],
+      });
+    });
+  ' target-lock-test "$ROOT/bin/fm-buzz-targets.mjs" "$targets" "$publisher" "$relay" "$channel_one") &
+  first=$!
+  (FM_TEST_BUZZ_TARGET_UPDATE_DELAY_MS=300 node -e '
+    import(process.argv[2]).then(({ recordPublisherTarget }) => {
+      recordPublisherTarget(process.argv[3], {
+        publisher_pubkey: process.argv[4], relay: process.argv[5], channel_id: process.argv[6],
+      });
+    });
+  ' target-lock-test "$ROOT/bin/fm-buzz-targets.mjs" "$targets" "$publisher" "$relay" "$channel_two") &
+  second=$!
+  wait "$first" || fail "first stale-candidate target update failed"
+  wait "$second" || fail "second stale-candidate target update failed"
+  [ "$(jq -s 'length' "$targets")" = "2" ] \
+    || fail "dead-candidate recovery lost a concurrent target update"
+  assert_absent "$lock" "dead-candidate recovery left registry ownership behind"
+  pass "registry ownership ignores dead candidates without replacing live ownership"
 }
 
 test_forget_target_attests_exact_retirement() {
@@ -1684,6 +1750,42 @@ test_orphan_gate_sees_legacy_replay_publisher_evidence() {
   pass "orphan identity inspection covers flat and host-keyed legacy replay entries"
 }
 
+test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine() {
+  local home relay private publisher channel seeded flat replay manifest output code
+  home=$(make_home orphan-quarantined-legacy)
+  run_keypair "$home" >/dev/null 2>&1 || fail "quarantined orphan setup failed"
+  relay="ws://127.0.0.1:1/quarantined-orphan"
+  private=$(new_private_key) || fail "could not mint a quarantined legacy publisher"
+  publisher=$(public_from_private "$private") || fail "could not derive the quarantined legacy publisher"
+  channel=$(default_channel_id "$home")
+  seeded=$(seed_replay_event "$home" "$relay" "$private" 1700000000 "$channel" quarantined-orphan) \
+    || fail "could not seed quarantined orphan evidence"
+  replay="$home/state/buzz-replay"
+  flat="$replay/$(basename "$seeded")"
+  mv "$seeded" "$flat"
+  node -e '
+    import(process.argv[1]).then(({ migrateReplayCache }) => {
+      const result = migrateReplayCache(process.argv[2]);
+      if (result.legacy.length || result.endpoint.length) process.exitCode = 1;
+    });
+  ' "$ROOT/bin/fm-buzz-publish.mjs" "$replay" \
+    || fail "could not quarantine the valid legacy publisher fixture"
+  manifest=$(grep -l "$publisher" "$replay/_legacy-quarantine/manifests"/*.json 2>/dev/null | head -1)
+  [ -n "$manifest" ] || fail "legacy quarantine did not retain its validated publisher identity"
+  rm -f -- "$(key_file "$home" "$home/xdg")" "$home/data/buzz-keypair.public"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with quarantined legacy identity evidence"
+  assert_contains "$output" "orphan identity evidence exists" \
+    "the orphan gate ignored quarantined legacy evidence"
+  assert_contains "$output" "$publisher" \
+    "the orphan gate lost the publisher recorded by legacy quarantine"
+  assert_absent "$(key_file "$home" "$home/xdg")" \
+    "default ensure minted over quarantined legacy identity evidence"
+  pass "legacy quarantine preserves publisher identity for orphan recovery"
+}
+
 test_orphan_identity_inspection_does_not_mutate_endpoint_replay() {
   local home relay channel seeded endpoint_file before output code
   home=$(make_home orphan-read-only-replay)
@@ -1854,6 +1956,55 @@ EOF
   pass "target and relay identity retirement wait for in-flight delivery"
 }
 
+test_target_retirement_cannot_pass_a_pre_delivery_publisher() {
+  local home publisher relay channel targets target_hex ready release publish_output forget_output
+  local publish_pid forget_pid waited
+  home=$(make_home pre-delivery-retirement)
+  publisher=$(run_keypair "$home" 2>/dev/null) || fail "pre-delivery retirement setup failed"
+  channel=$(channel_id_for_label pre-delivery-retirement)
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  ready="$home/pre-delivery-ready"
+  release="$home/pre-delivery-release"
+  publish_output="$home/pre-delivery-publish.out"
+  forget_output="$home/pre-delivery-forget.out"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  node -e '
+    import(process.argv[2]).then(({ recordPublisherTarget }) => {
+      recordPublisherTarget(process.argv[3], {
+        relay: process.argv[4], channel_id: process.argv[5], publisher_pubkey: process.argv[6],
+      });
+    });
+  ' target-fixture "$ROOT/bin/fm-buzz-targets.mjs" "$targets" "$relay" "$channel" "$publisher" \
+    || fail "could not seed the pre-delivery retirement target"
+  target_hex=$(node "$ROOT/bin/fm-buzz-targets.mjs" list-with-ids "$targets" | awk -F '\t' 'NR == 1 { print $1 }')
+
+  (printf '%s' '{"schema":"fm-bearings.v1","note":"pre-delivery-retirement"}' \
+    | FM_TEST_BUZZ_BEFORE_DELIVERY_LOCK_READY="$ready" \
+      FM_TEST_BUZZ_BEFORE_DELIVERY_LOCK_RELEASE="$release" \
+      FM_BUZZ_LOCK_TIMEOUT_S=5 run_publish "$home" "$relay" --channel-label pre-delivery-retirement) \
+    > "$publish_output" 2>&1 &
+  publish_pid=$!
+  waited=0
+  while [ ! -e "$ready" ] && [ "$waited" -lt 400 ]; do
+    sleep 0.01
+    waited=$((waited + 1))
+  done
+  [ -e "$ready" ] || fail "publisher did not pause before acquiring delivery ownership"
+  run_keypair "$home" --forget-target "$target_hex" > "$forget_output" 2>&1 &
+  forget_pid=$!
+  sleep 0.1
+  kill -0 "$forget_pid" 2>/dev/null \
+    || fail "target retirement passed a publisher before it registered delivery ownership"
+  : > "$release"
+  wait "$publish_pid" || fail "pre-delivery publisher violated fire-and-forget"
+  wait "$forget_pid" || fail "target retirement failed after the publisher completed"
+  stop_stub "$STUB_PID"
+  assert_absent "$targets" "target retirement raced with the publisher and left its target active"
+  pass "target retirement cannot pass a publisher entering delivery"
+}
+
 read -r ROTATION_GUARD_PID ROTATION_GUARD_RELAY <<EOF
 $(start_stub)
 EOF
@@ -1867,8 +2018,10 @@ test_rotation_refuses_or_quarantines_outgoing_pending_events
 test_rotation_refuses_an_existing_private_channel_before_mutation
 test_rotation_reports_every_membership_blocker
 test_rotation_query_errors_report_every_target_on_the_endpoint
+test_retirement_commands_quote_special_relay_endpoints
 test_publisher_target_overrides_are_recorded_and_guard_rotation
 test_publisher_target_updates_are_concurrent_and_fail_closed
+test_publisher_target_lock_ignores_only_identity_bound_dead_candidates
 test_forget_target_attests_exact_retirement
 test_forget_relay_identity_requires_exact_target_retirement
 test_rotation_checks_authoritative_current_membership
@@ -1893,6 +2046,8 @@ test_public_key_history_is_normalized_consistently
 test_public_flag_fails_before_a_keypair_exists
 test_rotation_stages_the_replacement_before_clearing_the_outgoing_key
 test_orphan_gate_sees_legacy_replay_publisher_evidence
+test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine
 test_orphan_identity_inspection_does_not_mutate_endpoint_replay
 test_publish_signing_is_serialized_with_compromised_rotation
 test_target_and_relay_retirement_wait_for_inflight_delivery
+test_target_retirement_cannot_pass_a_pre_delivery_publisher

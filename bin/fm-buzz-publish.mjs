@@ -419,6 +419,24 @@ function cachedEventChannelId(event) {
   return channels[0][1];
 }
 
+function cacheEntryDescriptor(file) {
+  const name = path.basename(file);
+  const match = /^(\d+)-([0-9a-f]{64})\.json$/.exec(name);
+  const createdAt = match ? Number(match[1]) : undefined;
+  if (!match || !Number.isSafeInteger(createdAt)) return null;
+  return { name, createdAt, id: match[2], file, malformed: false };
+}
+
+function validatedCachedPublisher(file) {
+  const entry = cacheEntryDescriptor(file);
+  if (entry === null) return null;
+  try {
+    return cachedEventFromFrame(readRegularFile(file).bytes.toString("utf8"), entry).pubkey;
+  } catch {
+    return null;
+  }
+}
+
 function containedCachePath(replayDir, candidate) {
   const relative = path.relative(replayDir, path.resolve(candidate));
   return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
@@ -467,9 +485,58 @@ function relayChannelCacheDirectory(replayDir, relay, channelId) {
   return path.join(relayCacheDirectory(replayDir, relay), channelId);
 }
 
+function assertNoSymlinkPathComponents(candidate) {
+  const resolved = path.resolve(candidate);
+  const root = path.parse(resolved).root;
+  let current = root;
+  for (const name of path.relative(root, resolved).split(path.sep).filter(Boolean)) {
+    current = path.join(current, name);
+    let metadata;
+    try {
+      metadata = lstatSync(current);
+    } catch (error) {
+      if (error.code === "ENOENT") return;
+      throw error;
+    }
+    if (metadata.isSymbolicLink() || (!metadata.isDirectory() && current !== resolved)) {
+      throw new Error(`replay cache ancestor ${current} is not a regular directory`);
+    }
+  }
+}
+
 function prepareCacheRoot(replayDir) {
   const requested = path.resolve(replayDir);
-  mkdirSync(requested, { recursive: true, mode: 0o700 });
+  assertNoSymlinkPathComponents(requested);
+  const missing = [];
+  let ancestor = requested;
+  for (;;) {
+    try {
+      const metadata = lstatSync(ancestor);
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+        throw new Error(`replay cache ancestor ${ancestor} is not a regular directory`);
+      }
+      break;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) throw error;
+      missing.push(path.basename(ancestor));
+      ancestor = parent;
+    }
+  }
+  for (const name of missing.reverse()) {
+    ancestor = path.join(ancestor, name);
+    try {
+      mkdirSync(ancestor, { mode: 0o700 });
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+    const metadata = lstatSync(ancestor);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new Error(`replay cache ancestor ${ancestor} is not a regular directory`);
+    }
+  }
+  assertNoSymlinkPathComponents(requested);
   const before = lstatSync(requested);
   if (before.isSymbolicLink() || !before.isDirectory()) {
     throw new Error(`replay cache path ${replayDir} is not a regular directory`);
@@ -1245,6 +1312,7 @@ function quarantineLegacyEntries(replayDir) {
         stagingDir,
         candidate.file,
         candidate.legacyHost,
+        { publisherPubkey: validatedCachedPublisher(candidate.file) },
       );
     } catch (error) {
       log(`could not quarantine legacy cache entry ${candidate.file}: ${error.message}`);
@@ -1488,6 +1556,75 @@ function legacyReplayPublisherEntries(cacheRoot) {
   return evidence;
 }
 
+function quarantinedReplayPublisherEntries(cacheRoot) {
+  const quarantineDir = path.join(cacheRoot, LEGACY_QUARANTINE);
+  let metadata;
+  try {
+    metadata = cacheLstatSync(quarantineDir);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`legacy quarantine path ${quarantineDir} is not a regular directory`);
+  }
+  pinCacheDirectory(quarantineDir);
+  const manifestsDir = path.join(quarantineDir, "manifests");
+  try {
+    metadata = cacheLstatSync(manifestsDir);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`legacy quarantine manifest path ${manifestsDir} is not a regular directory`);
+  }
+  pinCacheDirectory(manifestsDir);
+  const evidence = [];
+  for (const name of cacheReaddirSync(manifestsDir).filter((candidate) => candidate.endsWith(".json"))) {
+    const match = /^([0-9a-f]{64})\.json$/.exec(name);
+    if (!match) throw new Error(`legacy quarantine manifest ${name} has a noncanonical name`);
+    const manifestFile = quarantineManifestPath(manifestsDir, match[1]);
+    let manifest;
+    try {
+      manifest = readQuarantineManifest(manifestFile);
+    } catch (error) {
+      throw new Error(`could not read legacy quarantine manifest ${manifestFile}: ${error.message}`);
+    }
+    const recorded = manifest?.publisher_pubkey;
+    if (recorded !== null && recorded !== undefined) {
+      if (typeof recorded !== "string" || !CACHE_PARTITION.test(recorded)) {
+        throw new Error(`legacy quarantine manifest ${manifestFile} has an invalid publisher identity`);
+      }
+      evidence.push({ path: manifestFile, publisherPubkey: recorded });
+      continue;
+    }
+    if (typeof manifest?.original_path !== "string" || typeof manifest?.payload_reference !== "string") continue;
+    const payload = path.resolve(path.join(quarantineDir, manifest.payload_reference));
+    const payloadsDir = path.join(quarantineDir, "payloads");
+    if (!containedCachePath(payloadsDir, payload) || path.dirname(payload) !== path.resolve(payloadsDir)) continue;
+    try {
+      metadata = cacheLstatSync(payloadsDir);
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      throw error;
+    }
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new Error(`legacy quarantine payload path ${payloadsDir} is not a regular directory`);
+    }
+    pinCacheDirectory(payloadsDir);
+    const entry = cacheEntryDescriptor(path.join(path.dirname(payload), path.basename(manifest.original_path)));
+    if (entry === null) continue;
+    try {
+      const event = cachedEventFromFrame(readRegularFile(payload).bytes.toString("utf8"), entry);
+      evidence.push({ path: payload, publisherPubkey: event.pubkey });
+    } catch {
+      continue;
+    }
+  }
+  return evidence;
+}
+
 function endpointReplayPublisherEntries(cacheRoot) {
   const topology = cacheEndpointDirectories(cacheRoot);
   if (topology.failures.length > 0) {
@@ -1529,6 +1666,7 @@ export function inspectActiveReplayPublisherCache(replayDir) {
     ...activeReplayPublisherEntries(cacheRoot),
     ...endpointReplayPublisherEntries(cacheRoot),
     ...legacyReplayPublisherEntries(cacheRoot),
+    ...quarantinedReplayPublisherEntries(cacheRoot),
   ]
     .sort((left, right) => left.path.localeCompare(right.path));
 }

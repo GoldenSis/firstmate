@@ -322,10 +322,10 @@ publish() {
     log "replay cache path $REPLAY_DIR is not a regular directory"
     return 1
   fi
-  mkdir -p "$REPLAY_DIR" 2>/dev/null || { log "could not create $REPLAY_DIR"; return 1; }
-  [ -d "$REPLAY_DIR" ] && [ ! -L "$REPLAY_DIR" ] \
-    || { log "replay cache path $REPLAY_DIR is not a regular directory"; return 1; }
-  chmod 0700 "$REPLAY_DIR" 2>/dev/null || true
+  if [ -L "$STATE" ] || { [ -e "$STATE" ] && [ ! -d "$STATE" ]; }; then
+    log "replay cache ancestor $STATE is not a regular directory"
+    return 1
+  fi
   PUBLISH_LOCK=$(fm_buzz_replay_transaction_lock "$STATE") || {
     log "could not resolve replay cache ownership"
     drop_stdin_spool
@@ -361,14 +361,18 @@ publish() {
     drop_stdin_spool
     return 1
   }
-  fm_lock_release "$PUBLISH_LOCK"
-  PUBLISH_LOCK=""
-
   DELIVERY_LOCK=$(fm_buzz_replay_delivery_lock "$STATE" "$normalized_relay" "$channel") || {
     log "could not resolve this queue's delivery ownership"
     drop_stdin_spool
     return 1
   }
+  if [ -n "${FM_TEST_BUZZ_BEFORE_DELIVERY_LOCK_READY:-}" ]; then
+    : > "$FM_TEST_BUZZ_BEFORE_DELIVERY_LOCK_READY"
+    while [ ! -e "${FM_TEST_BUZZ_BEFORE_DELIVERY_LOCK_RELEASE:-}" ]; do
+      [ "$PUBLISH_INTERRUPTED" -eq 0 ] || return 1
+      sleep 0.01
+    done
+  fi
   acquire_bounded_lock "$DELIVERY_LOCK"
   local delivery_lock_status=$?
   if [ "$delivery_lock_status" -ne 0 ]; then
@@ -380,6 +384,8 @@ publish() {
     drop_stdin_spool
     return 1
   fi
+  fm_lock_release "$PUBLISH_LOCK"
+  PUBLISH_LOCK=""
 
   mkdir -p "$DATA" 2>/dev/null || {
     log "could not create $DATA"

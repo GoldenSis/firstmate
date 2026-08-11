@@ -37,16 +37,16 @@
 //   node bin/fm-buzz-targets.mjs retire-unverifiable TARGETS_FILE OUTPUT_FILE REASON PUBKEY...
 
 import {
-  closeSync,
-  fstatSync,
   lstatSync,
-  openSync,
+  mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeRelayEndpoint } from "./fm-buzz-lib.mjs";
@@ -54,7 +54,6 @@ import { normalizeRelayEndpoint } from "./fm-buzz-lib.mjs";
 const HEX_64 = /^[0-9a-f]{64}$/;
 const CHANNEL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const REGISTRY_LOCK_TIMEOUT_MS = 15000;
-const REGISTRY_LOCK_STALE_MS = 5000;
 const registryLockWaiter = new Int32Array(new SharedArrayBuffer(4));
 let registryTestDelayConsumed = false;
 
@@ -72,68 +71,136 @@ function registryLockOwnerAlive(pid) {
   }
 }
 
+function registryCandidateName(pid, token) {
+  return `${pid}-${token}.candidate`;
+}
+
+function readRegistryCandidate(lock, name) {
+  const match = /^([1-9][0-9]*)-([0-9a-f]{32})\.candidate$/.exec(name);
+  if (!match) throw new Error(`registry lock ${lock} has an invalid candidate ${name}`);
+  const candidate = path.join(lock, name);
+  const metadata = lstatSync(candidate);
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    throw new Error(`registry lock candidate ${candidate} is not a regular file`);
+  }
+  const pid = Number(match[1]);
+  let value;
+  try {
+    value = JSON.parse(readFileSync(candidate, "utf8"));
+  } catch {
+    return { candidate, metadata, pid, token: match[2], choosing: true, ticket: 0, malformed: true };
+  }
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    value.pid !== pid ||
+    value.token !== match[2] ||
+    typeof value.choosing !== "boolean" ||
+    !Number.isSafeInteger(value.ticket) ||
+    value.ticket < 0
+  ) {
+    return { candidate, metadata, pid, token: match[2], choosing: true, ticket: 0, malformed: true };
+  }
+  return { candidate, metadata, ...value, malformed: false };
+}
+
+function registryCandidates(lock) {
+  return readdirSync(lock)
+    .map((name) => readRegistryCandidate(lock, name));
+}
+
+function removeDeadRegistryCandidate(candidate) {
+  try {
+    const current = lstatSync(candidate.candidate);
+    if (current.dev === candidate.metadata.dev && current.ino === candidate.metadata.ino) {
+      unlinkSync(candidate.candidate);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+}
+
 function acquireRegistryLock(file) {
   const lock = `${path.resolve(file)}.registry-lock`;
   const deadline = Date.now() + REGISTRY_LOCK_TIMEOUT_MS;
-  for (;;) {
-    let descriptor;
-    try {
-      descriptor = openSync(lock, "wx", 0o600);
-      writeFileSync(descriptor, `${process.pid}\n`);
-      const metadata = fstatSync(descriptor);
-      return { descriptor, lock, dev: metadata.dev, ino: metadata.ino };
-    } catch (error) {
-      if (descriptor !== undefined) closeSync(descriptor);
-      if (error.code !== "EEXIST") throw error;
-    }
-
-    let metadata;
-    let owner;
-    try {
-      metadata = lstatSync(lock);
-      if (metadata.isSymbolicLink() || !metadata.isFile()) {
-        throw new Error(`registry lock ${lock} is not a regular file`);
-      }
-      const raw = readFileSync(lock, "utf8").trim();
-      owner = /^[1-9][0-9]*$/.test(raw) ? Number(raw) : null;
-    } catch (error) {
-      if (error.code === "ENOENT") continue;
-      throw error;
-    }
-
-    if (!registryLockOwnerAlive(owner) && Date.now() - metadata.mtimeMs >= REGISTRY_LOCK_STALE_MS) {
-      const stale = `${lock}.${process.pid}.${Date.now()}.stale`;
-      try {
-        renameSync(lock, stale);
-        unlinkSync(stale);
+  try {
+    mkdirSync(lock, { mode: 0o700 });
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+  }
+  const lockMetadata = lstatSync(lock);
+  if (lockMetadata.isSymbolicLink() || !lockMetadata.isDirectory()) {
+    throw new Error(`registry lock ${lock} is not a regular directory`);
+  }
+  const token = randomBytes(16).toString("hex");
+  const candidate = path.join(lock, registryCandidateName(process.pid, token));
+  writeFileSync(candidate, `${JSON.stringify({ pid: process.pid, token, choosing: true, ticket: 0 })}\n`, {
+    mode: 0o600,
+    flag: "wx",
+  });
+  try {
+    let maximum = 0;
+    for (const other of registryCandidates(lock)) {
+      if (!registryLockOwnerAlive(other.pid)) {
+        removeDeadRegistryCandidate(other);
         continue;
-      } catch (error) {
-        if (error.code === "ENOENT") continue;
-        throw error;
       }
+      if (!other.malformed) maximum = Math.max(maximum, other.ticket);
     }
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for registry lock ${lock}`);
-    registryLockSleep(10);
+    if (maximum >= Number.MAX_SAFE_INTEGER) throw new Error(`registry lock ${lock} exhausted its ticket range`);
+    const ticket = maximum + 1;
+    writeFileSync(candidate, `${JSON.stringify({ pid: process.pid, token, choosing: false, ticket })}\n`);
+    const heldMetadata = lstatSync(candidate);
+    for (;;) {
+      let blocked = false;
+      for (const other of registryCandidates(lock)) {
+        if (other.candidate === candidate) continue;
+        if (!registryLockOwnerAlive(other.pid)) {
+          removeDeadRegistryCandidate(other);
+          continue;
+        }
+        if (
+          other.malformed ||
+          other.choosing ||
+          other.ticket < ticket ||
+          (other.ticket === ticket && other.token < token)
+        ) {
+          blocked = true;
+          break;
+        }
+      }
+      if (!blocked) {
+        return { candidate, lock, dev: heldMetadata.dev, ino: heldMetadata.ino };
+      }
+      if (Date.now() >= deadline) throw new Error(`timed out waiting for registry lock ${lock}`);
+      registryLockSleep(10);
+    }
+  } catch (error) {
+    try {
+      unlinkSync(candidate);
+    } catch (cleanupError) {
+      if (cleanupError.code !== "ENOENT") throw cleanupError;
+    }
+    throw error;
   }
 }
 
 function releaseRegistryLock(held) {
+  const pathMetadata = lstatSync(held.candidate);
+  if (
+    pathMetadata.isSymbolicLink() ||
+    !pathMetadata.isFile() ||
+    pathMetadata.dev !== held.dev ||
+    pathMetadata.ino !== held.ino
+  ) {
+    throw new Error(`registry lock identity changed: ${held.candidate}`);
+  }
+  unlinkSync(held.candidate);
   try {
-    const descriptorMetadata = fstatSync(held.descriptor);
-    const pathMetadata = lstatSync(held.lock);
-    if (
-      pathMetadata.isSymbolicLink() ||
-      !pathMetadata.isFile() ||
-      descriptorMetadata.dev !== held.dev ||
-      descriptorMetadata.ino !== held.ino ||
-      pathMetadata.dev !== held.dev ||
-      pathMetadata.ino !== held.ino
-    ) {
-      throw new Error(`registry lock identity changed: ${held.lock}`);
-    }
-    unlinkSync(held.lock);
-  } finally {
-    closeSync(held.descriptor);
+    rmdirSync(held.lock);
+  } catch (error) {
+    if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error;
   }
 }
 
