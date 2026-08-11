@@ -286,8 +286,11 @@ test_missing_manifest_backed_quarantine_payloads_fail_closed() {
     source_device:1,
     source_inode:1,
     source_mode:33188,
+    payload_device:1,
+    payload_inode:1,
+    payload_mode:33188,
     corrupt_type:"regular-file",
-    content_sha256:null
+    content_sha256:"0000000000000000000000000000000000000000000000000000000000000000"
   }' > "$manifest"
   output=$(run_keypair "$home" 2>&1)
   code=$?
@@ -581,6 +584,9 @@ $(node -e '
       source_device: corruptMetadata.dev,
       source_inode: corruptMetadata.ino,
       source_mode: corruptMetadata.mode,
+      payload_device: corruptMetadata.dev,
+      payload_inode: corruptMetadata.ino,
+      payload_mode: corruptMetadata.mode,
       corrupt_type: "regular-file",
       content_sha256: createHash("sha256").update(corruptBytes).digest("hex"),
       publisher_pubkey: null,
@@ -1380,6 +1386,73 @@ EOF
   pass "partition-shaped special nodes are quarantined without blocking delivery"
 }
 
+test_corrupt_quarantine_payloads_are_provenance_and_content_bound() {
+  local home private relay channel seeded replay corrupt_path manifest payload retained digest output code
+  home=$(make_home corrupt-quarantine-provenance)
+  run_keypair "$home" >/dev/null 2>&1 || fail "corrupt quarantine provenance setup failed"
+  private=$(jq -r '.private_key' "$(key_file "$home" "$home/xdg")")
+  relay="ws://127.0.0.1:1/corrupt-quarantine-provenance"
+  channel=$(default_channel_id "$home")
+  seeded=$(seed_replay_event "$home" "$relay" "$private" 1700000204 "$channel" corrupt-provenance) \
+    || fail "could not seed corrupt quarantine provenance evidence"
+  replay="$home/state/buzz-replay"
+  corrupt_path="$replay/$(printf '%064d' 9)"
+  mv "$seeded" "$corrupt_path"
+  node -e '
+    import(process.argv[1]).then(({ migrateReplayCache }) => {
+      const result = migrateReplayCache(process.argv[2]);
+      if (result.legacy.length || result.endpoint.length) process.exitCode = 1;
+    });
+  ' "$ROOT/bin/fm-buzz-publish.mjs" "$replay" \
+    || fail "could not quarantine the corrupt provenance fixture"
+  manifest=$(grep -l '"corrupt_type": "regular-file"' \
+    "$replay/_legacy-quarantine/manifests"/*.json 2>/dev/null | head -1)
+  [ -n "$manifest" ] || fail "corrupt provenance fixture has no regular-file manifest"
+  payload="$replay/_legacy-quarantine/$(jq -r '.payload_reference' "$manifest")"
+  retained="$payload.retained"
+  cp "$payload" "$retained"
+  digest=$(node -e '
+    const fs = require("node:fs");
+    const { createHash } = require("node:crypto");
+    process.stdout.write(createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"));
+  ' "$payload")
+  [ "$(jq -r '.content_sha256' "$manifest")" = "$digest" ] \
+    || fail "regular corrupt quarantine did not retain its payload digest"
+
+  printf '%s' 'tampered-corrupt-quarantine-payload' > "$payload"
+  # shellcheck disable=SC2016
+  output=$(node -e '
+    import(process.argv[1]).then(({ inspectActiveReplayPublisherCache }) => {
+      inspectActiveReplayPublisherCache(process.argv[2]);
+    }).catch((error) => {
+      process.stderr.write(`${error.message}\n`);
+      process.exitCode = 1;
+    });
+  ' "$ROOT/bin/fm-buzz-publish.mjs" "$replay" 2>&1)
+  code=$?
+  expect_code 1 "$code" "corrupt quarantine payload changed in place"
+  assert_contains "$output" "does not match its content hash" \
+    "corrupt quarantine accepted changed bytes from the recorded inode"
+
+  cp "$retained" "$payload"
+  mv "$payload" "$payload.replaced"
+  cp "$retained" "$payload"
+  # shellcheck disable=SC2016
+  output=$(node -e '
+    import(process.argv[1]).then(({ inspectActiveReplayPublisherCache }) => {
+      inspectActiveReplayPublisherCache(process.argv[2]);
+    }).catch((error) => {
+      process.stderr.write(`${error.message}\n`);
+      process.exitCode = 1;
+    });
+  ' "$ROOT/bin/fm-buzz-publish.mjs" "$replay" 2>&1)
+  code=$?
+  expect_code 1 "$code" "corrupt quarantine payload replaced by another regular file"
+  assert_contains "$output" "does not match its source provenance" \
+    "corrupt quarantine accepted an unrelated regular-file payload"
+  pass "corrupt quarantine payloads remain bound to source provenance and content"
+}
+
 test_replay_cache_never_reads_non_regular_entries() {
   local home relay cache_dir fifo output_file publisher waited
   home=$(make_home cache-special-file)
@@ -1681,6 +1754,7 @@ test_cross_directory_quarantine_claims_cannot_follow_swapped_sources
 test_cross_directory_quarantine_directory_moves_pin_both_parents
 test_quarantine_header_defines_each_manifest_variant
 test_partition_shaped_special_nodes_are_quarantined_and_unblocked
+test_corrupt_quarantine_payloads_are_provenance_and_content_bound
 test_replay_cache_never_reads_non_regular_entries
 test_relay_timeout_must_fit_the_node_timer_range
 test_malformed_cache_names_are_discarded_or_accounted_for

@@ -215,7 +215,10 @@ fm_buzz_private_record_read() {  # <fallback|stage> <file>
         if (!value || !["prepared", "committable"].includes(value.phase)) process.exit(43);
         if (!/^[0-9a-f]{64}$/.test(value.private_key ?? "")) process.exit(43);
         if (!/^[0-9a-f]{64}$/.test(value.public_key ?? "")) process.exit(43);
-        process.stdout.write(`${value.phase}\n${value.private_key}\n${value.public_key}\n`);
+        const rotationIntent = value.rotation_intent ??
+          (value.phase === "committable" ? "ordinary" : null);
+        if (!["ordinary", "compromised"].includes(rotationIntent)) process.exit(43);
+        process.stdout.write(`${value.phase}\n${value.private_key}\n${value.public_key}\n${rotationIntent}\n`);
       } else {
         process.exit(43);
       }
@@ -329,21 +332,23 @@ fm_buzz_key_stage_file() {  # <data directory>
   printf '%s/.buzz-keypair.rotation-stage\n' "$data"
 }
 
-fm_buzz_key_stage_write() {  # <data directory> <prepared|committable> <private> <public>
+fm_buzz_key_stage_write() {  # <data directory> <prepared|committable> <private> <public> <ordinary|compromised>
   local data=${1:?data directory required} phase=${2:?phase required}
-  local private=${3:?private key required} public=${4:?public key required} file tmp
+  local private=${3:?private key required} public=${4:?public key required}
+  local intent=${5:?rotation intent required} file tmp
   case $phase in prepared|committable) ;; *) return 1 ;; esac
+  case $intent in ordinary|compromised) ;; *) return 1 ;; esac
   file=$(fm_buzz_key_stage_file "$data") || return 1
   mkdir -p "$data" 2>/dev/null || return 1
   fm_buzz_file_target_replaceable "$file" || return 1
   tmp=$(mktemp "$data/.buzz-keypair-rotation-stage.XXXXXX") || return 1
   chmod 0600 "$tmp" || { rm -f -- "$tmp"; return 1; }
-  printf '{"phase":"%s","private_key":"%s","public_key":"%s"}\n' \
-    "$phase" "$private" "$public" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  printf '{"phase":"%s","private_key":"%s","public_key":"%s","rotation_intent":"%s"}\n' \
+    "$phase" "$private" "$public" "$intent" > "$tmp" || { rm -f -- "$tmp"; return 1; }
   fm_buzz_replace_file "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
 }
 
-# Print `phase`, `private_key` and `public_key` on three lines. Return 1 when no
+# Print `phase`, `private_key`, `public_key`, and `rotation_intent` on four lines. Return 1 when no
 # stage exists, and 2 when one exists but is not a readable, well-formed stage.
 # Same output discipline as fm_buzz_key_load: the second line is a private key.
 fm_buzz_key_stage_read() {  # <data directory>

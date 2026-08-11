@@ -501,6 +501,7 @@ load_rotation_stage() {
   ROTATION_STAGE_PHASE=$(printf '%s\n' "$parsed" | sed -n 1p)
   ROTATION_STAGE_PRIVATE=$(printf '%s\n' "$parsed" | sed -n 2p)
   ROTATION_STAGE_PUBLIC=$(printf '%s\n' "$parsed" | sed -n 3p)
+  ROTATION_STAGE_INTENT=$(printf '%s\n' "$parsed" | sed -n 4p)
   parsed=
   # shellcheck disable=SC2016
   derived_stage=$(printf '%s' "$ROTATION_STAGE_PRIVATE" | node -e '
@@ -515,7 +516,7 @@ load_rotation_stage() {
 }
 
 generate_rotation_stage() {
-  local generated private public
+  local generated private public intent=ordinary
   # shellcheck disable=SC2016
   generated=$(node -e '
     import(process.argv[1]).then(({ generateKeypair }) => {
@@ -530,7 +531,8 @@ generate_rotation_stage() {
   [ "${#private}" -eq 64 ] || return 1
   case $public in *[!0-9a-f]*|'') return 1 ;; esac
   [ "${#public}" -eq 64 ] || return 1
-  fm_buzz_key_stage_write "$DATA" prepared "$private" "$public" || return 1
+  [ "$COMPROMISED" -eq 0 ] || intent=compromised
+  fm_buzz_key_stage_write "$DATA" prepared "$private" "$public" "$intent" || return 1
   private=
   public=
   load_rotation_stage
@@ -555,6 +557,7 @@ finish_committable_rotation_stage() {
   fm_buzz_key_stage_clear "$DATA" || return 1
   ROTATION_STAGE_PRIVATE=""
   ROTATION_STAGE_PHASE=""
+  ROTATION_STAGE_INTENT=""
   ROTATION_STAGE_STORE=$store
 }
 
@@ -728,12 +731,27 @@ add_recovery_reason() {  # <reason>
 ROTATION_STAGE_PHASE=""
 ROTATION_STAGE_PRIVATE=""
 ROTATION_STAGE_PUBLIC=""
+ROTATION_STAGE_INTENT=""
 if [ -e "$ROTATION_STAGE_FILE" ] || [ -L "$ROTATION_STAGE_FILE" ]; then
   load_rotation_stage || {
     printf 'fm-buzz-keypair.sh: rotation stage %s is invalid; nothing was changed\n' \
       "$ROTATION_STAGE_FILE" >&2
     exit 1
   }
+fi
+if [ "$ROTATION_STAGE_PHASE" = prepared ] && [ "$OPERATION" = rotate ]; then
+  if [ "$ROTATION_STAGE_INTENT" = compromised ] && [ "$COMPROMISED" -eq 0 ]; then
+    printf 'fm-buzz-keypair.sh: staged replacement belongs to a compromised rotation; retry with --rotate --compromised\n' >&2
+    exit 1
+  fi
+  if [ "$ROTATION_STAGE_INTENT" = ordinary ] && [ "$COMPROMISED" -eq 1 ]; then
+    fm_buzz_key_stage_write "$DATA" prepared "$ROTATION_STAGE_PRIVATE" \
+      "$ROTATION_STAGE_PUBLIC" compromised || {
+        printf 'fm-buzz-keypair.sh: could not persist compromised rotation intent; nothing was rotated\n' >&2
+        exit 1
+      }
+    ROTATION_STAGE_INTENT=compromised
+  fi
 fi
 if [ "$ROTATION_STAGE_PHASE" = committable ] && [ "$OPERATION" != public ]; then
   finish_committable_rotation_stage
@@ -979,7 +997,8 @@ EOF
     printf 'fm-buzz-keypair.sh: no key is stored for this home; there is nothing to retire\n' >&2
   fi
 
-  fm_buzz_key_stage_write "$DATA" committable "$ROTATION_STAGE_PRIVATE" "$ROTATION_STAGE_PUBLIC" || {
+  fm_buzz_key_stage_write "$DATA" committable "$ROTATION_STAGE_PRIVATE" \
+    "$ROTATION_STAGE_PUBLIC" "$ROTATION_STAGE_INTENT" || {
     printf 'fm-buzz-keypair.sh: could not commit the staged replacement transaction; the outgoing private key remains stored\n' >&2
     exit 1
   }

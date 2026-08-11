@@ -259,9 +259,9 @@ rotation_stage_file() {  # <home>
   ( . "$ROOT/bin/fm-buzz-key-lib.sh"; fm_buzz_key_stage_file "$1/data" )
 }
 
-write_rotation_stage() {  # <home> <phase> <private-key> <public-key>
+write_rotation_stage() {  # <home> <phase> <private-key> <public-key> [ordinary|compromised]
   # shellcheck disable=SC1091
-  ( . "$ROOT/bin/fm-buzz-key-lib.sh"; fm_buzz_key_stage_write "$1/data" "$2" "$3" "$4" )
+  ( . "$ROOT/bin/fm-buzz-key-lib.sh"; fm_buzz_key_stage_write "$1/data" "$2" "$3" "$4" "${5:-ordinary}" )
 }
 
 delivery_lock_path() {  # <home> <relay> <channel>

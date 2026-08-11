@@ -1886,6 +1886,33 @@ test_rotation_stages_the_replacement_before_clearing_the_outgoing_key() {
   pass "rotation stages and verifies the replacement before clearing the outgoing key"
 }
 
+test_compromised_rotation_stage_preserves_withdrawal_intent() {
+  local home old stage staged_private staged_public output code recovered
+  home=$(make_home compromised-rotation-stage)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "compromised-stage keypair setup failed"
+  stage=$(rotation_stage_file "$home")
+  staged_private=$(new_private_key) || fail "could not mint the compromised staged replacement"
+  staged_public=$(public_from_private "$staged_private") \
+    || fail "could not derive the compromised staged replacement"
+  write_rotation_stage "$home" prepared "$staged_private" "$staged_public" compromised
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "a plain retry of a staged compromised rotation"
+  assert_contains "$output" "retry with --rotate --compromised" \
+    "a staged compromised rotation lost its withdrawal intent"
+  assert_not_contains "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null)" "$old" \
+    "a plain retry re-trusted the compromised outgoing identity"
+  assert_present "$stage" "a rejected plain retry discarded the staged replacement"
+
+  recovered=$(run_keypair "$home" --rotate --compromised 2>/dev/null) \
+    || fail "the compromised rotation could not resume with its original intent"
+  [ "$recovered" = "$staged_public" ] || fail "the compromised retry replaced its staged identity"
+  assert_not_contains "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null)" "$old" \
+    "the resumed compromised rotation retained the withdrawn identity"
+  pass "staged compromised rotation intent survives an interrupted history withdrawal"
+}
+
 test_orphan_gate_sees_legacy_replay_publisher_evidence() {
   local home relay foreign_private foreign_public seeded channel flat host_dir
   local output code recovered
@@ -2052,6 +2079,55 @@ test_orphan_gate_preserves_corrupt_partition_publisher_evidence() {
   assert_absent "$(key_file "$home" "$home/xdg")" \
     "default ensure minted over corrupt-partition publisher evidence"
   pass "corrupt partition quarantine preserves validated publisher identity"
+}
+
+test_orphan_gate_includes_interrupted_corrupt_quarantine_transactions() {
+  local home private publisher relay channel seeded replay corrupt_path manifest payload
+  local transaction token origin output code
+  home=$(make_home orphan-interrupted-corrupt-quarantine)
+  publisher=$(run_keypair "$home" 2>/dev/null) || fail "interrupted corrupt quarantine setup failed"
+  private=$(jq -r '.private_key' "$(key_file "$home" "$home/xdg")")
+  relay="ws://127.0.0.1:1/interrupted-corrupt-quarantine"
+  channel=$(default_channel_id "$home")
+  seeded=$(seed_replay_event "$home" "$relay" "$private" 1700000203 "$channel" interrupted-corrupt) \
+    || fail "could not seed interrupted corrupt quarantine evidence"
+  replay="$home/state/buzz-replay"
+  corrupt_path="$replay/$(printf '%064d' 8)"
+  mv "$seeded" "$corrupt_path"
+  node -e '
+    import(process.argv[1]).then(({ migrateReplayCache }) => {
+      const result = migrateReplayCache(process.argv[2]);
+      if (result.legacy.length || result.endpoint.length) process.exitCode = 1;
+    });
+  ' "$ROOT/bin/fm-buzz-publish.mjs" "$replay" \
+    || fail "could not create the interrupted corrupt quarantine fixture"
+  manifest=$(grep -l "$publisher" "$replay/_legacy-quarantine/manifests"/*.json 2>/dev/null | head -1)
+  [ -n "$manifest" ] || fail "interrupted corrupt quarantine fixture has no publisher manifest"
+  payload="$replay/_legacy-quarantine/$(jq -r '.payload_reference' "$manifest")"
+  transaction=$(dirname "$payload")
+  token=$(basename "$transaction")
+  origin="$transaction/origin.json"
+  # shellcheck disable=SC2016
+  node -e '
+    const fs = require("node:fs");
+    const [manifestFile, originFile, token] = process.argv.slice(1);
+    const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+    fs.writeFileSync(originFile, `${JSON.stringify({ token, manifest }, null, 2)}\n`);
+    fs.unlinkSync(manifestFile);
+  ' "$manifest" "$origin" "$token" || fail "could not interrupt corrupt quarantine finalization"
+  rm -f -- "$(key_file "$home" "$home/xdg")" "$home/data/buzz-keypair.public"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with interrupted corrupt quarantine evidence"
+  assert_contains "$output" "$publisher" \
+    "the orphan gate ignored the interrupted corrupt quarantine publisher"
+  assert_contains "$output" "$origin" \
+    "the orphan gate did not name the interrupted corrupt quarantine record"
+  assert_present "$payload" "read-only orphan inspection removed interrupted corrupt evidence"
+  assert_absent "$(key_file "$home" "$home/xdg")" \
+    "default ensure minted over interrupted corrupt quarantine evidence"
+  pass "interrupted corrupt quarantine transactions remain visible to orphan recovery"
 }
 
 test_orphan_gate_validates_quarantine_payloads_without_filename_trust() {
@@ -2553,10 +2629,12 @@ test_public_read_cannot_commit_a_rotation_stage
 test_public_key_history_is_normalized_consistently
 test_public_flag_fails_before_a_keypair_exists
 test_rotation_stages_the_replacement_before_clearing_the_outgoing_key
+test_compromised_rotation_stage_preserves_withdrawal_intent
 test_orphan_gate_sees_legacy_replay_publisher_evidence
 test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine
 test_orphan_gate_includes_quarantine_manifest_temporaries
 test_orphan_gate_preserves_corrupt_partition_publisher_evidence
+test_orphan_gate_includes_interrupted_corrupt_quarantine_transactions
 test_orphan_gate_validates_quarantine_payloads_without_filename_trust
 test_orphan_gate_fails_closed_on_unreadable_quarantine_payloads
 test_orphan_gate_validates_quarantine_manifest_variants
