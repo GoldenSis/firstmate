@@ -248,18 +248,32 @@ fm_lock_recheck_stale_owner() {
   return 0
 }
 
-fm_lock_try_acquire_guard() {
-  local lockdir=$1 pid owner
+fm_lock_acquire_preflight() {
+  local lockdir=$1 pid
   FM_LOCK_HELD_PID=
   FM_LOCK_OWNER_DIR=
   if fm_lock_try_create "$lockdir"; then
     return 0
   fi
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
+  FM_LOCK_HELD_PID=$pid
   if fm_pid_alive "$pid" || fm_lock_mid_acquire_is_fresh "$lockdir" "$pid"; then
-    FM_LOCK_HELD_PID=$pid
     return 1
   fi
+  return 2
+}
+
+fm_lock_try_acquire_guard() {
+  local lockdir=$1 pid owner preflight_status
+  if fm_lock_acquire_preflight "$lockdir"; then
+    return 0
+  else
+    preflight_status=$?
+  fi
+  if [ "$preflight_status" -eq 1 ]; then
+    return 1
+  fi
+  pid=${FM_LOCK_HELD_PID:-}
   owner=
   if [ -L "$lockdir" ]; then
     owner=$(fm_lock_link_owner "$lockdir" 2>/dev/null || true)
@@ -270,23 +284,16 @@ fm_lock_try_acquire_guard() {
 }
 
 fm_lock_try_acquire() {
-  local lockdir=$1 pid steal cur rc steal_owner primary_owner
-  FM_LOCK_HELD_PID=
-  FM_LOCK_OWNER_DIR=
-
-  if fm_lock_try_create "$lockdir"; then
+  local lockdir=$1 pid steal cur rc steal_owner primary_owner preflight_status
+  if fm_lock_acquire_preflight "$lockdir"; then
     return 0
+  else
+    preflight_status=$?
   fi
-
-  pid=$(cat "$lockdir/pid" 2>/dev/null || true)
-  if fm_pid_alive "$pid"; then
-    FM_LOCK_HELD_PID=$pid
+  if [ "$preflight_status" -eq 1 ]; then
     return 1
   fi
-  if fm_lock_mid_acquire_is_fresh "$lockdir" "$pid"; then
-    FM_LOCK_HELD_PID=$pid
-    return 1
-  fi
+  pid=${FM_LOCK_HELD_PID:-}
 
   steal="$lockdir.steal"
   if ! fm_lock_try_acquire_guard "$steal"; then

@@ -315,7 +315,7 @@ publisher_is_current_channel_member() {  # <keychain|file> <relay> <channel> <ti
     "$relay" "$channel" "$timeout_ms" "$AUTHORITIES_FILE" "$STRICT_RELAY_AUTHORITY"
 }
 
-refuse_rotation_for_current_membership() {  # <keychain|file> <public-key> <target-hex> <relay> <channel>
+check_rotation_target_membership() {  # <keychain|file> <public-key> <target-hex> <relay> <channel>
   local store=$1 public=$2 target_hex=$3 relay=$4 channel=$5 check check_key
   [ -n "$public" ] || return 0
   check_key="$public"$'\t'"$relay"$'\t'"$channel"
@@ -326,18 +326,42 @@ refuse_rotation_for_current_membership() {  # <keychain|file> <public-key> <targ
     "$store" "$relay" "$channel" "$rotation_timeout" 2>&1)
   check_status=$?
   if [ "$check_status" -ne 0 ]; then
-    printf 'fm-buzz-keypair.sh: could not verify current membership for target %s, relay %s, channel %s: %s; nothing was rotated\n' \
-      "$target_hex" "$relay" "$channel" "$check" >&2
-    return 1
+    rotation_membership_errors="${rotation_membership_errors:+$rotation_membership_errors
+}fm-buzz-keypair.sh: could not verify current membership for target $target_hex, relay $relay, channel $channel: $check; nothing was rotated"
+    return 0
   fi
   [ "$check" = "member" ] || return 0
-  printf 'fm-buzz-keypair.sh: outgoing publisher target %s has current membership on relay %s, channel %s; nothing was rotated\n' \
-    "$target_hex" "$relay" "$channel" >&2
+  rotation_membership_blockers="${rotation_membership_blockers:+$rotation_membership_blockers
+}$target_hex"$'\t'"$relay"$'\t'"$channel"
+}
+
+report_rotation_membership_results() {
+  local target_hex relay channel
+  [ -n "$rotation_membership_errors" ] && printf '%s\n' "$rotation_membership_errors" >&2
+  if [ -z "$rotation_membership_blockers" ]; then
+    [ -z "$rotation_membership_errors" ]
+    return
+  fi
+  while IFS=$'\t' read -r target_hex relay channel; do
+    [ -n "$target_hex" ] || continue
+    printf 'fm-buzz-keypair.sh: outgoing publisher target %s has current membership on relay %s, channel %s; nothing was rotated\n' \
+      "$target_hex" "$relay" "$channel" >&2
+  done <<EOF
+$rotation_membership_blockers
+EOF
   printf '%s\n' 'Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity.' >&2
-  printf '%s\n' 'If this relay or channel is truly retired, run this full recovery sequence:' >&2
+  printf '%s\n' 'If these relays or channels are truly retired, run this full recovery sequence:' >&2
   printf '%s\n' '  docker compose -f docker-compose.buzz-loopback.yml down -v' >&2
-  printf '  fm-buzz-keypair.sh --forget-target %s\n' "$target_hex" >&2
-  printf '  fm-buzz-keypair.sh --forget-relay-identity %s\n' "$relay" >&2
+  while IFS= read -r target_hex; do
+    [ -n "$target_hex" ] && printf '  fm-buzz-keypair.sh --forget-target %s\n' "$target_hex" >&2
+  done <<EOF
+$(printf '%s\n' "$rotation_membership_blockers" | cut -f1 | awk '!seen[$0]++')
+EOF
+  while IFS= read -r relay; do
+    [ -n "$relay" ] && printf '  fm-buzz-keypair.sh --forget-relay-identity %s\n' "$relay" >&2
+  done <<EOF
+$(printf '%s\n' "$rotation_membership_blockers" | cut -f2 | awk '!seen[$0]++')
+EOF
   printf '%s\n' '  fm-buzz-keypair.sh --rotate' >&2
   printf '%s\n' 'Reference: https://github.com/block/buzz/blob/main/ARCHITECTURE.md' >&2
   printf '%s\n' 'Reference: https://github.com/block/buzz/blob/main/NOSTR.md' >&2
@@ -349,8 +373,8 @@ check_rotation_targets_for_store() {  # <keychain|file> <public-key>
   while IFS=$'\t' read -r target_hex target_public target_relay target_channel; do
     [ -n "$target_public" ] || continue
     [ "$target_public" = "$public" ] || continue
-    refuse_rotation_for_current_membership \
-      "$store" "$public" "$target_hex" "$target_relay" "$target_channel" || return 1
+    check_rotation_target_membership \
+      "$store" "$public" "$target_hex" "$target_relay" "$target_channel"
   done <<EOF
 $rotation_targets
 EOF
@@ -668,12 +692,15 @@ if [ "$ROTATE" -eq 1 ]; then
   fi
   rotation_timeout=${FM_BUZZ_TIMEOUT_MS:-15000}
   checked_rotation_targets=""
+  rotation_membership_errors=""
+  rotation_membership_blockers=""
   if [ -n "$keychain_public" ]; then
-    check_rotation_targets_for_store keychain "$keychain_public" || exit 1
+    check_rotation_targets_for_store keychain "$keychain_public"
   fi
   if [ -n "$file_public" ]; then
-    check_rotation_targets_for_store file "$file_public" || exit 1
+    check_rotation_targets_for_store file "$file_public"
   fi
+  report_rotation_membership_results || exit 1
 
   rotation_publics=()
   rotation_candidate_publics=$(printf '%s\n%s\n%s\n' "$recorded" "$keychain_public" "$file_public")
@@ -716,6 +743,11 @@ EOF
   if [ "$COMPROMISED" -eq 1 ] && [ -n "$recovery_reason" ]; then
     while IFS=$'\t' read -r _target_hex target_public _target_relay _target_channel; do
       [ -n "$target_public" ] || continue
+      implicated_public=0
+      for known_public in "${rotation_publics[@]}"; do
+        [ "$known_public" = "$target_public" ] && implicated_public=1
+      done
+      [ "$implicated_public" -eq 1 ] || continue
       [ "$target_public" = "$keychain_public" ] && continue
       [ "$target_public" = "$file_public" ] && continue
       seen_public=0

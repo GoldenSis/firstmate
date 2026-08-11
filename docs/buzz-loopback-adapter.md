@@ -153,8 +153,9 @@ With the relay stopped, `bin/fm-bearings-snapshot.sh --json`, `bin/fm-fleet-snap
 The exit-gate runs used an isolated `FM_HOME` rather than the live one.
 `bin/fm-session-start.sh` and `bin/fm-watch-arm.sh` were deliberately not run against the live home, because taking the session lock or arming a watcher would have disrupted the running fleet; their independence from Buzz follows from the structural check above.
 
-The automated suite runs against a stub relay (`tests/fm-buzz-stub-relay.mjs`) rather than the real stack, so it passes on a CI runner with no Docker.
+The default automated lane runs against a stub relay (`tests/fm-buzz-stub-relay.mjs`) so it passes on a CI runner with no Docker.
 The stub verifies every event's id and Schnorr signature before accepting it, so "the relay accepted it" is a real assertion rather than a stub agreeing with whatever it is sent.
+Setting `FM_BUZZ_DOCKER_INTEGRATION=1` enables the opt-in Compose relay signer-lifecycle regression on a Docker-capable host.
 
 ## Known limitations
 

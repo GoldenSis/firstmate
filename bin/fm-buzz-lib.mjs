@@ -17,11 +17,12 @@
 // rebuild events. The publisher's replay cache stores exact bytes for this reason.
 //
 // Scope note: this speaks only the subset of the protocol M1 needs - create a
-// private channel idempotently, publish append-only channel messages, and (for
-// human verification only) read events back. No canvas kind is implemented, by
-// invariant: Buzz canvases are a single mutable TEXT column overwritten with no
-// compare-and-set, so publishing state into one would silently clobber concurrent
-// captain edits. Append-only messages only.
+// private channel idempotently, publish append-only channel messages, read events
+// for human verification, and query authoritative membership state for safe key
+// rotation. No canvas kind is implemented, by invariant: Buzz canvases are a
+// single mutable TEXT column overwritten with no compare-and-set, so publishing
+// state into one would silently clobber concurrent captain edits. Append-only
+// messages only.
 
 import {
   schnorrSign,

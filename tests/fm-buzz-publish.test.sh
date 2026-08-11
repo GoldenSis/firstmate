@@ -5,9 +5,9 @@
 # replay, cache and quarantine safety, anonymous privacy diagnostics, official
 # BIP-340 vectors, and the fire-and-forget boundary.
 #
-# These run against tests/fm-buzz-stub-relay.mjs, not the real Buzz stack, so they
-# pass on a CI runner with no Docker. The real relay was exercised by hand for the
-# milestone's exit gate; see docs/buzz-loopback-adapter.md for that evidence.
+# The default lane uses tests/fm-buzz-stub-relay.mjs and needs no Docker.
+# FM_BUZZ_DOCKER_INTEGRATION=1 enables the opt-in Compose relay signer-lifecycle
+# regression; docs/buzz-loopback-adapter.md records the milestone evidence.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -710,6 +710,66 @@ EOF
   pass "rotation refuses an existing private channel before key mutation"
 }
 
+test_rotation_reports_every_membership_blocker() {
+  local home old keyfile private_before relay normalized_relay targets channel_a channel_b
+  local target_a target_b output code relay_instruction_count
+  home=$(make_home aggregate-membership-blockers)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "aggregate-membership keypair setup failed"
+  keyfile=$(key_file "$home" "$home/xdg")
+  private_before=$(cat "$keyfile")
+  channel_a="31313131-4242-5353-8464-757575757575"
+  channel_b="32323232-4343-5454-8565-767676767676"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  publish_membership_fixture "$relay" "$channel_a" "$old" \
+    || fail "could not seed the first blocking membership"
+  publish_membership_fixture "$relay" "$channel_b" "$old" \
+    || fail "could not seed the second blocking membership"
+  normalized_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
+    || fail "could not normalize the aggregate-membership relay"
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  node -e '
+    import(process.argv[2]).then(({ recordPublisherTarget }) => {
+      for (let index = 4; index < process.argv.length - 1; index += 2) {
+        recordPublisherTarget(process.argv[3], {
+          relay: process.argv[index],
+          channel_id: process.argv[index + 1],
+          publisher_pubkey: process.argv[process.argv.length - 1],
+        });
+      }
+    });
+  ' target-fixture "$ROOT/bin/fm-buzz-targets.mjs" "$targets" \
+    "$normalized_relay" "$channel_a" "$normalized_relay" "$channel_b" "$old" \
+    || fail "could not seed aggregate-membership targets"
+  target_a=$(node "$ROOT/bin/fm-buzz-targets.mjs" list-with-ids "$targets" \
+    | awk -F '\t' -v channel="$channel_a" '$4 == channel { print $1 }')
+  target_b=$(node "$ROOT/bin/fm-buzz-targets.mjs" list-with-ids "$targets" \
+    | awk -F '\t' -v channel="$channel_b" '$4 == channel { print $1 }')
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  stop_stub "$STUB_PID"
+  expect_code 1 "$code" "rotation with multiple blocking memberships"
+  assert_contains "$output" "target $target_a has current membership on relay $normalized_relay, channel $channel_a" \
+    "rotation refusal omitted the first blocking relay/channel pair"
+  assert_contains "$output" "target $target_b has current membership on relay $normalized_relay, channel $channel_b" \
+    "rotation refusal omitted the second blocking relay/channel pair"
+  assert_contains "$output" "--forget-target $target_a" \
+    "rotation refusal omitted the first target-retirement command"
+  assert_contains "$output" "--forget-target $target_b" \
+    "rotation refusal omitted the second target-retirement command"
+  relay_instruction_count=$(printf '%s\n' "$output" \
+    | grep -Fc -- "--forget-relay-identity $normalized_relay")
+  [ "$relay_instruction_count" = "1" ] \
+    || fail "rotation refusal did not deduplicate the shared relay-retirement command"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "aggregate membership refusal changed the recorded public key"
+  [ "$(cat "$keyfile")" = "$private_before" ] \
+    || fail "aggregate membership refusal changed the stored private key"
+  pass "rotation reports every membership blocker and complete retirement sequence"
+}
+
 test_publisher_target_overrides_are_recorded_and_guard_rotation() {
   local home relay label channel old keyfile private_before targets targets_before output code normalized_relay
   home=$(make_home tracked-rotation-target)
@@ -1228,7 +1288,8 @@ test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable() {
   # that worked - the stored private half is what settles it. And when neither
   # source can name the outgoing key, the rotation must STOP: the very next step
   # forgets the private half, after which nothing can derive that key again.
-  local home first second third history keyfile output code
+  local home first second third history keyfile output code targets artifact unrelated
+  local current_channel unrelated_channel current_relay unrelated_relay
   home=$(make_home rotate-unusable)
   history="$home/data/buzz-keypair.public-history"
   keyfile=$(key_file "$home" "$home/xdg")
@@ -1242,6 +1303,32 @@ test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable() {
   assert_no_grep "deadbeefdeadbeef" "$history" \
     "a truncated recorded file was recorded as though it were a key"
 
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  artifact="$home/data/buzz-compromised-unverifiable-pairs.jsonl"
+  unrelated=$(public_from_private "$(printf '%064d' 9)") \
+    || fail "could not derive the unrelated publisher fixture"
+  current_channel="19191919-2020-5151-8282-939393939393"
+  unrelated_channel="29292929-3030-5151-8282-949494949494"
+  current_relay="ws://localhost:3000/current-compromised"
+  unrelated_relay="ws://localhost:3000/unrelated-retired"
+  node -e '
+    import(process.argv[2]).then(({ recordPublisherTarget }) => {
+      recordPublisherTarget(process.argv[3], {
+        relay: process.argv[4],
+        channel_id: process.argv[5],
+        publisher_pubkey: process.argv[6],
+      });
+      recordPublisherTarget(process.argv[3], {
+        relay: process.argv[7],
+        channel_id: process.argv[8],
+        publisher_pubkey: process.argv[9],
+      });
+    });
+  ' target-fixture "$ROOT/bin/fm-buzz-targets.mjs" "$targets" \
+    "$current_relay" "$current_channel" "$second" \
+    "$unrelated_relay" "$unrelated_channel" "$unrelated" \
+    || fail "could not seed scoped compromised-recovery targets"
+  printf '%s\n' "$unrelated" >> "$history"
   printf '{"private_key": "unreadable"}\n' > "$keyfile"
   output=$(run_keypair "$home" --rotate 2>&1)
   code=$?
@@ -1266,6 +1353,18 @@ test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable() {
     "compromised recovery retained the unreadable outgoing key"
   assert_grep "$first" "$history" \
     "compromised recovery disturbed an earlier uncompromised retired key"
+  assert_grep "$unrelated" "$history" \
+    "compromised recovery purged an unrelated historical publisher"
+  jq -e --arg publisher "$unrelated" 'select(.publisher_pubkey == $publisher)' "$targets" >/dev/null \
+    || fail "compromised recovery retired an unrelated publisher target"
+  if jq -e --arg publisher "$second" 'select(.publisher_pubkey == $publisher)' "$targets" >/dev/null; then
+    fail "compromised recovery left the implicated publisher target active"
+  fi
+  jq -e --arg publisher "$second" 'select(.publisher_pubkey == $publisher)' "$artifact" >/dev/null \
+    || fail "compromised recovery did not record the implicated unverifiable target"
+  if jq -e --arg publisher "$unrelated" 'select(.publisher_pubkey == $publisher)' "$artifact" >/dev/null; then
+    fail "compromised recovery recorded an unrelated publisher as unverifiable"
+  fi
   pass "rotation refuses or recovers explicitly when private material is unusable"
 }
 
@@ -1866,6 +1965,30 @@ test_publisher_target_is_recorded_only_after_cache() {
   pass "publisher targets are recorded only after durable caching"
 }
 
+test_cache_cap_is_enforced_before_target_registry_failure() {
+  local home relay targets output code
+  home=$(make_home cache-cap-before-target-failure)
+  run_keypair "$home" >/dev/null 2>&1 || fail "cache-cap target-failure keypair setup failed"
+  relay="ws://127.0.0.1:1/cache-cap-target-failure"
+  printf '%s' '{"schema":"fm-bearings.v1","note":"cached-one"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  printf '%s' '{"schema":"fm-bearings.v1","note":"cached-two"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  [ "$(replay_count "$home")" = "2" ] || fail "cache-cap target-failure fixture did not seed two entries"
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  printf '%s\n' '{"relay":"ws://localhost:3000"}' > "$targets"
+
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"current-before-target-error"}' \
+    | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
+  code=$?
+  expect_code 0 "$code" "target-registry failure through the fire-and-forget wrapper"
+  assert_contains "$output" "publisher target registry" \
+    "the malformed target registry did not stop target recording"
+  [ "$(replay_count "$home")" = "1" ] \
+    || fail "a target-registry failure bypassed the replay cache cap"
+  pass "cache pruning precedes fallible publisher-target recording"
+}
+
 test_rotation_uses_the_authoritative_replay_cache_path() {
   local home relay channel old keyfile private cache_file cache_name output code
   home=$(make_home authoritative-replay-path)
@@ -2253,6 +2376,68 @@ EOF
   [ "$(cat "$payload")" = 'claimed-before-append-appended-through-open-fd' ] \
     || fail "quarantine discarded bytes appended through an already-open writer"
   pass "legacy quarantine retains the claimed inode for open writers"
+}
+
+test_quarantine_retry_reuses_link_stable_transaction_identity() {
+  local home replay legacy_dir legacy_file quarantine output manifests payloads staging
+  home=$(make_home quarantine-link-stable-retry)
+  run_keypair "$home" >/dev/null 2>&1 || fail "quarantine retry keypair setup failed"
+  replay="$home/state/buzz-replay"
+  legacy_dir="$replay/localhost%3A3000"
+  legacy_file="$legacy_dir/1700000000-$(printf '%064d' 6).json"
+  quarantine="$replay/_legacy-quarantine"
+  mkdir -p "$legacy_dir" "$quarantine/manifests" "$quarantine/payloads" \
+    "$quarantine/staging" "$quarantine/corrupt" "$quarantine/recovery-corrupt"
+  printf '%s' 'link-stable-quarantine-payload' > "$legacy_file"
+  node -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const { createHash } = require("node:crypto");
+    const replay = process.argv[1];
+    const source = process.argv[2];
+    const quarantine = process.argv[3];
+    const metadata = fs.lstatSync(source);
+    const originalPath = path.relative(replay, source);
+    const token = createHash("sha256").update(JSON.stringify({
+      original_path: originalPath,
+      device: metadata.dev,
+      inode: metadata.ino,
+      birthtime_ms: metadata.birthtimeMs,
+    })).digest("hex");
+    const transaction = path.join(quarantine, "staging", token);
+    fs.mkdirSync(transaction);
+    fs.writeFileSync(path.join(transaction, "origin.json"), JSON.stringify({
+      original_path: originalPath,
+      legacy_host: "localhost:3000",
+      original_timestamps: {
+        atime_ms: metadata.atimeMs,
+        mtime_ms: metadata.mtimeMs,
+        ctime_ms: metadata.ctimeMs,
+        birthtime_ms: metadata.birthtimeMs,
+      },
+      transaction_token: token,
+      payload_reference: path.join("payloads", token + ".json"),
+      source_device: metadata.dev,
+      source_inode: metadata.ino,
+      quarantine_reason: "legacy-cache-migration",
+      publisher_pubkey: null,
+    }));
+    fs.linkSync(source, path.join(transaction, "source"));
+  ' "$replay" "$legacy_file" "$quarantine" \
+    || fail "could not seed the interrupted hard-link quarantine transaction"
+
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"recover-link-stable-quarantine"}' \
+    | run_publish "$home" "ws://127.0.0.1:1/link-stable-quarantine" 2>&1)
+  assert_absent "$legacy_file" "quarantine retry left the already-claimed legacy source active"
+  manifests=$(find "$quarantine/manifests" -type f -name '*.json' | wc -l | tr -d ' ')
+  payloads=$(find "$quarantine/payloads" -type f -name '*.json' | wc -l | tr -d ' ')
+  staging=$(find "$quarantine/staging" -mindepth 1 -print -quit 2>/dev/null)
+  [ "$manifests" = "1" ] || fail "hard-link crash recovery duplicated the quarantine manifest"
+  [ "$payloads" = "1" ] || fail "hard-link crash recovery duplicated the quarantine payload"
+  [ -z "$staging" ] || fail "hard-link crash recovery left a staged transaction behind"
+  assert_contains "$output" "legacy replay quarantine: 1 entry(s)" \
+    "hard-link crash recovery did not report the single retained entry"
+  pass "quarantine retries reuse transaction identity after hard-link ctime changes"
 }
 
 test_quarantine_recovers_atomic_manifest_temporaries() {
@@ -4478,6 +4663,13 @@ test_quarantine_lifecycle_has_one_pinned_cache_owner() {
     "the quarantine owner does not document manifest identity"
   assert_grep "Startup first accounts for invalid recovery residue" "$ROOT/bin/fm-buzz-publish.mjs" \
     "the quarantine owner does not document recovery order"
+  assert_grep "Active entries live at <replay-root>/<endpoint-digest>/<created_at>-<event-id>.json" \
+    "$ROOT/bin/fm-buzz-publish.mjs" \
+    "the active-cache owner does not document its partition and entry layout"
+  assert_grep "query authoritative membership state for safe key" "$ROOT/bin/fm-buzz-lib.mjs" \
+    "the relay-client scope omits rotation membership queries"
+  assert_grep 'FM_BUZZ_DOCKER_INTEGRATION=1` enables the opt-in Compose' "$ROOT/docs/buzz-loopback-adapter.md" \
+    "the adapter guide does not distinguish the opt-in Docker lane"
   assert_no_grep "runLegacyQuarantineLifecycle" "$ROOT/bin/fm-buzz-publish.mjs" \
     "the publisher still delegates through the callback facade"
   pass "quarantine lifecycle and pinned mutations have one owner"
@@ -4507,6 +4699,7 @@ test_rotation_replaces_the_key_in_whichever_store_holds_it
 test_a_compromised_rotation_does_not_keep_the_retired_key
 test_rotation_refuses_or_quarantines_outgoing_pending_events
 test_rotation_refuses_an_existing_private_channel_before_mutation
+test_rotation_reports_every_membership_blocker
 test_publisher_target_overrides_are_recorded_and_guard_rotation
 test_publisher_target_updates_are_concurrent_and_fail_closed
 test_forget_target_attests_exact_retirement
@@ -4532,6 +4725,7 @@ test_public_key_history_is_normalized_consistently
 test_two_homes_sharing_one_xdg_get_separate_keys
 test_publish_with_relay_down_exits_zero_and_enqueues
 test_publisher_target_is_recorded_only_after_cache
+test_cache_cap_is_enforced_before_target_registry_failure
 test_rotation_uses_the_authoritative_replay_cache_path
 test_malformed_projection_is_rejected_before_signing
 test_refresh_preserves_the_snapshot_bytes_including_its_trailing_newline
@@ -4545,6 +4739,7 @@ test_relay_cache_partition_uses_the_normalized_complete_endpoint
 test_legacy_replay_entries_are_quarantined_with_a_manifest
 test_legacy_quarantine_claims_the_source_before_reading
 test_legacy_quarantine_retains_open_writer_appends
+test_quarantine_retry_reuses_link_stable_transaction_identity
 test_quarantine_recovers_atomic_manifest_temporaries
 test_quarantine_recovery_rejects_noncanonical_tokens
 test_invalid_quarantine_temporaries_are_accounted_for

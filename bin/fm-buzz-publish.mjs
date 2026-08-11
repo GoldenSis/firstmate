@@ -13,6 +13,11 @@
 // semantics. This engine owns active-cache and quarantine layout, mutation
 // order, validation, recovery, pruning, and relay outcomes because every
 // mutation must share the pinned cache-directory interface below.
+// Active entries live at <replay-root>/<endpoint-digest>/<created_at>-<event-id>.json,
+// where endpoint-digest is SHA-256 of the complete normalized relay endpoint.
+// A complete EVENT frame is cached atomically before target tracking or network
+// access, pruning is oldest-first across active partitions while protecting the
+// current event, and only a classified relay outcome removes a replay entry.
 //
 // Reads one JSON envelope on stdin so that neither the private key nor the
 // projection - which carries task ids, project names, blockers and PR URLs -
@@ -31,8 +36,8 @@
 // quarantine_reason, and publisher_pubkey, and records original timestamps,
 // quarantine time, plus observed content evidence when the payload is readable.
 // A lowercase SHA-256 token binds stable source provenance: original path,
-// device, inode, ctime, and birthtime for regular files, or mode for corrupt
-// partition nodes, without using access time.
+// device, inode, and birthtime for regular files, or mode for corrupt partition
+// nodes, without using access or link-mutated change time.
 // Startup first accounts for invalid recovery residue, then completes manifest
 // temporaries, staged regular files, and corrupt nodes before discovering new
 // legacy entries, and it reports every unsettled mutation as a cleanup failure.
@@ -367,9 +372,6 @@ function removeCacheFile(replayDir, file, description) {
   }
 }
 
-// Each normalized relay endpoint gets its own digest directory, with entries
-// named <created_at>-<id>.json. created_at is parsed back out for ordering rather than relying on
-// lexicographic sort, which would misorder the moment the epoch gains a digit.
 function relayCacheDirectory(replayDir, relay) {
   return path.join(replayDir, relayCacheKey(relay));
 }
@@ -883,7 +885,6 @@ function quarantineLegacyEntry(
     original_path: originalPath,
     device: metadata.dev,
     inode: metadata.ino,
-    ctime_ms: metadata.ctimeMs,
     birthtime_ms: metadata.birthtimeMs,
   })));
   const transactionDir = prepareCacheDirectory(stagingDir, transactionToken);
@@ -1487,12 +1488,12 @@ async function main() {
   // Cache the signed event before network access: from here on it survives a
   // crash, a kill, or a relay that is not running at all.
   const currentFile = cacheEvent(relayCacheDir, event);
+  const cacheMaintenance = pruneCache(cacheRoot, maxCache, currentFile);
   recordPublisherTarget(targetsFile, {
     relay,
     channel_id: channelId,
     publisher_pubkey: event.pubkey,
   });
-  const cacheMaintenance = pruneCache(cacheRoot, maxCache, currentFile);
   let cleanupFailures = cacheMaintenance.failed + legacyMigration.failures.length;
   log(`signed event ${event.id} (${Buffer.byteLength(content, "utf8")} bytes) for channel ${channelId}`);
 
