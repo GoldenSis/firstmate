@@ -26,3 +26,4 @@ run/**/*.log
 # public or private, is ever committed.
 state/buzz-replay/
 data/buzz-keypair.*
+data/buzz-publisher-targets.jsonl

@@ -47,6 +47,12 @@
 
 FM_BUZZ_KEYCHAIN_SERVICE=firstmate-buzz
 
+# Print the one per-home transaction lock shared by key management and publishing.
+fm_buzz_key_transaction_lock() {  # <data directory>
+  local data=${1:?data directory required}
+  printf '%s/.buzz-keypair.lock\n' "$data"
+}
+
 # The account label identifying this home's key inside the keychain.
 fm_buzz_key_account() {
   local home=${1:?home required}

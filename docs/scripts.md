@@ -92,3 +92,4 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-buzz-inspect.mjs`    | Read-back engine behind `fm-buzz-inspect.sh`; never consumed by firstmate            |
 | `fm-buzz-lib.mjs`        | NIP-01 event construction and the loopback Buzz relay client                          |
 | `fm-buzz-crypto.mjs`     | Dependency-free BIP-340 Schnorr signing over secp256k1 for the Buzz adapter          |
+| `fm-buzz-targets.mjs`    | Durable normalized relay/channel/publisher registry shared by publish and rotation    |

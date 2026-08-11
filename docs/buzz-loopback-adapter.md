@@ -126,12 +126,7 @@ docker run -i --rm -v /var/run/docker.sock:/var/run/docker.sock docker:cli \
 
 ## Idempotency, and why re-signing is the trap
 
-A NIP-01 event id is a SHA-256 over `[0, pubkey, created_at, kind, tags, content]`, so `created_at` is part of the event's identity.
-The relay dedupes on that id with `INSERT ... ON CONFLICT DO NOTHING`.
-The consequence is sharp: resubmitting the byte-identical signed event is perfectly idempotent, while rebuilding and re-signing the same logical message mints a new id and lands a duplicate.
-
-The replay cache therefore preserves exact signed bytes so retries keep one event id instead of creating duplicate logical messages.
-Caching before network delivery makes projection failures retryable, while partitioning by relay prevents queued projections from crossing relay boundaries.
+The header of `bin/fm-buzz-lib.mjs` owns the signed-event identity and byte-preserving replay contract.
 The header and implementation of `bin/fm-buzz-publish.mjs` own the exact cache layout, write ordering, validation, pruning, cleanup, acknowledgement classification, and late-authentication state machine.
 
 ## Verification evidence

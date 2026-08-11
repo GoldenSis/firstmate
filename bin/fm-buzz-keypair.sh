@@ -31,10 +31,10 @@
 # Rotation: Buzz documents no key-rotation procedure, so `--rotate` is this
 # adapter's. It clears BOTH stores - the keychain entry and the 0600 fallback
 # file - plus data/buzz-keypair.public, then mints a fresh keypair and prints the
-# new public key. Before mutation it checks the configured relay and refuses when
-# the outgoing publisher owns this home's existing private channel, because M1
-# has no membership-transfer operation. It never prints the private key, old or
-# new.
+# new public key. Before mutation it checks the default target and every used
+# relay/channel pair recorded by bin/fm-buzz-targets.mjs, refusing when the
+# outgoing publisher owns an existing private channel because M1 has no
+# membership-transfer operation. It never prints the private key, old or new.
 #
 # The retired PUBLIC key is appended to data/buzz-keypair.public-history first, so
 # events this home signed before the rotation stay attributable to it.
@@ -93,6 +93,7 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 PUBLIC_FILE="$DATA/buzz-keypair.public"
 HISTORY_FILE="$DATA/buzz-keypair.public-history"
+TARGETS_FILE="$DATA/buzz-publisher-targets.jsonl"
 PUBLIC_ONLY=0
 ROTATE=0
 COMPROMISED=0
@@ -144,7 +145,10 @@ if [ "$PUBLIC_ONLY" -eq 0 ]; then
   }
   # shellcheck source=bin/fm-wake-lib.sh
   . "$SCRIPT_DIR/fm-wake-lib.sh"
-  KEYPAIR_LOCK="$DATA/.buzz-keypair.lock"
+  KEYPAIR_LOCK=$(fm_buzz_key_transaction_lock "$DATA") || {
+    printf 'fm-buzz-keypair.sh: could not resolve the key transaction lock\n' >&2
+    exit 1
+  }
   fm_lock_acquire_wait "$KEYPAIR_LOCK"
   trap release_keypair_lock EXIT
   trap 'exit 1' HUP INT TERM
@@ -226,28 +230,42 @@ publisher_owns_private_channel() {  # <keychain|file> <relay> <channel> <timeout
   ' "$SCRIPT_DIR/fm-buzz-lib.mjs" "$relay" "$channel" "$timeout_ms"
 }
 
-refuse_rotation_for_owned_channel() {  # <keychain|file> <public-key>
-  local store=$1 public=$2 check
+refuse_rotation_for_owned_channel() {  # <keychain|file> <public-key> <relay> <channel>
+  local store=$1 public=$2 relay=$3 channel=$4 check check_key
   [ -n "$public" ] || return 0
-  case ",${checked_rotation_publishers:-}," in
-    *,"$public",*) return 0 ;;
-  esac
-  checked_rotation_publishers="${checked_rotation_publishers:+$checked_rotation_publishers,}$public"
+  check_key="$public"$'\t'"$relay"$'\t'"$channel"
+  printf '%s\n' "${checked_rotation_targets:-}" | grep -Fqx -- "$check_key" && return 0
+  checked_rotation_targets="${checked_rotation_targets:+$checked_rotation_targets
+}$check_key"
   check=$(publisher_owns_private_channel \
-    "$store" "$rotation_relay" "$rotation_channel" "$rotation_timeout" 2>&1)
+    "$store" "$relay" "$channel" "$rotation_timeout" 2>&1)
   check_status=$?
   if [ "$check_status" -ne 0 ]; then
     printf 'fm-buzz-keypair.sh: could not verify whether channel %s exists on %s: %s; nothing was rotated\n' \
-      "$rotation_channel" "$rotation_relay" "$check" >&2
+      "$channel" "$relay" "$check" >&2
     return 1
   fi
   [ "$check" = "owned" ] || return 0
-  printf 'fm-buzz-keypair.sh: channel %s already belongs to the outgoing publisher; nothing was rotated\n' \
-    "$rotation_channel" >&2
+  printf 'fm-buzz-keypair.sh: channel %s already belongs to the outgoing publisher on relay %s; nothing was rotated\n' \
+    "$channel" "$relay" >&2
   printf '%s\n' 'Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity.' >&2
   printf '%s\n' 'Reference: https://github.com/block/buzz/blob/main/ARCHITECTURE.md' >&2
   printf '%s\n' 'Reference: https://github.com/block/buzz/blob/main/NOSTR.md' >&2
   return 1
+}
+
+check_rotation_targets_for_store() {  # <keychain|file> <public-key>
+  local store=$1 public=$2 target_public target_relay target_channel
+  refuse_rotation_for_owned_channel \
+    "$store" "$public" "$rotation_relay" "$rotation_channel" || return 1
+  while IFS=$'\t' read -r target_public target_relay target_channel; do
+    [ -n "$target_public" ] || continue
+    [ "$target_public" = "$public" ] || continue
+    refuse_rotation_for_owned_channel \
+      "$store" "$public" "$target_relay" "$target_channel" || return 1
+  done <<EOF
+$rotation_targets
+EOF
 }
 
 record_public() {
@@ -440,19 +458,33 @@ if [ "$ROTATE" -eq 1 ]; then
     printf 'rotating compromised key: %s; no outgoing public key will be retained\n' "$recovery_reason" >&2
   fi
 
-  rotation_relay=${FM_BUZZ_RELAY:-ws://localhost:3000}
+  rotation_relay=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" normalize-relay \
+    "${FM_BUZZ_RELAY:-ws://localhost:3000}" 2>&1)
+  rotation_relay_status=$?
+  if [ "$rotation_relay_status" -ne 0 ]; then
+    printf 'fm-buzz-keypair.sh: configured relay is invalid: %s; nothing was rotated\n' \
+      "$rotation_relay" >&2
+    exit 1
+  fi
   rotation_timeout=${FM_BUZZ_TIMEOUT_MS:-15000}
   rotation_label=$(fm_buzz_key_account "$FM_HOME")
   rotation_channel=$(fm_buzz_channel_id "$SCRIPT_DIR" "$rotation_label") || {
     printf 'fm-buzz-keypair.sh: could not derive the channel id; nothing was rotated\n' >&2
     exit 1
   }
-  checked_rotation_publishers=""
+  rotation_targets=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" list "$TARGETS_FILE" 2>&1)
+  rotation_targets_status=$?
+  if [ "$rotation_targets_status" -ne 0 ]; then
+    printf 'fm-buzz-keypair.sh: could not validate %s: %s; nothing was rotated\n' \
+      "$TARGETS_FILE" "$rotation_targets" >&2
+    exit 1
+  fi
+  checked_rotation_targets=""
   if [ -n "$keychain_public" ]; then
-    refuse_rotation_for_owned_channel keychain "$keychain_public" || exit 1
+    check_rotation_targets_for_store keychain "$keychain_public" || exit 1
   fi
   if [ -n "$file_public" ]; then
-    refuse_rotation_for_owned_channel file "$file_public" || exit 1
+    check_rotation_targets_for_store file "$file_public" || exit 1
   fi
 
   # Settle the recorded-key set while the private half is still stored, and stop

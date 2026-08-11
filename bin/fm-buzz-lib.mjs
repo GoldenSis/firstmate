@@ -47,7 +47,7 @@ export function normalizeRelayEndpoint(relay) {
   try {
     url = new URL(relay);
   } catch {
-    throw new Error(`invalid relay URL: ${relay}`);
+    throw new Error("invalid relay URL");
   }
   if (url.protocol !== "ws:" && url.protocol !== "wss:") {
     throw new Error(`invalid relay protocol: ${url.protocol}`);

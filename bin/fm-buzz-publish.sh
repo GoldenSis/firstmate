@@ -34,8 +34,9 @@
 # through untouched rather than summarised or stripped.
 #
 # This script reads Firstmate state only through the snapshot's read-only command,
-# writes signed projections to Buzz, and maintains local replay and legacy-
-# quarantine state under state/buzz-replay. It never reads Buzz into Firstmate
+# writes signed projections to Buzz, maintains local replay and legacy-
+# quarantine state under state/buzz-replay, and records used publisher targets
+# under data/buzz-publisher-targets.jsonl. It never reads Buzz into Firstmate
 # state. Buzz is a projection target, never a state source;
 # bin/fm-buzz-inspect.mjs is a human diagnostic and is not consumed here.
 #
@@ -78,6 +79,7 @@ TIMEOUT_MS=${FM_BUZZ_TIMEOUT_MS:-15000}
 MAX_CACHE=${FM_BUZZ_MAX_CACHE:-100}
 REFRESH=0
 REPLAY_DIR="$STATE/buzz-replay"
+TARGETS_FILE="$DATA/buzz-publisher-targets.jsonl"
 
 STDIN_TIMEOUT_S=${FM_BUZZ_STDIN_TIMEOUT_S:-30}
 PUBLISH_LOCK_TIMEOUT_S=${FM_BUZZ_LOCK_TIMEOUT_S:-30}
@@ -323,7 +325,11 @@ publish() {
     drop_stdin_spool
     return 1
   }
-  KEYPAIR_LOCK="$DATA/.buzz-keypair.lock"
+  KEYPAIR_LOCK=$(fm_buzz_key_transaction_lock "$DATA") || {
+    log "could not resolve publishing key ownership"
+    drop_stdin_spool
+    return 1
+  }
   acquire_bounded_lock "$KEYPAIR_LOCK"
   keypair_lock_status=$?
   if [ "$keypair_lock_status" -ne 0 ]; then
@@ -360,10 +366,12 @@ publish() {
     --arg relay "$RELAY" \
     --arg channelId "$channel" \
     --arg replayDir "$REPLAY_DIR" \
+    --arg targetsFile "$TARGETS_FILE" \
     --argjson timeoutMs "$TIMEOUT_MS" \
     --argjson maxCache "$MAX_CACHE" \
     '{privateKey:$privateKey, content:$content, relay:$relay, channelId:$channelId,
-      replayDir:$replayDir, timeoutMs:$timeoutMs, maxCache:$maxCache}' \
+      replayDir:$replayDir, targetsFile:$targetsFile,
+      timeoutMs:$timeoutMs, maxCache:$maxCache}' \
     | node "$SCRIPT_DIR/fm-buzz-publish.mjs"
   rc=$?
   fm_lock_release "$KEYPAIR_LOCK"
@@ -403,7 +411,7 @@ while [ "$#" -gt 0 ]; do
       awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
       exit 0
       ;;
-    *) log "ignoring unknown argument: $1" ;;
+    *) log "unknown argument: $1"; ARGUMENT_ERROR=1 ;;
   esac
   shift
 done

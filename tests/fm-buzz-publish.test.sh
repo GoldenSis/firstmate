@@ -79,6 +79,27 @@ run_inspect() {  # <home> <relay> [args...]
     "$INSPECT" --relay "$relay" "$@"
 }
 
+publish_signed_fixture() {  # <private-key> <relay> <channel> <note>
+  local private_key=$1 relay=$2 channel=$3 note=$4
+  printf '%s' "$private_key" | node -e '
+    let privateKey = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { privateKey += chunk; });
+    process.stdin.on("end", async () => {
+      const { buildBearingsEvent, withRelay } = await import(process.argv[1]);
+      const event = buildBearingsEvent(
+        process.argv[3],
+        JSON.stringify({ schema: "fm-bearings.v1", note: process.argv[4] }),
+        privateKey,
+      );
+      await withRelay(process.argv[2], privateKey, 8000, async (api) => {
+        const response = await api.publish(event);
+        if (response.accepted !== true) throw new Error(response.message);
+      });
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay" "$channel" "$note"
+}
+
 # Start the stub on an ephemeral port and echo "<pid> <url>".
 start_stub() {  # [stub args...]
   local out pid port line
@@ -518,6 +539,86 @@ EOF
   pass "rotation refuses an existing private channel before key mutation"
 }
 
+test_publisher_target_overrides_are_recorded_and_guard_rotation() {
+  local home relay label channel old keyfile private_before targets targets_before output code normalized_relay
+  home=$(make_home tracked-rotation-target)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "tracked-target keypair setup failed"
+  keyfile=$(key_file "$home" "$home/xdg")
+  private_before=$(cat "$keyfile")
+  label="non-default-private-channel"
+  channel=$(node -e '
+    import(process.argv[1]).then(({ channelIdForLabel }) => {
+      process.stdout.write(channelIdForLabel(process.argv[2]));
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$label") || fail "could not derive the tracked override channel"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"tracked-override"}' \
+    | run_publish "$home" "$relay" --channel-label "$label" >/dev/null 2>&1
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  assert_present "$targets" "publish did not create the publisher-target registry"
+  normalized_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
+    || fail "could not normalize the tracked relay"
+  jq -e \
+    --arg relay "$normalized_relay" \
+    --arg channel "$channel" \
+    --arg publisher "$old" \
+    'select(.relay == $relay and .channel_id == $channel and .publisher_pubkey == $publisher)' \
+    "$targets" >/dev/null \
+    || fail "publish did not persist the normalized relay/channel/publisher tuple"
+  targets_before=$(cat "$targets")
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  stop_stub "$STUB_PID"
+  expect_code 1 "$code" "rotation with a tracked non-default private channel"
+  assert_contains "$output" "channel $channel" \
+    "rotation refusal did not name the tracked override channel"
+  assert_contains "$output" "relay $normalized_relay" \
+    "rotation refusal did not name the tracked override relay"
+  assert_contains "$output" "Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity." \
+    "tracked-target refusal omitted the M1 membership explanation"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "tracked-target refusal changed the recorded public key"
+  [ "$(cat "$keyfile")" = "$private_before" ] \
+    || fail "tracked-target refusal changed the private key"
+  [ "$(cat "$targets")" = "$targets_before" ] \
+    || fail "tracked-target refusal changed the target registry"
+  pass "publisher target overrides are recorded and guard rotation"
+}
+
+test_publisher_target_updates_are_concurrent_and_fail_closed() {
+  local home relay publisher first second targets output code
+  home=$(make_home publisher-target-concurrency)
+  publisher=$(run_keypair "$home" 2>/dev/null) || fail "publisher-target concurrency setup failed"
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  (printf '%s' '{"schema":"fm-bearings.v1","note":"target-one"}' \
+    | run_publish "$home" "$relay" --channel-label target-one >/dev/null 2>&1) &
+  first=$!
+  (printf '%s' '{"schema":"fm-bearings.v1","note":"target-two"}' \
+    | run_publish "$home" "$relay" --channel-label target-two >/dev/null 2>&1) &
+  second=$!
+  wait "$first" || fail "first concurrent target publish failed"
+  wait "$second" || fail "second concurrent target publish failed"
+  stop_stub "$STUB_PID"
+  [ "$(jq -s --arg publisher "$publisher" '[.[] | select(.publisher_pubkey == $publisher)] | length' "$targets")" = "2" ] \
+    || fail "concurrent publisher-target updates lost or duplicated a tuple"
+
+  printf '%s\n' '{"relay":"ws://localhost:3000"}' > "$targets"
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation with a malformed publisher-target registry"
+  assert_contains "$output" "could not validate $targets" \
+    "malformed publisher-target state did not fail closed"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$publisher" ] \
+    || fail "malformed publisher-target state allowed key mutation"
+  pass "publisher target updates serialize and malformed state fails closed"
+}
+
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable() {
   # data/buzz-keypair.public is a cache, not the authority. A half-written one
   # holds something that is not a key at all, and retaining that would leave a
@@ -878,10 +979,13 @@ test_key_record_replace_is_exact_destination() {
 }
 
 test_keypair_transactions_are_serialized_per_home() {
-  local home ready output holder worker waited current
+  local home ready output holder worker waited current lock
   home=$(make_home serialized-keypair)
   ready="$home/key-lock-ready"
   output="$home/keypair-output"
+  lock=$(bash -c '. "$1"; fm_buzz_key_transaction_lock "$2"' \
+    _ "$ROOT/bin/fm-buzz-key-lib.sh" "$home/data") \
+    || fail "could not resolve the shared key transaction lock"
 
   FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" bash -c '
     . "$1"
@@ -889,7 +993,7 @@ test_keypair_transactions_are_serialized_per_home() {
     : > "$3"
     sleep 1
     fm_lock_release "$2"
-  ' _ "$ROOT/bin/fm-wake-lib.sh" "$home/data/.buzz-keypair.lock" "$ready" &
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$lock" "$ready" &
   holder=$!
   waited=0
   while [ ! -e "$ready" ] && [ "$waited" -lt 100 ]; do
@@ -911,6 +1015,8 @@ test_keypair_transactions_are_serialized_per_home() {
   current=$(run_keypair "$home" --public 2>/dev/null) || fail "serialized keypair was unreadable"
   [ "$(tail -1 "$output")" = "$current" ] \
     || fail "serialized keypair output disagrees with its recorded identity"
+  ! grep -F '.buzz-keypair.lock' "$ROOT/bin/fm-buzz-keypair.sh" "$ROOT/bin/fm-buzz-publish.sh" >/dev/null \
+    || fail "a key transaction caller duplicated the lock-path contract"
   pass "keypair ensure, rotation, and withdrawal share one home transaction lock"
 }
 
@@ -1118,6 +1224,23 @@ test_credential_bearing_relays_are_rejected_before_signing_or_caching() {
       || fail "credential-bearing relay $relay created replay data"
   done
   pass "credential-bearing relays are rejected before signing or caching"
+}
+
+test_rotation_rejects_credential_relays_without_logging_credentials() {
+  local home old output code
+  home=$(make_home rotation-credential-redaction)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "rotation credential fixture setup failed"
+  output=$(FM_BUZZ_KEYPAIR_RELAY='ws://operator:super-secret@localhost:3000/private' \
+    run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation with a credential-bearing relay"
+  assert_contains "$output" "credential-bearing relay URLs are not supported" \
+    "rotation did not diagnose the unsupported credential-bearing relay"
+  assert_not_contains "$output" "operator" "rotation logged the relay username"
+  assert_not_contains "$output" "super-secret" "rotation logged the relay password"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "credential-bearing relay validation changed the publishing key"
+  pass "rotation rejects credential relays without logging credentials"
 }
 
 # --- (c) relay up ----------------------------------------------------------
@@ -1331,6 +1454,69 @@ EOF
   assert_contains "$output" "legacy replay quarantine: 1 entry(s)" \
     "the first staged quarantine transaction was not reported"
   pass "legacy quarantine atomically claims sources and preserves later bytes"
+}
+
+test_legacy_quarantine_retains_open_writer_appends() {
+  local home relay replay legacy_dir legacy_file quarantine payload
+  home=$(make_home legacy-quarantine-open-writer)
+  run_keypair "$home" >/dev/null 2>&1 || fail "legacy open-writer keypair setup failed"
+  replay="$home/state/buzz-replay"
+  legacy_dir="$replay/localhost%3A3000"
+  legacy_file="$legacy_dir/1700000000-$(printf '%064d' 7).json"
+  quarantine="$replay/_legacy-quarantine"
+  mkdir -p "$legacy_dir"
+  printf '%s' 'claimed-before-append' > "$legacy_file"
+  exec 9>> "$legacy_file"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"open-writer-quarantine"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  printf '%s' '-appended-through-open-fd' >&9
+  exec 9>&-
+  stop_stub "$STUB_PID"
+  payload=$(find "$quarantine/payloads" -type f -name '*.json' | head -1)
+  [ -n "$payload" ] || fail "open-writer quarantine did not retain a payload"
+  [ "$(cat "$payload")" = 'claimed-before-append-appended-through-open-fd' ] \
+    || fail "quarantine discarded bytes appended through an already-open writer"
+  pass "legacy quarantine retains the claimed inode for open writers"
+}
+
+test_quarantine_recovers_atomic_manifest_temporaries() {
+  local home relay replay quarantine payload content digest temporary final
+  home=$(make_home quarantine-temporary-recovery)
+  run_keypair "$home" >/dev/null 2>&1 || fail "quarantine temporary keypair setup failed"
+  replay="$home/state/buzz-replay"
+  quarantine="$replay/_legacy-quarantine"
+  mkdir -p "$quarantine/manifests" "$quarantine/payloads" "$quarantine/staging" "$quarantine/corrupt"
+  payload="$quarantine/payloads/recovered-payload.json"
+  content='legacy-payload-for-temporary-recovery'
+  printf '%s' "$content" > "$payload"
+  digest=$(node -e '
+    const { createHash } = require("node:crypto");
+    process.stdout.write(createHash("sha256").update(process.argv[1]).digest("hex"));
+  ' "$content")
+  temporary="$quarantine/manifests/recovered-manifest.json.4242.tmp"
+  final="$quarantine/manifests/recovered-manifest.json"
+  jq -n \
+    --arg digest "$digest" \
+    '{original_path:"localhost%3A3000/legacy.json",
+      legacy_host:"localhost:3000",
+      original_timestamps:{atime_ms:1,mtime_ms:2,ctime_ms:3,birthtime_ms:4},
+      content_sha256:$digest,
+      quarantine_timestamp:"2026-08-11T00:00:00.000Z",
+      payload_reference:"payloads/recovered-payload.json"}' > "$temporary"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"recover-manifest-temp"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  stop_stub "$STUB_PID"
+  assert_present "$final" "quarantine did not recover the atomic manifest temporary"
+  assert_absent "$temporary" "quarantine left the recovered manifest temporary behind"
+  [ "$(jq -r '.payload_reference' "$final")" = "payloads/recovered-payload.json" ] \
+    || fail "recovered quarantine manifest changed its payload reference"
+  pass "quarantine recovers current and historical atomic temporary names"
 }
 
 # --- (d) reconnect replays the identical event id --------------------------
@@ -1871,7 +2057,7 @@ test_publish_signing_is_serialized_with_compromised_rotation() {
   rotate_output="$home/rotation.out"
   old=$(run_keypair "$home" 2>/dev/null) || fail "publish-rotation keypair setup failed"
   read -r STUB_PID relay <<EOF
-$(start_stub)
+$(start_stub --reject "restricted: channel fixture stays uncreated")
 EOF
 
   (printf '%s' '{"schema":"fm-bearings.v1","note":"signed-before-compromised-rotation"}' \
@@ -1910,8 +2096,8 @@ EOF
 
   assert_contains "$(cat "$publish_output")" "signed event" \
     "the delayed projection was not signed under the protected transaction"
-  assert_contains "$(cat "$publish_output")" "delivered=1" \
-    "the delayed projection did not complete before rotation"
+  assert_contains "$(cat "$publish_output")" "retained=1" \
+    "the delayed projection was not durably cached before rotation"
   [ "$new" != "$old" ] || fail "compromised rotation did not replace the publishing identity"
   assert_not_contains "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null)" "$old" \
     "compromised rotation retained the protected outgoing identity"
@@ -1976,6 +2162,47 @@ test_replay_cache_rejects_symlink_boundaries() {
   [ "$(cat "$target")" = '{"outside":true}' ] \
     || fail "cache-entry cleanup mutated the symlink target"
   pass "replay cache mutations reject root, relay, and entry symlinks"
+}
+
+test_replay_cache_pins_the_root_before_mutation() {
+  local home replay held outside preload output
+  home=$(make_home replay-root-pin)
+  run_keypair "$home" >/dev/null 2>&1 || fail "replay-root pin keypair setup failed"
+  replay="$home/state/buzz-replay"
+  held="$home/state/buzz-replay-original"
+  outside="$home/outside-replay-root"
+  preload="$home/replay-root-swap.mjs"
+  mkdir -p "$replay" "$outside"
+  cat > "$preload" <<'EOF'
+import fs from "node:fs";
+import path from "node:path";
+import { syncBuiltinESMExports } from "node:module";
+
+const originalRealpathSync = fs.realpathSync;
+let swapped = false;
+fs.realpathSync = function guardedRealpathSync(value, ...args) {
+  const candidate = path.resolve(String(value));
+  const replayRoot = path.resolve(process.env.FM_TEST_REPLAY_ROOT);
+  if (!swapped && candidate === replayRoot) {
+    swapped = true;
+    fs.renameSync(replayRoot, process.env.FM_TEST_REPLAY_HELD);
+    fs.symlinkSync(process.env.FM_TEST_REPLAY_OUTSIDE, replayRoot, "dir");
+  }
+  return originalRealpathSync.call(fs, value, ...args);
+};
+syncBuiltinESMExports();
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"root-pin"}' \
+    | NODE_OPTIONS="--import=$preload" \
+      FM_TEST_REPLAY_ROOT="$replay" \
+      FM_TEST_REPLAY_HELD="$held" \
+      FM_TEST_REPLAY_OUTSIDE="$outside" \
+      run_publish "$home" ws://127.0.0.1:9 2>&1)
+  assert_contains "$output" "replay cache root identity changed" \
+    "a replay-root symlink swap was not diagnosed"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "a replay-root symlink swap redirected a cache mutation outside the pinned root"
+  pass "replay cache root identity is pinned before mutation"
 }
 
 test_partition_shaped_special_nodes_are_quarantined_and_unblocked() {
@@ -2371,6 +2598,25 @@ test_required_option_operands_are_not_consumed_as_flags() {
       "inspect option $option consumed the following flag as its value"
   done
   pass "publish and inspect reject missing option operands before shifting"
+}
+
+test_unknown_publish_options_are_safe_non_events() {
+  local home output code
+  home=$(make_home unknown-publish-option)
+  run_keypair "$home" >/dev/null 2>&1 || fail "unknown-option keypair setup failed"
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"must-not-publish"}' \
+    | run_publish "$home" ws://127.0.0.1:9 --relai ws://127.0.0.1:3000 2>&1)
+  code=$?
+  expect_code 0 "$code" "unknown publish option through the fire-and-forget wrapper"
+  assert_contains "$output" "unknown argument: --relai" \
+    "unknown publish option was not diagnosed"
+  assert_not_contains "$output" "signed event" \
+    "unknown publish option fell through to default publication"
+  [ "$(replay_count "$home")" = "0" ] \
+    || fail "unknown publish option created replay state"
+  assert_absent "$home/data/buzz-publisher-targets.jsonl" \
+    "unknown publish option recorded a publisher target"
+  pass "unknown publish options are logged safe non-events"
 }
 
 test_a_signalled_read_leaves_no_projection_in_temp() {
@@ -2870,17 +3116,26 @@ test_a_rotated_home_still_recognises_its_own_leaked_events() {
   # only the current key would make the probe answer INCONCLUSIVE over exactly the
   # leak it exists to catch - a false negative created by the home's own key
   # hygiene. The retired PUBLIC key is retained precisely so that cannot happen.
-  local home relay retired retired_upper rotated leaked
+  local home relay retired retired_private retired_upper rotated leaked channel label
   home=$(make_home rotated-breach)
   retired=$(run_keypair "$home" 2>/dev/null) || fail "keypair setup failed"
+  retired_private=$(sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' \
+    "$(key_file "$home" "$home/xdg")")
+  label=$(cd "$home" && pwd -P)
+  channel=$(node -e '
+    import(process.argv[1]).then(({ channelIdForLabel }) => {
+      process.stdout.write(channelIdForLabel(process.argv[2]));
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$label") || fail "could not derive the rotated fixture channel"
+  rotated=$(run_keypair "$home" --rotate 2>/dev/null) || fail "rotation failed"
+  [ "$rotated" != "$retired" ] || fail "rotation did not replace the key, so nothing here is under test"
 
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","note":"published-before-rotation"}' \
-    | run_publish "$home" "$relay" >/dev/null 2>&1
-  rotated=$(run_keypair "$home" --rotate 2>/dev/null) || fail "rotation failed"
-  [ "$rotated" != "$retired" ] || fail "rotation did not replace the key, so nothing here is under test"
+  publish_signed_fixture "$retired_private" "$relay" "$channel" "published-before-rotation" \
+    || fail "could not seed the pre-rotation signed event"
+  retired_private=""
   retired_upper=$(printf '%s' "$retired" | tr 'a-f' 'A-F')
   printf '  %s  \r\n' "$retired_upper" > "$home/data/buzz-keypair.public-history"
   leaked=$(run_inspect "$home" "$relay" --anonymous 2>&1)
@@ -2919,19 +3174,28 @@ test_forget_key_withdraws_an_already_retired_key() {
   # longer evidence of anything - anyone holding the leaked private half could
   # have minted it against a channel id that is not a secret - so the probe must
   # fall back to INCONCLUSIVE rather than report this home's own leak.
-  local home relay retired rotated history withdrawn after code
+  local home relay retired retired_private rotated history withdrawn after code label channel
   home=$(make_home forget-key)
   history="$home/data/buzz-keypair.public-history"
   retired=$(run_keypair "$home" 2>/dev/null) || fail "keypair setup failed"
+  retired_private=$(sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' \
+    "$(key_file "$home" "$home/xdg")")
+  label=$(cd "$home" && pwd -P)
+  channel=$(node -e '
+    import(process.argv[1]).then(({ channelIdForLabel }) => {
+      process.stdout.write(channelIdForLabel(process.argv[2]));
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$label") || fail "could not derive the withdrawal fixture channel"
+  rotated=$(run_keypair "$home" --rotate 2>/dev/null) || fail "rotation failed"
+  assert_grep "$retired" "$history" \
+    "the ordinary rotation did not retain the key the withdrawal is about"
 
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","note":"signed-by-the-leaked-key"}' \
-    | run_publish "$home" "$relay" >/dev/null 2>&1
-  rotated=$(run_keypair "$home" --rotate 2>/dev/null) || fail "rotation failed"
-  assert_grep "$retired" "$history" \
-    "the ordinary rotation did not retain the key the withdrawal is about"
+  publish_signed_fixture "$retired_private" "$relay" "$channel" "signed-by-the-leaked-key" \
+    || fail "could not seed the withdrawn-key event"
+  retired_private=""
 
   withdrawn=$(run_keypair "$home" --forget-key "$retired" 2>&1)
   code=$?
@@ -3095,6 +3359,8 @@ test_public_flag_fails_before_a_keypair_exists
 test_rotation_replaces_the_key_in_whichever_store_holds_it
 test_a_compromised_rotation_does_not_keep_the_retired_key
 test_rotation_refuses_an_existing_private_channel_before_mutation
+test_publisher_target_overrides_are_recorded_and_guard_rotation
+test_publisher_target_updates_are_concurrent_and_fail_closed
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable
 test_rotation_compares_the_recorded_key_with_stored_private_material
 test_rotation_detects_and_cleans_up_divergent_stores
@@ -3114,11 +3380,14 @@ test_refresh_preserves_the_snapshot_bytes_including_its_trailing_newline
 test_publish_without_a_keypair_still_exits_zero
 test_non_loopback_env_relay_is_rejected_before_network
 test_credential_bearing_relays_are_rejected_before_signing_or_caching
+test_rotation_rejects_credential_relays_without_logging_credentials
 test_publish_with_relay_up_delivers_and_lands
 test_relay_switch_does_not_replay_another_relays_cache
 test_relay_cache_partition_uses_the_normalized_complete_endpoint
 test_legacy_replay_entries_are_quarantined_with_a_manifest
 test_legacy_quarantine_claims_the_source_before_reading
+test_legacy_quarantine_retains_open_writer_appends
+test_quarantine_recovers_atomic_manifest_temporaries
 test_reconnect_replays_the_identical_event_id
 test_replaying_a_known_event_is_deduped_and_evicted
 test_an_unacknowledged_publish_does_not_starve_the_drain
@@ -3134,6 +3403,7 @@ test_concurrent_publishers_serialize_the_cache_lifecycle
 test_publish_lock_acquisition_is_validated_bounded_and_interruptible
 test_publish_signing_is_serialized_with_compromised_rotation
 test_replay_cache_rejects_symlink_boundaries
+test_replay_cache_pins_the_root_before_mutation
 test_partition_shaped_special_nodes_are_quarantined_and_unblocked
 test_replay_cache_never_reads_non_regular_entries
 test_relay_timeout_must_fit_the_node_timer_range
@@ -3146,6 +3416,7 @@ test_cache_prune_failures_are_reported_and_accounted_for
 test_a_writer_that_never_closes_does_not_hang_the_publish
 test_invalid_stdin_timeouts_are_rejected_before_reading
 test_required_option_operands_are_not_consumed_as_flags
+test_unknown_publish_options_are_safe_non_events
 test_a_signalled_read_leaves_no_projection_in_temp
 test_a_signalled_read_releases_the_callers_output
 test_fire_and_forget_contract_is_intact

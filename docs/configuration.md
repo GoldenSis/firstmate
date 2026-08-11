@@ -498,6 +498,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   <id>/report.md     scout task deliverable, written by the crewmate; survives teardown
   buzz-keypair.public  this home's loopback Buzz publishing PUBLIC key; LOCAL, gitignored; written by fm-buzz-keypair.sh, which never records the private half here (docs/buzz-loopback-adapter.md)
   buzz-keypair.public-history  public keys this home still trusts for pre-rotation event attribution, one per line; LOCAL, gitignored; exact lifecycle owned by fm-buzz-keypair.sh --help
+  buzz-publisher-targets.jsonl  used relay/channel/publisher tuples that protect private-channel membership during rotation; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs
 projects/            cloned repos; gitignored; READ-ONLY for you
 state/               volatile runtime signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth
