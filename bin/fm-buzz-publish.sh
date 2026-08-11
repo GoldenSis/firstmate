@@ -50,7 +50,7 @@
 #   fm-buzz-publish.sh --relay <url>   override the relay (default ws://localhost:3000)
 #   fm-buzz-publish.sh --channel-label <s>
 #                                      override the channel-derivation label
-#   fm-buzz-publish.sh --timeout <ms>  relay timeout (default 15000)
+#   fm-buzz-publish.sh --timeout <ms>  relay timeout, integer 1..2147483647 (default 15000)
 #   fm-buzz-publish.sh --help          this text
 #
 # Each publisher lock acquisition waits at most FM_BUZZ_LOCK_TIMEOUT_S seconds
@@ -63,6 +63,8 @@
 # to isolate whole-tree migration, per-channel delivery, signing, and rotation.
 #
 # Relay host note: the default is ws://localhost:3000, not ws://127.0.0.1:3000.
+# Relay URLs must use ws or wss, contain no credentials, and name 127.0.0.1,
+# localhost, or [::1].
 # Buzz resolves its tenant from the HTTP Host header and the bundled deployment
 # community is registered as `localhost:3000`, so a bare-IP Host is answered with
 # `relay: no community is configured for this host`. Both spellings are loopback;

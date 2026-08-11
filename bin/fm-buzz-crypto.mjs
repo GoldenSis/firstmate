@@ -29,7 +29,7 @@
 // --help owns the rotation, retention, membership, and recovery procedure.
 //
 // The exported surface is deliberately small: schnorrSign, schnorrVerify,
-// publicKeyFromPrivate, and the hex helpers the event layer needs.
+// generateKeypair, publicKeyFromPrivate, sha256, bytesToHex, and hexToBytes.
 // bin/fm-buzz-lib.mjs owns NIP-01 event construction on top of this.
 
 import { createHash, randomBytes } from "node:crypto";

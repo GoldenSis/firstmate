@@ -388,6 +388,10 @@ fm_buzz_key_store() {
 # it is removed the moment the replacement is stored and recorded. Custody lives
 # here rather than in bin/fm-buzz-keypair.sh so this file stays the single answer
 # to where a private key can be found.
+# The record also preserves its prepared-or-committable phase and its ordinary-or-
+# compromised rotation intent, so an interrupted retry cannot silently weaken a
+# compromised recovery. bin/fm-buzz-keypair.sh --help owns the operator decision
+# procedure for resuming it.
 fm_buzz_key_stage_file() {  # <data directory>
   local data=${1:?data directory required}
   printf '%s/.buzz-keypair.rotation-stage\n' "$data"

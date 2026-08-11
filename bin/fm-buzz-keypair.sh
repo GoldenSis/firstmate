@@ -95,10 +95,22 @@
 # private half - orphan recovery, out of a routine rotation. With the stage, the
 # next ordinary run finishes the replacement instead.
 #
+# The stage preserves both its prepared-or-committable phase and its ordinary-or-
+# compromised intent across retries. A prepared compromised rotation resumes only
+# with `--rotate --compromised`; a prepared ordinary rotation may be upgraded by
+# adding `--compromised` before retirement. Once an ordinary stage is committable,
+# its outgoing key has already been retained: finish it with `--rotate`, then use
+# `--forget-key` if that retired key must be withdrawn after a later disclosure.
+#
 # The outgoing key is only accepted as 64 lowercase hex characters. data/
 # buzz-keypair.public is a cache, not the authority: every rotation derives the
 # public half from the still-stored private key and compares the recorded value
 # when one exists.
+# A missing current key is not a clean slate when publisher-target records or any
+# active, legacy, quarantined, or interrupted replay entry still provides identity
+# evidence. An ordinary ensure refuses to mint over that evidence and requires
+# explicit `--rotate --compromised` recovery; unreadable or inconsistent evidence
+# also fails closed instead of being ignored.
 # Compromised recovery that cannot authenticate a recorded identity's tracked
 # memberships records every affected pair in
 # data/buzz-compromised-unverifiable-pairs.jsonl before replacing the key.
