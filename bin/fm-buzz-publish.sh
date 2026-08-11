@@ -2,7 +2,7 @@
 # fm-buzz-publish.sh - publish one bearings projection to the loopback Buzz relay.
 #
 # ============================ FIRE-AND-FORGET ==============================
-# RUNTIME PUBLISH FAILURES EXIT 0. PREREQUISITE AND INPUT-CONTRACT FAILURES EXIT NON-ZERO.
+# RUNTIME PUBLISH FAILURES EXIT 0. MISSING PYTHON 3 AND INPUT-CONTRACT FAILURES EXIT NON-ZERO.
 #
 # Every failure path - relay down, connection refused, timeout, NIP-42 auth
 # failure, event rejected, signing error, missing keypair, missing node or its
@@ -55,6 +55,8 @@
 #
 # Each publisher lock acquisition waits at most FM_BUZZ_LOCK_TIMEOUT_S seconds
 # (default 30).
+# Projection input is capped at FM_BUZZ_MAX_PROJECTION_BYTES bytes (default and
+# hard ceiling 1048576); an oversized projection is rejected before signing.
 # Invalid deadlines, acquisition timeouts, and interrupted waits are logged and
 # converted to the same exit-0 non-event as every other publishing failure.
 # bin/fm-buzz-key-lib.sh owns the lock ordering and phase-boundary contract used
@@ -90,6 +92,7 @@ REPLAY_DIR=$(fm_buzz_replay_cache_dir "$STATE") || {
 TARGETS_FILE="$DATA/buzz-publisher-targets.jsonl"
 
 STDIN_TIMEOUT_S=${FM_BUZZ_STDIN_TIMEOUT_S:-30}
+MAX_PROJECTION_BYTES=${FM_BUZZ_MAX_PROJECTION_BYTES:-1048576}
 PUBLISH_LOCK_TIMEOUT_S=${FM_BUZZ_LOCK_TIMEOUT_S:-30}
 
 log() {
@@ -144,6 +147,49 @@ validate_projection_contract() {
     log "the projection field omitted must be an array of {surface,reveal} non-empty strings"
     return 1
   }
+}
+
+validate_projection_json() {
+  local projection=$1 duplicate rc
+  duplicate=$(python3 - "$projection" <<'PY'
+import json
+import sys
+
+
+class DuplicateKey(Exception):
+    pass
+
+
+def reject_duplicate_keys(pairs):
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            print(json.dumps(key, ensure_ascii=True))
+            raise DuplicateKey
+        seen.add(key)
+    return dict(pairs)
+
+
+try:
+    with open(sys.argv[1], "rb") as projection:
+        json.load(
+            projection,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+        )
+except DuplicateKey:
+    raise SystemExit(42)
+except (OSError, UnicodeError, ValueError):
+    raise SystemExit(43)
+PY
+  )
+  rc=$?
+  case $rc in
+    0) return 0 ;;
+    42) log "the projection contains duplicate field $duplicate" ;;
+    *) log "the projection is not one valid JSON value; skipping publish" ;;
+  esac
+  return 1
 }
 
 # The projection spool holds the bearings projection - task ids, project names,
@@ -206,8 +252,8 @@ interrupt_publish() {
 trap drop_stdin_spool EXIT
 trap interrupt_publish INT TERM HUP
 
-# Spool stdin into the caller's file under a total deadline. Reports status only;
-# the caller owns the spool and reads it afterwards.
+# Spool stdin into the caller's file under a total deadline and byte limit.
+# Reports status only; the caller owns the spool and reads it afterwards.
 #
 # The spool path is the CALLER's, and this function is invoked as a plain command
 # rather than inside `$(...)`, both for the same reason: a command substitution
@@ -238,7 +284,20 @@ read_stdin_bounded() {  # <spool>
   local spool=$1 reader watchdog rc
   # Published to the script scope so the signal handler can reap it too; cleared
   # again below once `wait` has.
-  cat <&0 > "$spool" &
+  python3 -c '
+import sys
+
+output_path, maximum = sys.argv[1], int(sys.argv[2])
+written = 0
+with open(output_path, "wb", buffering=0) as output:
+    while written <= maximum:
+        chunk = sys.stdin.buffer.read(min(65536, maximum + 1 - written))
+        if not chunk:
+            break
+        output.write(chunk)
+        written += len(chunk)
+raise SystemExit(42 if written > maximum else 0)
+' "$spool" "$MAX_PROJECTION_BYTES" <&0 &
   STDIN_READER=$!
   reader=$STDIN_READER
   (
@@ -260,7 +319,7 @@ read_stdin_bounded() {  # <spool>
   return "$rc"
 }
 
-normalize_shell_timeout() {
+normalize_positive_integer() {
   local normalized=$1
   case $normalized in
     ''|*[!0-9]*) return 1 ;;
@@ -276,11 +335,16 @@ normalize_shell_timeout() {
 }
 
 validate_stdin_timeout() {
-  STDIN_TIMEOUT_S=$(normalize_shell_timeout "$STDIN_TIMEOUT_S") || return 1
+  STDIN_TIMEOUT_S=$(normalize_positive_integer "$STDIN_TIMEOUT_S") || return 1
+}
+
+validate_projection_byte_limit() {
+  MAX_PROJECTION_BYTES=$(normalize_positive_integer "$MAX_PROJECTION_BYTES") || return 1
+  [ "$MAX_PROJECTION_BYTES" -le 1048576 ]
 }
 
 validate_publish_lock_timeout() {
-  PUBLISH_LOCK_TIMEOUT_S=$(normalize_shell_timeout "$PUBLISH_LOCK_TIMEOUT_S") || return 1
+  PUBLISH_LOCK_TIMEOUT_S=$(normalize_positive_integer "$PUBLISH_LOCK_TIMEOUT_S") || return 1
 }
 
 acquire_bounded_lock() {  # <lock>
@@ -305,6 +369,7 @@ acquire_bounded_lock() {  # <lock>
 # Everything substantive runs inside this function so the tail of the script can
 # hold the single unconditional `exit 0` that the contract above demands.
 publish() {
+  local read_status projection_bytes
   case $MAX_CACHE in
     ''|0|*[!0-9]*|0*)
       log "invalid FM_BUZZ_MAX_CACHE value '$MAX_CACHE': expected a positive integer"
@@ -313,6 +378,10 @@ publish() {
   esac
   if ! validate_publish_lock_timeout; then
     log "FM_BUZZ_LOCK_TIMEOUT_S must be a positive integer no greater than 2147483647"
+    return 1
+  fi
+  if ! validate_projection_byte_limit; then
+    log "FM_BUZZ_MAX_PROJECTION_BYTES must be a positive integer no greater than 1048576"
     return 1
   fi
 
@@ -338,20 +407,35 @@ publish() {
       log "stdin is a terminal; pipe the projection in or use --refresh"
       return 1
     fi
-    if ! read_stdin_bounded "$STDIN_SPOOL"; then
+    read_stdin_bounded "$STDIN_SPOOL"
+    read_status=$?
+    if [ "$read_status" -ne 0 ]; then
       drop_stdin_spool
+      if [ "$read_status" -eq 42 ]; then
+        log "the projection exceeds FM_BUZZ_MAX_PROJECTION_BYTES (${MAX_PROJECTION_BYTES} bytes)"
+        return 2
+      fi
       log "could not read the projection from stdin within ${STDIN_TIMEOUT_S}s"
       return 1
     fi
+  fi
+  projection_bytes=$(wc -c < "$STDIN_SPOOL" | tr -d '[:space:]') || {
+    drop_stdin_spool
+    log "could not measure the projection"
+    return 1
+  }
+  if [ "$projection_bytes" -gt "$MAX_PROJECTION_BYTES" ]; then
+    drop_stdin_spool
+    log "the projection exceeds FM_BUZZ_MAX_PROJECTION_BYTES (${MAX_PROJECTION_BYTES} bytes)"
+    return 2
   fi
   [ -s "$STDIN_SPOOL" ] || {
     drop_stdin_spool
     log "the projection is empty; skipping publish"
     return 1
   }
-  jq -s -e 'length == 1' "$STDIN_SPOOL" >/dev/null 2>&1 || {
+  validate_projection_json "$STDIN_SPOOL" || {
     drop_stdin_spool
-    log "the projection is not one valid JSON value; skipping publish"
     return 2
   }
   validate_projection_contract "$STDIN_SPOOL" || {

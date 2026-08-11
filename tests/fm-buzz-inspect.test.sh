@@ -335,7 +335,7 @@ test_a_rotated_home_still_recognises_its_own_leaked_events() {
   # only the current key would make the probe answer INCONCLUSIVE over exactly the
   # leak it exists to catch - a false negative created by the home's own key
   # hygiene. The retired PUBLIC key is retained precisely so that cannot happen.
-  local home relay retired retired_private retired_upper rotated leaked channel label
+  local home relay retired retired_private retired_upper rotated leaked malformed channel label
   home=$(make_home rotated-breach)
   retired=$(run_keypair "$home" 2>/dev/null) || fail "keypair setup failed"
   retired_private=$(sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' \
@@ -358,7 +358,6 @@ EOF
   retired_upper=$(printf '%s' "$retired" | tr 'a-f' 'A-F')
   printf '  %s  \r\n' "$retired_upper" > "$home/data/buzz-keypair.public-history"
   leaked=$(run_inspect "$home" "$relay" --anonymous 2>&1)
-  stop_stub "$STUB_PID"
 
   assert_contains "$(tr 'A-F' 'a-f' < "$home/data/buzz-keypair.public-history")" "$retired" \
     "rotation dropped the retired public key instead of retaining it"
@@ -371,6 +370,15 @@ EOF
     "rotation blinded the probe to this home's own leaked content"
   assert_not_contains "$leaked" "INCONCLUSIVE" \
     "a leak of this home's own pre-rotation content is conclusive, not inconclusive"
+
+  printf '%s\n' 'not-a-public-key' >> "$home/data/buzz-keypair.public-history"
+  malformed=$(run_inspect "$home" "$relay" --anonymous 2>&1)
+  assert_contains "$malformed" "NOT this home's publisher" \
+    "the inspector partially trusted a malformed public-key history"
+  assert_contains "$malformed" "INCONCLUSIVE" \
+    "malformed public-key history expanded publisher attribution"
+  printf '%s\n' "$retired" > "$home/data/buzz-keypair.public-history"
+  stop_stub "$STUB_PID"
 
   # The recorded file is the cheap source of the outgoing key, not the only one:
   # once it is gone the stored private half is the last thing that can name what

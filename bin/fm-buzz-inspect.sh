@@ -118,34 +118,18 @@ CHANNEL=$(fm_buzz_channel_id "$SCRIPT_DIR" "$CHANNEL_LABEL") || {
 # another label is handled by declining a verdict, never by reading another home's
 # files.
 EXPECTED_AUTHORS=()
-collect_author() {  # <line>
-  local key
-  key=$(fm_buzz_normalize_public_key "$1") || return 0
-  EXPECTED_AUTHORS+=("$key")
-}
 current_file="$DATA/buzz-keypair.public"
-if [ -r "$current_file" ]; then
-  current_count=0
-  current_valid=1
-  current_key=""
-  while IFS= read -r author_line || [ -n "$author_line" ]; do
-    current_count=$((current_count + 1))
-    normalized=$(fm_buzz_normalize_public_key "$author_line") || {
-      current_valid=0
-      continue
-    }
-    current_key=$normalized
-  done < "$current_file"
-  if [ "$current_count" -eq 1 ] && [ "$current_valid" -eq 1 ]; then
-    collect_author "$current_key"
-  fi
+if current_key=$(fm_buzz_current_public_record_read "$current_file" 2>/dev/null); then
+  EXPECTED_AUTHORS+=("$current_key")
 fi
 
 history_file="$DATA/buzz-keypair.public-history"
-if [ -r "$history_file" ]; then
+if history=$(fm_buzz_public_history_read "$history_file" 2>/dev/null); then
   while IFS= read -r author_line || [ -n "$author_line" ]; do
-    collect_author "$author_line"
-  done < "$history_file"
+    [ -n "$author_line" ] && EXPECTED_AUTHORS+=("$author_line")
+  done <<EOF
+$history
+EOF
 fi
 
 KEY=""

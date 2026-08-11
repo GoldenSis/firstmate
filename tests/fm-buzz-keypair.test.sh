@@ -2497,6 +2497,64 @@ test_orphan_gate_validates_quarantine_manifest_variants() {
   pass "orphan inspection validates every null-publisher quarantine manifest variant"
 }
 
+test_orphan_gate_includes_signed_recovery_residue() {
+  local home relay private publisher channel seeded replay quarantine output code
+  home=$(make_home orphan-signed-recovery-residue)
+  relay="ws://127.0.0.1:1/signed-recovery-residue"
+  private=$(new_private_key) || fail "could not mint the recovery-residue publisher"
+  publisher=$(public_from_private "$private") \
+    || fail "could not derive the recovery-residue publisher"
+  channel=$(default_channel_id "$home")
+  seeded=$(seed_replay_event "$home" "$relay" "$private" 1700000000 "$channel" signed-residue) \
+    || fail "could not seed signed recovery-residue evidence"
+  replay="$home/state/buzz-replay"
+  quarantine="$replay/_legacy-quarantine"
+  # shellcheck disable=SC2016
+  node -e '
+    const fs = require("node:fs");
+    const { createHash } = require("node:crypto");
+    const [quarantine, source] = process.argv.slice(1);
+    const originalPath = "manifests/interrupted.json.tmp";
+    fs.mkdirSync(`${quarantine}/recovery-corrupt`, { recursive: true });
+    fs.mkdirSync(`${quarantine}/manifests`, { recursive: true });
+    const metadata = fs.statSync(source);
+    const token = createHash("sha256").update(JSON.stringify({
+      original_path: originalPath,
+      device: metadata.dev,
+      inode: metadata.ino,
+    })).digest("hex");
+    const payload = `${quarantine}/recovery-corrupt/${token}.invalid`;
+    fs.renameSync(source, payload);
+    fs.writeFileSync(`${quarantine}/manifests/${token}.json`, JSON.stringify({
+      original_path: originalPath,
+      legacy_host: null,
+      original_timestamps: {
+        atime_ms: metadata.atimeMs,
+        mtime_ms: metadata.mtimeMs,
+        ctime_ms: metadata.ctimeMs,
+        birthtime_ms: metadata.birthtimeMs,
+      },
+      quarantine_timestamp: new Date(0).toISOString(),
+      payload_reference: `recovery-corrupt/${token}.invalid`,
+      source_device: metadata.dev,
+      source_inode: metadata.ino,
+      corrupt_type: "invalid-quarantine-recovery-residue",
+      recovery_error: "fixture",
+    }, null, 2) + "\n");
+  ' "$quarantine" "$seeded" || fail "could not create signed recovery-residue evidence"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with signed recovery-residue evidence"
+  assert_contains "$output" "orphan identity evidence" \
+    "signed recovery residue did not block replacement identity creation"
+  assert_contains "$output" "$publisher" \
+    "signed recovery residue did not preserve its publisher identity"
+  assert_absent "$home/data/buzz-keypair.public" \
+    "signed recovery residue allowed a replacement identity"
+  pass "signed recovery residue preserves publisher identity"
+}
+
 test_orphan_gate_includes_recoverable_quarantine_staging() {
   local home relay private publisher channel seeded replay token transaction output code
   home=$(make_home orphan-quarantine-staging)
@@ -2831,6 +2889,7 @@ test_orphan_gate_inventories_signed_frames_inside_quarantined_directories
 test_orphan_gate_validates_quarantine_payloads_without_filename_trust
 test_orphan_gate_fails_closed_on_unreadable_quarantine_payloads
 test_orphan_gate_validates_quarantine_manifest_variants
+test_orphan_gate_includes_signed_recovery_residue
 test_orphan_gate_includes_recoverable_quarantine_staging
 test_orphan_identity_inspection_does_not_mutate_endpoint_replay
 test_publish_signing_is_serialized_with_compromised_rotation

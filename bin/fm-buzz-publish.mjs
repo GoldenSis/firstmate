@@ -18,8 +18,11 @@
 // where endpoint-digest is SHA-256 of the complete normalized relay endpoint and
 // channel-id is the exact canonical h tag. A complete EVENT frame is cached
 // atomically before target tracking or network access, pruning is oldest-first
-// within only the invoked channel partition while protecting the current event,
-// and only a classified relay outcome removes a replay entry. The only children
+// within only the invoked channel partition while protecting the current event.
+// Entries leave the active cache only after delivered or permanent relay outcomes,
+// explicit rotation quarantine, duplicate or invalid recovery cleanup, or
+// current-publisher cap pruning.
+// The only children
 // an endpoint partition may hold are canonical channel directories, entries
 // awaiting migration, and the `.json.tmp` half of an interrupted write; every
 // other child is quarantined as a corrupt partition node rather than skipped.
@@ -2349,7 +2352,6 @@ function quarantinedReplayPublisherEntries(cacheRoot) {
       evidence.push({ path: manifestFile, publisherPubkey: recorded });
       continue;
     }
-    if (retained.variant === "recovery-residue") continue;
     evidence.push(...quarantinedPayloadPublisherEntries(retained));
   }
   return evidence;

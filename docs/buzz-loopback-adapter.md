@@ -31,7 +31,7 @@ Each one is the reason a specific failure mode cannot occur, and breaching any o
 
    Loopback is not the same boundary as single-user, and the difference is worth stating rather than blurring.
    The relay runs open - no auth token, no membership enforcement - so any local process on this host, running as any user, can reach `127.0.0.1:3000` and publish.
-   The channel id is not a secret either: `channelIdForLabel` is a plain SHA-256 of the `FM_HOME` path, derived on purpose so a lost keypair cannot orphan the channel.
+   The channel id is not a secret either: `channelIdForLabel` hashes the UTF-8 string `firstmate-buzz-channel:<label>`, where the default label is the resolved `FM_HOME`, takes the first 16 bytes, and sets the UUID version and variant bits, derived on purpose so a lost keypair cannot orphan the channel.
    A local process that created the group first would own it and could read the bearings projections published into it.
    That is an accepted risk for a proof of concept on a single-user laptop with a disposable stack; the boundary actually being relied on is "no other local user", not "no remote party".
    Closing it means enforcing membership, which belongs to Milestone 2 along with the rest of channel membership management.

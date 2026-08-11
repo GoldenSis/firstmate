@@ -417,8 +417,9 @@ BUZZ_IMAGE=ghcr.io/block/buzz:main  # Compose-only relay image override; pin an 
 BUZZ_LOOPBACK_PORT=3000             # Compose-only host loopback port; when changed, set FM_BUZZ_RELAY=ws://localhost:<port> so publishing, inspection, and rotation address the same relay
 FM_BUZZ_RELAY=ws://localhost:3000   # loopback Buzz relay URL; only 127.0.0.1, localhost, and [::1] hosts are accepted, and the `localhost` spelling is load-bearing for the bundled relay's HTTP Host routing
 FM_BUZZ_TIMEOUT_MS=15000            # relay budget for each publish connection and rotation membership query; `fm-buzz-publish.sh --timeout` overrides it for publishing
-FM_BUZZ_MAX_CACHE=100               # positive-integer cap per relay/channel replay partition before its oldest signed events are dropped
+FM_BUZZ_MAX_CACHE=100               # best-effort total per relay/channel partition enforced by pruning current-publisher events; retained foreign-author and unreadable evidence may keep it above the limit
 FM_BUZZ_STDIN_TIMEOUT_S=30          # deadline for reading the projection on stdin; an expired read is discarded rather than published
+FM_BUZZ_MAX_PROJECTION_BYTES=1048576 # positive projection byte limit up to the fixed 1048576-byte ceiling; oversized input is rejected before signing or caching
 FM_BUZZ_LOCK_TIMEOUT_S=30           # deadline for each publisher lock acquisition; timeout and interruption remain logged exit-0 non-events
 FM_BUZZ_FORCE_FILE_STORE=           # set to 1 to select the 0600 fallback for normal loads and stores; rotation still inspects and clears every store per `fm-buzz-keypair.sh --help`
 FM_BUZZ_REQUIRE_PINNED_RELAY_AUTHORITY=0 # set to 1 to refuse rotation membership checks until the relay/channel signer is already pinned

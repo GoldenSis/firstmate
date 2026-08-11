@@ -152,6 +152,37 @@ fm_buzz_normalize_public_key() {
   printf '%s\n' "$key"
 }
 
+fm_buzz_current_public_record_read() {  # <file>
+  local file=${1:?public record required} record
+  [ -f "$file" ] || return 1
+  record=$(sed -n 1p "$file") || return 1
+  [ "${#record}" -eq 64 ] || return 1
+  case $record in *[!0-9a-f]*) return 1 ;; esac
+  printf '%s\n' "$record" | cmp -s - "$file" || return 1
+  printf '%s\n' "$record"
+}
+
+fm_buzz_public_history_read() {  # <file>
+  local file=${1:?public history required} raw line normalized history=""
+  if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+    return 0
+  fi
+  [ -f "$file" ] || return 1
+  raw=$(cat -- "$file") || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    normalized=$(fm_buzz_normalize_public_key "$line") || return 1
+    case $'\n'"$history"$'\n' in
+      *$'\n'"$normalized"$'\n'*) ;;
+      *) history="${history:+$history
+}$normalized" ;;
+    esac
+  done <<EOF
+$raw
+EOF
+  [ -z "$history" ] || printf '%s\n' "$history"
+}
+
 # The 0600 fallback file for hosts with no reachable keychain.
 #
 # The filename carries a digest of the home account, not a fixed name: two homes

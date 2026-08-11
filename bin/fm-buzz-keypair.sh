@@ -285,36 +285,6 @@ command -v node >/dev/null 2>&1 || {
   exit 1
 }
 
-read_history() {
-  local raw line normalized history=""
-  if [ ! -e "$HISTORY_FILE" ] && [ ! -L "$HISTORY_FILE" ]; then
-    return 0
-  fi
-  [ -f "$HISTORY_FILE" ] || return 1
-  raw=$(cat -- "$HISTORY_FILE") || return 1
-  while IFS= read -r line || [ -n "$line" ]; do
-    [ -n "$line" ] || continue
-    normalized=$(fm_buzz_normalize_public_key "$line") || return 1
-    case $'\n'"$history"$'\n' in
-      *$'\n'"$normalized"$'\n'*) ;;
-      *) history="${history:+$history
-}$normalized" ;;
-    esac
-  done <<EOF
-$raw
-EOF
-  [ -z "$history" ] || printf '%s\n' "$history"
-}
-
-read_current_public_record() {
-  local record
-  record=$(sed -n 1p "$PUBLIC_FILE") || return 1
-  [ "${#record}" -eq 64 ] || return 1
-  case $record in *[!0-9a-f]*) return 1 ;; esac
-  printf '%s\n' "$record" | cmp -s - "$PUBLIC_FILE" || return 1
-  printf '%s\n' "$record"
-}
-
 # Derive the public key from the stored private key without the private key ever
 # reaching a command line or this script's own output: it goes straight down a
 # pipe into node's stdin.
@@ -596,7 +566,7 @@ retain_public() {  # <retired public key>
   local retired=$1 merged
   [ -n "$retired" ] || return 0
   retired=$(fm_buzz_normalize_public_key "$retired") || return 1
-  merged=$(read_history) || return 1
+  merged=$(fm_buzz_public_history_read "$HISTORY_FILE") || return 1
   merged="${merged:+$merged
 }$retired"
   merged=$(printf '%s\n' "$merged" | awk 'NF && !seen[$0]++') || return 1
@@ -619,7 +589,7 @@ purge_public_set() {  # <public keys to withdraw...>
     esac
   done
   [ -n "$drops" ] || return 0
-  merged=$(read_history) || return 1
+  merged=$(fm_buzz_public_history_read "$HISTORY_FILE") || return 1
   merged=$(printf '%s\n' "$merged" | awk -v drops="$drops" '
     BEGIN {
       count = split(drops, keys, ",")
@@ -693,7 +663,7 @@ run_forget_key_operation() {
     exit 2
   }
 
-  history=$(read_history) || {
+  history=$(fm_buzz_public_history_read "$HISTORY_FILE") || {
     printf 'fm-buzz-keypair.sh: could not read %s; nothing was changed\n' "$HISTORY_FILE" >&2
     exit 1
   }
@@ -797,7 +767,7 @@ run_rotate_operation() {
   recorded=""
   recovery_reason=""
   if [ -e "$PUBLIC_FILE" ] || [ -L "$PUBLIC_FILE" ]; then
-    recorded=$(read_current_public_record 2>/dev/null) \
+    recorded=$(fm_buzz_current_public_record_read "$PUBLIC_FILE" 2>/dev/null) \
       || add_recovery_reason "the recorded public key in $PUBLIC_FILE is not exactly one canonical lowercase key"
   fi
   keychain_public=""

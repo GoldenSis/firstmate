@@ -202,6 +202,41 @@ test_malformed_projection_omitted_is_rejected_before_signing() {
   pass "malformed projection omitted is rejected before signing"
 }
 
+test_duplicate_projection_fields_are_rejected_before_signing() {
+  local home field projection output code
+  home=$(make_home duplicate-projection-fields)
+  run_keypair "$home" >/dev/null 2>&1 || fail "duplicate-field keypair setup failed"
+  while IFS='|' read -r field projection; do
+    output=$(printf '%s' "$projection" | run_publish "$home" "ws://127.0.0.1:1" 2>&1)
+    code=$?
+    expect_code 1 "$code" "projection with duplicate $field"
+    assert_contains "$output" "duplicate field \"$field\"" \
+      "duplicate $field was not identified"
+    assert_not_contains "$output" "signed event" "projection with duplicate $field was signed"
+    [ "$(replay_count "$home")" = "0" ] \
+      || fail "projection with duplicate $field entered the replay cache"
+  done <<'EOF'
+schema|{"schema":"untrusted","schema":"fm-bearings.v1","home":"test/home","generated":"2026-08-10T00:00:00Z","prs":"not_requested","in_flight":[],"omitted":[]}
+state|{"schema":"fm-bearings.v1","home":"test/home","generated":"2026-08-10T00:00:00Z","prs":"not_requested","in_flight":[{"id":"task-1","kind":"ship","state":null,"state":"running","doing":"testing"}],"omitted":[]}
+EOF
+  pass "duplicate projection fields are rejected recursively before signing"
+}
+
+test_oversized_projection_is_rejected_before_signing() {
+  local home output code
+  home=$(make_home oversized-projection)
+  run_keypair "$home" >/dev/null 2>&1 || fail "oversized-projection keypair setup failed"
+  output=$(test_projection "oversized-projection" \
+    | FM_BUZZ_MAX_PROJECTION_BYTES=128 run_publish "$home" "ws://127.0.0.1:1" 2>&1)
+  code=$?
+  expect_code 1 "$code" "projection over the configured byte limit"
+  assert_contains "$output" "exceeds FM_BUZZ_MAX_PROJECTION_BYTES (128 bytes)" \
+    "oversized projection did not identify the byte limit"
+  assert_not_contains "$output" "signed event" "oversized projection was signed"
+  [ "$(replay_count "$home")" = "0" ] || fail "oversized projection entered the replay cache"
+  pass "oversized projections are rejected before signing"
+}
+
 test_required_projection_fields_are_validated_before_signing() {
   local home field filter projection output code
   home=$(make_home required-projection-fields)
@@ -1334,6 +1369,8 @@ test_replayed_events_are_tracked_before_delivery
 test_malformed_projection_is_rejected_before_signing
 test_missing_projection_schema_is_rejected_before_signing
 test_malformed_projection_omitted_is_rejected_before_signing
+test_duplicate_projection_fields_are_rejected_before_signing
+test_oversized_projection_is_rejected_before_signing
 test_required_projection_fields_are_validated_before_signing
 test_refresh_preserves_the_snapshot_bytes_including_its_trailing_newline
 test_publish_without_a_keypair_still_exits_zero
