@@ -27,9 +27,9 @@ jobs:
   tests:
     name: Behavior tests
     runs-on: ubuntu-latest
-    # The suite should finish in ~2-3 minutes; this generous cap fails loudly on a
-    # hung watcher or tmux test instead of riding GitHub's 360-minute default.
-    timeout-minutes: 15
+    # Suite currently finishes near ~15 minutes on ubuntu-latest after Buzz M1
+    # coverage landed; keep a margin so growth fails on hangs, not wall-clock.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
         with:
