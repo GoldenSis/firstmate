@@ -972,34 +972,41 @@ EOF
   pass "cross-directory quarantine claims reject swapped source paths"
 }
 
-test_cross_directory_quarantine_directory_moves_pin_the_source() {
-  local home replay endpoint source held outside preload output sentinel
-  home=$(make_home quarantine-directory-source-swap)
-  run_keypair "$home" >/dev/null 2>&1 || fail "directory-source quarantine keypair setup failed"
+test_cross_directory_quarantine_directory_moves_pin_both_parents() {
+  local home replay endpoint source held outside preload output swap_log
+  home=$(make_home quarantine-directory-destination-swap)
+  run_keypair "$home" >/dev/null 2>&1 || fail "directory-destination quarantine keypair setup failed"
   replay="$home/state/buzz-replay"
   endpoint="$replay/$(printf '%064d' 7)"
   source="$endpoint/not-a-channel"
-  held="$home/held-endpoint"
-  outside="$home/outside-endpoint"
-  preload="$home/quarantine-directory-source-swap.mjs"
-  sentinel="$outside/not-a-channel/outside.txt"
-  mkdir -p "$source" "$(dirname "$sentinel")"
+  held="$home/held-quarantine-destination"
+  outside="$home/outside-quarantine-destination"
+  preload="$home/quarantine-directory-destination-swap.mjs"
+  swap_log="$home/quarantine-directory-destination-swap.log"
+  mkdir -p "$source" "$outside"
   printf '%s' 'original-directory' > "$source/original.txt"
-  printf '%s' 'outside-must-remain' > "$sentinel"
   cat > "$preload" <<'EOF'
 import path from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 
 const fs = createRequire(import.meta.url)("node:fs");
+const originalMkdirSync = fs.mkdirSync;
 const originalRenameSync = fs.renameSync;
 let swapped = false;
+function swapDestination(parent) {
+  if (swapped || !parent.includes(`${path.sep}_legacy-quarantine${path.sep}corrupt${path.sep}`)) return;
+  swapped = true;
+  originalRenameSync(parent, process.env.FM_TEST_CACHE_HELD);
+  fs.symlinkSync(process.env.FM_TEST_CACHE_OUTSIDE, parent, "dir");
+  fs.writeFileSync(process.env.FM_TEST_CACHE_SWAP_LOG, `${parent}\n`);
+}
+fs.mkdirSync = function guardedMkdirSync(directory, ...args) {
+  const absolute = path.resolve(String(directory));
+  if (path.basename(absolute) === "entry") swapDestination(path.dirname(absolute));
+  return originalMkdirSync.call(fs, directory, ...args);
+};
 fs.renameSync = function guardedRenameSync(source, destination, ...args) {
-  if (!swapped && path.basename(String(source)) === "not-a-channel") {
-    swapped = true;
-    const sourceParent = path.dirname(path.resolve(String(source)));
-    originalRenameSync(sourceParent, process.env.FM_TEST_CACHE_HELD);
-    fs.symlinkSync(process.env.FM_TEST_CACHE_OUTSIDE, sourceParent, "dir");
-  }
+  if (path.basename(String(source)) === "not-a-channel") swapDestination(path.dirname(path.resolve(String(destination))));
   return originalRenameSync.call(fs, source, destination, ...args);
 };
 syncBuiltinESMExports();
@@ -1008,15 +1015,16 @@ EOF
     | NODE_OPTIONS="--import=$preload" \
       FM_TEST_CACHE_HELD="$held" \
       FM_TEST_CACHE_OUTSIDE="$outside" \
+      FM_TEST_CACHE_SWAP_LOG="$swap_log" \
       run_publish "$home" "ws://127.0.0.1:1" 2>&1)
+  assert_present "$swap_log" "the destination-swap fixture did not exercise a directory move"
   assert_contains "$output" "cache directory identity changed" \
-    "a swapped directory source parent was not diagnosed"
-  assert_present "$sentinel" "a directory quarantine move consumed an external source"
-  [ "$(cat "$sentinel")" = "outside-must-remain" ] \
-    || fail "a directory quarantine move mutated an external source"
-  assert_absent "$outside/not-a-channel/original.txt" \
-    "a directory quarantine move followed the swapped external source"
-  pass "cross-directory directory moves keep their source parent pinned"
+    "a swapped directory destination parent was not diagnosed"
+  assert_absent "$outside/entry/original.txt" \
+    "a directory quarantine move followed the swapped external destination"
+  assert_present "$source/original.txt" \
+    "a rejected directory quarantine move removed the original source"
+  pass "cross-directory directory moves keep both parents pinned"
 }
 
 test_partition_shaped_special_nodes_are_quarantined_and_unblocked() {
@@ -1325,7 +1333,7 @@ test_replay_cache_rejects_symlink_boundaries
 test_replay_cache_pins_the_root_before_mutation
 test_replay_cache_pins_descendant_directories
 test_cross_directory_quarantine_claims_cannot_follow_swapped_sources
-test_cross_directory_quarantine_directory_moves_pin_the_source
+test_cross_directory_quarantine_directory_moves_pin_both_parents
 test_partition_shaped_special_nodes_are_quarantined_and_unblocked
 test_replay_cache_never_reads_non_regular_entries
 test_relay_timeout_must_fit_the_node_timer_range

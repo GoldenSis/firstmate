@@ -466,24 +466,34 @@ EOF
 }
 
 test_publisher_target_updates_are_concurrent_and_fail_closed() {
-  local home relay publisher first second targets output code
+  local home relay publisher first second targets output code channel_one channel_two
   home=$(make_home publisher-target-concurrency)
   publisher=$(run_keypair "$home" 2>/dev/null) || fail "publisher-target concurrency setup failed"
   targets="$home/data/buzz-publisher-targets.jsonl"
-  read -r STUB_PID relay <<EOF
-$(start_stub)
-EOF
-  (printf '%s' '{"schema":"fm-bearings.v1","note":"target-one"}' \
-    | run_publish "$home" "$relay" --channel-label target-one >/dev/null 2>&1) &
+  relay="ws://127.0.0.1:3001/concurrent-targets"
+  channel_one=$(channel_id_for_label target-one)
+  channel_two=$(channel_id_for_label target-two)
+  (FM_TEST_BUZZ_TARGET_UPDATE_DELAY_MS=750 node -e '
+    import(process.argv[2]).then(({ recordPublisherTarget }) => {
+      recordPublisherTarget(process.argv[3], {
+        publisher_pubkey: process.argv[4], relay: process.argv[5], channel_id: process.argv[6],
+      });
+    });
+  ' buzz-target-test "$ROOT/bin/fm-buzz-targets.mjs" "$targets" "$publisher" "$relay" "$channel_one") &
   first=$!
-  (printf '%s' '{"schema":"fm-bearings.v1","note":"target-two"}' \
-    | run_publish "$home" "$relay" --channel-label target-two >/dev/null 2>&1) &
+  (FM_TEST_BUZZ_TARGET_UPDATE_DELAY_MS=750 node -e '
+    import(process.argv[2]).then(({ recordPublisherTarget }) => {
+      recordPublisherTarget(process.argv[3], {
+        publisher_pubkey: process.argv[4], relay: process.argv[5], channel_id: process.argv[6],
+      });
+    });
+  ' buzz-target-test "$ROOT/bin/fm-buzz-targets.mjs" "$targets" "$publisher" "$relay" "$channel_two") &
   second=$!
   wait "$first" || fail "first concurrent target publish failed"
   wait "$second" || fail "second concurrent target publish failed"
-  stop_stub "$STUB_PID"
   [ "$(jq -s --arg publisher "$publisher" '[.[] | select(.publisher_pubkey == $publisher)] | length' "$targets")" = "2" ] \
     || fail "concurrent publisher-target updates lost or duplicated a tuple"
+  assert_absent "$targets.registry-lock" "publisher-target serialization left its lock behind"
 
   printf '%s\n' '{"relay":"ws://localhost:3000"}' > "$targets"
   output=$(run_keypair "$home" --rotate 2>&1)
@@ -1769,6 +1779,81 @@ EOF
   pass "publishing signs before compromised rotation can withdraw its key"
 }
 
+test_target_and_relay_retirement_wait_for_inflight_delivery() {
+  local home relay publisher channel target_hex publish_output forget_output publish_pid forget_pid waited
+  local relay_home relay_endpoint relay_channel relay_authority relay_output relay_publish delivery_lock code
+  home=$(make_home target-retirement-delivery)
+  publisher=$(run_keypair "$home" 2>/dev/null) || fail "target-retirement keypair setup failed"
+  channel=$(channel_id_for_label target-retirement-delivery)
+  publish_output="$home/target-retirement-publish.out"
+  forget_output="$home/target-retirement-forget.out"
+  read -r STUB_PID relay <<EOF
+$(start_stub --challenge --challenge-delay-ms 2000)
+EOF
+  (printf '%s' '{"schema":"fm-bearings.v1","note":"target-retirement-delivery"}' \
+    | FM_BUZZ_LOCK_TIMEOUT_S=5 run_publish "$home" "$relay" --channel-label target-retirement-delivery) \
+    > "$publish_output" 2>&1 &
+  publish_pid=$!
+  waited=0
+  while ! grep -F 'signed event' "$publish_output" >/dev/null 2>&1 && [ "$waited" -lt 400 ]; do
+    sleep 0.01
+    waited=$((waited + 1))
+  done
+  grep -F 'signed event' "$publish_output" >/dev/null 2>&1 || fail "target-retirement publish never reached delivery"
+  target_hex=$(node "$ROOT/bin/fm-buzz-targets.mjs" list-with-ids \
+    "$home/data/buzz-publisher-targets.jsonl" | awk -F '\t' -v channel="$channel" '$4 == channel {print $1}')
+  [ -n "$target_hex" ] || fail "target-retirement publish did not persist its target"
+  run_keypair "$home" --forget-target "$target_hex" > "$forget_output" 2>&1 &
+  forget_pid=$!
+  sleep 0.1
+  kill -0 "$forget_pid" 2>/dev/null || fail "target retirement did not wait for in-flight delivery"
+  wait "$publish_pid" || fail "target-retirement publish violated fire-and-forget"
+  wait "$forget_pid" || fail "target retirement failed after delivery completed"
+  stop_stub "$STUB_PID"
+  assert_not_contains "$(node "$ROOT/bin/fm-buzz-targets.mjs" list-with-ids "$home/data/buzz-publisher-targets.jsonl")" \
+    "$target_hex" "target retirement did not remove the exact delivered target"
+
+  relay_home=$(make_home relay-retirement-delivery)
+  run_keypair "$relay_home" >/dev/null 2>&1 || fail "relay-retirement keypair setup failed"
+  relay_channel=$(channel_id_for_label relay-retirement-delivery)
+  relay_authority=$(printf '%064d' 8)
+  relay_output="$relay_home/relay-retirement-publish.out"
+  read -r STUB_PID relay_endpoint <<EOF
+$(start_stub)
+EOF
+  node -e '
+    import(process.argv[2]).then(({ verifyOrRecordRelayAuthority }) => {
+      verifyOrRecordRelayAuthority(process.argv[3], {
+        relay: process.argv[4], channel_id: process.argv[5], signer_pubkey: process.argv[6],
+      }, { strict: false });
+    });
+  ' buzz-target-test "$ROOT/bin/fm-buzz-targets.mjs" "$relay_home/data/buzz-relay-authorities.jsonl" \
+    "$relay_endpoint" "$relay_channel" "$relay_authority" \
+    || fail "could not seed relay-retirement authority"
+  delivery_lock=$(delivery_lock_path "$relay_home" "$relay_endpoint" "$relay_channel")
+  (printf '%s' '{"schema":"fm-bearings.v1","note":"relay-retirement-delivery"}' \
+    | FM_TEST_BUZZ_TARGET_UPDATE_DELAY_MS=1500 FM_BUZZ_LOCK_TIMEOUT_S=5 \
+      run_publish "$relay_home" "$relay_endpoint" --channel-label relay-retirement-delivery) \
+    > "$relay_output" 2>&1 &
+  relay_publish=$!
+  waited=0
+  while [ ! -d "$delivery_lock" ] && [ "$waited" -lt 400 ]; do
+    sleep 0.01
+    waited=$((waited + 1))
+  done
+  [ -d "$delivery_lock" ] || fail "relay-retirement publish never acquired delivery ownership"
+  relay_output=$(run_keypair "$relay_home" --forget-relay-identity "$relay_endpoint" 2>&1)
+  code=$?
+  wait "$relay_publish" || fail "relay-retirement publish violated fire-and-forget"
+  stop_stub "$STUB_PID"
+  expect_code 1 "$code" "relay identity retirement during in-flight target persistence"
+  assert_contains "$relay_output" "publisher targets still exist" \
+    "relay identity retirement did not recheck targets after delivery"
+  assert_contains "$(cat "$relay_home/data/buzz-relay-authorities.jsonl")" "$relay_authority" \
+    "relay identity retirement removed an authority while delivery was in flight"
+  pass "target and relay identity retirement wait for in-flight delivery"
+}
+
 read -r ROTATION_GUARD_PID ROTATION_GUARD_RELAY <<EOF
 $(start_stub)
 EOF
@@ -1810,3 +1895,4 @@ test_rotation_stages_the_replacement_before_clearing_the_outgoing_key
 test_orphan_gate_sees_legacy_replay_publisher_evidence
 test_orphan_identity_inspection_does_not_mutate_endpoint_replay
 test_publish_signing_is_serialized_with_compromised_rotation
+test_target_and_relay_retirement_wait_for_inflight_delivery

@@ -215,6 +215,66 @@ function cacheWriteFileSync(file, ...args) {
   return withPinnedCacheDirectory(path.dirname(resolved), () => writeFileSync(path.basename(resolved), ...args));
 }
 
+function cacheMoveDirectoryTree(source, destination) {
+  const resolvedSource = path.resolve(source);
+  const resolvedDestination = path.resolve(destination);
+  const sourceMetadata = cacheLstatSync(resolvedSource);
+  if (sourceMetadata.isSymbolicLink() || !sourceMetadata.isDirectory()) {
+    throw new Error(`cache path ${resolvedSource} is not a regular directory`);
+  }
+  pinCacheDirectory(resolvedSource);
+  try {
+    const destinationMetadata = cacheLstatSync(resolvedDestination);
+    if (destinationMetadata.isSymbolicLink() || !destinationMetadata.isDirectory()) {
+      throw new Error(`cache path ${resolvedDestination} is not a regular directory`);
+    }
+    pinCacheDirectory(resolvedDestination);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    cacheMkdirSync(resolvedDestination, { mode: sourceMetadata.mode & 0o777 });
+  }
+
+  for (const name of cacheReaddirSync(resolvedSource)) {
+    const sourceEntry = path.join(resolvedSource, name);
+    const destinationEntry = path.join(resolvedDestination, name);
+    const entryMetadata = cacheLstatSync(sourceEntry);
+    if (entryMetadata.isDirectory() && !entryMetadata.isSymbolicLink()) {
+      cacheMoveDirectoryTree(sourceEntry, destinationEntry);
+      continue;
+    }
+    let destinationMetadata;
+    try {
+      destinationMetadata = cacheLstatSync(destinationEntry);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    if (destinationMetadata === undefined) {
+      cacheRenameSync(sourceEntry, destinationEntry);
+      continue;
+    }
+    if (entryMetadata.isSymbolicLink()) {
+      const sourceTarget = withPinnedCacheDirectory(
+        resolvedSource,
+        () => readlinkSync(path.basename(sourceEntry)),
+      );
+      const destinationTarget = withPinnedCacheDirectory(
+        resolvedDestination,
+        () => readlinkSync(path.basename(destinationEntry)),
+      );
+      if (!destinationMetadata.isSymbolicLink() || destinationTarget !== sourceTarget) {
+        throw new Error(`cross-directory cache move collision at ${resolvedDestination}`);
+      }
+    } else if (
+      destinationMetadata.dev !== entryMetadata.dev ||
+      destinationMetadata.ino !== entryMetadata.ino
+    ) {
+      throw new Error(`cross-directory cache move collision at ${resolvedDestination}`);
+    }
+    cacheUnlinkSync(sourceEntry);
+  }
+  cacheRmdirSync(resolvedSource);
+}
+
 function cacheRenameSync(source, destination) {
   const resolvedSource = path.resolve(source);
   const resolvedDestination = path.resolve(destination);
@@ -227,20 +287,10 @@ function cacheRenameSync(source, destination) {
     ));
   }
   const sourceMetadata = cacheLstatSync(resolvedSource);
-  // A directory cannot be hard-linked, so the link-then-verify-then-unlink route
-  // below is not available to it. It does not need it either: that route exists to
-  // keep an open writer's inode alive across the move, and only a file has one.
-  // rename(2) moves the directory inode itself and is atomic, so a crash leaves it
-  // at one end or the other, never at both.
+  // A directory cannot be hard-linked, so its children move through their pinned
+  // parents before the empty source directory is removed.
   if (sourceMetadata.isDirectory()) {
-    const moved = withPinnedCacheDirectory(destinationParent, () => (
-      withPinnedCacheDirectory(sourceParent, () => renameSync(
-        path.basename(resolvedSource),
-        resolvedDestination,
-      ))
-    ));
-    pinCacheDirectory(resolvedDestination);
-    return moved;
+    return cacheMoveDirectoryTree(resolvedSource, resolvedDestination);
   }
   if (sourceMetadata.isSymbolicLink()) {
     const target = withPinnedCacheDirectory(sourceParent, () => readlinkSync(path.basename(resolvedSource)));

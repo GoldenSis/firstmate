@@ -8,9 +8,8 @@
 // lowercase 64-character hex values.
 // A target's canonical selector is the lowercase SHA-256 digest of the exact
 // JSON.stringify() bytes of that normalized three-field object.
-// Callers hold fm_buzz_key_transaction_lock across every read or rewrite, so a
-// whole-file exact-destination replacement is atomic, concurrent publishes are
-// serialized, duplicate tuples collapse, and an earlier target is never lost.
+// Every mutation holds the registry's adjacent transaction lock while reading
+// and replacing the complete file, so concurrent publishers cannot lose a tuple.
 // Forgetting a selector removes only that object, and removes the registry file
 // when no targets remain because an existing empty registry is corrupt state.
 // Any malformed, non-regular, or symlinked existing registry fails closed.
@@ -38,7 +37,10 @@
 //   node bin/fm-buzz-targets.mjs retire-unverifiable TARGETS_FILE OUTPUT_FILE REASON PUBKEY...
 
 import {
+  closeSync,
+  fstatSync,
   lstatSync,
+  openSync,
   readFileSync,
   renameSync,
   unlinkSync,
@@ -51,6 +53,112 @@ import { normalizeRelayEndpoint } from "./fm-buzz-lib.mjs";
 
 const HEX_64 = /^[0-9a-f]{64}$/;
 const CHANNEL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const REGISTRY_LOCK_TIMEOUT_MS = 15000;
+const REGISTRY_LOCK_STALE_MS = 5000;
+const registryLockWaiter = new Int32Array(new SharedArrayBuffer(4));
+let registryTestDelayConsumed = false;
+
+function registryLockSleep(milliseconds) {
+  Atomics.wait(registryLockWaiter, 0, 0, milliseconds);
+}
+
+function registryLockOwnerAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function acquireRegistryLock(file) {
+  const lock = `${path.resolve(file)}.registry-lock`;
+  const deadline = Date.now() + REGISTRY_LOCK_TIMEOUT_MS;
+  for (;;) {
+    let descriptor;
+    try {
+      descriptor = openSync(lock, "wx", 0o600);
+      writeFileSync(descriptor, `${process.pid}\n`);
+      const metadata = fstatSync(descriptor);
+      return { descriptor, lock, dev: metadata.dev, ino: metadata.ino };
+    } catch (error) {
+      if (descriptor !== undefined) closeSync(descriptor);
+      if (error.code !== "EEXIST") throw error;
+    }
+
+    let metadata;
+    let owner;
+    try {
+      metadata = lstatSync(lock);
+      if (metadata.isSymbolicLink() || !metadata.isFile()) {
+        throw new Error(`registry lock ${lock} is not a regular file`);
+      }
+      const raw = readFileSync(lock, "utf8").trim();
+      owner = /^[1-9][0-9]*$/.test(raw) ? Number(raw) : null;
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      throw error;
+    }
+
+    if (!registryLockOwnerAlive(owner) && Date.now() - metadata.mtimeMs >= REGISTRY_LOCK_STALE_MS) {
+      const stale = `${lock}.${process.pid}.${Date.now()}.stale`;
+      try {
+        renameSync(lock, stale);
+        unlinkSync(stale);
+        continue;
+      } catch (error) {
+        if (error.code === "ENOENT") continue;
+        throw error;
+      }
+    }
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for registry lock ${lock}`);
+    registryLockSleep(10);
+  }
+}
+
+function releaseRegistryLock(held) {
+  try {
+    const descriptorMetadata = fstatSync(held.descriptor);
+    const pathMetadata = lstatSync(held.lock);
+    if (
+      pathMetadata.isSymbolicLink() ||
+      !pathMetadata.isFile() ||
+      descriptorMetadata.dev !== held.dev ||
+      descriptorMetadata.ino !== held.ino ||
+      pathMetadata.dev !== held.dev ||
+      pathMetadata.ino !== held.ino
+    ) {
+      throw new Error(`registry lock identity changed: ${held.lock}`);
+    }
+    unlinkSync(held.lock);
+  } finally {
+    closeSync(held.descriptor);
+  }
+}
+
+function withRegistryLocks(files, operation) {
+  const held = [];
+  try {
+    for (const file of [...new Set(files.map((value) => path.resolve(value)))].sort()) {
+      held.push(acquireRegistryLock(file));
+    }
+    return operation();
+  } finally {
+    for (let index = held.length - 1; index >= 0; index -= 1) releaseRegistryLock(held[index]);
+  }
+}
+
+function delayRegistryUpdateForTest() {
+  const raw = process.env.FM_TEST_BUZZ_TARGET_UPDATE_DELAY_MS;
+  if (raw === undefined || registryTestDelayConsumed) return;
+  const milliseconds = Number(raw);
+  if (!Number.isSafeInteger(milliseconds) || milliseconds < 0 || milliseconds > 5000) {
+    throw new Error("invalid FM_TEST_BUZZ_TARGET_UPDATE_DELAY_MS");
+  }
+  registryTestDelayConsumed = true;
+  registryLockSleep(milliseconds);
+}
 
 function normalizeHexIdentity(value, field) {
   if (typeof value !== "string") throw new Error(`${field} must be a string`);
@@ -201,23 +309,28 @@ function replaceRegistry(file, records, label) {
 
 export function recordPublisherTarget(file, value) {
   const target = normalizePublisherTarget(value);
-  const existing = readPublisherTargets(file);
-  const merged = canonicalTargets([...existing, target]);
-  if (merged.length === existing.length && existing.some((candidate) => targetIdentity(candidate) === targetIdentity(target))) {
+  return withRegistryLocks([file], () => {
+    const existing = readPublisherTargets(file);
+    delayRegistryUpdateForTest();
+    const merged = canonicalTargets([...existing, target]);
+    if (merged.length === existing.length && existing.some((candidate) => targetIdentity(candidate) === targetIdentity(target))) {
+      return target;
+    }
+    replaceRegistry(file, merged, "publisher target");
     return target;
-  }
-  replaceRegistry(file, merged, "publisher target");
-  return target;
+  });
 }
 
 export function forgetPublisherTarget(file, value) {
   const targetHex = normalizeTargetHex(value);
-  const existing = readPublisherTargets(file);
-  const matches = existing.filter((target) => publisherTargetHex(target) === targetHex);
-  if (matches.length !== 1) throw new Error(`publisher target ${targetHex} was not found`);
-  const remaining = existing.filter((target) => publisherTargetHex(target) !== targetHex);
-  replaceRegistry(file, remaining, "publisher target");
-  return matches[0];
+  return withRegistryLocks([file], () => {
+    const existing = readPublisherTargets(file);
+    const matches = existing.filter((target) => publisherTargetHex(target) === targetHex);
+    if (matches.length !== 1) throw new Error(`publisher target ${targetHex} was not found`);
+    const remaining = existing.filter((target) => publisherTargetHex(target) !== targetHex);
+    replaceRegistry(file, remaining, "publisher target");
+    return matches[0];
+  });
 }
 
 export function normalizeRelayAuthority(value) {
@@ -242,37 +355,41 @@ export function readRelayAuthorities(file) {
 export function verifyOrRecordRelayAuthority(file, value, options = {}) {
   const authority = normalizeRelayAuthority(value);
   if (typeof options.strict !== "boolean") throw new Error("relay authority strict mode must be boolean");
-  const existing = readRelayAuthorities(file);
-  const pinned = existing.find((candidate) => relayChannelIdentity(candidate) === relayChannelIdentity(authority));
-  if (pinned !== undefined) {
-    if (pinned.signer_pubkey !== authority.signer_pubkey) {
-      throw new Error(
-        `relay membership authority mismatch: expected ${pinned.signer_pubkey}, received ${authority.signer_pubkey}`,
-      );
+  return withRegistryLocks([file], () => {
+    const existing = readRelayAuthorities(file);
+    const pinned = existing.find((candidate) => relayChannelIdentity(candidate) === relayChannelIdentity(authority));
+    if (pinned !== undefined) {
+      if (pinned.signer_pubkey !== authority.signer_pubkey) {
+        throw new Error(
+          `relay membership authority mismatch: expected ${pinned.signer_pubkey}, received ${authority.signer_pubkey}`,
+        );
+      }
+      return { authority: pinned, recorded: false };
     }
-    return { authority: pinned, recorded: false };
-  }
-  if (options.strict) throw new Error("relay membership authority is not pinned in strict mode");
-  const merged = [...existing, authority]
-    .sort((left, right) => relayChannelIdentity(left).localeCompare(relayChannelIdentity(right)));
-  replaceRegistry(file, merged, "relay authority");
-  return { authority, recorded: true };
+    if (options.strict) throw new Error("relay membership authority is not pinned in strict mode");
+    const merged = [...existing, authority]
+      .sort((left, right) => relayChannelIdentity(left).localeCompare(relayChannelIdentity(right)));
+    replaceRegistry(file, merged, "relay authority");
+    return { authority, recorded: true };
+  });
 }
 
 export function forgetRelayIdentity(targetsFile, authoritiesFile, endpoint) {
   const relay = normalizeRelayEndpoint(endpoint);
-  const targets = readPublisherTargets(targetsFile).filter((target) => target.relay === relay);
-  if (targets.length > 0) {
-    const selectors = targets.map(publisherTargetHex).sort();
-    throw new Error(
-      `publisher targets still exist for relay ${relay}: ${selectors.join(", ")}`,
-    );
-  }
-  const existing = readRelayAuthorities(authoritiesFile);
-  const retiring = existing.filter((authority) => authority.relay === relay);
-  const remaining = existing.filter((authority) => authority.relay !== relay);
-  if (retiring.length > 0) replaceRegistry(authoritiesFile, remaining, "relay authority");
-  return { relay, removed: retiring };
+  return withRegistryLocks([targetsFile, authoritiesFile], () => {
+    const targets = readPublisherTargets(targetsFile).filter((target) => target.relay === relay);
+    if (targets.length > 0) {
+      const selectors = targets.map(publisherTargetHex).sort();
+      throw new Error(
+        `publisher targets still exist for relay ${relay}: ${selectors.join(", ")}`,
+      );
+    }
+    const existing = readRelayAuthorities(authoritiesFile);
+    const retiring = existing.filter((authority) => authority.relay === relay);
+    const remaining = existing.filter((authority) => authority.relay !== relay);
+    if (retiring.length > 0) replaceRegistry(authoritiesFile, remaining, "relay authority");
+    return { relay, removed: retiring };
+  });
 }
 
 export function normalizeCompromisedUnverifiablePair(value) {
@@ -309,18 +426,20 @@ export function readCompromisedUnverifiablePairs(file) {
 
 export function recordCompromisedUnverifiablePairs(file, values) {
   const incoming = values.map(normalizeCompromisedUnverifiablePair);
-  const existing = readCompromisedUnverifiablePairs(file);
-  const merged = new Map(existing.map((value) => [unverifiableIdentity(value), value]));
-  for (const value of incoming) {
-    const identity = unverifiableIdentity(value);
-    if (!merged.has(identity)) merged.set(identity, value);
-  }
-  const records = [...merged.values()].sort((left, right) =>
-    unverifiableIdentity(left).localeCompare(unverifiableIdentity(right)));
-  if (records.length !== existing.length) {
-    replaceRegistry(file, records, "compromised unverifiable pair");
-  }
-  return incoming;
+  return withRegistryLocks([file], () => {
+    const existing = readCompromisedUnverifiablePairs(file);
+    const merged = new Map(existing.map((value) => [unverifiableIdentity(value), value]));
+    for (const value of incoming) {
+      const identity = unverifiableIdentity(value);
+      if (!merged.has(identity)) merged.set(identity, value);
+    }
+    const records = [...merged.values()].sort((left, right) =>
+      unverifiableIdentity(left).localeCompare(unverifiableIdentity(right)));
+    if (records.length !== existing.length) {
+      replaceRegistry(file, records, "compromised unverifiable pair");
+    }
+    return incoming;
+  });
 }
 
 export function retirePublisherTargetsAsUnverifiable(targetsFile, outputFile, publisherPubkeys, reason) {
@@ -331,17 +450,27 @@ export function retirePublisherTargetsAsUnverifiable(targetsFile, outputFile, pu
     throw new Error("reason must be a nonempty trimmed string");
   }
   const publishers = new Set(publisherPubkeys.map((value) => normalizeHexIdentity(value, "publisher_pubkey")));
-  const existing = readPublisherTargets(targetsFile);
-  const retiring = existing.filter((target) => publishers.has(target.publisher_pubkey));
-  if (retiring.length === 0) return [];
-  const recordedAt = new Date().toISOString();
-  recordCompromisedUnverifiablePairs(
-    outputFile,
-    retiring.map((target) => ({ ...target, recorded_at: recordedAt, reason })),
-  );
-  const remaining = existing.filter((target) => !publishers.has(target.publisher_pubkey));
-  replaceRegistry(targetsFile, remaining, "publisher target");
-  return retiring;
+  return withRegistryLocks([targetsFile, outputFile], () => {
+    const existing = readPublisherTargets(targetsFile);
+    const retiring = existing.filter((target) => publishers.has(target.publisher_pubkey));
+    if (retiring.length === 0) return [];
+    const recordedAt = new Date().toISOString();
+    const incoming = retiring.map((target) => ({ ...target, recorded_at: recordedAt, reason }));
+    const recorded = readCompromisedUnverifiablePairs(outputFile);
+    const merged = new Map(recorded.map((value) => [unverifiableIdentity(value), value]));
+    for (const value of incoming) {
+      const identity = unverifiableIdentity(value);
+      if (!merged.has(identity)) merged.set(identity, value);
+    }
+    const records = [...merged.values()].sort((left, right) =>
+      unverifiableIdentity(left).localeCompare(unverifiableIdentity(right)));
+    if (records.length !== recorded.length) {
+      replaceRegistry(outputFile, records, "compromised unverifiable pair");
+    }
+    const remaining = existing.filter((target) => !publishers.has(target.publisher_pubkey));
+    replaceRegistry(targetsFile, remaining, "publisher target");
+    return retiring;
+  });
 }
 
 function usage() {

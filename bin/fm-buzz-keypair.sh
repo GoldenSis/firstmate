@@ -234,9 +234,9 @@ if [ "$PUBLIC_ONLY" -eq 0 ]; then
   trap 'exit 1' HUP INT TERM
   # Ordering is fm-buzz-key-lib.sh's contract: whole tree, then each queue, then
   # the key. Both the ensure and the rotate paths read - and migrate - the whole
-  # replay tree, so both take the first lock; only rotation mutates entries inside
-  # a queue, so only it takes the second. Holding the first for the whole run is
-  # what stops a queue appearing behind the enumeration below.
+  # replay tree, so both take the first lock. Rotation and explicit target or relay
+  # retirement wait for every delivery before changing identity state. Holding the
+  # first for the whole run stops a queue appearing behind the enumeration below.
   mkdir -p "$STATE" 2>/dev/null || {
     printf 'fm-buzz-keypair.sh: could not create %s\n' "$STATE" >&2
     exit 1
@@ -246,7 +246,7 @@ if [ "$PUBLIC_ONLY" -eq 0 ]; then
     exit 1
   }
   fm_lock_acquire_wait "$PUBLISH_LOCK"
-  if [ "$ROTATE" -eq 1 ]; then
+  if [ "$ROTATE" -eq 1 ] || [ "$TARGET_FORGETTING" -eq 1 ] || [ "$RELAY_IDENTITY_FORGETTING" -eq 1 ]; then
     for delivery_lock in "$STATE"/.buzz-replay-delivery-*.lock; do
       if [ ! -e "$delivery_lock" ] && [ ! -L "$delivery_lock" ]; then
         continue
