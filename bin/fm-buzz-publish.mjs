@@ -1459,10 +1459,22 @@ function quarantineLegacyEntries(replayDir) {
       continue;
     }
     if (name.endsWith(".json")) {
-      if (metadata.isFile()) candidates.push({ file: candidate, legacyHost: null });
-      else {
-        log(`legacy cache entry ${candidate} is not a regular file; left in place`);
-        failures.push(candidate);
+      if (metadata.isFile()) {
+        candidates.push({ file: candidate, legacyHost: null });
+      } else {
+        try {
+          quarantineCorruptPartitionNode(
+            replayDir,
+            quarantineDir,
+            corruptDir,
+            manifestsDir,
+            candidate,
+            metadata,
+          );
+        } catch (error) {
+          log(`could not quarantine unexpected replay cache path ${candidate}: ${error.message}`);
+          failures.push(candidate);
+        }
       }
       continue;
     }
@@ -1483,12 +1495,22 @@ function quarantineLegacyEntries(replayDir) {
       }
       continue;
     }
-    if (metadata.isSymbolicLink()) {
-      log(`rejected cache directory symlink ${candidate}`);
-      failures.push(candidate);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      try {
+        quarantineCorruptPartitionNode(
+          replayDir,
+          quarantineDir,
+          corruptDir,
+          manifestsDir,
+          candidate,
+          metadata,
+        );
+      } catch (error) {
+        log(`could not quarantine unexpected replay cache path ${candidate}: ${error.message}`);
+        failures.push(candidate);
+      }
       continue;
     }
-    if (!metadata.isDirectory()) continue;
     pinCacheDirectory(candidate);
     let legacyNames;
     try {
@@ -1499,13 +1521,21 @@ function quarantineLegacyEntries(replayDir) {
       continue;
     }
     const legacyHost = decodeLegacyHost(name);
-    for (const legacyName of legacyNames.filter((entry) => entry.endsWith(".json"))) {
+    for (const legacyName of legacyNames) {
       const legacyFile = path.join(candidate, legacyName);
       try {
-        if (cacheLstatSync(legacyFile).isFile()) candidates.push({ file: legacyFile, legacyHost });
-        else {
-          log(`legacy cache entry ${legacyFile} is not a regular file; left in place`);
-          failures.push(legacyFile);
+        const legacyMetadata = cacheLstatSync(legacyFile);
+        if (legacyMetadata.isFile()) {
+          candidates.push({ file: legacyFile, legacyHost });
+        } else {
+          quarantineCorruptPartitionNode(
+            replayDir,
+            quarantineDir,
+            corruptDir,
+            manifestsDir,
+            legacyFile,
+            legacyMetadata,
+          );
         }
       } catch (error) {
         if (error.code === "ENOENT") continue;
@@ -1743,28 +1773,37 @@ function activeReplayPublisherEntries(cacheRoot) {
 // exists to refuse. Read-only on purpose: this reports, it does not migrate.
 function legacyReplayPublisherEntries(cacheRoot) {
   const evidence = [];
+  const inspectedFiles = new Set();
   const collect = (directory) => {
-    const inventory = cacheEntries(directory);
-    if (inventory.failures.length > 0) {
-      throw new Error(`could not inspect legacy replay entries:\n${inventory.failures.map((file) => `  ${file}`).join("\n")}`);
+    let names;
+    try {
+      names = cacheReaddirSync(directory);
+    } catch (error) {
+      if (error.code === "ENOENT") return;
+      throw new Error(`could not inspect legacy replay directory ${directory}: ${error.message}`);
     }
-    for (const entry of inventory.entries) {
-      if (entry.malformed) throw new Error(`legacy replay entry ${entry.file} is invalid: ${entry.reason}`);
-      let raw;
+    for (const name of names) {
+      const file = path.join(directory, name);
+      let metadata;
       try {
-        raw = readRegularFile(entry.file).bytes.toString("utf8");
+        metadata = cacheLstatSync(file);
       } catch (error) {
-        throw new Error(`could not read legacy replay entry ${entry.file}: ${error.message}`);
+        if (error.code === "ENOENT") continue;
+        throw new Error(`could not inspect legacy replay entry ${file}: ${error.message}`);
       }
-      let event;
-      try {
-        event = cachedEventFromFrame(raw, entry);
-      } catch (error) {
-        throw new Error(`legacy replay entry ${entry.file} is invalid: ${error.message}`);
+      const expectedFile = name.endsWith(".json") || name.endsWith(".json.tmp");
+      if (!metadata.isFile()) {
+        if (expectedFile) throw new Error(`legacy replay entry ${file} is not a regular file`);
+        continue;
       }
-      evidence.push({ path: entry.file, publisherPubkey: event.pubkey });
+      inspectedFiles.add(file);
+      const publisherPubkey = validatedSignedPublisher(file);
+      if (publisherPubkey !== null) {
+        evidence.push({ path: file, publisherPubkey });
+      } else if (expectedFile) {
+        throw new Error(`legacy replay entry ${file} is not a valid signed EVENT frame`);
+      }
     }
-    evidence.push(...temporaryReplayPublisherEntries(directory, "legacy replay"));
   };
   collect(cacheRoot);
   let names;
@@ -1788,10 +1827,13 @@ function legacyReplayPublisherEntries(cacheRoot) {
       throw new Error(`legacy replay path ${candidate} is a symbolic link`);
     }
     if (CACHE_PARTITION.test(name)) {
-      if (metadata.isFile()) {
+      if (metadata.isFile() && !inspectedFiles.has(candidate)) {
         const publisherPubkey = validatedSignedPublisher(candidate);
         if (publisherPubkey !== null) evidence.push({ path: candidate, publisherPubkey });
       }
+      continue;
+    }
+    if (metadata.isFile()) {
       continue;
     }
     if (!metadata.isDirectory()) continue;
@@ -1926,7 +1968,9 @@ function quarantinedReplayPublisherEntries(cacheRoot) {
       try {
         metadata = cacheLstatSync(corruptDir);
       } catch (error) {
-        if (error.code === "ENOENT") continue;
+        if (error.code === "ENOENT") {
+          throw new Error(`legacy quarantine corrupt path ${corruptDir} is missing`);
+        }
         throw error;
       }
       if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
@@ -1942,7 +1986,9 @@ function quarantinedReplayPublisherEntries(cacheRoot) {
     try {
       metadata = cacheLstatSync(payloadParent);
     } catch (error) {
-      if (error.code === "ENOENT") continue;
+      if (error.code === "ENOENT") {
+        throw new Error(`legacy quarantine payload path ${payloadParent} is missing`);
+      }
       throw error;
     }
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
@@ -1952,10 +1998,17 @@ function quarantinedReplayPublisherEntries(cacheRoot) {
     try {
       metadata = cacheLstatSync(payload);
     } catch (error) {
-      if (error.code === "ENOENT") continue;
+      if (error.code === "ENOENT") {
+        throw new Error(`legacy quarantine payload ${payload} is missing`);
+      }
       throw error;
     }
-    if (!metadata.isFile()) continue;
+    if (!metadata.isFile()) {
+      if (manifest.payload_reference === regularReference) {
+        throw new Error(`legacy quarantine payload ${payload} is not a regular file`);
+      }
+      continue;
+    }
     const publisherPubkey = validatedSignedPublisher(payload);
     if (publisherPubkey !== null) evidence.push({ path: payload, publisherPubkey });
   }

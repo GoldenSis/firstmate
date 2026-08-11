@@ -248,6 +248,20 @@ fm_lock_recheck_stale_owner() {
   return 0
 }
 
+fm_lock_reclaim_stale_owner() {
+  local lockdir=$1 expected_owner=$2 expected_pid=$3
+  fm_lock_recheck_stale_owner "$lockdir" "$expected_owner" "$expected_pid" || return 1
+  if [ -n "$expected_owner" ]; then
+    fm_lock_clean_known_files "$expected_owner"
+    rmdir "$expected_owner" 2>/dev/null || return 1
+    fm_lock_points_to_owner "$lockdir" "$expected_owner" || return 1
+    rm -f "$lockdir" 2>/dev/null
+    return
+  fi
+  fm_lock_clean_known_files "$lockdir"
+  rmdir "$lockdir" 2>/dev/null
+}
+
 fm_lock_acquire_preflight() {
   local lockdir=$1 pid
   FM_LOCK_HELD_PID=
@@ -278,8 +292,7 @@ fm_lock_try_acquire_guard() {
   if [ -L "$lockdir" ]; then
     owner=$(fm_lock_link_owner "$lockdir" 2>/dev/null || true)
   fi
-  fm_lock_recheck_stale_owner "$lockdir" "$owner" "$pid" || return 1
-  fm_lock_remove_path "$lockdir" || return 1
+  fm_lock_reclaim_stale_owner "$lockdir" "$owner" "$pid" || return 1
   fm_lock_try_create "$lockdir"
 }
 

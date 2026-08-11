@@ -288,6 +288,60 @@ test_lock_live_steal_mutex_is_not_reclaimed() {
   pass "live steal mutex is not reclaimed"
 }
 
+test_stale_guard_reclamation_cannot_remove_a_live_replacement() {
+  local dir state fakebin guard stale_owner live_owner dead live started release result worker real_rm
+  dir=$(make_case lock-stale-guard-race)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  guard="$state/.contend.lock.steal"
+  stale_owner="$state/.stale-guard-owner"
+  live_owner="$state/.live-guard-owner"
+  started="$dir/remove-started"
+  release="$dir/remove-release"
+  result="$dir/result"
+  dead=$(dead_pid)
+  real_rm=$(command -v rm)
+  mkdir -p "$fakebin" "$stale_owner"
+  printf '%s\n' "$dead" > "$stale_owner/pid"
+  ln -s "$stale_owner" "$guard"
+  cat > "$fakebin/rm" <<EOF
+#!/usr/bin/env bash
+if [ ! -e "$started" ]; then
+  : > "$started"
+  while [ ! -e "$release" ]; do sleep 0.01; done
+fi
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$fakebin/rm"
+
+  FM_LOCK_STALE_AFTER=0 PATH="$fakebin:$PATH" bash -c '
+    . "$1"
+    if fm_lock_try_acquire_guard "$2"; then rc=0; else rc=$?; fi
+    printf "rc=%s\n" "$rc" > "$3"
+  ' _ "$LIB" "$guard" "$result" &
+  worker=$!
+  while [ ! -e "$started" ]; do sleep 0.01; done
+
+  sleep 300 &
+  live=$!
+  "$real_rm" -f "$guard"
+  mkdir "$live_owner"
+  printf '%s\n' "$live" > "$live_owner/pid"
+  ln -s "$live_owner" "$guard"
+  : > "$release"
+  wait "$worker" || true
+
+  [ "$(cat "$result")" = "rc=1" ] \
+    || fail "a stale guard reclaimer acquired after its inspected owner changed"
+  [ "$(readlink "$guard" 2>/dev/null || true)" = "$live_owner" ] \
+    || fail "a stale guard reclaimer removed the replacement guard"
+  [ "$(cat "$guard/pid" 2>/dev/null || true)" = "$live" ] \
+    || fail "a stale guard reclaimer changed the replacement owner"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "stale guard reclamation removes only the inspected owner identity"
+}
+
 test_lock_does_not_steal_live_lock() {
   local dir state lockdir live out lockpid
   dir=$(make_case lock-live-noop)
@@ -748,6 +802,7 @@ test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency
 test_lock_live_steal_mutex_is_not_reclaimed
+test_stale_guard_reclamation_cannot_remove_a_live_replacement
 test_lock_does_not_steal_live_lock
 test_lock_empty_pid_uses_minimum_grace
 test_lock_late_claim_loses_after_recreate

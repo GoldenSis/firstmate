@@ -202,6 +202,87 @@ test_noncanonical_endpoint_children_are_quarantined_and_accounted() {
   pass "noncanonical endpoint children are quarantined rather than silently skipped"
 }
 
+test_unexpected_root_signed_frame_remains_identity_evidence() {
+  local home relay replay private public channel seeded unexpected output code manifest
+  home=$(make_home unexpected-root-signed-frame)
+  relay="ws://127.0.0.1:1/unexpected-root"
+  replay="$home/state/buzz-replay"
+  private=$(new_private_key)
+  public=$(public_from_private "$private")
+  channel=$(default_channel_id "$home")
+  seeded=$(seed_replay_event "$home" "$relay" "$private" 1700000130 "$channel" unexpected-root) \
+    || fail "could not seed an unexpected-root signed frame"
+  unexpected="$replay/signed-frame-without-a-cache-name"
+  mv "$seeded" "$unexpected"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with unexpected-root publisher evidence"
+  assert_contains "$output" "$public" \
+    "an unexpected-root signed frame was omitted from the read-only identity inventory"
+  assert_present "$unexpected" "read-only identity inspection mutated the unexpected root frame"
+
+  rm -f "$unexpected"
+  run_keypair "$home" >/dev/null 2>&1 || fail "unexpected-root quarantine keypair setup failed"
+  seeded=$(seed_replay_event \
+    "$home" "$relay" "$private" 1700000131 "$channel" unexpected-root-quarantine) \
+    || fail "could not seed the unexpected-root quarantine fixture"
+  mv "$seeded" "$unexpected"
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"quarantine-unexpected-root"}' \
+    | run_publish "$home" "$relay" 2>&1)
+  assert_absent "$unexpected" "an unexpected root cache child was not quarantined"
+  manifest=$(grep -Fl "signed-frame-without-a-cache-name" \
+    "$replay/_legacy-quarantine/manifests"/*.json 2>/dev/null | head -1)
+  [ -n "$manifest" ] || fail "an unexpected root cache child has no quarantine manifest"
+  [ "$(jq -r '.publisher_pubkey' "$manifest")" = "$public" ] \
+    || fail "unexpected-root quarantine dropped validated publisher evidence"
+  assert_contains "$output" "quarantined corrupt cache partition path" \
+    "unexpected-root quarantine was not reported"
+  pass "unexpected root signed frames remain durable publisher evidence"
+}
+
+test_missing_manifest_backed_quarantine_payloads_fail_closed() {
+  local home replay quarantine token manifest output code
+  home=$(make_home missing-regular-quarantine-payload)
+  replay="$home/state/buzz-replay"
+  quarantine="$replay/_legacy-quarantine"
+  token=$(printf '%064d' 71)
+  mkdir -p "$quarantine/manifests" "$quarantine/payloads"
+  manifest="$quarantine/manifests/$token.json"
+  jq -cn --arg token "$token" '{
+    original_path:"legacy.json",
+    payload_reference:("payloads/" + $token + ".json"),
+    publisher_pubkey:null
+  }' > "$manifest"
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with a missing regular quarantine payload"
+  assert_contains "$output" "legacy quarantine payload" \
+    "a missing regular quarantine payload did not fail closed"
+  assert_absent "$home/data/buzz-keypair.public" \
+    "missing regular quarantine evidence allowed a replacement identity"
+
+  home=$(make_home missing-corrupt-quarantine-payload)
+  replay="$home/state/buzz-replay"
+  quarantine="$replay/_legacy-quarantine"
+  token=$(printf '%064d' 72)
+  mkdir -p "$quarantine/manifests" "$quarantine/corrupt/$token"
+  manifest="$quarantine/manifests/$token.json"
+  jq -cn --arg token "$token" '{
+    original_path:"corrupt-node",
+    payload_reference:("corrupt/" + $token + "/entry"),
+    publisher_pubkey:null
+  }' > "$manifest"
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with a missing corrupt quarantine payload"
+  assert_contains "$output" "legacy quarantine payload" \
+    "a missing corrupt quarantine payload did not fail closed"
+  assert_absent "$home/data/buzz-keypair.public" \
+    "missing corrupt quarantine evidence allowed a replacement identity"
+  pass "missing manifest-backed quarantine payloads fail identity checks closed"
+}
+
 test_relay_cache_partition_uses_the_normalized_complete_endpoint() {
   local result
   result=$(node -e '
@@ -1233,7 +1314,7 @@ EOF
   pass "malformed cache filenames are discarded or retained with truthful accounting"
 }
 
-test_cache_directory_stat_failures_are_accounted_for() {
+test_unexpected_root_symlinks_are_quarantined_and_accounted_for() {
   local home relay replay loop output
   home=$(make_home cache-stat-failure)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
@@ -1249,15 +1330,15 @@ EOF
     | run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
-  assert_contains "$output" "rejected cache directory symlink" \
-    "a cache child symlink was silently ignored"
+  assert_contains "$output" "quarantined corrupt cache partition path" \
+    "an unexpected root symlink was not quarantined"
   assert_contains "$output" "uninspectable-relay" \
-    "the cache child stat failure did not identify the affected path"
-  assert_contains "$output" "delivered=1 retained=1 discarded=0 cleanup_failed=1" \
-    "a cache child stat failure was omitted from retained or cleanup accounting"
-  assert_contains "$output" "publish did not complete; Firstmate is unaffected" \
-    "a cache child stat failure did not reach the fire-and-forget conversion"
-  pass "cache directory inspection failures remain visible in outcome accounting"
+    "the quarantined root symlink did not identify the affected path"
+  assert_contains "$output" "delivered=1 retained=0 discarded=0 cleanup_failed=0" \
+    "a quarantined root symlink was reported as unresolved cleanup"
+  assert_not_contains "$output" "publish did not complete; Firstmate is unaffected" \
+    "a settled root symlink quarantine failed the publication"
+  pass "unexpected root symlinks are quarantined with truthful accounting"
 }
 
 test_an_interrupted_cache_write_is_recovered_or_discarded_safely() {
@@ -1404,6 +1485,8 @@ test_rotation_uses_the_authoritative_replay_cache_path
 test_relay_switch_does_not_replay_another_relays_cache
 test_endpoint_only_cache_entries_migrate_to_their_exact_channel
 test_noncanonical_endpoint_children_are_quarantined_and_accounted
+test_unexpected_root_signed_frame_remains_identity_evidence
+test_missing_manifest_backed_quarantine_payloads_fail_closed
 test_relay_cache_partition_uses_the_normalized_complete_endpoint
 test_legacy_replay_entries_are_quarantined_with_a_manifest
 test_legacy_quarantine_claims_the_source_before_reading
@@ -1429,7 +1512,7 @@ test_partition_shaped_special_nodes_are_quarantined_and_unblocked
 test_replay_cache_never_reads_non_regular_entries
 test_relay_timeout_must_fit_the_node_timer_range
 test_malformed_cache_names_are_discarded_or_accounted_for
-test_cache_directory_stat_failures_are_accounted_for
+test_unexpected_root_symlinks_are_quarantined_and_accounted_for
 test_an_interrupted_cache_write_is_recovered_or_discarded_safely
 test_unreadable_cache_entry_is_retained_as_retryable
 test_parseable_cache_corruption_is_discarded_without_replay
