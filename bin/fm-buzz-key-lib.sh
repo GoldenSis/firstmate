@@ -60,6 +60,14 @@ fm_buzz_replay_transaction_lock() {  # <state directory>
   printf '%s/.buzz-replay-publish.lock\n' "$state"
 }
 
+# Print the one authoritative replay-cache path shared by publishing and key
+# rotation. An environment override would let the two operations inspect
+# different queues and retire an identity whose events still need it.
+fm_buzz_replay_cache_dir() {  # <state directory>
+  local state=${1:?state directory required}
+  printf '%s/buzz-replay\n' "$state"
+}
+
 # The account label identifying this home's key inside the keychain.
 fm_buzz_key_account() {
   local home=${1:?home required}

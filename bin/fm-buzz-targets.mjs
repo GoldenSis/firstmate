@@ -6,9 +6,13 @@
 // publisher_pubkey string fields. Relays use normalizeRelayEndpoint(), while
 // channel identities are lowercase canonical UUIDs and publisher identities are
 // lowercase 64-character hex values.
+// A target's canonical selector is the lowercase SHA-256 digest of the exact
+// JSON.stringify() bytes of that normalized three-field object.
 // Callers hold fm_buzz_key_transaction_lock across every read or rewrite, so a
 // whole-file exact-destination replacement is atomic, concurrent publishes are
 // serialized, duplicate tuples collapse, and an earlier target is never lost.
+// Forgetting a selector removes only that object, and removes the registry file
+// when no targets remain because an existing empty registry is corrupt state.
 // Any malformed, non-regular, or symlinked existing registry fails closed.
 // data/buzz-relay-authorities.jsonl contains one canonical JSON object per
 // relay/channel pair, with exactly relay, channel_id, and signer_pubkey fields.
@@ -23,8 +27,11 @@
 //
 // Usage:
 //   node bin/fm-buzz-targets.mjs list FILE
+//   node bin/fm-buzz-targets.mjs list-with-ids FILE
 //   node bin/fm-buzz-targets.mjs normalize-relay URL
 //   node bin/fm-buzz-targets.mjs record-unverifiable TARGETS_FILE OUTPUT_FILE PUBKEY REASON
+//   node bin/fm-buzz-targets.mjs forget-target FILE TARGET_HEX
+//   node bin/fm-buzz-targets.mjs retire-unverifiable TARGETS_FILE OUTPUT_FILE REASON PUBKEY...
 
 import {
   lstatSync,
@@ -33,6 +40,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeRelayEndpoint } from "./fm-buzz-lib.mjs";
@@ -71,6 +79,18 @@ function normalizeChannelIdentity(value) {
 
 function targetIdentity(target) {
   return `${target.publisher_pubkey}\u0000${target.relay}\u0000${target.channel_id}`;
+}
+
+export function publisherTargetHex(value) {
+  const target = normalizePublisherTarget(value);
+  return createHash("sha256").update(JSON.stringify(target)).digest("hex");
+}
+
+function normalizeTargetHex(value) {
+  if (typeof value !== "string" || !HEX_64.test(value)) {
+    throw new Error("target hex must be 64 lowercase hexadecimal characters");
+  }
+  return value;
 }
 
 function relayChannelIdentity(value) {
@@ -149,6 +169,14 @@ function replaceRegistry(file, records, label) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
+  if (records.length === 0) {
+    try {
+      unlinkSync(file);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    return;
+  }
   const temporary = path.join(
     directory,
     `.${path.basename(file)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
@@ -176,6 +204,16 @@ export function recordPublisherTarget(file, value) {
   }
   replaceRegistry(file, merged, "publisher target");
   return target;
+}
+
+export function forgetPublisherTarget(file, value) {
+  const targetHex = normalizeTargetHex(value);
+  const existing = readPublisherTargets(file);
+  const matches = existing.filter((target) => publisherTargetHex(target) === targetHex);
+  if (matches.length !== 1) throw new Error(`publisher target ${targetHex} was not found`);
+  const remaining = existing.filter((target) => publisherTargetHex(target) !== targetHex);
+  replaceRegistry(file, remaining, "publisher target");
+  return matches[0];
 }
 
 export function normalizeRelayAuthority(value) {
@@ -265,9 +303,30 @@ export function recordCompromisedUnverifiablePairs(file, values) {
   return incoming;
 }
 
+export function retirePublisherTargetsAsUnverifiable(targetsFile, outputFile, publisherPubkeys, reason) {
+  if (!Array.isArray(publisherPubkeys) || publisherPubkeys.length === 0) {
+    throw new Error("at least one publisher_pubkey is required");
+  }
+  if (typeof reason !== "string" || reason.trim() === "" || reason !== reason.trim()) {
+    throw new Error("reason must be a nonempty trimmed string");
+  }
+  const publishers = new Set(publisherPubkeys.map((value) => normalizeHexIdentity(value, "publisher_pubkey")));
+  const existing = readPublisherTargets(targetsFile);
+  const retiring = existing.filter((target) => publishers.has(target.publisher_pubkey));
+  if (retiring.length === 0) return [];
+  const recordedAt = new Date().toISOString();
+  recordCompromisedUnverifiablePairs(
+    outputFile,
+    retiring.map((target) => ({ ...target, recorded_at: recordedAt, reason })),
+  );
+  const remaining = existing.filter((target) => !publishers.has(target.publisher_pubkey));
+  replaceRegistry(targetsFile, remaining, "publisher target");
+  return retiring;
+}
+
 function usage() {
   process.stderr.write(
-    "usage: fm-buzz-targets.mjs <list FILE|normalize-relay URL|record-unverifiable TARGETS_FILE OUTPUT_FILE PUBKEY REASON>\n",
+    "usage: fm-buzz-targets.mjs <list FILE|list-with-ids FILE|normalize-relay URL|record-unverifiable TARGETS_FILE OUTPUT_FILE PUBKEY REASON|forget-target FILE TARGET_HEX|retire-unverifiable TARGETS_FILE OUTPUT_FILE REASON PUBKEY...>\n",
   );
 }
 
@@ -276,6 +335,14 @@ async function cli() {
   if (operation === "list" && value && rest.length === 0) {
     for (const target of readPublisherTargets(value)) {
       process.stdout.write(`${target.publisher_pubkey}\t${target.relay}\t${target.channel_id}\n`);
+    }
+    return;
+  }
+  if (operation === "list-with-ids" && value && rest.length === 0) {
+    for (const target of readPublisherTargets(value)) {
+      process.stdout.write(
+        `${publisherTargetHex(target)}\t${target.publisher_pubkey}\t${target.relay}\t${target.channel_id}\n`,
+      );
     }
     return;
   }
@@ -292,6 +359,22 @@ async function cli() {
       .map((target) => ({ ...target, recorded_at: recordedAt, reason }));
     recordCompromisedUnverifiablePairs(outputFile, records);
     for (const record of records) process.stdout.write(`${record.relay}\t${record.channel_id}\n`);
+    return;
+  }
+  if (operation === "forget-target" && value && rest.length === 1) {
+    const target = forgetPublisherTarget(value, rest[0]);
+    process.stdout.write(
+      `${publisherTargetHex(target)}\t${target.publisher_pubkey}\t${target.relay}\t${target.channel_id}\n`,
+    );
+    return;
+  }
+  if (operation === "retire-unverifiable" && value && rest.length >= 3) {
+    const [outputFile, reason, ...publishers] = rest;
+    for (const target of retirePublisherTargetsAsUnverifiable(value, outputFile, publishers, reason)) {
+      process.stdout.write(
+        `${publisherTargetHex(target)}\t${target.publisher_pubkey}\t${target.relay}\t${target.channel_id}\n`,
+      );
+    }
     return;
   }
   usage();

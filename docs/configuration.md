@@ -520,7 +520,7 @@ state/               volatile runtime signals; gitignored
   x-context/         generated X-mode durable per-request reply context (platform/budget), keyed by request_id; survives inbox cleanup so a delayed follow-up recovers the original platform (section 14; bin/fm-x-lib.sh)
   x-outbox/          generated X-mode dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
   x-poll.error       generated X-mode relay diagnostic dedupe marker
-  buzz-replay/       loopback Buzz publisher replay state; active-cache mechanics are owned by bin/fm-buzz-publish.mjs and legacy-quarantine orchestration by bin/fm-buzz-quarantine.mjs, with rationale in docs/buzz-loopback-adapter.md
+  buzz-replay/       loopback Buzz publisher replay and quarantine state; mechanics are owned by bin/fm-buzz-publish.mjs, with rationale in docs/buzz-loopback-adapter.md
   .wake-queue        durable queued wakes: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
   .afk               durable away-mode flag; present = sub-supervisor may inject escalations (set by /afk, cleared on user return)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks

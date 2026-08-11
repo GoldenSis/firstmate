@@ -131,8 +131,7 @@ docker run -i --rm -v /var/run/docker.sock:/var/run/docker.sock docker:cli \
 ## Idempotency, and why re-signing is the trap
 
 The header of `bin/fm-buzz-lib.mjs` owns the signed-event identity and byte-preserving replay contract.
-The header and implementation of `bin/fm-buzz-publish.mjs` own active-cache layout, write ordering, validation, pruning, and cleanup.
-The header and implementation of `bin/fm-buzz-quarantine.mjs` own legacy migration discovery, recovery ordering, accounting, and notices.
+The header and implementation of `bin/fm-buzz-publish.mjs` own active-cache and quarantine layout, write and recovery ordering, validation, pruning, accounting, notices, and cleanup.
 The header and implementation of `bin/fm-buzz-lib.mjs` own relay acknowledgement classification and the late-authentication state machine.
 
 ## Verification evidence
@@ -168,7 +167,8 @@ The inspector uses current and uncompromised historical public keys as authorshi
 `bin/fm-buzz-keypair.sh --help` owns the detailed rotation, compromised-recovery, and historical-key withdrawal decision procedure.
 
 Buzz is pre-1.0 with no long-term support branches and a very high release cadence, so `ghcr.io/block/buzz:main` can move under this adapter at any time.
-The relay stack is disposable by design; `down -v` and `up -d` is the whole recovery procedure.
+The relay stack is disposable by design, while durable adapter target records survive relay-volume disposal so rotation cannot mistake missing relay state for proof that a channel was retired.
+`bin/fm-buzz-keypair.sh --help` owns the explicit target-retirement and rotation recovery procedure.
 
 ## Out of scope
 

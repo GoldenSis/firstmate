@@ -42,7 +42,7 @@ See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/star
   A local `config/backend` file explicitly overrides runtime auto-detection for new task endpoints and stays gitignored; spawn-supported values are `tmux` plus experimental `herdr`, `zellij`, `orca`, and `cmux`, while `codex-app` is documented only in `docs/codex-app-backend.md`.
   It does not make `data/` tracked.
 - Helpers under bin/ and tests/ are plain Bash by default.
-  Node ESM modules (.mjs) are permitted narrowly for cryptographic operations, protocol handling, and stub servers that require ecosystem libraries (noble-secp256k1, nostr-tools, ws) with no clean shell equivalent.
+  Node ESM modules (.mjs) are permitted narrowly for cryptographic operations, protocol handling, ecosystem-dependent stub servers, and filesystem workflows requiring atomic manifest emission or portable JSON handling.
   New Node helpers must justify the exception in the PR body.
   Each starts with a usage header comment; keep it accurate when you change behavior.
   `bin/fm-lint.sh` must pass: it is the single owner of the lint definition (the shellcheck file set, config, and pinned shellcheck version), and both CI and the no-mistakes pre-push gate run it, so local and CI can never diverge.

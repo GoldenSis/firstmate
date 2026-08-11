@@ -18,11 +18,12 @@
 #   fm-buzz-keypair.sh --rotate --compromised  as above, but do not keep the retired key
 #   fm-buzz-keypair.sh --rotate --discard-pending-cache  quarantine outgoing pending events first
 #   fm-buzz-keypair.sh --forget-key <hex>    withdraw one already-retired public key
+#   fm-buzz-keypair.sh --forget-target <hex> attest one retired relay/channel target
 #   fm-buzz-keypair.sh --help                this text
 #
 # Exit status: 0 when ensure or --rotate leaves a recorded keypair, when --public
 # prints an existing stored identity, or when --forget-key completes even if the
-# named key was not recorded.
+# named key was not recorded, or when --forget-target removes its exact record.
 # Exit status 1 reports an operational or inconsistent-state failure, and 2
 # reports invalid or contradictory arguments.
 # Unlike bin/fm-buzz-publish.sh this script is NOT fire-and-forget: it is run
@@ -91,6 +92,9 @@
 # Compromised recovery that cannot authenticate a recorded identity's tracked
 # memberships records every affected pair in
 # data/buzz-compromised-unverifiable-pairs.jsonl before replacing the key.
+# When a channel or relay is truly retired, first destroy its disposable relay
+# state with `docker compose down -v`, then attest exactly one retired tracked
+# target with `--forget-target <target-hex>`, and only then run `--rotate`.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -98,10 +102,14 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-REPLAY_DIR="${FM_BUZZ_REPLAY_DIR:-$STATE/buzz-replay}"
 
 # shellcheck source=bin/fm-buzz-key-lib.sh
 . "$SCRIPT_DIR/fm-buzz-key-lib.sh"
+
+REPLAY_DIR=$(fm_buzz_replay_cache_dir "$STATE") || {
+  printf 'fm-buzz-keypair.sh: could not resolve the replay cache path\n' >&2
+  exit 1
+}
 
 PUBLIC_FILE="$DATA/buzz-keypair.public"
 HISTORY_FILE="$DATA/buzz-keypair.public-history"
@@ -114,6 +122,8 @@ COMPROMISED=0
 DISCARD_PENDING_CACHE=0
 FORGET_KEY=""
 FORGETTING=0
+FORGET_TARGET=""
+TARGET_FORGETTING=0
 STRICT_RELAY_AUTHORITY=${FM_BUZZ_REQUIRE_PINNED_RELAY_AUTHORITY:-0}
 
 while [ "$#" -gt 0 ]; do
@@ -126,6 +136,7 @@ while [ "$#" -gt 0 ]; do
     # typed the flag and lost its argument must get an error, never a silent fall
     # through into the default "ensure a keypair exists" behaviour.
     --forget-key) FORGETTING=1; shift; FORGET_KEY=${1:-} ;;
+    --forget-target) TARGET_FORGETTING=1; shift; FORGET_TARGET=${1:-} ;;
     --help|-h) awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; exit 0 ;;
     *) printf 'fm-buzz-keypair.sh: unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
@@ -147,8 +158,13 @@ if [ "$DISCARD_PENDING_CACHE" -eq 1 ] && [ "$ROTATE" -eq 0 ]; then
   exit 2
 fi
 
-if [ "$FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ]; }; then
+if [ "$FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ] || [ "$TARGET_FORGETTING" -eq 1 ]; }; then
   printf 'fm-buzz-keypair.sh: --forget-key is its own operation; run it on its own\n' >&2
+  exit 2
+fi
+
+if [ "$TARGET_FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ] || [ "$COMPROMISED" -eq 1 ] || [ "$DISCARD_PENDING_CACHE" -eq 1 ]; }; then
+  printf 'fm-buzz-keypair.sh: --forget-target is its own operation; run it on its own\n' >&2
   exit 2
 fi
 
@@ -285,8 +301,8 @@ publisher_is_current_channel_member() {  # <keychain|file> <relay> <channel> <ti
     "$relay" "$channel" "$timeout_ms" "$AUTHORITIES_FILE" "$STRICT_RELAY_AUTHORITY"
 }
 
-refuse_rotation_for_current_membership() {  # <keychain|file> <public-key> <relay> <channel>
-  local store=$1 public=$2 relay=$3 channel=$4 check check_key
+refuse_rotation_for_current_membership() {  # <keychain|file> <public-key> <target-hex> <relay> <channel>
+  local store=$1 public=$2 target_hex=$3 relay=$4 channel=$5 check check_key
   [ -n "$public" ] || return 0
   check_key="$public"$'\t'"$relay"$'\t'"$channel"
   printf '%s\n' "${checked_rotation_targets:-}" | grep -Fqx -- "$check_key" && return 0
@@ -296,26 +312,28 @@ refuse_rotation_for_current_membership() {  # <keychain|file> <public-key> <rela
     "$store" "$relay" "$channel" "$rotation_timeout" 2>&1)
   check_status=$?
   if [ "$check_status" -ne 0 ]; then
-    printf 'fm-buzz-keypair.sh: could not verify current membership for relay %s, channel %s: %s; nothing was rotated\n' \
-      "$relay" "$channel" "$check" >&2
+    printf 'fm-buzz-keypair.sh: could not verify current membership for target %s, relay %s, channel %s: %s; nothing was rotated\n' \
+      "$target_hex" "$relay" "$channel" "$check" >&2
     return 1
   fi
   [ "$check" = "member" ] || return 0
-  printf 'fm-buzz-keypair.sh: outgoing publisher has current membership on relay %s, channel %s; nothing was rotated\n' \
-    "$relay" "$channel" >&2
+  printf 'fm-buzz-keypair.sh: outgoing publisher target %s has current membership on relay %s, channel %s; nothing was rotated\n' \
+    "$target_hex" "$relay" "$channel" >&2
   printf '%s\n' 'Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity.' >&2
+  printf 'If this relay or channel is truly retired, run docker compose down -v, then fm-buzz-keypair.sh --forget-target %s, then fm-buzz-keypair.sh --rotate.\n' \
+    "$target_hex" >&2
   printf '%s\n' 'Reference: https://github.com/block/buzz/blob/main/ARCHITECTURE.md' >&2
   printf '%s\n' 'Reference: https://github.com/block/buzz/blob/main/NOSTR.md' >&2
   return 1
 }
 
 check_rotation_targets_for_store() {  # <keychain|file> <public-key>
-  local store=$1 public=$2 target_public target_relay target_channel
-  while IFS=$'\t' read -r target_public target_relay target_channel; do
+  local store=$1 public=$2 target_hex target_public target_relay target_channel
+  while IFS=$'\t' read -r target_hex target_public target_relay target_channel; do
     [ -n "$target_public" ] || continue
     [ "$target_public" = "$public" ] || continue
     refuse_rotation_for_current_membership \
-      "$store" "$public" "$target_relay" "$target_channel" || return 1
+      "$store" "$public" "$target_hex" "$target_relay" "$target_channel" || return 1
   done <<EOF
 $rotation_targets
 EOF
@@ -340,6 +358,21 @@ protect_rotation_replay_cache() {  # <discard:0|1> <public-key>...
       process.exitCode = 1;
     });
   ' "$SCRIPT_DIR/fm-buzz-publish.mjs" "$REPLAY_DIR" "$discard" "$@"
+}
+
+inspect_replay_identity_evidence() {
+  # shellcheck disable=SC2016
+  node -e '
+    const [modulePath, replayDir] = process.argv.slice(1);
+    import(modulePath).then(({ inspectActiveReplayPublisherCache }) => {
+      for (const entry of inspectActiveReplayPublisherCache(replayDir)) {
+        process.stdout.write(`${entry.publisherPubkey}\t${entry.path}\n`);
+      }
+    }).catch((error) => {
+      process.stderr.write(`${error.message}\n`);
+      process.exitCode = 1;
+    });
+  ' "$SCRIPT_DIR/fm-buzz-publish.mjs" "$REPLAY_DIR"
 }
 
 record_public() {
@@ -414,6 +447,33 @@ purge_public_set() {  # <public keys to withdraw...>
 purge_public() {  # <public key to withdraw>
   purge_public_set "$1"
 }
+
+if [ "$TARGET_FORGETTING" -eq 1 ]; then
+  case $FORGET_TARGET in
+    ""|*[!0-9a-f]*)
+      printf 'fm-buzz-keypair.sh: --forget-target wants a canonical 64-character lowercase target hex\n' >&2
+      exit 2
+      ;;
+  esac
+  if [ "${#FORGET_TARGET}" -ne 64 ]; then
+    printf 'fm-buzz-keypair.sh: --forget-target wants a canonical 64-character lowercase target hex\n' >&2
+    exit 2
+  fi
+  forgotten_target=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" forget-target \
+    "$TARGETS_FILE" "$FORGET_TARGET" 2>&1)
+  forgotten_target_status=$?
+  if [ "$forgotten_target_status" -ne 0 ]; then
+    printf 'fm-buzz-keypair.sh: could not forget publisher target %s: %s; nothing was changed\n' \
+      "$FORGET_TARGET" "$forgotten_target" >&2
+    exit 1
+  fi
+  IFS=$'\t' read -r forgotten_hex forgotten_public forgotten_relay forgotten_channel <<EOF
+$forgotten_target
+EOF
+  printf 'forgotten target: %s publisher %s relay %s channel %s\n' \
+    "$forgotten_hex" "$forgotten_public" "$forgotten_relay" "$forgotten_channel" >&2
+  exit 0
+fi
 
 # --forget-key: withdraw one already-retired key from the recorded set. This is
 # what --compromised cannot be, and the reason it is a separate operation: a
@@ -524,6 +584,34 @@ if [ "$ROTATE" -eq 1 ]; then
     add_recovery_reason "the recorded public key in $PUBLIC_FILE has no stored private key"
   fi
 
+  rotation_targets=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" list-with-ids "$TARGETS_FILE" 2>&1)
+  rotation_targets_status=$?
+  if [ "$rotation_targets_status" -ne 0 ]; then
+    printf 'fm-buzz-keypair.sh: could not validate %s: %s; nothing was rotated\n' \
+      "$TARGETS_FILE" "$rotation_targets" >&2
+    exit 1
+  fi
+  rotation_replay_evidence=$(inspect_replay_identity_evidence 2>&1)
+  rotation_replay_status=$?
+  if [ "$rotation_replay_status" -ne 0 ]; then
+    printf 'fm-buzz-keypair.sh: could not inspect replay identity evidence: %s; nothing was rotated\n' \
+      "$rotation_replay_evidence" >&2
+    exit 1
+  fi
+  orphan_identity_mode=0
+  if [ -z "$keychain_public" ] && [ -z "$file_public" ] && [ -z "$recorded" ]; then
+    if [ -n "$rotation_targets" ]; then
+      orphan_identity_mode=1
+      orphan_target_ids=$(printf '%s\n' "$rotation_targets" | cut -f1 | paste -sd, -)
+      add_recovery_reason "orphan publisher target records are present: $orphan_target_ids"
+    fi
+    if [ -n "$rotation_replay_evidence" ]; then
+      orphan_identity_mode=1
+      orphan_replay_paths=$(printf '%s\n' "$rotation_replay_evidence" | cut -f2- | paste -sd, -)
+      add_recovery_reason "orphan replay entries are present: $orphan_replay_paths"
+    fi
+  fi
+
   if [ -n "$recovery_reason" ]; then
     if [ "$COMPROMISED" -eq 0 ]; then
       printf 'fm-buzz-keypair.sh: %s; nothing was rotated\n' "$recovery_reason" >&2
@@ -541,13 +629,6 @@ if [ "$ROTATE" -eq 1 ]; then
     exit 1
   fi
   rotation_timeout=${FM_BUZZ_TIMEOUT_MS:-15000}
-  rotation_targets=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" list "$TARGETS_FILE" 2>&1)
-  rotation_targets_status=$?
-  if [ "$rotation_targets_status" -ne 0 ]; then
-    printf 'fm-buzz-keypair.sh: could not validate %s: %s; nothing was rotated\n' \
-      "$TARGETS_FILE" "$rotation_targets" >&2
-    exit 1
-  fi
   checked_rotation_targets=""
   if [ -n "$keychain_public" ]; then
     check_rotation_targets_for_store keychain "$keychain_public" || exit 1
@@ -557,7 +638,13 @@ if [ "$ROTATE" -eq 1 ]; then
   fi
 
   rotation_publics=()
-  for candidate_public in "$recorded" "$keychain_public" "$file_public"; do
+  rotation_candidate_publics=$(printf '%s\n%s\n%s\n' "$recorded" "$keychain_public" "$file_public")
+  if [ "$orphan_identity_mode" -eq 1 ]; then
+    rotation_candidate_publics="${rotation_candidate_publics}
+$(printf '%s\n' "$rotation_targets" | cut -f2)
+$(printf '%s\n' "$rotation_replay_evidence" | cut -f1)"
+  fi
+  while IFS= read -r candidate_public; do
     [ -n "$candidate_public" ] || continue
     seen_public=0
     if [ "${#rotation_publics[@]}" -gt 0 ]; then
@@ -566,7 +653,9 @@ if [ "$ROTATE" -eq 1 ]; then
       done
     fi
     [ "$seen_public" -eq 1 ] || rotation_publics+=("$candidate_public")
-  done
+  done <<EOF
+$rotation_candidate_publics
+EOF
   if [ "${#rotation_publics[@]}" -gt 0 ]; then
     cache_preflight=$(protect_rotation_replay_cache \
       "$DISCARD_PENDING_CACHE" "${rotation_publics[@]}" 2>&1)
@@ -585,13 +674,30 @@ if [ "$ROTATE" -eq 1 ]; then
   fi
 
   unverifiable_pairs=""
-  if [ "$COMPROMISED" -eq 1 ] && [ -n "$recovery_reason" ] && [ -n "$recorded" ] \
-    && [ "$recorded" != "$keychain_public" ] && [ "$recorded" != "$file_public" ]; then
-    unverifiable_pairs=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" record-unverifiable \
-      "$TARGETS_FILE" "$UNVERIFIABLE_FILE" "$recorded" "$recovery_reason" 2>&1)
+  unverifiable_publics=()
+  if [ "$COMPROMISED" -eq 1 ] && [ -n "$recovery_reason" ]; then
+    while IFS=$'\t' read -r _target_hex target_public _target_relay _target_channel; do
+      [ -n "$target_public" ] || continue
+      [ "$target_public" = "$keychain_public" ] && continue
+      [ "$target_public" = "$file_public" ] && continue
+      seen_public=0
+      if [ "${#unverifiable_publics[@]}" -gt 0 ]; then
+        for known_public in "${unverifiable_publics[@]}"; do
+          [ "$known_public" = "$target_public" ] && seen_public=1
+        done
+      fi
+      [ "$seen_public" -eq 1 ] || unverifiable_publics+=("$target_public")
+    done <<EOF
+$rotation_targets
+EOF
+  fi
+  if [ "${#unverifiable_publics[@]}" -gt 0 ]; then
+    unverifiable_pairs=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" retire-unverifiable \
+      "$TARGETS_FILE" "$UNVERIFIABLE_FILE" "$recovery_reason" \
+      "${unverifiable_publics[@]}" 2>&1)
     unverifiable_status=$?
     if [ "$unverifiable_status" -ne 0 ]; then
-      printf 'fm-buzz-keypair.sh: could not record unverifiable compromised memberships in %s: %s; nothing was rotated\n' \
+      printf 'fm-buzz-keypair.sh: could not retire unverifiable compromised memberships into %s: %s; nothing was rotated\n' \
         "$UNVERIFIABLE_FILE" "$unverifiable_pairs" >&2
       exit 1
     fi
@@ -673,6 +779,33 @@ fi
 if [ "$PUBLIC_ONLY" -eq 1 ]; then
   printf 'fm-buzz-keypair.sh: no keypair exists yet; run without --public to create one\n' >&2
   exit 1
+fi
+
+if [ "$ROTATE" -eq 0 ]; then
+  ensure_targets=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" list-with-ids "$TARGETS_FILE" 2>&1)
+  ensure_targets_status=$?
+  if [ "$ensure_targets_status" -ne 0 ]; then
+    printf 'fm-buzz-keypair.sh: could not validate %s: %s; no replacement identity was minted\n' \
+      "$TARGETS_FILE" "$ensure_targets" >&2
+    exit 1
+  fi
+  ensure_replay_evidence=$(inspect_replay_identity_evidence 2>&1)
+  ensure_replay_status=$?
+  if [ "$ensure_replay_status" -ne 0 ]; then
+    printf 'fm-buzz-keypair.sh: could not inspect replay identity evidence: %s; no replacement identity was minted\n' \
+      "$ensure_replay_evidence" >&2
+    exit 1
+  fi
+  if [ -n "$ensure_targets" ] || [ -n "$ensure_replay_evidence" ]; then
+    printf 'fm-buzz-keypair.sh: orphan identity evidence exists without readable current key material; recover with --rotate --compromised\n' >&2
+    if [ -n "$ensure_targets" ]; then
+      printf 'orphan publisher target records present:\n%s\n' "$ensure_targets" >&2
+    fi
+    if [ -n "$ensure_replay_evidence" ]; then
+      printf 'orphan replay entries present:\n%s\n' "$ensure_replay_evidence" >&2
+    fi
+    exit 1
+  fi
 fi
 
 # Mint a fresh keypair. Node emits two lines - private then public - and only the

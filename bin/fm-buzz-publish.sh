@@ -78,7 +78,10 @@ CHANNEL_LABEL=""
 TIMEOUT_MS=${FM_BUZZ_TIMEOUT_MS:-15000}
 MAX_CACHE=${FM_BUZZ_MAX_CACHE:-100}
 REFRESH=0
-REPLAY_DIR="$STATE/buzz-replay"
+REPLAY_DIR=$(fm_buzz_replay_cache_dir "$STATE") || {
+  printf 'fm-buzz-publish: could not resolve the replay cache path\n' >&2
+  exit 0
+}
 TARGETS_FILE="$DATA/buzz-publisher-targets.jsonl"
 
 STDIN_TIMEOUT_S=${FM_BUZZ_STDIN_TIMEOUT_S:-30}

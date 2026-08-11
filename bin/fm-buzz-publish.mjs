@@ -10,9 +10,9 @@
 //
 // REPLAY CACHE LIFECYCLE
 // bin/fm-buzz-lib.mjs owns signed-event identity and byte-preserving replay
-// semantics. This engine owns active-cache layout, mutation order, validation,
-// pruning, and the relay outcomes that retain or remove each entry.
-// bin/fm-buzz-quarantine.mjs owns legacy migration discovery and recovery order.
+// semantics. This engine owns active-cache and quarantine layout, mutation
+// order, validation, recovery, pruning, and relay outcomes because every
+// mutation must share the pinned cache-directory interface below.
 //
 // Reads one JSON envelope on stdin so that neither the private key nor the
 // projection - which carries task ids, project names, blockers and PR URLs -
@@ -22,8 +22,7 @@
 //
 // Legacy and explicitly discarded rotation entries are retained under
 // _legacy-quarantine with payloads and manifests rather than silently deleted.
-// The lifecycle owner and the transaction helpers below jointly define that
-// durable quarantine contract.
+// The schema and lifecycle below define that durable quarantine contract.
 
 import {
   closeSync,
@@ -61,11 +60,9 @@ import {
   RETRYABLE,
 } from "./fm-buzz-lib.mjs";
 import { recordPublisherTarget } from "./fm-buzz-targets.mjs";
-import {
-  CACHE_PARTITION,
-  LEGACY_QUARANTINE,
-  runLegacyQuarantineLifecycle,
-} from "./fm-buzz-quarantine.mjs";
+
+const CACHE_PARTITION = /^[0-9a-f]{64}$/;
+const LEGACY_QUARANTINE = "_legacy-quarantine";
 
 function log(message) {
   process.stderr.write(`fm-buzz-publish: ${message}\n`);
@@ -1013,45 +1010,138 @@ function quarantineManifestCount(manifestsDir, failures = []) {
 }
 
 function quarantineLegacyEntries(replayDir) {
-  return runLegacyQuarantineLifecycle({
-    replayDir,
-    log,
-    prepareCacheDirectory,
-    recoverInvalidRecoveryResidues,
-    recoverQuarantineTransactions,
-    recoverStagedLegacyEntries,
-    recoverCorruptPartitionNodes,
-    cacheReaddirSync,
-    cacheLstatSync,
-    pinCacheDirectory,
-    decodeLegacyHost,
-    quarantineCorruptPartitionNode,
-    quarantineLegacyEntry,
-    quarantineManifestCount,
-  });
+  const failures = [];
+  const quarantineDir = prepareCacheDirectory(replayDir, LEGACY_QUARANTINE);
+  const manifestsDir = prepareCacheDirectory(quarantineDir, "manifests");
+  const payloadsDir = prepareCacheDirectory(quarantineDir, "payloads");
+  const stagingDir = prepareCacheDirectory(quarantineDir, "staging");
+  const corruptDir = prepareCacheDirectory(quarantineDir, "corrupt");
+  const recoveryCorruptDir = prepareCacheDirectory(quarantineDir, "recovery-corrupt");
+  recoverInvalidRecoveryResidues(quarantineDir, manifestsDir, recoveryCorruptDir, failures);
+  recoverQuarantineTransactions(
+    quarantineDir,
+    manifestsDir,
+    payloadsDir,
+    recoveryCorruptDir,
+    failures,
+  );
+  recoverStagedLegacyEntries(
+    quarantineDir,
+    manifestsDir,
+    payloadsDir,
+    stagingDir,
+    recoveryCorruptDir,
+    failures,
+  );
+  recoverCorruptPartitionNodes(quarantineDir, corruptDir, manifestsDir, failures);
+
+  let names;
+  try {
+    names = cacheReaddirSync(replayDir);
+  } catch (error) {
+    log(`could not inspect replay cache for legacy entries: ${error.message}`);
+    failures.push(replayDir);
+    const count = quarantineManifestCount(manifestsDir, failures);
+    return { failures, count };
+  }
+
+  const candidates = [];
+  for (const name of names) {
+    if (name === LEGACY_QUARANTINE) continue;
+    const candidate = path.join(replayDir, name);
+    let metadata;
+    try {
+      metadata = cacheLstatSync(candidate);
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      log(`could not inspect cache path ${candidate}: ${error.message}`);
+      failures.push(candidate);
+      continue;
+    }
+    if (name.endsWith(".json")) {
+      if (metadata.isFile()) candidates.push({ file: candidate, legacyHost: null });
+      else {
+        log(`legacy cache entry ${candidate} is not a regular file; left in place`);
+        failures.push(candidate);
+      }
+      continue;
+    }
+    if (CACHE_PARTITION.test(name)) {
+      if (metadata.isDirectory() && !metadata.isSymbolicLink()) continue;
+      try {
+        quarantineCorruptPartitionNode(
+          replayDir,
+          quarantineDir,
+          corruptDir,
+          manifestsDir,
+          candidate,
+          metadata,
+        );
+      } catch (error) {
+        log(`could not quarantine corrupt cache partition path ${candidate}: ${error.message}`);
+        failures.push(candidate);
+      }
+      continue;
+    }
+    if (metadata.isSymbolicLink()) {
+      log(`rejected cache directory symlink ${candidate}`);
+      failures.push(candidate);
+      continue;
+    }
+    if (!metadata.isDirectory()) continue;
+    pinCacheDirectory(candidate);
+    let legacyNames;
+    try {
+      legacyNames = cacheReaddirSync(candidate);
+    } catch (error) {
+      log(`could not inspect legacy cache directory ${candidate}: ${error.message}`);
+      failures.push(candidate);
+      continue;
+    }
+    const legacyHost = decodeLegacyHost(name);
+    for (const legacyName of legacyNames.filter((entry) => entry.endsWith(".json"))) {
+      const legacyFile = path.join(candidate, legacyName);
+      try {
+        if (cacheLstatSync(legacyFile).isFile()) candidates.push({ file: legacyFile, legacyHost });
+        else {
+          log(`legacy cache entry ${legacyFile} is not a regular file; left in place`);
+          failures.push(legacyFile);
+        }
+      } catch (error) {
+        if (error.code === "ENOENT") continue;
+        log(`could not inspect legacy cache entry ${legacyFile}: ${error.message}`);
+        failures.push(legacyFile);
+      }
+    }
+  }
+
+  for (const candidate of candidates) {
+    try {
+      quarantineLegacyEntry(
+        replayDir,
+        quarantineDir,
+        manifestsDir,
+        payloadsDir,
+        stagingDir,
+        candidate.file,
+        candidate.legacyHost,
+      );
+    } catch (error) {
+      log(`could not quarantine legacy cache entry ${candidate.file}: ${error.message}`);
+      failures.push(candidate.file);
+    }
+  }
+  const count = quarantineManifestCount(manifestsDir, failures);
+  if (count > 0) log(`legacy replay quarantine: ${count} entry(s) at ${quarantineDir}`);
+  return { failures, count };
 }
 
-export function protectOutgoingPublisherCache(replayDir, publisherPubkeys, options = {}) {
-  const publishers = Array.isArray(publisherPubkeys) ? publisherPubkeys : [publisherPubkeys];
-  if (publishers.length === 0 || publishers.some((value) => !/^[0-9a-f]{64}$/.test(value))) {
-    throw new Error("outgoing publishers must be 64 lowercase hexadecimal characters");
-  }
-  const publisherSet = new Set(publishers);
-  if (typeof options.discard !== "boolean") {
-    throw new Error("pending-cache discard mode must be boolean");
-  }
-  const cacheRoot = prepareCacheRoot(replayDir);
-  const legacyMigration = quarantineLegacyEntries(cacheRoot);
-  if (legacyMigration.failures.length > 0) {
-    throw new Error(
-      `could not settle replay quarantine:\n${legacyMigration.failures.map((file) => `  ${file}`).join("\n")}`,
-    );
-  }
+function activeReplayPublisherEntries(cacheRoot) {
   const topology = cacheDirectories(cacheRoot);
   if (topology.failures.length > 0) {
     throw new Error(`could not inspect active replay partitions:\n${topology.failures.map((file) => `  ${file}`).join("\n")}`);
   }
-  const blocking = [];
+  const active = [];
   for (const directory of topology.directories) {
     const inventory = cacheEntries(directory);
     if (inventory.failures.length > 0) {
@@ -1071,10 +1161,44 @@ export function protectOutgoingPublisherCache(replayDir, publisherPubkeys, optio
       } catch (error) {
         throw new Error(`active replay entry ${entry.file} is invalid: ${error.message}`);
       }
-      if (publisherSet.has(event.pubkey)) blocking.push({ path: entry.file, publisherPubkey: event.pubkey });
+      active.push({ path: entry.file, publisherPubkey: event.pubkey });
     }
   }
-  blocking.sort((left, right) => left.path.localeCompare(right.path));
+  return active.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+export function inspectActiveReplayPublisherCache(replayDir) {
+  let metadata;
+  try {
+    metadata = lstatSync(replayDir);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`replay cache path ${replayDir} is not a regular directory`);
+  }
+  return activeReplayPublisherEntries(prepareCacheRoot(replayDir));
+}
+
+export function protectOutgoingPublisherCache(replayDir, publisherPubkeys, options = {}) {
+  const publishers = Array.isArray(publisherPubkeys) ? publisherPubkeys : [publisherPubkeys];
+  if (publishers.length === 0 || publishers.some((value) => !/^[0-9a-f]{64}$/.test(value))) {
+    throw new Error("outgoing publishers must be 64 lowercase hexadecimal characters");
+  }
+  const publisherSet = new Set(publishers);
+  if (typeof options.discard !== "boolean") {
+    throw new Error("pending-cache discard mode must be boolean");
+  }
+  const cacheRoot = prepareCacheRoot(replayDir);
+  const legacyMigration = quarantineLegacyEntries(cacheRoot);
+  if (legacyMigration.failures.length > 0) {
+    throw new Error(
+      `could not settle replay quarantine:\n${legacyMigration.failures.map((file) => `  ${file}`).join("\n")}`,
+    );
+  }
+  const blocking = activeReplayPublisherEntries(cacheRoot)
+    .filter((entry) => publisherSet.has(entry.publisherPubkey));
   const paths = blocking.map((entry) => entry.path);
   if (!options.discard || blocking.length === 0) {
     return { count: blocking.length, paths, quarantined: [] };
@@ -1343,11 +1467,6 @@ async function main() {
   const event = buildBearingsEvent(channelId, content, privateKey, [
     ["fm-schema", "fm-bearings.v1"],
   ]);
-  recordPublisherTarget(targetsFile, {
-    relay,
-    channel_id: channelId,
-    publisher_pubkey: event.pubkey,
-  });
   const cacheRoot = prepareCacheRoot(replayDir);
   const legacyMigration = quarantineLegacyEntries(cacheRoot);
   const relayCacheDir = prepareRelayCacheDirectory(cacheRoot, relay);
@@ -1355,6 +1474,11 @@ async function main() {
   // Cache the signed event before network access: from here on it survives a
   // crash, a kill, or a relay that is not running at all.
   const currentFile = cacheEvent(relayCacheDir, event);
+  recordPublisherTarget(targetsFile, {
+    relay,
+    channel_id: channelId,
+    publisher_pubkey: event.pubkey,
+  });
   const cacheMaintenance = pruneCache(cacheRoot, maxCache, currentFile);
   let cleanupFailures = cacheMaintenance.failed + legacyMigration.failures.length;
   log(`signed event ${event.id} (${Buffer.byteLength(content, "utf8")} bytes) for channel ${channelId}`);

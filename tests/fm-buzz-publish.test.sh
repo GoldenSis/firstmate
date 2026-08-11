@@ -798,6 +798,72 @@ EOF
   pass "publisher target updates serialize and malformed state fails closed"
 }
 
+test_forget_target_attests_exact_retirement() {
+  local home other relay label channel old other_public targets normalized_relay other_channel
+  local target_hex output code replacement
+  home=$(make_home forget-publisher-target)
+  other=$(make_home forget-publisher-target-other)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "forget-target keypair setup failed"
+  other_public=$(run_keypair "$other" 2>/dev/null) || fail "forget-target unrelated publisher setup failed"
+  label="retired-private-channel"
+  channel=$(node -e '
+    import(process.argv[1]).then(({ channelIdForLabel }) => {
+      process.stdout.write(channelIdForLabel(process.argv[2]));
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$label") || fail "could not derive the retired target channel"
+  other_channel="12121212-3434-5656-8787-909090909090"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  printf '%s' '{"schema":"fm-bearings.v1","note":"target-retirement"}' \
+    | run_publish "$home" "$relay" --channel-label "$label" >/dev/null 2>&1
+  normalized_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
+    || fail "could not normalize the retired target relay"
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  node -e '
+    import(process.argv[2]).then(({ recordPublisherTarget }) => {
+      recordPublisherTarget(process.argv[3], {
+        relay: process.argv[4],
+        channel_id: process.argv[5],
+        publisher_pubkey: process.argv[6],
+      });
+    });
+  ' target-fixture "$ROOT/bin/fm-buzz-targets.mjs" "$targets" \
+    "$normalized_relay" "$other_channel" "$other_public" \
+    || fail "could not seed the unrelated publisher target"
+  target_hex=$(node "$ROOT/bin/fm-buzz-targets.mjs" list-with-ids "$targets" \
+    | awk -F '\t' -v channel="$channel" '$4 == channel { print $1 }')
+  [ "${#target_hex}" = 64 ] || fail "the tracked target has no canonical target hex"
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation before target retirement"
+  assert_contains "$output" "target $target_hex" \
+    "rotation refusal did not expose the exact target identifier"
+  assert_contains "$output" "docker compose down -v" \
+    "rotation refusal omitted the disposable-relay retirement step"
+  assert_contains "$output" "--forget-target $target_hex" \
+    "rotation refusal omitted its exact target-retirement command"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "pre-retirement refusal changed the publishing identity"
+
+  stop_stub "$STUB_PID"
+  output=$(run_keypair "$home" --forget-target "$target_hex" 2>&1)
+  code=$?
+  expect_code 0 "$code" "exact target retirement after relay reset"
+  assert_contains "$output" "forgotten target: $target_hex" \
+    "target retirement did not confirm the exact record"
+  assert_not_contains "$(node "$ROOT/bin/fm-buzz-targets.mjs" list-with-ids "$targets")" "$target_hex" \
+    "target retirement left the selected record behind"
+  assert_grep "$other_public" "$targets" \
+    "target retirement removed an unrelated publisher target"
+
+  replacement=$(run_keypair "$home" --rotate 2>/dev/null) \
+    || fail "rotation did not proceed after exact target retirement"
+  [ "$replacement" != "$old" ] || fail "post-retirement rotation kept the old identity"
+  pass "exact target retirement unblocks rotation without dropping unrelated targets"
+}
+
 test_rotation_checks_authoritative_current_membership() {
   local home relay old channel keyfile private_before targets normalized_relay output code
   home=$(make_home current-membership-rotation)
@@ -1122,6 +1188,70 @@ test_compromised_orphan_recovery_records_unverifiable_memberships() {
     )' "$artifact" >/dev/null \
     || fail "compromised recovery artifact omitted canonical identity, pair, time, or reason"
   pass "compromised orphan recovery records every unverifiable tracked membership"
+}
+
+test_orphan_identity_evidence_requires_compromised_recovery() {
+  local home relay old keyfile public_file targets cache_file cache_name targets_before cache_before
+  local output code replacement artifact manifest
+  home=$(make_home orphan-identity-evidence)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "orphan-evidence keypair setup failed"
+  keyfile=$(key_file "$home" "$home/xdg")
+  public_file="$home/data/buzz-keypair.public"
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  relay="ws://127.0.0.1:1/orphan-evidence"
+  printf '%s' '{"schema":"fm-bearings.v1","note":"orphan-evidence"}' \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  cache_file=$(find "$home/state/buzz-replay" -type f -name '*.json' | head -1)
+  assert_present "$cache_file" "orphan-evidence setup did not create a replay entry"
+  cache_name=$(basename "$cache_file")
+  targets_before=$(cat "$targets")
+  cache_before=$(cat "$cache_file")
+  rm "$keyfile" "$public_file"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with orphan identity evidence"
+  assert_contains "$output" "orphan identity evidence exists" \
+    "default ensure did not refuse orphan identity evidence"
+  assert_contains "$output" "orphan publisher target records present" \
+    "default ensure did not name orphan target evidence"
+  assert_contains "$output" "$cache_name" \
+    "default ensure did not name orphan replay evidence"
+  [ "$(cat "$targets")" = "$targets_before" ] || fail "default ensure changed orphan target state"
+  [ "$(cat "$cache_file")" = "$cache_before" ] || fail "default ensure changed orphan replay bytes"
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "plain rotation with orphan identity evidence"
+  assert_contains "$output" "orphan publisher target records are present" \
+    "plain rotation did not refuse orphan target state"
+  assert_contains "$output" "$cache_name" "plain rotation did not name orphan replay state"
+  [ "$(cat "$targets")" = "$targets_before" ] || fail "plain rotation changed orphan target state"
+  [ "$(cat "$cache_file")" = "$cache_before" ] || fail "plain rotation changed orphan replay bytes"
+
+  output=$(run_keypair "$home" --rotate --compromised 2>&1)
+  code=$?
+  expect_code 1 "$code" "compromised orphan recovery without cache disposition"
+  assert_contains "$output" "retry with --discard-pending-cache" \
+    "compromised recovery bypassed the explicit pending-cache disposition"
+
+  output=$(run_keypair "$home" --rotate --compromised --discard-pending-cache 2>&1)
+  code=$?
+  expect_code 0 "$code" "explicit compromised orphan recovery"
+  replacement=$(printf '%s\n' "$output" | tail -1)
+  [ "$replacement" != "$old" ] || fail "compromised orphan recovery reused the orphan identity"
+  artifact="$home/data/buzz-compromised-unverifiable-pairs.jsonl"
+  assert_present "$artifact" "compromised orphan recovery created no durable warning artifact"
+  jq -e --arg publisher "$old" 'select(.publisher_pubkey == $publisher)' "$artifact" >/dev/null \
+    || fail "compromised orphan recovery artifact omitted the orphan publisher"
+  assert_absent "$targets" "compromised orphan recovery left its retired target active"
+  assert_absent "$cache_file" "compromised orphan recovery left its replay entry active"
+  manifest=$(grep -l 'pending-key-rotation' \
+    "$home/state/buzz-replay/_legacy-quarantine/manifests"/*.json 2>/dev/null | head -1)
+  [ -n "$manifest" ] || fail "compromised orphan recovery did not quarantine pending replay evidence"
+  assert_contains "$output" "they may be stranded and are recorded in $artifact" \
+    "compromised orphan recovery omitted its stranded-pair warning"
+  pass "orphan identity evidence requires explicit compromised recovery"
 }
 
 test_rotation_compares_the_recorded_key_with_stored_private_material() {
@@ -1571,6 +1701,52 @@ test_publish_with_relay_down_exits_zero_and_enqueues() {
   [ "$(replay_count "$home")" = "1" ] \
     || fail "the signed event was not enqueued in the replay cache"
   pass "publish with the relay down exits 0 and enqueues the signed event"
+}
+
+test_publisher_target_is_recorded_only_after_cache() {
+  local home replay outside output code
+  home=$(make_home target-after-cache)
+  run_keypair "$home" >/dev/null 2>&1 || fail "target-after-cache keypair setup failed"
+  replay="$home/state/buzz-replay"
+  outside="$home/outside-quarantine"
+  mkdir -p "$replay" "$outside"
+  ln -s "$outside" "$replay/_legacy-quarantine" \
+    || fail "could not create the cache-failure fixture"
+
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"cache-must-precede-target"}' \
+    | run_publish "$home" "ws://127.0.0.1:1/cache-failure" 2>&1)
+  code=$?
+  expect_code 0 "$code" "cache failure through the fire-and-forget wrapper"
+  assert_contains "$output" "not a regular directory" \
+    "the cache failure fixture did not stop publication"
+  assert_absent "$home/data/buzz-publisher-targets.jsonl" \
+    "a failed cache write left a phantom publisher target"
+  [ "$(replay_count "$home")" = "0" ] \
+    || fail "the cache failure unexpectedly retained an active projection"
+  pass "publisher targets are recorded only after durable caching"
+}
+
+test_rotation_uses_the_authoritative_replay_cache_path() {
+  local home relay channel old keyfile private cache_file cache_name output code
+  home=$(make_home authoritative-replay-path)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "authoritative-replay keypair setup failed"
+  keyfile=$(key_file "$home" "$home/xdg")
+  private=$(jq -r '.private_key' "$keyfile")
+  relay="ws://127.0.0.1:1/authoritative-replay"
+  channel="abababab-cdcd-5efe-8123-456789abcdef"
+  cache_file=$(seed_replay_event "$home" "$relay" "$private" 1700000110 "$channel" authoritative-path) \
+    || fail "could not seed the authoritative replay path"
+  cache_name=$(basename "$cache_file")
+
+  output=$(FM_BUZZ_REPLAY_DIR="$home/state/wrong-replay" run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation with a misleading replay override"
+  assert_contains "$output" "$cache_name" \
+    "rotation inspected a split replay tree instead of the authoritative cache"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "a replay-path override bypassed pending-event rotation safety"
+  assert_present "$cache_file" "replay-path validation removed the pending event"
+  pass "publishing and rotation share one authoritative replay cache path"
 }
 
 test_malformed_projection_is_rejected_before_signing() {
@@ -4149,15 +4325,16 @@ test_compose_relay_signer_survives_restart_but_not_volume_teardown() {
   pass "compose relay signer survives restart and changes after down -v"
 }
 
-test_quarantine_lifecycle_has_a_dedicated_owner() {
-  assert_present "$ROOT/bin/fm-buzz-quarantine.mjs" \
-    "the legacy quarantine lifecycle has no dedicated module"
-  assert_grep "export function runLegacyQuarantineLifecycle" \
-    "$ROOT/bin/fm-buzz-quarantine.mjs" \
-    "the quarantine module does not own lifecycle orchestration"
-  assert_grep "runLegacyQuarantineLifecycle" "$ROOT/bin/fm-buzz-publish.mjs" \
-    "the publisher does not delegate legacy quarantine orchestration"
-  pass "legacy quarantine orchestration has one dedicated module owner"
+test_quarantine_lifecycle_has_one_pinned_cache_owner() {
+  assert_absent "$ROOT/bin/fm-buzz-quarantine.mjs" \
+    "the quarantine callback middleman still splits lifecycle ownership"
+  assert_grep "function quarantineLegacyEntries" "$ROOT/bin/fm-buzz-publish.mjs" \
+    "the pinned cache owner does not own legacy quarantine orchestration"
+  assert_grep "function recoverStagedLegacyEntries" "$ROOT/bin/fm-buzz-publish.mjs" \
+    "the pinned cache owner does not own quarantine recovery"
+  assert_no_grep "runLegacyQuarantineLifecycle" "$ROOT/bin/fm-buzz-publish.mjs" \
+    "the publisher still delegates through the callback facade"
+  pass "quarantine lifecycle and pinned mutations have one owner"
 }
 
 test_no_firstmate_path_depends_on_buzz() {
@@ -4186,12 +4363,14 @@ test_rotation_refuses_or_quarantines_outgoing_pending_events
 test_rotation_refuses_an_existing_private_channel_before_mutation
 test_publisher_target_overrides_are_recorded_and_guard_rotation
 test_publisher_target_updates_are_concurrent_and_fail_closed
+test_forget_target_attests_exact_retirement
 test_rotation_checks_authoritative_current_membership
 test_rotation_fails_closed_on_unverifiable_membership
 test_rotation_pins_and_verifies_relay_membership_authority
 test_empty_relay_authority_registry_fails_closed
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable
 test_compromised_orphan_recovery_records_unverifiable_memberships
+test_orphan_identity_evidence_requires_compromised_recovery
 test_rotation_compares_the_recorded_key_with_stored_private_material
 test_rotation_detects_and_cleans_up_divergent_stores
 test_orphaned_public_record_requires_compromised_recovery
@@ -4205,6 +4384,8 @@ test_public_read_cannot_restore_a_concurrently_retired_identity
 test_public_key_history_is_normalized_consistently
 test_two_homes_sharing_one_xdg_get_separate_keys
 test_publish_with_relay_down_exits_zero_and_enqueues
+test_publisher_target_is_recorded_only_after_cache
+test_rotation_uses_the_authoritative_replay_cache_path
 test_malformed_projection_is_rejected_before_signing
 test_refresh_preserves_the_snapshot_bytes_including_its_trailing_newline
 test_publish_without_a_keypair_still_exits_zero
@@ -4270,5 +4451,5 @@ test_an_anonymous_read_of_a_foreign_channel_claims_no_verdict
 test_a_membership_refusal_for_an_empty_foreign_channel_is_inconclusive
 test_an_anonymous_read_of_this_homes_own_label_still_reaches_a_verdict
 test_compose_relay_signer_survives_restart_but_not_volume_teardown
-test_quarantine_lifecycle_has_a_dedicated_owner
+test_quarantine_lifecycle_has_one_pinned_cache_owner
 test_no_firstmate_path_depends_on_buzz
