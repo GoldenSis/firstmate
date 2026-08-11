@@ -19,13 +19,23 @@
 // channel-id is the exact canonical h tag. A complete EVENT frame is cached
 // atomically before target tracking or network access, pruning is oldest-first
 // within only the invoked channel partition while protecting the current event,
-// and only a classified relay outcome removes a replay entry.
+// and only a classified relay outcome removes a replay entry. The only children
+// an endpoint partition may hold are canonical channel directories, entries
+// awaiting migration, and the `.json.tmp` half of an interrupted write; every
+// other child is quarantined as a corrupt partition node rather than skipped.
+//
+// The whole-tree half of a run - quarantine and endpoint-to-channel migration -
+// is migrateReplayCache, a separate entry point so its caller can hold the
+// whole-tree lock across a filesystem walk instead of across a relay round trip.
+// main() therefore never walks outside the queue it was invoked for, and takes
+// that step's failures through the envelope so they still reach this run's
+// accounting. bin/fm-buzz-key-lib.sh owns the lock ordering the two steps assume.
 //
 // Reads one JSON envelope on stdin so that neither the private key nor the
 // projection - which carries task ids, project names, blockers and PR URLs -
 // appears in a command line or in the process environment. Fields: privateKey,
 // content, relay, channelId, channelName, timeoutMs, replayDir, targetsFile,
-// maxCache.
+// migration, maxCache.
 //
 // Legacy and explicitly discarded rotation entries are retained under
 // _legacy-quarantine with payloads and manifests rather than silently deleted.
@@ -217,6 +227,19 @@ function cacheRenameSync(source, destination) {
     ));
   }
   const sourceMetadata = cacheLstatSync(resolvedSource);
+  // A directory cannot be hard-linked, so the link-then-verify-then-unlink route
+  // below is not available to it. It does not need it either: that route exists to
+  // keep an open writer's inode alive across the move, and only a file has one.
+  // rename(2) moves the directory inode itself and is atomic, so a crash leaves it
+  // at one end or the other, never at both.
+  if (sourceMetadata.isDirectory()) {
+    const moved = withPinnedCacheDirectory(destinationParent, () => renameSync(
+      resolvedSource,
+      path.basename(resolvedDestination),
+    ));
+    pinCacheDirectory(resolvedDestination);
+    return moved;
+  }
   if (sourceMetadata.isSymbolicLink()) {
     const target = withPinnedCacheDirectory(sourceParent, () => readlinkSync(path.basename(resolvedSource)));
     withPinnedCacheDirectory(destinationParent, () => symlinkSync(
@@ -960,6 +983,7 @@ function corruptNodeType(metadata) {
   if (metadata.isCharacterDevice()) return "character-device";
   if (metadata.isBlockDevice()) return "block-device";
   if (metadata.isFile()) return "regular-file";
+  if (metadata.isDirectory()) return "directory";
   return "non-directory";
 }
 
@@ -1180,6 +1204,63 @@ function quarantineLegacyEntries(replayDir) {
   return { failures, count };
 }
 
+// The only children an endpoint partition may hold are canonical channel
+// directories, `<created_at>-<event-id>.json` entries awaiting migration, and the
+// `.json.tmp` half of an interrupted write. Anything else - a stray directory, a
+// device node, a symlink standing in for a channel - was silently skipped by both
+// the channel walk and the entry walk, so a frame parked under it was neither
+// replayed, capped, quarantined, nor seen by rotation's outgoing-identity scan.
+// Move it into the same accounted corrupt quarantine the root layer uses, so it
+// is preserved and counted rather than invisible.
+function quarantineNoncanonicalEndpointChildren(
+  replayDir,
+  endpointDirectory,
+  quarantineDir,
+  corruptDir,
+  manifestsDir,
+  failures,
+) {
+  let quarantined = 0;
+  let names;
+  try {
+    names = cacheReaddirSync(endpointDirectory);
+  } catch (error) {
+    if (error.code === "ENOENT") return quarantined;
+    log(`could not inspect endpoint cache directory ${endpointDirectory}: ${error.message}`);
+    failures.push(endpointDirectory);
+    return quarantined;
+  }
+  for (const name of names) {
+    if (name.endsWith(".json") || name.endsWith(".json.tmp")) continue;
+    const candidate = path.join(endpointDirectory, name);
+    let metadata;
+    try {
+      metadata = cacheLstatSync(candidate);
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      log(`could not inspect endpoint cache path ${candidate}: ${error.message}`);
+      failures.push(candidate);
+      continue;
+    }
+    if (CHANNEL_PARTITION.test(name) && metadata.isDirectory() && !metadata.isSymbolicLink()) continue;
+    try {
+      quarantineCorruptPartitionNode(
+        replayDir,
+        quarantineDir,
+        corruptDir,
+        manifestsDir,
+        candidate,
+        metadata,
+      );
+      quarantined += 1;
+    } catch (error) {
+      log(`could not quarantine noncanonical endpoint cache path ${candidate}: ${error.message}`);
+      failures.push(candidate);
+    }
+  }
+  return quarantined;
+}
+
 function migrateEndpointReplayEntries(replayDir) {
   const failures = [];
   let migrated = 0;
@@ -1251,6 +1332,14 @@ function migrateEndpointReplayEntries(replayDir) {
     }
     const sweep = sweepOrphanTemporaries(endpointDirectory, Date.now());
     if (sweep.failed > 0) failures.push(endpointDirectory);
+    quarantined += quarantineNoncanonicalEndpointChildren(
+      replayDir,
+      endpointDirectory,
+      quarantineDir,
+      corruptDir,
+      manifestsDir,
+      failures,
+    );
   }
   if (migrated > 0) log(`migrated ${migrated} endpoint-only replay event(s) into channel partitions`);
   if (quarantined > 0) log(`quarantined ${quarantined} ambiguous endpoint-only replay entr${quarantined === 1 ? "y" : "ies"}`);
@@ -1288,6 +1377,65 @@ function activeReplayPublisherEntries(cacheRoot) {
   return active.sort((left, right) => left.path.localeCompare(right.path));
 }
 
+// Flat and host-keyed entries predate the endpoint-digest layout and are never
+// activated or delivered - quarantineLegacyEntries moves them aside because their
+// scheme and path are unrecoverable. They are still authorship evidence, though:
+// each one names the publisher that signed it. Leaving them out of the identity
+// scan let an ensure or a plain rotation mint a replacement over an identity this
+// home demonstrably published under, which is the very state the orphan gate
+// exists to refuse. Read-only on purpose: this reports, it does not migrate.
+function legacyReplayPublisherEntries(cacheRoot) {
+  const evidence = [];
+  const collect = (directory) => {
+    const inventory = cacheEntries(directory);
+    if (inventory.failures.length > 0) {
+      throw new Error(`could not inspect legacy replay entries:\n${inventory.failures.map((file) => `  ${file}`).join("\n")}`);
+    }
+    for (const entry of inventory.entries) {
+      if (entry.malformed) throw new Error(`legacy replay entry ${entry.file} is invalid: ${entry.reason}`);
+      let raw;
+      try {
+        raw = readRegularFile(entry.file).bytes.toString("utf8");
+      } catch (error) {
+        throw new Error(`could not read legacy replay entry ${entry.file}: ${error.message}`);
+      }
+      let event;
+      try {
+        event = cachedEventFromFrame(raw, entry);
+      } catch (error) {
+        throw new Error(`legacy replay entry ${entry.file} is invalid: ${error.message}`);
+      }
+      evidence.push({ path: entry.file, publisherPubkey: event.pubkey });
+    }
+  };
+  collect(cacheRoot);
+  let names;
+  try {
+    names = cacheReaddirSync(cacheRoot);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    return evidence;
+  }
+  for (const name of names) {
+    if (name === LEGACY_QUARANTINE || CACHE_PARTITION.test(name) || name.endsWith(".json")) continue;
+    const candidate = path.join(cacheRoot, name);
+    let metadata;
+    try {
+      metadata = cacheLstatSync(candidate);
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      throw new Error(`could not inspect legacy replay directory ${candidate}: ${error.message}`);
+    }
+    if (metadata.isSymbolicLink()) {
+      throw new Error(`legacy replay path ${candidate} is a symbolic link`);
+    }
+    if (!metadata.isDirectory()) continue;
+    pinCacheDirectory(candidate);
+    collect(candidate);
+  }
+  return evidence;
+}
+
 export function inspectActiveReplayPublisherCache(replayDir) {
   let metadata;
   try {
@@ -1304,7 +1452,8 @@ export function inspectActiveReplayPublisherCache(replayDir) {
   if (migration.failures.length > 0) {
     throw new Error(`could not migrate endpoint-only replay entries:\n${migration.failures.map((file) => `  ${file}`).join("\n")}`);
   }
-  return activeReplayPublisherEntries(cacheRoot);
+  return [...activeReplayPublisherEntries(cacheRoot), ...legacyReplayPublisherEntries(cacheRoot)]
+    .sort((left, right) => left.path.localeCompare(right.path));
 }
 
 export function protectOutgoingPublisherCache(replayDir, publisherPubkeys, options = {}) {
@@ -1455,11 +1604,16 @@ function cacheChannelDirectories(endpointDirectory) {
   const directories = [];
   const failures = [];
   for (const name of names) {
-    if (!CHANNEL_PARTITION.test(name)) continue;
+    // `.json` entries are the endpoint-only migration's business and `.json.tmp`
+    // is the orphan sweep's; everything else that is not a canonical channel
+    // directory is corrupt state that quarantineNoncanonicalEndpointChildren
+    // should already have moved aside. Reporting rather than skipping it is what
+    // stops rotation from certifying a partition it never actually walked.
+    if (name.endsWith(".json") || name.endsWith(".json.tmp")) continue;
     const directory = path.join(endpointDirectory, name);
     try {
       const metadata = cacheLstatSync(directory);
-      if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      if (!CHANNEL_PARTITION.test(name) || metadata.isSymbolicLink() || !metadata.isDirectory()) {
         log(`rejected channel cache path ${directory}`);
         failures.push(directory);
       } else {
@@ -1607,6 +1761,31 @@ function cacheEvent(replayDir, event) {
   return target;
 }
 
+// The whole-tree half of a publish, split out so its lock is held for a
+// filesystem walk rather than for a relay round trip. Quarantine and endpoint
+// migration touch paths no single channel owns, so they cannot run under a
+// per-queue lock; delivery must not run under a home-wide one.
+export function migrateReplayCache(replayDir) {
+  const cacheRoot = prepareCacheRoot(replayDir);
+  const legacy = quarantineLegacyEntries(cacheRoot);
+  const endpoint = migrateEndpointReplayEntries(cacheRoot);
+  return { legacy: legacy.failures, endpoint: endpoint.failures };
+}
+
+function normalizeMigrationFailures(migration) {
+  if (!migration || typeof migration !== "object" || Array.isArray(migration)) {
+    throw new Error("missing envelope field: migration");
+  }
+  const read = (name) => {
+    const value = migration[name];
+    if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+      throw new Error(`invalid envelope field: migration.${name}`);
+    }
+    return value;
+  };
+  return { legacy: read("legacy"), endpoint: read("endpoint") };
+}
+
 async function main() {
   const envelope = JSON.parse(await readStdin());
   const {
@@ -1631,13 +1810,16 @@ async function main() {
     throw new Error(`invalid relay timeout ${JSON.stringify(timeoutMs)}: expected an integer from 1 to 2147483647`);
   }
   if (!CHANNEL_PARTITION.test(channelId)) throw new Error("channel id must be a canonical UUID");
+  // Migration ran in migrateReplayCache under the whole-tree lock, which the
+  // caller has already dropped; this step owns one queue and must not walk paths
+  // outside it. Its failures still belong in this run's accounting, so they
+  // arrive here rather than being recomputed.
+  const migrationFailures = normalizeMigrationFailures(envelope.migration);
   resolveLoopbackRelayHost(relay);
   const event = buildBearingsEvent(channelId, content, privateKey, [
     ["fm-schema", "fm-bearings.v1"],
   ]);
   const cacheRoot = prepareCacheRoot(replayDir);
-  const legacyMigration = quarantineLegacyEntries(cacheRoot);
-  const endpointMigration = migrateEndpointReplayEntries(cacheRoot);
   const relayCacheDir = prepareRelayCacheDirectory(cacheRoot, relay, channelId);
 
   // Cache the signed event before network access: from here on it survives a
@@ -1649,7 +1831,9 @@ async function main() {
     channel_id: channelId,
     publisher_pubkey: event.pubkey,
   });
-  let cleanupFailures = cacheMaintenance.failed + legacyMigration.failures.length + endpointMigration.failures.length;
+  let cleanupFailures = cacheMaintenance.failed
+    + migrationFailures.legacy.length
+    + migrationFailures.endpoint.length;
   log(`signed event ${event.id} (${Buffer.byteLength(content, "utf8")} bytes) for channel ${channelId}`);
 
   const pending = cacheMaintenance.entries;
@@ -1658,8 +1842,8 @@ async function main() {
   // completed is superseded by the one that ran after it, and incrementing
   // counters would report the same event as both retained and delivered.
   const outcome = new Map(cacheMaintenance.outcomes);
-  for (const file of legacyMigration.failures) outcome.set(`legacy:${file}`, RETRYABLE);
-  for (const file of endpointMigration.failures) outcome.set(`endpoint-migration:${file}`, RETRYABLE);
+  for (const file of migrationFailures.legacy) outcome.set(`legacy:${file}`, RETRYABLE);
+  for (const file of migrationFailures.endpoint) outcome.set(`endpoint-migration:${file}`, RETRYABLE);
   const authRefused = new Set();
 
   await withRelay(relay, privateKey, timeoutMs, async (api) => {

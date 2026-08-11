@@ -502,6 +502,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   buzz-publisher-targets.jsonl  used relay/channel/publisher tuples that protect private-channel membership during rotation; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs
   buzz-relay-authorities.jsonl  pinned kind-39002 membership signers by relay/channel pair; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs
   buzz-compromised-unverifiable-pairs.jsonl  tracked memberships that compromised recovery could not authenticate; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs
+  .buzz-keypair.rotation-stage  a rotation's verified replacement key, held only until it is stored and recorded; LOCAL, gitignored; custody and lifecycle owned by bin/fm-buzz-key-lib.sh
 projects/            cloned repos; gitignored; READ-ONLY for you
 state/               volatile runtime signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth

@@ -88,6 +88,14 @@
 # public key a second time, and the probe silently loses the very attribution this
 # retention exists to preserve. Stopping first leaves the rotation retryable.
 #
+# The replacement is likewise minted and verified BEFORE the outgoing key is
+# cleared, and staged where bin/fm-buzz-key-lib.sh keeps it until it is stored and
+# recorded. The two stores cannot simply be written over: the replacement may land
+# in a different store than the outgoing key, so both have to be cleared first, and
+# a failure inside that window would otherwise leave a public record with no
+# private half - orphan recovery, out of a routine rotation. With the stage, the
+# next ordinary run finishes the replacement instead.
+#
 # The outgoing key is only accepted as 64 lowercase hex characters. data/
 # buzz-keypair.public is a cache, not the authority: every rotation derives the
 # public half from the still-stored private key and compares the recorded value
@@ -122,6 +130,7 @@ HISTORY_FILE="$DATA/buzz-keypair.public-history"
 TARGETS_FILE="$DATA/buzz-publisher-targets.jsonl"
 AUTHORITIES_FILE="$DATA/buzz-relay-authorities.jsonl"
 UNVERIFIABLE_FILE="$DATA/buzz-compromised-unverifiable-pairs.jsonl"
+ROTATION_STAGE_FILE=$(fm_buzz_key_stage_file "$DATA")
 PUBLIC_ONLY=0
 ROTATE=0
 COMPROMISED=0
@@ -194,10 +203,18 @@ fi
 
 KEYPAIR_LOCK=""
 PUBLISH_LOCK=""
+DELIVERY_LOCKS=()
 release_keypair_lock() {
   if [ -n "$KEYPAIR_LOCK" ]; then
     fm_lock_release "$KEYPAIR_LOCK"
     KEYPAIR_LOCK=""
+  fi
+  if [ "${#DELIVERY_LOCKS[@]}" -gt 0 ]; then
+    local index
+    for ((index=${#DELIVERY_LOCKS[@]}-1; index>=0; index--)); do
+      fm_lock_release "${DELIVERY_LOCKS[$index]}"
+    done
+    DELIVERY_LOCKS=()
   fi
   if [ -n "$PUBLISH_LOCK" ]; then
     fm_lock_release "$PUBLISH_LOCK"
@@ -215,16 +232,28 @@ if [ "$PUBLIC_ONLY" -eq 0 ]; then
     . "$SCRIPT_DIR/fm-wake-lib.sh"
   trap release_keypair_lock EXIT
   trap 'exit 1' HUP INT TERM
+  # Ordering is fm-buzz-key-lib.sh's contract: whole tree, then each queue, then
+  # the key. Both the ensure and the rotate paths read - and migrate - the whole
+  # replay tree, so both take the first lock; only rotation mutates entries inside
+  # a queue, so only it takes the second. Holding the first for the whole run is
+  # what stops a queue appearing behind the enumeration below.
+  mkdir -p "$STATE" 2>/dev/null || {
+    printf 'fm-buzz-keypair.sh: could not create %s\n' "$STATE" >&2
+    exit 1
+  }
+  PUBLISH_LOCK=$(fm_buzz_replay_transaction_lock "$STATE") || {
+    printf 'fm-buzz-keypair.sh: could not resolve the replay cache transaction lock\n' >&2
+    exit 1
+  }
+  fm_lock_acquire_wait "$PUBLISH_LOCK"
   if [ "$ROTATE" -eq 1 ]; then
-    mkdir -p "$STATE" 2>/dev/null || {
-      printf 'fm-buzz-keypair.sh: could not create %s\n' "$STATE" >&2
-      exit 1
-    }
-    PUBLISH_LOCK=$(fm_buzz_replay_transaction_lock "$STATE") || {
-      printf 'fm-buzz-keypair.sh: could not resolve the replay cache transaction lock\n' >&2
-      exit 1
-    }
-    fm_lock_acquire_wait "$PUBLISH_LOCK"
+    for delivery_lock in "$STATE"/.buzz-replay-delivery-*.lock; do
+      if [ ! -e "$delivery_lock" ] && [ ! -L "$delivery_lock" ]; then
+        continue
+      fi
+      fm_lock_acquire_wait "$delivery_lock"
+      DELIVERY_LOCKS+=("$delivery_lock")
+    done
   fi
   KEYPAIR_LOCK=$(fm_buzz_key_transaction_lock "$DATA") || {
     printf 'fm-buzz-keypair.sh: could not resolve the key transaction lock\n' >&2
@@ -437,6 +466,74 @@ record_public() {
   fm_buzz_replace_file "$tmp" "$PUBLIC_FILE" || { rm -f -- "$tmp"; return 1; }
 }
 
+# Read the stage back through the custody owner and re-derive its public half, so
+# a stage whose two halves disagree is rejected rather than committed. Returns 1
+# when there is no stage and 2 when the one that exists cannot be trusted.
+load_rotation_stage() {
+  local parsed status derived_stage
+  parsed=$(fm_buzz_key_stage_read "$DATA")
+  status=$?
+  [ "$status" -eq 0 ] || return "$status"
+  ROTATION_STAGE_PHASE=$(printf '%s\n' "$parsed" | sed -n 1p)
+  ROTATION_STAGE_PRIVATE=$(printf '%s\n' "$parsed" | sed -n 2p)
+  ROTATION_STAGE_PUBLIC=$(printf '%s\n' "$parsed" | sed -n 3p)
+  parsed=
+  # shellcheck disable=SC2016
+  derived_stage=$(printf '%s' "$ROTATION_STAGE_PRIVATE" | node -e '
+    let input = "";
+    process.stdin.on("data", (chunk) => { input += chunk; });
+    process.stdin.on("end", async () => {
+      const { publicKeyFromPrivate } = await import(process.argv[1]);
+      process.stdout.write(`${publicKeyFromPrivate(input.trim())}\n`);
+    });
+  ' "$SCRIPT_DIR/fm-buzz-crypto.mjs" 2>/dev/null) || return 2
+  [ "$derived_stage" = "$ROTATION_STAGE_PUBLIC" ] || return 2
+}
+
+generate_rotation_stage() {
+  local generated private public
+  # shellcheck disable=SC2016
+  generated=$(node -e '
+    import(process.argv[1]).then(({ generateKeypair }) => {
+      const kp = generateKeypair();
+      process.stdout.write(`${kp.privateKey}\n${kp.publicKey}\n`);
+    });
+  ' "$SCRIPT_DIR/fm-buzz-crypto.mjs") || return 1
+  private=$(printf '%s\n' "$generated" | sed -n 1p)
+  public=$(printf '%s\n' "$generated" | sed -n 2p)
+  generated=
+  case $private in *[!0-9a-f]*|'') return 1 ;; esac
+  [ "${#private}" -eq 64 ] || return 1
+  case $public in *[!0-9a-f]*|'') return 1 ;; esac
+  [ "${#public}" -eq 64 ] || return 1
+  fm_buzz_key_stage_write "$DATA" prepared "$private" "$public" || return 1
+  private=
+  public=
+  load_rotation_stage
+}
+
+finish_committable_rotation_stage() {
+  local status current store
+  fm_buzz_key_load "$FM_HOME" >/dev/null 2>&1
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    current=$(derive_public) || return 1
+    [ "$current" = "$ROTATION_STAGE_PUBLIC" ] || return 3
+    store=existing
+  elif [ "$status" -eq 1 ]; then
+    store=$(fm_buzz_key_store "$FM_HOME" "$ROTATION_STAGE_PRIVATE") || return 1
+    current=$(derive_public) || return 1
+    [ "$current" = "$ROTATION_STAGE_PUBLIC" ] || return 1
+  else
+    return 1
+  fi
+  record_public "$ROTATION_STAGE_PUBLIC" || return 1
+  fm_buzz_key_stage_clear "$DATA" || return 1
+  ROTATION_STAGE_PRIVATE=""
+  ROTATION_STAGE_PHASE=""
+  ROTATION_STAGE_STORE=$store
+}
+
 # Replace the history file's contents. Whole-file rewrite through a temp file and
 # one `mv`, for the same reason record_public does it: a rotation interrupted
 # midway must leave either the old history or the new one, never a half-written
@@ -598,6 +695,32 @@ add_recovery_reason() {  # <reason>
   fi
 }
 
+ROTATION_STAGE_PHASE=""
+ROTATION_STAGE_PRIVATE=""
+ROTATION_STAGE_PUBLIC=""
+if [ -e "$ROTATION_STAGE_FILE" ] || [ -L "$ROTATION_STAGE_FILE" ]; then
+  load_rotation_stage || {
+    printf 'fm-buzz-keypair.sh: rotation stage %s is invalid; nothing was changed\n' \
+      "$ROTATION_STAGE_FILE" >&2
+    exit 1
+  }
+fi
+if [ "$ROTATION_STAGE_PHASE" = committable ]; then
+  finish_committable_rotation_stage
+  stage_finish_status=$?
+  if [ "$stage_finish_status" -eq 0 ]; then
+    printf 'recovered: completed staged buzz publishing key replacement (private key stored in %s)\n' \
+      "$ROTATION_STAGE_STORE" >&2
+    printf '%s\n' "$ROTATION_STAGE_PUBLIC"
+    exit 0
+  fi
+  if [ "$stage_finish_status" -ne 3 ] || [ "$ROTATE" -eq 0 ]; then
+    printf 'fm-buzz-keypair.sh: could not complete staged replacement %s; retry with --rotate\n' \
+      "$ROTATION_STAGE_FILE" >&2
+    exit 1
+  fi
+fi
+
 if [ "$ROTATE" -eq 1 ]; then
   fm_buzz_file_target_replaceable "$PUBLIC_FILE" || {
     printf 'fm-buzz-keypair.sh: public key record target %s is not a regular file; nothing was rotated\n' "$PUBLIC_FILE" >&2
@@ -749,6 +872,26 @@ EOF
     [ -n "$cache_preflight" ] && printf '%s\n' "$cache_preflight" >&2
   fi
 
+  if [ -z "$ROTATION_STAGE_PHASE" ]; then
+    generate_rotation_stage || {
+      printf 'fm-buzz-keypair.sh: replacement key generation or staging failed; the outgoing private key remains stored\n' >&2
+      exit 1
+    }
+  fi
+  for candidate_public in "${rotation_publics[@]}"; do
+    if [ "$candidate_public" = "$ROTATION_STAGE_PUBLIC" ]; then
+      # Discard the offending stage, but only while the outgoing key is still
+      # stored: keeping it would make every retry re-read the same collision and
+      # wedge the rotation, and dropping a committable one would throw away the
+      # only copy of a key the home already depends on.
+      if [ "$ROTATION_STAGE_PHASE" = prepared ]; then
+        fm_buzz_key_stage_clear "$DATA" || true
+      fi
+      printf 'fm-buzz-keypair.sh: staged replacement matches an outgoing identity; nothing was rotated\n' >&2
+      exit 1
+    fi
+  done
+
   unverifiable_pairs=""
   unverifiable_publics=()
   if [ "$COMPROMISED" -eq 1 ] && [ -n "$recovery_reason" ]; then
@@ -806,6 +949,12 @@ EOF
     printf 'fm-buzz-keypair.sh: no key is stored for this home; there is nothing to retire\n' >&2
   fi
 
+  fm_buzz_key_stage_write "$DATA" committable "$ROTATION_STAGE_PRIVATE" "$ROTATION_STAGE_PUBLIC" || {
+    printf 'fm-buzz-keypair.sh: could not commit the staged replacement transaction; the outgoing private key remains stored\n' >&2
+    exit 1
+  }
+  ROTATION_STAGE_PHASE=committable
+
   cleared=$(fm_buzz_key_forget "$FM_HOME") || {
     printf 'fm-buzz-keypair.sh: could not verify removal of the old key from every store; nothing was replaced\n' >&2
     exit 1
@@ -815,6 +964,37 @@ EOF
   else
     printf 'fm-buzz-keypair.sh: no previous key was stored for this home; minting one\n' >&2
   fi
+
+  store=$(fm_buzz_key_store "$FM_HOME" "$ROTATION_STAGE_PRIVATE") || {
+    printf 'fm-buzz-keypair.sh: could not install the staged replacement key; retry to recover from %s\n' \
+      "$ROTATION_STAGE_FILE" >&2
+    exit 1
+  }
+  installed_public=$(derive_public) || {
+    printf 'fm-buzz-keypair.sh: staged replacement was stored but its public half could not be derived; retry is safe\n' >&2
+    exit 1
+  }
+  if [ "$installed_public" != "$ROTATION_STAGE_PUBLIC" ]; then
+    printf 'fm-buzz-keypair.sh: stored replacement does not match the staged identity; retry is required\n' >&2
+    exit 1
+  fi
+  record_public "$ROTATION_STAGE_PUBLIC" || {
+    printf 'fm-buzz-keypair.sh: could not record %s; the private key remains stored for a safe retry in the staged replacement\n' \
+      "$PUBLIC_FILE" >&2
+    exit 1
+  }
+  fm_buzz_key_stage_clear "$DATA" || {
+    printf 'fm-buzz-keypair.sh: replacement was installed but %s could not be cleared; retry is required\n' \
+      "$ROTATION_STAGE_FILE" >&2
+    exit 1
+  }
+  printf 'created: buzz publishing keypair (private key stored in %s)\n' "$store" >&2
+  if [ -n "${unverifiable_pairs:-}" ]; then
+    printf 'WARNING: compromised recovery could not authenticate these memberships for the retired identity; they may be stranded and are recorded in %s:\n%s\n' \
+      "$UNVERIFIABLE_FILE" "$unverifiable_pairs" >&2
+  fi
+  printf '%s\n' "$ROTATION_STAGE_PUBLIC"
+  exit 0
 fi
 
 fm_buzz_key_load "$FM_HOME" >/dev/null 2>&1

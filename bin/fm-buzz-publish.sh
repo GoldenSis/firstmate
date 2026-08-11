@@ -112,8 +112,10 @@ log() {
 STDIN_SPOOL=""
 STDIN_READER=""
 PUBLISH_LOCK=""
+DELIVERY_LOCK=""
 KEYPAIR_LOCK=""
 PUBLISH_INTERRUPTED=0
+# Released highest-numbered first, matching the ordering fm-buzz-key-lib.sh owns.
 drop_stdin_spool() {
   if [ -n "$STDIN_READER" ]; then
     kill "$STDIN_READER" 2>/dev/null
@@ -126,6 +128,10 @@ drop_stdin_spool() {
   if [ -n "$KEYPAIR_LOCK" ]; then
     fm_lock_release "$KEYPAIR_LOCK"
     KEYPAIR_LOCK=""
+  fi
+  if [ -n "$DELIVERY_LOCK" ]; then
+    fm_lock_release "$DELIVERY_LOCK"
+    DELIVERY_LOCK=""
   fi
   if [ -n "$PUBLISH_LOCK" ]; then
     fm_lock_release "$PUBLISH_LOCK"
@@ -302,6 +308,16 @@ publish() {
     return 1
   }
 
+  # The delivery lock is scoped to the queue this run owns, so it has to agree
+  # with the cache partitioning on what "this relay" means - hence the same
+  # normalization the cache digest uses, which also rejects credential-bearing
+  # URLs before any of them can reach a lock name, a log line, or the network.
+  local normalized_relay
+  normalized_relay=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" normalize-relay "$RELAY" 2>&1) || {
+    log "$normalized_relay"
+    return 1
+  }
+
   if [ -L "$REPLAY_DIR" ] || { [ -e "$REPLAY_DIR" ] && [ ! -d "$REPLAY_DIR" ]; }; then
     log "replay cache path $REPLAY_DIR is not a regular directory"
     return 1
@@ -322,6 +338,44 @@ publish() {
       log "interrupted while waiting for replay cache ownership"
     else
       log "could not acquire replay cache ownership within ${PUBLISH_LOCK_TIMEOUT_S}s"
+    fi
+    drop_stdin_spool
+    return 1
+  fi
+
+  # Whole-tree work, and the only thing the whole-tree lock is held for. Its
+  # failures still have to reach this run's accounting, so they travel to the
+  # delivery step in the envelope instead of being recomputed there.
+  local migration
+  # shellcheck disable=SC2016
+  migration=$(node -e '
+    const [modulePath, replayDir] = process.argv.slice(1);
+    import(modulePath).then(({ migrateReplayCache }) => {
+      process.stdout.write(JSON.stringify(migrateReplayCache(replayDir)));
+    }).catch((error) => {
+      process.stderr.write(`${error.message}\n`);
+      process.exitCode = 1;
+    });
+  ' "$SCRIPT_DIR/fm-buzz-publish.mjs" "$REPLAY_DIR") || {
+    log "could not settle the replay cache; skipping publish"
+    drop_stdin_spool
+    return 1
+  }
+  fm_lock_release "$PUBLISH_LOCK"
+  PUBLISH_LOCK=""
+
+  DELIVERY_LOCK=$(fm_buzz_replay_delivery_lock "$STATE" "$normalized_relay" "$channel") || {
+    log "could not resolve this queue's delivery ownership"
+    drop_stdin_spool
+    return 1
+  }
+  acquire_bounded_lock "$DELIVERY_LOCK"
+  local delivery_lock_status=$?
+  if [ "$delivery_lock_status" -ne 0 ]; then
+    if [ "$delivery_lock_status" -eq 2 ]; then
+      log "interrupted while waiting for this queue's delivery ownership"
+    else
+      log "could not acquire this queue's delivery ownership within ${PUBLISH_LOCK_TIMEOUT_S}s"
     fi
     drop_stdin_spool
     return 1
@@ -376,15 +430,16 @@ publish() {
     --arg targetsFile "$TARGETS_FILE" \
     --argjson timeoutMs "$TIMEOUT_MS" \
     --argjson maxCache "$MAX_CACHE" \
+    --argjson migration "$migration" \
     '{privateKey:$privateKey, content:$content, relay:$relay, channelId:$channelId,
-      replayDir:$replayDir, targetsFile:$targetsFile,
+      replayDir:$replayDir, targetsFile:$targetsFile, migration:$migration,
       timeoutMs:$timeoutMs, maxCache:$maxCache}' \
     | node "$SCRIPT_DIR/fm-buzz-publish.mjs"
   rc=$?
   fm_lock_release "$KEYPAIR_LOCK"
   KEYPAIR_LOCK=""
-  fm_lock_release "$PUBLISH_LOCK"
-  PUBLISH_LOCK=""
+  fm_lock_release "$DELIVERY_LOCK"
+  DELIVERY_LOCK=""
   drop_stdin_spool
   return "$rc"
 }

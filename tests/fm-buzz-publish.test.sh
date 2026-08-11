@@ -258,6 +258,63 @@ key_file() {  # <home> <xdg>
     fm_buzz_key_fallback_file "$1" )
 }
 
+# Ask the custody library where the rotation stage lives and how to write one, for
+# the same reason key_file does: the layout is what is under test.
+rotation_stage_file() {  # <home>
+  # shellcheck disable=SC1091
+  ( . "$ROOT/bin/fm-buzz-key-lib.sh"; fm_buzz_key_stage_file "$1/data" )
+}
+
+write_rotation_stage() {  # <home> <phase> <private-key> <public-key>
+  # shellcheck disable=SC1091
+  ( . "$ROOT/bin/fm-buzz-key-lib.sh"; fm_buzz_key_stage_write "$1/data" "$2" "$3" "$4" )
+}
+
+delivery_lock_path() {  # <home> <relay> <channel>
+  local normalized
+  normalized=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$2") || return 1
+  # shellcheck disable=SC1091
+  ( . "$ROOT/bin/fm-buzz-key-lib.sh"; fm_buzz_replay_delivery_lock "$1/state" "$normalized" "$3" )
+}
+
+# Hold a lock from a live background process, so the holder is a real owner rather
+# than a hand-forged directory the acquire path would rightly treat as stale.
+#
+# The holder's stdout and stderr are closed off deliberately: this runs inside a
+# command substitution, which waits for every writer to the capture pipe, so a
+# holder that inherited them would hang the caller until it exited - which is
+# precisely never.
+hold_lock() {  # <lock path> -> holder pid
+  local lock=$1 pid
+  bash -c '
+    . "$1/bin/fm-wake-lib.sh"
+    trap "fm_lock_release \"\$2\"; exit 0" TERM INT
+    fm_lock_try_acquire "$2" || exit 1
+    while :; do sleep 0.2; done
+  ' bash "$ROOT" "$lock" >/dev/null 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do
+    [ -e "$lock" ] && { printf '%s\n' "$pid"; return 0; }
+    sleep 0.1
+  done
+  kill "$pid" 2>/dev/null
+  return 1
+}
+
+release_lock() {  # <holder pid>
+  kill -TERM "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+}
+
+new_private_key() {
+  # shellcheck disable=SC2016
+  node -e '
+    import(process.argv[1]).then(({ generateKeypair }) => {
+      process.stdout.write(`${generateKeypair().privateKey}\n`);
+    });
+  ' "$ROOT/bin/fm-buzz-crypto.mjs"
+}
+
 public_from_private() {  # <private-key>
   # shellcheck disable=SC2016
   printf '%s' "$1" | node -e '
@@ -2442,6 +2499,157 @@ EOF
   [ -d "$(channel_cache_dir "$home" "$relay" "$channel_b")" ] \
     || fail "channel B did not use its exact channel partition"
   pass "same-endpoint channel queues are provisioned and drained independently"
+}
+
+test_rotation_stages_the_replacement_before_clearing_the_outgoing_key() {
+  local home stage first staged_private staged_public output code recovered mode
+  home=$(make_home rotate-staging)
+  first=$(run_keypair "$home" 2>/dev/null) || fail "staging keypair setup failed"
+  stage=$(rotation_stage_file "$home")
+
+  # An ordinary rotation must leave nothing behind: the stage exists only between
+  # the outgoing key being cleared and the replacement being recorded.
+  output=$(run_keypair "$home" --rotate 2>&1)
+  expect_code 0 "$?" "an ordinary rotation with the replacement staged first"
+  assert_absent "$stage" "a completed rotation left its replacement staged"
+
+  # The crash this staging exists for: the outgoing private key is gone and only
+  # the public record survives. Without a stage that is the orphan state, which
+  # needs --rotate --compromised; with one the next run simply finishes the job.
+  staged_private=$(new_private_key) || fail "could not mint a staged replacement"
+  staged_public=$(public_from_private "$staged_private") || fail "could not derive the staged key"
+  write_rotation_stage "$home" committable "$staged_private" "$staged_public"
+  mode=$(file_mode "$stage")
+  [ "$mode" = "600" ] || fail "the rotation stage holds key material at mode $mode"
+  rm -f -- "$(key_file "$home" "$home/xdg")"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 0 "$code" "an interrupted rotation must be completable, not orphan recovery"
+  assert_contains "$output" "completed staged buzz publishing key replacement" \
+    "the interrupted rotation was not recognised as completable"
+  recovered=$(printf '%s\n' "$output" | tail -1)
+  [ "$recovered" = "$staged_public" ] \
+    || fail "the recovered identity is not the staged replacement"
+  assert_grep "$staged_public" "$home/data/buzz-keypair.public" \
+    "the completed staged replacement was not recorded"
+  assert_absent "$stage" "completing the staged replacement left the stage behind"
+  [ "$(run_keypair "$home" --public 2>/dev/null)" = "$staged_public" ] \
+    || fail "the staged replacement was recorded without being stored"
+  pass "rotation stages and verifies the replacement before clearing the outgoing key"
+}
+
+test_orphan_gate_sees_legacy_replay_publisher_evidence() {
+  local home relay foreign_private foreign_public seeded channel flat host_dir
+  local output code recovered
+  home=$(make_home orphan-legacy-replay)
+  run_keypair "$home" >/dev/null 2>&1 || fail "legacy orphan keypair setup failed"
+  relay="ws://127.0.0.1:1"
+  channel=$(default_channel_id "$home")
+  foreign_private=$(new_private_key) || fail "could not mint a legacy publisher"
+  foreign_public=$(public_from_private "$foreign_private") || fail "could not derive the legacy publisher"
+  seeded=$(seed_replay_event "$home" "$relay" "$foreign_private" 1700000000 "$channel" legacy-orphan) \
+    || fail "could not seed a replay event"
+
+  # Flat and host-keyed entries are the two pre-endpoint-digest layouts. Neither is
+  # ever delivered, but both name the publisher that signed them, so both have to
+  # reach the orphan gate.
+  flat="$home/state/buzz-replay/$(basename "$seeded")"
+  mv "$seeded" "$flat"
+  host_dir="$home/state/buzz-replay/127.0.0.1%3A1"
+  mkdir -p "$host_dir"
+  cp "$flat" "$host_dir/"
+
+  rm -f -- "$(key_file "$home" "$home/xdg")" "$home/data/buzz-keypair.public"
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "an ensure over legacy replay evidence from another publisher"
+  assert_contains "$output" "orphan identity evidence exists" \
+    "the orphan gate ignored legacy replay evidence"
+  assert_contains "$output" "$foreign_public" \
+    "the orphan gate did not name the legacy publisher"
+  assert_contains "$output" "buzz-replay/$(basename "$flat")" \
+    "the orphan gate did not name the flat legacy entry"
+  assert_contains "$output" "$(basename "$host_dir")/$(basename "$flat")" \
+    "the orphan gate did not name the host-keyed legacy entry"
+
+  output=$(run_keypair "$home" --rotate --compromised 2>&1)
+  code=$?
+  expect_code 0 "$code" "compromised recovery over legacy orphan evidence"
+  recovered=$(printf '%s\n' "$output" | tail -1)
+  [ "$recovered" != "$foreign_public" ] || fail "compromised recovery adopted the legacy publisher"
+  assert_not_contains "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null)" "$foreign_public" \
+    "compromised recovery retained the legacy orphan identity"
+  pass "orphan identity inspection covers flat and host-keyed legacy replay entries"
+}
+
+test_noncanonical_endpoint_children_are_quarantined_and_accounted() {
+  local home relay channel endpoint stray output manifests payloads
+  home=$(make_home noncanonical-endpoint-child)
+  run_keypair "$home" >/dev/null 2>&1 || fail "noncanonical child keypair setup failed"
+  relay="ws://127.0.0.1:1"
+  channel=$(default_channel_id "$home")
+  seed_replay_event "$home" "$relay" \
+    "$(new_private_key)" 1700000001 "$channel" noncanonical-neighbour >/dev/null \
+    || fail "could not seed a channel entry"
+  endpoint=$(relay_cache_dir "$home" "$relay")
+
+  # A child that is neither a canonical channel directory nor an entry awaiting
+  # migration used to be skipped by both walks, so a frame parked under it was
+  # invisible to replay, to the cap, and to rotation's outgoing-identity scan.
+  stray="$endpoint/not-a-channel"
+  mkdir -p "$stray"
+  printf '%s' '["EVENT",{}]' > "$stray/1700000002-deadbeef.json"
+
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"noncanonical"}' \
+    | run_publish "$home" "$relay" 2>&1)
+  expect_code 0 "$?" "a noncanonical endpoint child through fire-and-forget"
+  assert_absent "$stray" "the noncanonical endpoint child was left in place"
+  manifests="$home/state/buzz-replay/_legacy-quarantine/manifests"
+  payloads="$home/state/buzz-replay/_legacy-quarantine/corrupt"
+  [ "$(find "$manifests" -name '*.json' | wc -l | tr -d ' ')" != "0" ] \
+    || fail "the noncanonical endpoint child was discarded without a manifest"
+  grep -Rql "not-a-channel" "$manifests" >/dev/null \
+    || fail "no quarantine manifest records the noncanonical endpoint child"
+  [ "$(find "$payloads" -name '1700000002-deadbeef.json' | wc -l | tr -d ' ')" = "1" ] \
+    || fail "the noncanonical endpoint child's payload was not preserved"
+  pass "noncanonical endpoint children are quarantined rather than silently skipped"
+}
+
+test_channel_delivery_locks_do_not_share_one_home_wide_queue() {
+  local home relay port channel_a channel_b lock_a lock_b holder output
+  home=$(make_home channel-delivery-locks)
+  run_keypair "$home" >/dev/null 2>&1 || fail "delivery lock keypair setup failed"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  port=${relay##*:}
+  channel_a=$(channel_id_for_label delivery-lock-a)
+  channel_b=$(channel_id_for_label delivery-lock-b)
+  lock_a=$(delivery_lock_path "$home" "$relay" "$channel_a")
+  lock_b=$(delivery_lock_path "$home" "$relay" "$channel_b")
+  [ "$lock_a" != "$lock_b" ] || fail "two channels on one relay share a delivery lock"
+
+  # Stand in for a channel-A publish whose relay is slow: its queue is owned, the
+  # rest of the home is not. Channel B must not spend its deadline waiting on it.
+  mkdir -p "$home/state"
+  holder=$(hold_lock "$lock_a") || fail "could not hold channel A's delivery lock"
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"delivery-lock-b"}' \
+    | FM_BUZZ_LOCK_TIMEOUT_S=2 run_publish "$home" "$relay" --channel-label delivery-lock-b 2>&1)
+  assert_contains "$output" "delivered=1" \
+    "channel B could not publish while channel A's queue was held"
+  assert_not_contains "$output" "could not acquire" \
+    "channel B waited on ownership channel A was holding"
+
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"delivery-lock-a"}' \
+    | FM_BUZZ_LOCK_TIMEOUT_S=1 run_publish "$home" "$relay" --channel-label delivery-lock-a 2>&1)
+  assert_contains "$output" "could not acquire this queue's delivery ownership" \
+    "a second channel A publish ignored the held queue"
+  release_lock "$holder"
+  stop_stub "$STUB_PID"
+  [ "$(find "$(channel_cache_dir "$home" "$relay" "$channel_a")" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')" = "0" ] \
+    || fail "the refused channel A publish cached a projection anyway"
+  pass "delivery ownership is scoped per endpoint and channel, not per home"
 }
 
 test_relay_cache_partition_uses_the_normalized_complete_endpoint() {
@@ -4946,7 +5154,8 @@ test_quarantine_lifecycle_has_one_pinned_cache_owner() {
     "the relay-client scope omits rotation membership queries"
   assert_grep 'FM_BUZZ_DOCKER_INTEGRATION=1` enables the opt-in Compose' "$ROOT/docs/buzz-loopback-adapter.md" \
     "the adapter guide does not distinguish the opt-in Docker lane"
-  assert_grep "header of .*fm-buzz-publish.sh.* owns input, option, default, and termination mechanics" \
+  # shellcheck disable=SC2016
+  assert_grep 'The header of `bin/fm-buzz-publish.sh` owns input, option, default, and termination mechanics' \
     "$ROOT/docs/buzz-loopback-adapter.md" \
     "the adapter guide does not point runtime mechanics to their owner"
   assert_no_grep "runLegacyQuarantineLifecycle" "$ROOT/bin/fm-buzz-publish.mjs" \
@@ -5018,6 +5227,10 @@ test_publish_with_relay_up_delivers_and_lands
 test_relay_switch_does_not_replay_another_relays_cache
 test_endpoint_only_cache_entries_migrate_to_their_exact_channel
 test_same_endpoint_channel_queues_are_isolated
+test_rotation_stages_the_replacement_before_clearing_the_outgoing_key
+test_orphan_gate_sees_legacy_replay_publisher_evidence
+test_noncanonical_endpoint_children_are_quarantined_and_accounted
+test_channel_delivery_locks_do_not_share_one_home_wide_queue
 test_relay_cache_partition_uses_the_normalized_complete_endpoint
 test_legacy_replay_entries_are_quarantined_with_a_manifest
 test_legacy_quarantine_claims_the_source_before_reading

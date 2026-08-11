@@ -27,6 +27,7 @@ run/**/*.log
 state/buzz-replay/
 state/buzz-relay-key/
 data/buzz-keypair.*
+data/.buzz-keypair.rotation-stage
 data/buzz-publisher-targets.jsonl
 data/buzz-relay-authorities.jsonl
 data/buzz-compromised-unverifiable-pairs.jsonl

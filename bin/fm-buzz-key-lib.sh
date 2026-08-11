@@ -49,7 +49,26 @@
 
 FM_BUZZ_KEYCHAIN_SERVICE=firstmate-buzz
 
-# Print the one per-home transaction lock shared by key management and publishing.
+# LOCK ORDERING
+# Three locks guard this adapter, and every holder takes them in this order and
+# releases them in the reverse one. Anything else can deadlock publishing against
+# rotation, both of which need more than one of them.
+#
+#   1. fm_buzz_replay_transaction_lock  - the whole replay tree. Migration and
+#      quarantine walk paths no single channel owns, so they need it; publishing
+#      holds it only for that walk and drops it before the network.
+#   2. fm_buzz_replay_delivery_lock     - one endpoint-and-channel queue. Held
+#      across signing, caching, and delivery, which is the slow part. Scoping it
+#      per queue is the point: a channel whose relay is unreachable must not spend
+#      another channel's bounded acquisition deadline.
+#   3. fm_buzz_key_transaction_lock     - this home's key material. Rotation and
+#      the publisher's key capture are mutually exclusive, so a compromised
+#      rotation cannot withdraw an identity a delayed publish is about to sign as.
+#
+# Rotation takes all three, holding 1 for its whole run so no queue can appear
+# behind its back. Publishing takes 1, releases it, then takes 2 and 3 - dropping
+# a lower-numbered lock early is safe, re-taking one while holding a higher one is
+# not.
 fm_buzz_key_transaction_lock() {  # <data directory>
   local data=${1:?data directory required}
   printf '%s/.buzz-keypair.lock\n' "$data"
@@ -58,6 +77,17 @@ fm_buzz_key_transaction_lock() {  # <data directory>
 fm_buzz_replay_transaction_lock() {  # <state directory>
   local state=${1:?state directory required}
   printf '%s/.buzz-replay-publish.lock\n' "$state"
+}
+
+# The digest covers the complete normalized endpoint AND the channel id, matching
+# how the cache itself is partitioned, so two channels on one relay - and one
+# channel on two relays - never share a delivery lock.
+fm_buzz_replay_delivery_lock() {  # <state directory> <normalized relay> <channel id>
+  local state=${1:?state directory required} relay=${2:?normalized relay required}
+  local channel=${3:?channel id required} digest
+  digest=$(printf '%s\n%s' "$relay" "$channel" | fm_buzz_key_sha256) || return 1
+  [ -n "$digest" ] || return 1
+  printf '%s/.buzz-replay-delivery-%s.lock\n' "$state" "$digest"
 }
 
 # Print the one authoritative replay-cache path shared by publishing and key
@@ -229,6 +259,71 @@ fm_buzz_key_store() {
   printf '{\n  "private_key": "%s"\n}\n' "$private" > "$tmp" || { rm -f -- "$tmp"; return 1; }
   fm_buzz_replace_file "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
   printf 'file\n'
+}
+
+# THE ROTATION STAGE IS THE THIRD PLACE A PRIVATE KEY CAN LIVE
+# fm_buzz_key_forget has to clear every store before the replacement is stored,
+# because the replacement may land in a different store than the outgoing key and
+# a forget afterwards would take the new key with it. That leaves a window with no
+# key at all, and a keychain that refuses the write inside it strands the home with
+# a public record and nothing to derive it from - orphan recovery, from a routine
+# rotation. So the replacement is written here first, verified, and only then is
+# the outgoing key cleared: a failure at any later point leaves a stage file the
+# next run finishes, rather than a home with no key.
+#
+# It lives beside the record it replaces, in the gitignored per-home data/, at the
+# same 0600 as the fallback store and by the same mktemp-then-tighten route, and
+# it is removed the moment the replacement is stored and recorded. Custody lives
+# here rather than in bin/fm-buzz-keypair.sh so this file stays the single answer
+# to where a private key can be found.
+fm_buzz_key_stage_file() {  # <data directory>
+  local data=${1:?data directory required}
+  printf '%s/.buzz-keypair.rotation-stage\n' "$data"
+}
+
+fm_buzz_key_stage_write() {  # <data directory> <prepared|committable> <private> <public>
+  local data=${1:?data directory required} phase=${2:?phase required}
+  local private=${3:?private key required} public=${4:?public key required} file tmp
+  case $phase in prepared|committable) ;; *) return 1 ;; esac
+  file=$(fm_buzz_key_stage_file "$data") || return 1
+  mkdir -p "$data" 2>/dev/null || return 1
+  fm_buzz_file_target_replaceable "$file" || return 1
+  tmp=$(mktemp "$data/.buzz-keypair-rotation-stage.XXXXXX") || return 1
+  chmod 0600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  printf '{"phase":"%s","private_key":"%s","public_key":"%s"}\n' \
+    "$phase" "$private" "$public" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  fm_buzz_replace_file "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
+}
+
+# Print `phase`, `private_key` and `public_key` on three lines. Return 1 when no
+# stage exists, and 2 when one exists but is not a readable, well-formed stage.
+# Same output discipline as fm_buzz_key_load: the second line is a private key.
+fm_buzz_key_stage_read() {  # <data directory>
+  local data=${1:?data directory required} file
+  file=$(fm_buzz_key_stage_file "$data") || return 2
+  if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+    return 1
+  fi
+  [ -f "$file" ] && [ ! -L "$file" ] || return 2
+  # shellcheck disable=SC2016
+  node -e '
+    const { readFileSync } = require("node:fs");
+    const value = JSON.parse(readFileSync(process.argv[1], "utf8"));
+    if (!value || !["prepared", "committable"].includes(value.phase)) process.exit(1);
+    if (!/^[0-9a-f]{64}$/.test(value.private_key ?? "")) process.exit(1);
+    if (!/^[0-9a-f]{64}$/.test(value.public_key ?? "")) process.exit(1);
+    process.stdout.write(`${value.phase}\n${value.private_key}\n${value.public_key}\n`);
+  ' "$file" 2>/dev/null || return 2
+}
+
+fm_buzz_key_stage_clear() {  # <data directory>
+  local data=${1:?data directory required} file
+  file=$(fm_buzz_key_stage_file "$data") || return 1
+  if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+    return 0
+  fi
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  rm -f -- "$file"
 }
 
 # Remove this home's private key from EVERY store, printing one line per store
