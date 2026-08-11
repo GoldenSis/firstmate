@@ -5,8 +5,8 @@
 # RUNTIME PUBLISH FAILURES EXIT 0. A MISSING REQUIRED PYTHON3 EXITS NON-ZERO.
 #
 # Every failure path - relay down, connection refused, timeout, NIP-42 auth
-# failure, event rejected, signing error, missing keypair, missing node, missing
-# jq, unreadable replay cache, or malformed snapshot - is caught, logged to
+# failure, event rejected, signing error, missing keypair, missing node or its
+# WebSocket API, missing jq, unreadable replay cache, or malformed snapshot - is caught, logged to
 # stderr, and followed by exit 0. Python 3 is the declared prerequisite for the
 # descriptor-relative filesystem operations that enforce the cache boundary, so
 # its absence is a loud startup error rather than an optional publish failure.
@@ -495,6 +495,10 @@ publish() {
 
 check_publish_prerequisites() {
   command -v node >/dev/null 2>&1 || { log "node is unavailable; skipping publish"; return 1; }
+  node -e 'if (typeof globalThis.WebSocket !== "function") process.exit(1)' >/dev/null 2>&1 || {
+    log "Node.js does not provide the global WebSocket API; skipping publish"
+    return 1
+  }
   command -v jq >/dev/null 2>&1 || { log "jq is unavailable; skipping publish"; return 1; }
   command -v python3 >/dev/null 2>&1 || {
     log "python3 is required for safe replay-cache operations; see docs/buzz-loopback-adapter.md#prerequisites"

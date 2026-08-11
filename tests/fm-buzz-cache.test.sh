@@ -508,41 +508,113 @@ test_quarantine_retry_reuses_link_stable_transaction_identity() {
 }
 
 test_quarantine_recovers_atomic_manifest_temporaries() {
-  local home relay replay quarantine payload content digest token temporary final
+  local home replay quarantine regular_token corrupt_token recovery_token mismatch_token digest_token
+  local regular_payload corrupt_payload recovery_payload digest_payload token
   home=$(make_home quarantine-temporary-recovery)
   run_keypair "$home" >/dev/null 2>&1 || fail "quarantine temporary keypair setup failed"
   replay="$home/state/buzz-replay"
   quarantine="$replay/_legacy-quarantine"
-  mkdir -p "$quarantine/manifests" "$quarantine/payloads" "$quarantine/staging" "$quarantine/corrupt"
-  payload="$quarantine/payloads/recovered-payload.json"
-  content='legacy-payload-for-temporary-recovery'
-  printf '%s' "$content" > "$payload"
-  digest=$(node -e '
+  regular_token=$(printf '%064d' 61)
+  corrupt_token=$(printf '%064d' 62)
+  recovery_token=$(printf '%064d' 63)
+  mismatch_token=$(printf '%064d' 64)
+  digest_token=$(printf '%064d' 65)
+  regular_payload="$quarantine/payloads/$regular_token.json"
+  corrupt_payload="$quarantine/corrupt/$corrupt_token/entry"
+  recovery_payload="$quarantine/recovery-corrupt/$recovery_token.invalid"
+  digest_payload="$quarantine/payloads/$digest_token.json"
+  mkdir -p "$quarantine/manifests" "$quarantine/payloads" "$quarantine/staging" \
+    "$quarantine/corrupt/$corrupt_token" "$quarantine/recovery-corrupt"
+  printf '%s' 'regular-manifest-payload' > "$regular_payload"
+  printf '%s' 'corrupt-manifest-payload' > "$corrupt_payload"
+  printf '%s' 'recovery-manifest-payload' > "$recovery_payload"
+  printf '%s' 'digest-mismatch-payload' > "$digest_payload"
+  # shellcheck disable=SC2016
+  node -e '
+    const fs = require("node:fs");
     const { createHash } = require("node:crypto");
-    process.stdout.write(createHash("sha256").update(process.argv[1]).digest("hex"));
-  ' "$content")
-  token=$(printf '%064d' 6)
-  temporary="$quarantine/manifests/$token.json.4242.tmp"
-  final="$quarantine/manifests/$token.json"
-  jq -n \
-    --arg digest "$digest" \
-    '{original_path:"localhost%3A3000/legacy.json",
-      legacy_host:"localhost:3000",
-      original_timestamps:{atime_ms:1,mtime_ms:2,ctime_ms:3,birthtime_ms:4},
-      content_sha256:$digest,
-      quarantine_timestamp:"2026-08-11T00:00:00.000Z",
-      payload_reference:"payloads/recovered-payload.json"}' > "$temporary"
-  read -r STUB_PID relay <<EOF
-$(start_stub)
-EOF
+    const [quarantine, manifests, ...tokens] = process.argv.slice(1);
+    const timestamps = (metadata) => ({
+      atime_ms: metadata.atimeMs,
+      mtime_ms: metadata.mtimeMs,
+      ctime_ms: metadata.ctimeMs,
+      birthtime_ms: metadata.birthtimeMs,
+    });
+    const write = (token, suffix, manifest) => {
+      fs.writeFileSync(`${manifests}/${token}.json${suffix}.tmp`, `${JSON.stringify(manifest)}\n`);
+    };
+    const [regular, corrupt, recovery, mismatch, digestMismatch] = tokens;
+    const regularPayload = `${quarantine}/payloads/${regular}.json`;
+    const regularMetadata = fs.statSync(regularPayload);
+    const regularBytes = fs.readFileSync(regularPayload);
+    const regularManifest = {
+      original_path: "legacy/regular.json",
+      legacy_host: "localhost:3000",
+      original_timestamps: timestamps(regularMetadata),
+      quarantine_timestamp: new Date(0).toISOString(),
+      payload_reference: `payloads/${regular}.json`,
+      source_device: regularMetadata.dev,
+      source_inode: regularMetadata.ino,
+      content_sha256_observed: createHash("sha256").update(regularBytes).digest("hex"),
+      content_size_observed: regularBytes.length,
+      quarantine_reason: "temporary-recovery-fixture",
+      publisher_pubkey: null,
+    };
+    write(regular, ".4242", regularManifest);
+    const corruptPayload = `${quarantine}/corrupt/${corrupt}/entry`;
+    const corruptMetadata = fs.statSync(corruptPayload);
+    const corruptBytes = fs.readFileSync(corruptPayload);
+    write(corrupt, "", {
+      original_path: "legacy/corrupt-node",
+      legacy_host: null,
+      original_timestamps: timestamps(corruptMetadata),
+      quarantine_timestamp: new Date(0).toISOString(),
+      payload_reference: `corrupt/${corrupt}/entry`,
+      corrupt_type: "regular-file",
+      content_sha256: createHash("sha256").update(corruptBytes).digest("hex"),
+      publisher_pubkey: null,
+    });
+    const recoveryPayload = `${quarantine}/recovery-corrupt/${recovery}.invalid`;
+    const recoveryMetadata = fs.statSync(recoveryPayload);
+    write(recovery, ".4243", {
+      original_path: "manifests/interrupted.json.tmp",
+      original_timestamps: timestamps(recoveryMetadata),
+      quarantine_timestamp: new Date(0).toISOString(),
+      payload_reference: `recovery-corrupt/${recovery}.invalid`,
+      source_device: recoveryMetadata.dev,
+      source_inode: recoveryMetadata.ino,
+      corrupt_type: "invalid-quarantine-recovery-residue",
+      recovery_error: "temporary-recovery-fixture",
+    });
+    write(mismatch, "", { ...regularManifest });
+    const digestPayload = `${quarantine}/payloads/${digestMismatch}.json`;
+    const digestMetadata = fs.statSync(digestPayload);
+    write(digestMismatch, "", {
+      ...regularManifest,
+      payload_reference: `payloads/${digestMismatch}.json`,
+      source_device: digestMetadata.dev,
+      source_inode: digestMetadata.ino,
+      content_sha256_observed: "0".repeat(64),
+      content_size_observed: fs.statSync(digestPayload).size,
+    });
+  ' "$quarantine" "$quarantine/manifests" "$regular_token" "$corrupt_token" \
+    "$recovery_token" "$mismatch_token" "$digest_token"
+
   printf '%s' '{"schema":"fm-bearings.v1","note":"recover-manifest-temp"}' \
-    | run_publish "$home" "$relay" >/dev/null 2>&1
-  stop_stub "$STUB_PID"
-  assert_present "$final" "quarantine did not recover the atomic manifest temporary"
-  assert_absent "$temporary" "quarantine left the recovered manifest temporary behind"
-  [ "$(jq -r '.payload_reference' "$final")" = "payloads/recovered-payload.json" ] \
-    || fail "recovered quarantine manifest changed its payload reference"
-  pass "quarantine recovers current and historical atomic temporary names"
+    | run_publish "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
+  for token in "$regular_token" "$corrupt_token" "$recovery_token"; do
+    assert_present "$quarantine/manifests/$token.json" \
+      "quarantine did not recover manifest temporary variant $token"
+  done
+  assert_absent "$quarantine/manifests/$mismatch_token.json" \
+    "quarantine finalized a manifest whose token did not bind its payload"
+  assert_absent "$quarantine/manifests/$digest_token.json" \
+    "quarantine finalized a manifest whose observed digest did not match"
+  grep -l 'does not match its observed content' "$quarantine/manifests"/*.json >/dev/null 2>&1 \
+    || fail "quarantine did not retain the observed-content failure reason"
+  [ -z "$(find "$quarantine/manifests" -type f -name '*.tmp' -print -quit)" ] \
+    || fail "quarantine left a manifest temporary active"
+  pass "quarantine recovery validates and completes every manifest variant"
 }
 
 test_quarantine_recovery_rejects_noncanonical_tokens() {

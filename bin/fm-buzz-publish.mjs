@@ -60,9 +60,9 @@
 // A lowercase SHA-256 token binds stable source provenance: original path,
 // device, and inode for regular files, or mode for corrupt partition nodes,
 // without using access or link-mutated change time.
-// Startup first accounts for invalid recovery residue, then completes manifest
-// temporaries, staged regular files, and corrupt nodes before discovering new
-// legacy entries, and it reports every unsettled mutation as a cleanup failure.
+// Startup completes manifest temporaries before accounting for invalid recovery
+// residue, then completes staged regular files and corrupt nodes before discovering
+// new legacy entries, and it reports every unsettled mutation as a cleanup failure.
 
 import {
   closeSync,
@@ -984,6 +984,92 @@ function quarantineManifestVariant(manifest, token) {
   throw new Error("quarantine manifest has an invalid payload_reference");
 }
 
+function requireQuarantinePayloadDirectory(directory) {
+  let metadata;
+  try {
+    metadata = cacheLstatSync(directory);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      throw new Error(`legacy quarantine payload path ${directory} is missing`);
+    }
+    throw error;
+  }
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`legacy quarantine payload path ${directory} is not a regular directory`);
+  }
+  return pinCacheDirectory(directory);
+}
+
+function readQuarantinePayloadBytes(payload) {
+  try {
+    return readRegularFile(payload).bytes;
+  } catch (error) {
+    throw new Error(`could not read legacy quarantine payload ${payload}: ${error.message}`);
+  }
+}
+
+function quarantineManifestPayload(quarantineDir, manifest, token) {
+  const variant = quarantineManifestVariant(manifest, token);
+  let payloadParent;
+  if (variant === "regular") {
+    payloadParent = requireQuarantinePayloadDirectory(path.join(quarantineDir, "payloads"));
+  } else if (variant === "corrupt") {
+    const corruptDir = requireQuarantinePayloadDirectory(path.join(quarantineDir, "corrupt"));
+    payloadParent = requireQuarantinePayloadDirectory(path.join(corruptDir, token));
+  } else {
+    payloadParent = requireQuarantinePayloadDirectory(path.join(quarantineDir, "recovery-corrupt"));
+  }
+  const payload = path.resolve(path.join(quarantineDir, manifest.payload_reference));
+  if (!containedCachePath(payloadParent, payload) || path.dirname(payload) !== path.resolve(payloadParent)) {
+    throw new Error("legacy quarantine payload path does not match its manifest variant");
+  }
+  let metadata;
+  try {
+    metadata = cacheLstatSync(payload);
+  } catch (error) {
+    if (error.code === "ENOENT") throw new Error(`legacy quarantine payload ${payload} is missing`);
+    throw error;
+  }
+  let bytes = null;
+  if (variant === "regular" || variant === "recovery-residue") {
+    if (!metadata.isFile()) {
+      throw new Error(`legacy quarantine payload ${payload} is not a regular file`);
+    }
+    if (metadata.dev !== manifest.source_device || metadata.ino !== manifest.source_inode) {
+      throw new Error(`legacy quarantine payload ${payload} does not match its source identity`);
+    }
+  }
+  if (variant === "regular") {
+    bytes = readQuarantinePayloadBytes(payload);
+    if (
+      sha256(bytes) !== manifest.content_sha256_observed ||
+      bytes.length !== manifest.content_size_observed
+    ) {
+      throw new Error(`legacy quarantine payload ${payload} does not match its observed content`);
+    }
+  }
+  if (variant === "corrupt") {
+    if (corruptNodeType(metadata) !== manifest.corrupt_type) {
+      throw new Error(`legacy quarantine payload ${payload} does not match corrupt_type ${manifest.corrupt_type}`);
+    }
+    if (typeof manifest.content_sha256 === "string") {
+      if (!metadata.isFile()) {
+        throw new Error(`legacy quarantine payload ${payload} cannot provide its recorded content hash`);
+      }
+      bytes = readQuarantinePayloadBytes(payload);
+      if (sha256(bytes) !== manifest.content_sha256) {
+        throw new Error(`legacy quarantine payload ${payload} does not match its content hash`);
+      }
+    }
+  }
+  if (manifest.publisher_pubkey !== null && manifest.publisher_pubkey !== undefined) {
+    if (!metadata.isFile() || validatedSignedPublisher(payload) !== manifest.publisher_pubkey) {
+      throw new Error(`legacy quarantine payload ${payload} does not match its publisher identity`);
+    }
+  }
+  return { variant, payload, metadata };
+}
+
 function writeJsonAtomically(file, value) {
   const temporary = `${file}.tmp`;
   cacheWriteFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: "wx" });
@@ -1094,10 +1180,8 @@ function recoverInvalidRecoveryResidues(quarantineDir, manifestsDir, recoveryCor
         if (error.code !== "ENOENT") throw error;
       }
       if (existing !== undefined) {
-        if (
-          existing.corrupt_type !== "invalid-quarantine-recovery-residue" ||
-          existing.payload_reference !== expectedReference
-        ) {
+        const retained = quarantineManifestPayload(quarantineDir, existing, match[1]);
+        if (retained.variant !== "recovery-residue" || existing.payload_reference !== expectedReference) {
           throw new Error("recovery-residue manifest does not match its payload");
         }
         continue;
@@ -1187,7 +1271,6 @@ function recoverAtomicJson(file, recovery) {
 function recoverQuarantineTransactions(
   quarantineDir,
   manifestsDir,
-  payloadsDir,
   recoveryCorruptDir,
   failures,
 ) {
@@ -1198,15 +1281,9 @@ function recoverQuarantineTransactions(
       const match = temporaryPattern.exec(name);
       if (!match) throw new Error("invalid quarantine temporary name");
       const manifest = readQuarantineManifest(stage);
-      const payload = path.resolve(path.join(path.dirname(manifestsDir), manifest.payload_reference));
-      if (!containedCachePath(payloadsDir, payload)) {
-        throw new Error("quarantine transaction path escapes replay cache");
-      }
-      const { bytes } = readRegularFile(payload);
-      if (typeof manifest.content_sha256 === "string" && sha256(bytes) !== manifest.content_sha256) {
-        throw new Error("quarantine payload digest mismatch");
-      }
-      const final = quarantineManifestPath(manifestsDir, match[1]);
+      const token = requireQuarantineToken(match[1]);
+      quarantineManifestPayload(quarantineDir, manifest, token);
+      const final = quarantineManifestPath(manifestsDir, token);
       finalizeQuarantineManifest(stage, final, manifest);
     } catch (error) {
       try {
@@ -1499,14 +1576,13 @@ function quarantineLegacyEntries(replayDir) {
   const stagingDir = prepareCacheDirectory(quarantineDir, "staging");
   const corruptDir = prepareCacheDirectory(quarantineDir, "corrupt");
   const recoveryCorruptDir = prepareCacheDirectory(quarantineDir, "recovery-corrupt");
-  recoverInvalidRecoveryResidues(quarantineDir, manifestsDir, recoveryCorruptDir, failures);
   recoverQuarantineTransactions(
     quarantineDir,
     manifestsDir,
-    payloadsDir,
     recoveryCorruptDir,
     failures,
   );
+  recoverInvalidRecoveryResidues(quarantineDir, manifestsDir, recoveryCorruptDir, failures);
   recoverStagedLegacyEntries(
     quarantineDir,
     manifestsDir,
@@ -1814,36 +1890,34 @@ function migrateEndpointReplayEntries(replayDir) {
   return { failures, migrated, quarantined };
 }
 
-function activeReplayPublisherEntries(cacheRoot) {
-  const topology = activeCacheDirectories(cacheRoot);
+function replayPublisherEntries(cacheRoot, topologyProvider, description) {
+  const topology = topologyProvider(cacheRoot);
   if (topology.failures.length > 0) {
-    throw new Error(`could not inspect active replay partitions:\n${topology.failures.map((file) => `  ${file}`).join("\n")}`);
+    throw new Error(`could not inspect ${description} partitions:\n${topology.failures.map((file) => `  ${file}`).join("\n")}`);
   }
-  const active = [];
+  const evidence = [];
   for (const directory of topology.directories) {
     const inventory = cacheEntries(directory);
     if (inventory.failures.length > 0) {
-      throw new Error(`could not inspect active replay entries:\n${inventory.failures.map((file) => `  ${file}`).join("\n")}`);
+      throw new Error(`could not inspect ${description} entries:\n${inventory.failures.map((file) => `  ${file}`).join("\n")}`);
     }
     for (const entry of inventory.entries) {
-      if (entry.malformed) throw new Error(`active replay entry ${entry.file} is invalid: ${entry.reason}`);
-      let raw;
-      try {
-        raw = readRegularFile(entry.file).bytes.toString("utf8");
-      } catch (error) {
-        throw new Error(`could not read active replay entry ${entry.file}: ${error.message}`);
-      }
+      if (entry.malformed) throw new Error(`${description} entry ${entry.file} is invalid: ${entry.reason}`);
       let event;
       try {
-        event = cachedEventFromFrame(raw, entry);
+        event = cachedEventFromFrame(readRegularFile(entry.file).bytes.toString("utf8"), entry);
       } catch (error) {
-        throw new Error(`active replay entry ${entry.file} is invalid: ${error.message}`);
+        throw new Error(`${description} entry ${entry.file} is invalid: ${error.message}`);
       }
-      active.push({ path: entry.file, publisherPubkey: event.pubkey });
+      evidence.push({ path: entry.file, publisherPubkey: event.pubkey });
     }
-    active.push(...temporaryReplayPublisherEntries(directory, "active replay"));
+    evidence.push(...temporaryReplayPublisherEntries(directory, description));
   }
-  return active.sort((left, right) => left.path.localeCompare(right.path));
+  return evidence.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function activeReplayPublisherEntries(cacheRoot) {
+  return replayPublisherEntries(cacheRoot, activeCacheDirectories, "active replay");
 }
 
 // Flat and host-keyed entries predate the endpoint-digest layout and are never
@@ -2031,119 +2105,26 @@ function quarantinedReplayPublisherEntries(cacheRoot) {
     } catch (error) {
       throw new Error(`could not read legacy quarantine manifest ${manifestFile}: ${error.message}`);
     }
-    let variant;
+    let retained;
     try {
-      variant = quarantineManifestVariant(manifest, match[1]);
+      retained = quarantineManifestPayload(quarantineDir, manifest, match[1]);
     } catch (error) {
-      throw new Error(`legacy quarantine manifest ${manifestFile} is malformed: ${error.message}`);
+      throw new Error(`legacy quarantine manifest ${manifestFile} is malformed or inconsistent: ${error.message}`);
     }
     const recorded = manifest.publisher_pubkey;
     if (recorded !== null && recorded !== undefined) {
       evidence.push({ path: manifestFile, publisherPubkey: recorded });
       continue;
     }
-    const regularReference = path.join("payloads", `${match[1]}.json`);
-    const corruptReference = path.join("corrupt", match[1], "entry");
-    const recoveryReference = path.join("recovery-corrupt", `${match[1]}.invalid`);
-    let payloadParent;
-    if (variant === "regular") {
-      payloadParent = path.join(quarantineDir, "payloads");
-    } else if (variant === "corrupt") {
-      const corruptDir = path.join(quarantineDir, "corrupt");
-      try {
-        metadata = cacheLstatSync(corruptDir);
-      } catch (error) {
-        if (error.code === "ENOENT") {
-          throw new Error(`legacy quarantine corrupt path ${corruptDir} is missing`);
-        }
-        throw error;
-      }
-      if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-        throw new Error(`legacy quarantine corrupt path ${corruptDir} is not a regular directory`);
-      }
-      pinCacheDirectory(corruptDir);
-      payloadParent = path.join(quarantineDir, "corrupt", match[1]);
-    } else {
-      payloadParent = path.join(quarantineDir, "recovery-corrupt");
-    }
-    const payload = path.resolve(path.join(quarantineDir, manifest.payload_reference));
-    const expectedReference = variant === "regular"
-      ? regularReference
-      : variant === "corrupt"
-        ? corruptReference
-        : recoveryReference;
-    if (
-      manifest.payload_reference !== expectedReference ||
-      !containedCachePath(payloadParent, payload) ||
-      path.dirname(payload) !== path.resolve(payloadParent)
-    ) {
-      throw new Error(`legacy quarantine manifest ${manifestFile} has an invalid payload path`);
-    }
-    try {
-      metadata = cacheLstatSync(payloadParent);
-    } catch (error) {
-      if (error.code === "ENOENT") {
-        throw new Error(`legacy quarantine payload path ${payloadParent} is missing`);
-      }
-      throw error;
-    }
-    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-      throw new Error(`legacy quarantine payload path ${payloadParent} is not a regular directory`);
-    }
-    pinCacheDirectory(payloadParent);
-    try {
-      metadata = cacheLstatSync(payload);
-    } catch (error) {
-      if (error.code === "ENOENT") {
-        throw new Error(`legacy quarantine payload ${payload} is missing`);
-      }
-      throw error;
-    }
-    if (variant === "recovery-residue") {
-      if (!metadata.isFile()) {
-        throw new Error(`legacy quarantine recovery residue ${payload} is not a regular file`);
-      }
-      continue;
-    }
-    if (variant === "corrupt" && corruptNodeType(metadata) !== manifest.corrupt_type) {
-      throw new Error(`legacy quarantine payload ${payload} does not match corrupt_type ${manifest.corrupt_type}`);
-    }
-    if (!metadata.isFile()) {
-      if (variant === "regular") {
-        throw new Error(`legacy quarantine payload ${payload} is not a regular file`);
-      }
-      continue;
-    }
-    const publisherPubkey = validatedSignedPublisher(payload);
-    if (publisherPubkey !== null) evidence.push({ path: payload, publisherPubkey });
+    if (retained.variant === "recovery-residue" || !retained.metadata.isFile()) continue;
+    const publisherPubkey = validatedSignedPublisher(retained.payload);
+    if (publisherPubkey !== null) evidence.push({ path: retained.payload, publisherPubkey });
   }
   return evidence;
 }
 
 function endpointReplayPublisherEntries(cacheRoot) {
-  const topology = cacheEndpointDirectories(cacheRoot);
-  if (topology.failures.length > 0) {
-    throw new Error(`could not inspect endpoint replay partitions:\n${topology.failures.map((file) => `  ${file}`).join("\n")}`);
-  }
-  const evidence = [];
-  for (const directory of topology.directories) {
-    const inventory = cacheEntries(directory);
-    if (inventory.failures.length > 0) {
-      throw new Error(`could not inspect endpoint replay entries:\n${inventory.failures.map((file) => `  ${file}`).join("\n")}`);
-    }
-    for (const entry of inventory.entries) {
-      if (entry.malformed) throw new Error(`endpoint replay entry ${entry.file} is invalid: ${entry.reason}`);
-      let event;
-      try {
-        event = cachedEventFromFrame(readRegularFile(entry.file).bytes.toString("utf8"), entry);
-      } catch (error) {
-        throw new Error(`endpoint replay entry ${entry.file} is invalid: ${error.message}`);
-      }
-      evidence.push({ path: entry.file, publisherPubkey: event.pubkey });
-    }
-    evidence.push(...temporaryReplayPublisherEntries(directory, "endpoint replay"));
-  }
-  return evidence;
+  return replayPublisherEntries(cacheRoot, cacheEndpointDirectories, "endpoint replay");
 }
 
 export function inspectActiveReplayPublisherCache(replayDir) {

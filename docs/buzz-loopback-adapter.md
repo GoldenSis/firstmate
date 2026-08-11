@@ -61,7 +61,7 @@ Bring the relay up, publish, read back, tear down.
 
 ### Prerequisites
 
-Publishing requires Node.js, `jq`, and Python 3.
+Publishing requires Node.js with the global WebSocket API, `jq`, and Python 3.
 Python 3 provides the descriptor-relative filesystem operations that keep replay-cache mutations inside pinned directories, so a missing `python3` is a loud non-zero startup error with an install-documentation pointer.
 
 ```

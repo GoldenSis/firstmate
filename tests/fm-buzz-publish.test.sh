@@ -44,6 +44,35 @@ test_missing_python3_is_a_loud_prerequisite_failure() {
   pass "missing python3 fails loudly before publication"
 }
 
+test_missing_global_websocket_is_rejected_before_publication() {
+  local home tools tool real_node output code
+  home=$(make_home missing-websocket)
+  tools="$home/prerequisite-tools"
+  mkdir -p "$tools"
+  real_node=$(command -v node)
+  for tool in bash dirname jq python3; do
+    ln -s "$(command -v "$tool")" "$tools/$tool"
+  done
+  cat > "$tools/node" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-e" ] && [[ ${2:-} == *'globalThis.WebSocket'* ]]; then
+  exit 1
+fi
+exec "$FM_TEST_REAL_NODE" "$@"
+EOF
+  chmod +x "$tools/node"
+  output=$(PATH="$tools" FM_TEST_REAL_NODE="$real_node" \
+    FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$home/state" \
+    "$PUBLISH" --relay ws://127.0.0.1:1 </dev/null 2>&1)
+  code=$?
+  expect_code 0 "$code" "publish without the global WebSocket API"
+  assert_contains "$output" "Node.js does not provide the global WebSocket API" \
+    "missing WebSocket support reached publication"
+  [ "$(replay_count "$home")" = "0" ] \
+    || fail "missing WebSocket support still cached an event"
+  pass "missing global WebSocket support is rejected before publication"
+}
+
 test_same_second_identical_publishes_have_distinct_signed_identities() {
   local home clock cache files ids nonces
   home=$(make_home same-second-identical)
@@ -1238,6 +1267,7 @@ EOF
 
 test_publish_with_relay_down_exits_zero_and_enqueues
 test_missing_python3_is_a_loud_prerequisite_failure
+test_missing_global_websocket_is_rejected_before_publication
 test_same_second_identical_publishes_have_distinct_signed_identities
 test_replayed_events_are_tracked_before_delivery
 test_malformed_projection_is_rejected_before_signing

@@ -2096,7 +2096,7 @@ EOF
     run_keypair "$home" 2>&1)
   code=$?
   expect_code 1 "$code" "default ensure with an unreadable quarantine payload"
-  assert_contains "$output" "could not read signed cache payload $payload" \
+  assert_contains "$output" "could not read legacy quarantine payload $payload" \
     "an unreadable quarantine payload was treated as absent identity evidence"
   assert_absent "$(key_file "$home" "$home/xdg")" \
     "default ensure minted over uninspectable quarantine evidence"
