@@ -16,7 +16,7 @@ test_publisher_target_is_recorded_only_after_cache() {
   ln -s "$outside" "$replay/_legacy-quarantine" \
     || fail "could not create the cache-failure fixture"
 
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"cache-must-precede-target"}' \
+  output=$(test_projection "cache-must-precede-target" \
     | run_publish "$home" "ws://127.0.0.1:1/cache-failure" 2>&1)
   code=$?
   expect_code 0 "$code" "cache failure through the fire-and-forget wrapper"
@@ -34,15 +34,15 @@ test_cache_cap_is_enforced_before_target_registry_failure() {
   home=$(make_home cache-cap-before-target-failure)
   run_keypair "$home" >/dev/null 2>&1 || fail "cache-cap target-failure keypair setup failed"
   relay="ws://127.0.0.1:1/cache-cap-target-failure"
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"cached-one"}' \
+  test_projection "cached-one" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"cached-two"}' \
+  test_projection "cached-two" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   [ "$(replay_count "$home")" = "2" ] || fail "cache-cap target-failure fixture did not seed two entries"
   targets="$home/data/buzz-publisher-targets.jsonl"
   printf '%s\n' '{"relay":"ws://localhost:3000"}' > "$targets"
 
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"current-before-target-error"}' \
+  output=$(test_projection "current-before-target-error" \
     | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
   code=$?
   expect_code 0 "$code" "target-registry failure through the fire-and-forget wrapper"
@@ -82,7 +82,7 @@ test_relay_switch_does_not_replay_another_relays_cache() {
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
 
   # Queue one projection for a relay that is down.
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"relay-a-only"}' \
+  test_projection "relay-a-only" \
     | run_publish "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
   [ "$(replay_count "$home")" = "1" ] \
     || fail "relay A did not retain exactly one cached projection"
@@ -92,7 +92,7 @@ test_relay_switch_does_not_replay_another_relays_cache() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"relay-b-only"}' \
+  output=$(test_projection "relay-b-only" \
     | run_publish "$home" "$relay" 2>&1)
   assert_contains "$output" "delivered=1" \
     "relay B did not receive exactly its own newly cached projection"
@@ -144,7 +144,7 @@ EOF
   read -r STUB_PID relay <<EOF
 $(start_stub --port "$port")
 EOF
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"endpoint-migration-b"}' \
+  output=$(test_projection "endpoint-migration-b" \
     | run_publish "$home" "$relay" --channel-label endpoint-migration-b 2>&1)
 
   migrated="$endpoint/$channel_a/$(basename "$legacy")"
@@ -187,7 +187,7 @@ test_noncanonical_endpoint_children_are_quarantined_and_accounted() {
   mkdir -p "$stray"
   printf '%s' '["EVENT",{}]' > "$stray/1700000002-deadbeef.json"
 
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"noncanonical"}' \
+  output=$(test_projection "noncanonical" \
     | run_publish "$home" "$relay" 2>&1)
   expect_code 0 "$?" "a noncanonical endpoint child through fire-and-forget"
   assert_absent "$stray" "the noncanonical endpoint child was left in place"
@@ -228,7 +228,7 @@ test_unexpected_root_signed_frame_remains_identity_evidence() {
     "$home" "$relay" "$private" 1700000131 "$channel" unexpected-root-quarantine) \
     || fail "could not seed the unexpected-root quarantine fixture"
   mv "$seeded" "$unexpected"
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"quarantine-unexpected-root"}' \
+  output=$(test_projection "quarantine-unexpected-root" \
     | run_publish "$home" "$relay" 2>&1)
   assert_absent "$unexpected" "an unexpected root cache child was not quarantined"
   manifest=$(grep -Fl "signed-frame-without-a-cache-name" \
@@ -338,7 +338,7 @@ test_legacy_replay_entries_are_quarantined_with_a_manifest() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"fresh-after-legacy"}' \
+  output=$(test_projection "fresh-after-legacy" \
     | run_publish "$home" "$relay" 2>&1)
 
   assert_absent "$legacy_file" "a legacy replay entry remained in its active queue"
@@ -368,7 +368,7 @@ EOF
   assert_contains "$readback" "fresh-after-legacy" "the fresh projection did not land"
   assert_not_contains "$readback" "must-not-be-delivered" \
     "a legacy entry was delivered despite its unknown endpoint"
-  second=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"quarantine-retry"}' \
+  second=$(test_projection "quarantine-retry" \
     | run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
@@ -401,7 +401,7 @@ test_legacy_quarantine_claims_the_source_before_reading() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"claim-before-read"}' \
+  output=$(test_projection "claim-before-read" \
     | run_publish "$home" "$relay" 2>&1)
   wait "$writer" || fail "legacy in-place writer fixture failed"
   assert_present "$legacy_file" \
@@ -411,7 +411,7 @@ EOF
   payloads=$(grep -rl 'legacy-old-bytes' "$quarantine/payloads" 2>/dev/null | wc -l | tr -d ' ')
   [ "$payloads" = "1" ] || fail "the atomically claimed legacy bytes were not quarantined once"
 
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"claim-retry"}' \
+  test_projection "claim-retry" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   stop_stub "$STUB_PID"
   assert_absent "$legacy_file" "the replacement legacy entry was not quarantined on retry"
@@ -440,7 +440,7 @@ test_legacy_quarantine_retains_open_writer_appends() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"open-writer-quarantine"}' \
+  test_projection "open-writer-quarantine" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   printf '%s' '-appended-through-open-fd' >&9
   exec 9>&-
@@ -499,7 +499,7 @@ test_quarantine_retry_reuses_link_stable_transaction_identity() {
   ' "$replay" "$legacy_file" "$quarantine" \
     || fail "could not seed the interrupted hard-link quarantine transaction"
 
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"recover-link-stable-quarantine"}' \
+  output=$(test_projection "recover-link-stable-quarantine" \
     | run_publish "$home" "ws://127.0.0.1:1/link-stable-quarantine" 2>&1)
   assert_absent "$legacy_file" "quarantine retry left the already-claimed legacy source active"
   manifests=$(find "$quarantine/manifests" -type f -name '*.json' | wc -l | tr -d ' ')
@@ -650,7 +650,7 @@ $(node -e '
   ' "$quarantine" "$quarantine/manifests")
 EOF
 
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"recover-manifest-temp"}' \
+  test_projection "recover-manifest-temp" \
     | run_publish "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
   for token in "$regular_token" "$corrupt_token" "$recovery_token"; do
     assert_present "$quarantine/manifests/$token.json" \
@@ -705,7 +705,7 @@ test_quarantine_recovery_rejects_noncanonical_tokens() {
     }
   }' > "$corrupt/origin.json"
 
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"token-validation"}' \
+  output=$(test_projection "token-validation" \
     | run_publish "$home" "ws://127.0.0.1:1" 2>&1)
   assert_absent "$home/escaped-staged.json" \
     "a persisted staging token escaped the quarantine directory"
@@ -728,7 +728,7 @@ test_invalid_quarantine_temporaries_are_accounted_for() {
   temporary="$quarantine/manifests/$token.json.tmp"
   printf '%s' '{"truncated":' > "$temporary"
 
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"invalid-quarantine-temp"}' \
+  output=$(test_projection "invalid-quarantine-temp" \
     | run_publish "$home" "ws://127.0.0.1:1" 2>&1)
   assert_absent "$temporary" "an invalid quarantine temporary remained active"
   residue=$(find "$quarantine/recovery-corrupt" -type f -print -quit 2>/dev/null)
@@ -739,7 +739,7 @@ test_invalid_quarantine_temporaries_are_accounted_for() {
   assert_contains "$output" "quarantined invalid recovery residue" \
     "invalid quarantine residue was not diagnosed"
   rm "$manifest"
-  second=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"recover-invalid-residue"}' \
+  second=$(test_projection "recover-invalid-residue" \
     | run_publish "$home" "ws://127.0.0.1:1" 2>&1)
   manifest=$(grep -l 'invalid-quarantine-recovery-residue' \
     "$quarantine/manifests"/*.json 2>/dev/null | head -1)
@@ -783,7 +783,7 @@ childProcess.spawnSync = function guardedSpawnSync(command, args, options) {
 };
 syncBuiltinESMExports();
 EOF
-  first=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"residue-retry-first"}' \
+  first=$(test_projection "residue-retry-first" \
     | NODE_OPTIONS="--import=$preload" FM_TEST_RESIDUE_SENTINEL="$sentinel" \
       run_publish "$home" "ws://127.0.0.1:1/residue-retry" 2>&1)
   assert_present "$sentinel" "the residue retry fixture did not interrupt the hard-link claim"
@@ -791,7 +791,7 @@ EOF
   assert_contains "$first" "simulated residue hard-link interruption" \
     "the interrupted residue claim was not accounted for"
 
-  second=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"residue-retry-second"}' \
+  second=$(test_projection "residue-retry-second" \
     | run_publish "$home" "ws://127.0.0.1:1/residue-retry" 2>&1)
   residues=$(find "$quarantine/recovery-corrupt" -type f -name '*.invalid' | wc -l | tr -d ' ')
   manifests=$(grep -l 'invalid-quarantine-recovery-residue' \
@@ -835,7 +835,7 @@ EOF
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"manifest-accounting"}' \
+  output=$(test_projection "manifest-accounting" \
     | PATH="$tools:$PATH" FM_TEST_REAL_PYTHON="$real_python" \
       FM_TEST_QUARANTINE_MANIFEST="$manifest" \
       FM_TEST_QUARANTINE_MANIFEST_NAME="$(basename "$manifest")" \
@@ -894,7 +894,7 @@ test_replay_cache_is_capped_at_100() {
   newest=$(find "$cache_dir" -type f -name '1700000120-*.json' -print -quit)
   [ "$(replay_count "$home")" = "120" ] || fail "cache seeding failed"
 
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[]}' \
+  test_projection \
     | run_publish "$home" "$relay" >/dev/null 2>&1
 
   count=$(replay_count "$home")
@@ -914,7 +914,7 @@ test_cache_limit_must_be_a_positive_integer() {
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
 
   for invalid in 0 -5 abc; do
-    output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"invalid-limit"}' \
+    output=$(test_projection "invalid-limit" \
       | FM_BUZZ_MAX_CACHE=$invalid run_publish "$home" "ws://127.0.0.1:1" 2>&1)
     code=$?
     expect_code 0 "$code" "invalid cache limit $invalid through the fire-and-forget wrapper"
@@ -945,7 +945,7 @@ EOF
   old=$(seed_replay_event "$home" "$relay" "$private" 1700000000 "$channel" limit-one-old) \
     || fail "could not seed the same-second cache entry"
 
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"limit-one"}' \
+  output=$(test_projection "limit-one" \
     | NODE_OPTIONS="--import=$clock" FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
@@ -968,7 +968,7 @@ test_concurrent_publishers_serialize_the_cache_lifecycle() {
 $(start_stub --silent-ok)
 EOF
 
-  (printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"concurrent-first"}' \
+  (test_projection "concurrent-first" \
     | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" --timeout 1500) \
     > "$first_output" 2>&1 &
   first_pid=$!
@@ -979,7 +979,7 @@ EOF
   done
   [ -L "$lock" ] || fail "the first publisher never acquired cache ownership"
 
-  (printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"concurrent-second"}' \
+  (test_projection "concurrent-second" \
     | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" --timeout 1500) \
     > "$second_output" 2>&1 &
   second_pid=$!
@@ -1015,7 +1015,7 @@ test_replay_cache_rejects_symlink_boundaries() {
   expect_code 1 "$code" "direct replay migration through a symlinked ancestor"
   assert_contains "$output" "replay cache ancestor" \
     "the replay engine accepted a symlinked ancestor"
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"ancestor-symlink"}' \
+  output=$(test_projection "ancestor-symlink" \
     | run_publish "$ancestor_home" "ws://127.0.0.1:1" 2>&1)
   assert_contains "$output" "replay cache ancestor" \
     "a replay-root ancestor symlink was not rejected"
@@ -1028,7 +1028,7 @@ test_replay_cache_rejects_symlink_boundaries() {
   mkdir "$outside"
   rm -rf "$root_home/state/buzz-replay"
   ln -s "$outside" "$root_home/state/buzz-replay"
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"root-symlink"}' \
+  output=$(test_projection "root-symlink" \
     | run_publish "$root_home" "ws://127.0.0.1:1" 2>&1)
   assert_contains "$output" "replay cache path" "a replay-root symlink was not rejected"
   [ -z "$(find "$outside" -mindepth 1 -maxdepth 1 -print -quit)" ] \
@@ -1044,7 +1044,7 @@ test_replay_cache_rejects_symlink_boundaries() {
   outside="$relay_home/outside-relay-cache"
   mkdir -p "$replay" "$outside"
   ln -s "$outside" "$replay/$digest"
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"relay-symlink"}' \
+  output=$(test_projection "relay-symlink" \
     | run_publish "$relay_home" "$relay" 2>&1)
   assert_contains "$output" "quarantined corrupt cache partition path" \
     "a relay-directory symlink was not quarantined as corrupt state"
@@ -1070,7 +1070,7 @@ test_replay_cache_rejects_symlink_boundaries() {
   printf '%s' '{"outside":true}' > "$target"
   link="$replay/$digest/1700000000-$(printf '%064d' 7).json"
   ln -s "$target" "$link"
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"entry-symlink"}' \
+  output=$(test_projection "entry-symlink" \
     | run_publish "$entry_home" "$relay" 2>&1)
   assert_contains "$output" "cache entry is a symbolic link" \
     "a cache-entry symlink was treated as a replayable event"
@@ -1109,7 +1109,7 @@ fs.realpathSync = function guardedRealpathSync(value, ...args) {
 };
 syncBuiltinESMExports();
 EOF
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"root-pin"}' \
+  output=$(test_projection "root-pin" \
     | NODE_OPTIONS="--import=$preload" \
       FM_TEST_REPLAY_ROOT="$replay" \
       FM_TEST_REPLAY_HELD="$held" \
@@ -1167,7 +1167,7 @@ esac
 exec "$FM_TEST_REAL_PYTHON" "$@"
 EOF
   chmod +x "$tools/python3"
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"descendant-pin"}' \
+  output=$(test_projection "descendant-pin" \
     | PATH="$tools:$PATH" FM_TEST_REAL_PYTHON="$real_python" \
       FM_TEST_CACHE_HELD="$held" \
       FM_TEST_CACHE_OUTSIDE="$outside" \
@@ -1183,7 +1183,7 @@ EOF
     || fail "a descendant-directory swap left replay data outside the pinned cache"
   assert_contains "$output" "cache directory identity changed" \
     "a descendant-directory swap was not diagnosed"
-  if rg -q 'process\.chdir' "$ROOT/bin/fm-buzz-publish.mjs"; then
+  if grep -Eq 'process\.chdir' "$ROOT/bin/fm-buzz-publish.mjs"; then
     fail "cache mutations still change process cwd instead of using pinned descriptors"
   fi
   pass "replay cache mutations stay relative to pinned directory descriptors"
@@ -1223,7 +1223,7 @@ childProcess.spawnSync = function guardedSpawnSync(command, args, options) {
 };
 syncBuiltinESMExports();
 EOF
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"cross-directory-swap"}' \
+  output=$(test_projection "cross-directory-swap" \
     | NODE_OPTIONS="--import=$preload" \
       FM_TEST_CACHE_HELD="$held" \
       FM_TEST_CACHE_OUTSIDE="$outside" \
@@ -1336,7 +1336,7 @@ esac
 exec "$FM_TEST_REAL_PYTHON" "$@"
 EOF
   chmod +x "$tools/python3"
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"directory-source-swap"}' \
+  output=$(test_projection "directory-source-swap" \
     | PATH="$tools:$PATH" FM_TEST_REAL_PYTHON="$real_python" \
       FM_TEST_CACHE_HELD="$held" \
       FM_TEST_CACHE_OUTSIDE="$outside" \
@@ -1367,7 +1367,7 @@ EOF
   fifo="$replay/$digest"
   mkfifo "$fifo" || fail "could not create a partition-shaped FIFO"
 
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"after-corrupt-partition"}' \
+  output=$(test_projection "after-corrupt-partition" \
     | run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
   assert_contains "$output" "quarantined corrupt cache partition path" \
@@ -1495,7 +1495,7 @@ childProcess.spawnSync = function guardedSpawnSync(command, args, options) {
 };
 syncBuiltinESMExports();
 EOF
-  first=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"interrupt-retained-record"}' \
+  first=$(test_projection "interrupt-retained-record" \
     | NODE_OPTIONS="--import=$preload" FM_TEST_CORRUPT_RECORD_SENTINEL="$sentinel" \
       run_publish "$home" "$relay" 2>&1)
   assert_present "$sentinel" "the retained-record fixture did not interrupt the second provenance write"
@@ -1512,7 +1512,7 @@ EOF
   assert_absent "$replay/_legacy-quarantine/manifests/$token.json" \
     "the interrupted corrupt transaction was finalized without retained provenance"
 
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"recover-retained-record"}' \
+  test_projection "recover-retained-record" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   manifest="$replay/_legacy-quarantine/manifests/$token.json"
   assert_present "$manifest" "the prepared corrupt transaction did not recover on retry"
@@ -1536,7 +1536,7 @@ EOF
   mkfifo "$fifo" || fail "could not create cache FIFO fixture"
   output_file="$home/cache-special-file.out"
 
-  (printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"regular-after-fifo"}' \
+  (test_projection "regular-after-fifo" \
     | run_publish "$home" "$relay") > "$output_file" 2>&1 &
   publisher=$!
   waited=0
@@ -1566,7 +1566,7 @@ test_relay_timeout_must_fit_the_node_timer_range() {
   home=$(make_home invalid-relay-timeout)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
   for invalid in 0 -1 1.5 2147483648; do
-    output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"invalid-relay-timeout"}' \
+    output=$(test_projection "invalid-relay-timeout" \
       | run_publish "$home" "ws://127.0.0.1:1" --timeout "$invalid" 2>&1)
     code=$?
     expect_code 0 "$code" "invalid relay timeout $invalid through the fire-and-forget wrapper"
@@ -1605,7 +1605,7 @@ EOF
   printf '%s' '{"malformed":true}' > "$removable"
   mkdir "$retained"
 
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"malformed-cache-name"}' \
+  output=$(test_projection "malformed-cache-name" \
     | FM_BUZZ_MAX_CACHE=3 run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
@@ -1640,7 +1640,7 @@ test_unexpected_root_symlinks_are_quarantined_and_accounted_for() {
 $(start_stub)
 EOF
 
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"stat-failure"}' \
+  output=$(test_projection "stat-failure" \
     | run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
@@ -1677,7 +1677,7 @@ test_an_interrupted_cache_write_is_recovered_or_discarded_safely() {
   printf '["EVENT",{"id":"%064d","created_at":1700000002}]' 2 > "$fresh"
   touch -t 202001010000 "$complete" "$stale" || fail "could not age the interrupted writes"
 
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"orphan"}' \
+  test_projection "orphan" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
 
   assert_absent "$complete" "a complete interrupted cache write was left stranded"
@@ -1700,7 +1700,7 @@ test_unreadable_cache_entry_is_retained_as_retryable() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"prime-cache"}' \
+  test_projection "prime-cache" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   cache_dir=$(channel_cache_dir "$home" "$relay" "$(default_channel_id "$home")") \
     || fail "could not derive cache partition"
@@ -1708,7 +1708,7 @@ EOF
   unreadable="$cache_dir/1700000000-$(printf '%064d' 7).json"
   mkdir "$unreadable"
 
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"read-error"}' \
+  output=$(test_projection "read-error" \
     | run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
@@ -1729,7 +1729,7 @@ $(start_stub)
 EOF
   port=${relay##*:}
   stop_stub "$STUB_PID"
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"valid-frame"}' \
+  test_projection "valid-frame" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   cached=$(find "$home/state/buzz-replay" -type f -name '*.json' | head -1)
   [ -n "$cached" ] || fail "valid cache fixture was not created"
@@ -1744,7 +1744,7 @@ EOF
   read -r STUB_PID relay <<EOF
 $(start_stub --port "$port")
 EOF
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"fresh-event"}' \
+  output=$(test_projection "fresh-event" \
     | run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
@@ -1772,7 +1772,7 @@ EOF
   first="$replay/1700000001-$(printf '%064d' 1).json"
   second="$replay/1700000002-$(printf '%064d' 2).json"
   mkdir "$first" "$second"
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"prune-failure"}' \
+  output=$(test_projection "prune-failure" \
     | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 

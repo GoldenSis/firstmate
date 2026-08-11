@@ -289,7 +289,7 @@ test_lock_live_steal_mutex_is_not_reclaimed() {
 }
 
 test_stale_guard_reclamation_cannot_remove_a_live_replacement() {
-  local dir state fakebin guard stale_owner live_owner dead live started release result worker real_mv
+  local dir state fakebin guard stale_owner live_owner dead live started release result worker real_mv waited
   dir=$(make_case lock-stale-guard-race)
   state="$dir/state"
   fakebin="$dir/fakebin"
@@ -320,7 +320,17 @@ EOF
     printf "rc=%s\n" "$rc" > "$3"
   ' _ "$LIB" "$guard" "$result" &
   worker=$!
-  while [ ! -e "$started" ]; do sleep 0.01; done
+  waited=0
+  while [ ! -e "$started" ] && is_live_non_zombie "$worker" && [ "$waited" -lt 500 ]; do
+    sleep 0.01
+    waited=$((waited + 1))
+  done
+  if [ ! -e "$started" ]; then
+    : > "$release"
+    kill "$worker" 2>/dev/null || true
+    wait "$worker" 2>/dev/null || true
+    fail "stale guard reclaimer did not reach the guarded removal"
+  fi
 
   sleep 300 &
   live=$!

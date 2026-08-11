@@ -70,6 +70,20 @@ run_publish() {  # <home> <relay> [args...]
     "$PUBLISH" --relay "$relay" "$@"
 }
 
+test_projection() {  # [note] [omitted-json]
+  local note=${1:-} omitted=${2:-[]}
+  jq -cn --arg note "$note" --argjson omitted "$omitted" '
+    {
+      schema: "fm-bearings.v1",
+      home: "test/home",
+      generated: "2026-08-10T00:00:00Z",
+      prs: "not_requested (run: /bearings include PRs)",
+      in_flight: [],
+      omitted: $omitted
+    } + if $note == "" then {} else {note: $note} end
+  '
+}
+
 run_inspect() {  # <home> <relay> [args...]
   local home=$1 relay=$2
   shift 2
@@ -88,7 +102,15 @@ publish_signed_fixture() {  # <private-key> <relay> <channel> <note>
       const { buildBearingsEvent, withRelay } = await import(process.argv[1]);
       const event = buildBearingsEvent(
         process.argv[3],
-        JSON.stringify({ schema: "fm-bearings.v1", note: process.argv[4] }),
+        JSON.stringify({
+          schema: "fm-bearings.v1",
+          home: "test/home",
+          generated: "2026-08-10T00:00:00Z",
+          prs: "not_requested (run: /bearings include PRs)",
+          in_flight: [],
+          omitted: [],
+          note: process.argv[4],
+        }),
         privateKey,
       );
       await withRelay(process.argv[2], privateKey, 8000, async (api) => {
@@ -232,7 +254,15 @@ seed_replay_event() {  # <home> <relay> <private-key> <created-at> <channel> <no
         created_at: Number(process.argv[3]),
         kind: KIND_STREAM_MESSAGE,
         tags: [["h", process.argv[4]]],
-        content: JSON.stringify({ schema: "fm-bearings.v1", note: process.argv[5] }),
+        content: JSON.stringify({
+          schema: "fm-bearings.v1",
+          home: "test/home",
+          generated: "2026-08-10T00:00:00Z",
+          prs: "not_requested (run: /bearings include PRs)",
+          in_flight: [],
+          omitted: [],
+          note: process.argv[5],
+        }),
       }, privateKey.trim());
       const file = path.join(process.argv[2], `${event.created_at}-${event.id}.json`);
       writeFileSync(file, JSON.stringify(["EVENT", event]), { mode: 0o600, flag: "wx" });

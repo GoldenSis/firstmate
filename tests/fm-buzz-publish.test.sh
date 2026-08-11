@@ -13,7 +13,8 @@ test_publish_with_relay_down_exits_zero_and_enqueues() {
 
   # Port 1 is reserved and nothing listens there, so this is a hard connection
   # refusal rather than a timeout.
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[{"surface":"prs","reveal":"--include-prs"}]}' \
+  output=$(test_projection "" '[{"surface":"prs","reveal":"--include-prs"}]' \
+    | jq -c '.in_flight = [{id:"task-1",kind:"ship",state:"running",doing:"testing"}]' \
     | run_publish "$home" "ws://127.0.0.1:1" 2>&1)
   code=$?
 
@@ -82,9 +83,9 @@ test_same_second_identical_publishes_have_distinct_signed_identities() {
 Date.now = () => 1700000000000;
 EOF
 
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"same-second"}' \
+  test_projection "same-second" \
     | NODE_OPTIONS="--require=$clock" run_publish "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"same-second"}' \
+  test_projection "same-second" \
     | NODE_OPTIONS="--require=$clock" run_publish "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
   cache=$(channel_cache_dir "$home" "ws://127.0.0.1:1" "$(default_channel_id "$home")")
   files=$(find "$cache" -name '*.json' -type f | sort)
@@ -132,7 +133,7 @@ fs.renameSync = function guardedRenameSync(source, destination, ...args) {
 };
 syncBuiltinESMExports();
 EOF
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"replay-current"}' \
+  output=$(test_projection "replay-current" \
     | NODE_OPTIONS="--require=$preload" FM_TEST_TARGETS_FILE="$home/data/buzz-publisher-targets.jsonl" \
       FM_TEST_TARGETS_SENTINEL="$sentinel" \
       run_publish "$home" "$relay" 2>&1)
@@ -175,7 +176,7 @@ test_missing_projection_schema_is_rejected_before_signing() {
   local home output code
   home=$(make_home missing-projection-schema)
   run_keypair "$home" >/dev/null 2>&1 || fail "missing-schema keypair setup failed"
-  output=$(printf '%s' '{"omitted":[]}' \
+  output=$(test_projection | jq -c 'del(.schema)' \
     | run_publish "$home" "ws://127.0.0.1:1" 2>&1)
   code=$?
   expect_code 1 "$code" "projection without schema"
@@ -190,7 +191,7 @@ test_malformed_projection_omitted_is_rejected_before_signing() {
   local home output code
   home=$(make_home malformed-projection-omitted)
   run_keypair "$home" >/dev/null 2>&1 || fail "malformed-omitted keypair setup failed"
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[{"surface":"prs"}]}' \
+  output=$(test_projection "" '[{"surface":"prs"}]' \
     | run_publish "$home" "ws://127.0.0.1:1" 2>&1)
   code=$?
   expect_code 1 "$code" "projection with malformed omitted"
@@ -199,6 +200,35 @@ test_malformed_projection_omitted_is_rejected_before_signing() {
   assert_not_contains "$output" "signed event" "projection with malformed omitted was signed"
   [ "$(replay_count "$home")" = "0" ] || fail "malformed omitted entered the replay cache"
   pass "malformed projection omitted is rejected before signing"
+}
+
+test_required_projection_fields_are_validated_before_signing() {
+  local home field filter projection output code
+  home=$(make_home required-projection-fields)
+  run_keypair "$home" >/dev/null 2>&1 || fail "required-field keypair setup failed"
+  while IFS='|' read -r field filter; do
+    projection=$(test_projection | jq -c "$filter") \
+      || fail "could not build invalid $field projection fixture"
+    output=$(printf '%s' "$projection" | run_publish "$home" "ws://127.0.0.1:1" 2>&1)
+    code=$?
+    expect_code 1 "$code" "projection with invalid $field"
+    assert_contains "$output" "projection field $field" \
+      "invalid $field did not identify the rejected field"
+    assert_not_contains "$output" "signed event" "projection with invalid $field was signed"
+    [ "$(replay_count "$home")" = "0" ] \
+      || fail "projection with invalid $field entered the replay cache"
+  done <<'EOF'
+home|del(.home)
+home|.home = null
+generated|del(.generated)
+generated|.generated = 123
+prs|del(.prs)
+prs|.prs = []
+in_flight|del(.in_flight)
+in_flight|.in_flight = {}
+in_flight|.in_flight = [{id:"task-1",kind:"ship",state:"running"}]
+EOF
+  pass "required projection fields and types are rejected before signing"
 }
 
 test_refresh_preserves_the_snapshot_bytes_including_its_trailing_newline() {
@@ -235,7 +265,7 @@ test_refresh_preserves_the_snapshot_bytes_including_its_trailing_newline() {
 test_publish_without_a_keypair_still_exits_zero() {
   local home code
   home=$(make_home no-key)
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[]}' | run_publish "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
+  test_projection | run_publish "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
   code=$?
   expect_code 0 "$code" "publish with no keypair must still exit 0"
   pass "publish with no keypair exits 0"
@@ -261,7 +291,7 @@ globalThis.WebSocket = class NetworkAttempt {
 };
 EOF
 
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"must-stay-local"}' \
+  output=$(test_projection "must-stay-local" \
     | env FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$home/state" \
       XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 FM_BUZZ_TIMEOUT_MS=8000 \
       FM_BUZZ_RELAY="wss://evil.example" FM_BUZZ_NETWORK_SENTINEL="$sentinel" \
@@ -282,7 +312,7 @@ test_credential_bearing_relays_are_rejected_before_signing_or_caching() {
   home=$(make_home relay-credentials)
   run_keypair "$home" >/dev/null 2>&1 || fail "credential-relay keypair setup failed"
   for relay in 'ws://operator@127.0.0.1:1' 'ws://operator:secret@127.0.0.1:1'; do
-    output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"no-credential-relay"}' \
+    output=$(test_projection "no-credential-relay" \
       | run_publish "$home" "$relay" 2>&1)
     code=$?
     expect_code 0 "$code" "credential-bearing relay through fire-and-forget"
@@ -324,7 +354,7 @@ test_publish_with_relay_up_delivers_and_lands() {
 $(start_stub --challenge)
 EOF
 
-  content='{"schema":"fm-bearings.v1","in_flight":[],"omitted":[{"surface":"prs: not requested","reveal":"--include-prs"}]}'
+  content=$(test_projection "" '[{"surface":"prs: not requested","reveal":"--include-prs"}]')
   output=$(printf '%s' "$content" | run_publish "$home" "$relay" 2>&1)
   code=$?
   expect_code 0 "$code" "publish with the relay up"
@@ -369,9 +399,9 @@ EOF
   stop_stub "$STUB_PID"
   channel_a=$(channel_id_for_label same-endpoint-a)
   channel_b=$(channel_id_for_label same-endpoint-b)
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"same-endpoint-a-one"}' \
+  test_projection "same-endpoint-a-one" \
     | run_publish "$home" "$relay" --channel-label same-endpoint-a >/dev/null 2>&1
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"same-endpoint-a-two"}' \
+  test_projection "same-endpoint-a-two" \
     | run_publish "$home" "$relay" --channel-label same-endpoint-a >/dev/null 2>&1
   directory_a=$(channel_cache_dir "$home" "$relay" "$channel_a")
   [ "$(find "$directory_a" -type f -name '*.json' | wc -l | tr -d ' ')" = "2" ] \
@@ -381,7 +411,7 @@ EOF
   read -r STUB_PID relay <<EOF
 $(start_stub --port "$port")
 EOF
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"same-endpoint-b"}' \
+  output=$(test_projection "same-endpoint-b" \
     | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" --channel-label same-endpoint-b 2>&1)
   after=$(find "$directory_a" -type f -name '*.json' -print0 | sort -z | xargs -0 shasum -a 256)
   [ "$before" = "$after" ] || fail "channel B inspected or mutated channel A replay bytes"
@@ -427,7 +457,7 @@ EOF
   # rest of the home is not. Channel B must not spend its deadline waiting on it.
   mkdir -p "$home/state"
   holder=$(hold_lock "$lock_a") || fail "could not hold channel A's delivery lock"
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"delivery-lock-b"}' \
+  output=$(test_projection "delivery-lock-b" \
     | FM_BUZZ_LOCK_TIMEOUT_S=2 run_publish "$home" "$relay" --channel-label delivery-lock-b 2>&1)
   assert_contains "$output" "delivered=1" \
     "channel B could not publish while channel A's queue was held"
@@ -435,7 +465,7 @@ EOF
     "channel B waited on ownership channel A was holding"
 
   waiter_output="$home/channel-a-waiter.out"
-  (printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"delivery-lock-a-waiter"}' \
+  (test_projection "delivery-lock-a-waiter" \
     | FM_BUZZ_LOCK_TIMEOUT_S=2 run_publish "$home" "$relay" --channel-label delivery-lock-a) \
     > "$waiter_output" 2>&1 &
   waiter=$!
@@ -447,7 +477,7 @@ EOF
     waited=$((waited + 1))
   done
   [ -n "$intent" ] || fail "the channel-A waiter did not register delivery intent"
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"delivery-lock-b-during-a-wait"}' \
+  output=$(test_projection "delivery-lock-b-during-a-wait" \
     | FM_BUZZ_LOCK_TIMEOUT_S=1 run_publish "$home" "$relay" --channel-label delivery-lock-b 2>&1)
   assert_contains "$output" "delivered=1" \
     "a channel-A waiter convoyed channel B on whole-tree ownership"
@@ -455,7 +485,7 @@ EOF
     "a channel-A waiter retained whole-tree ownership"
   wait "$waiter" || fail "the channel-A waiter violated fire-and-forget"
 
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"delivery-lock-a"}' \
+  output=$(test_projection "delivery-lock-a" \
     | FM_BUZZ_LOCK_TIMEOUT_S=1 run_publish "$home" "$relay" --channel-label delivery-lock-a 2>&1)
   assert_contains "$output" "could not acquire this queue's delivery ownership" \
     "a second channel A publish ignored the held queue"
@@ -475,7 +505,7 @@ test_network_delivery_does_not_hold_the_key_transaction_lock() {
 $(start_stub --challenge --challenge-delay-ms 2500)
 EOF
 
-  (printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"slow-channel-a"}' \
+  (test_projection "slow-channel-a" \
     | FM_BUZZ_LOCK_TIMEOUT_S=5 run_publish "$home" "$relay" --channel-label slow-channel-a) \
     > "$slow_output" 2>&1 &
   slow=$!
@@ -490,7 +520,7 @@ EOF
     fail "the slow channel never completed signing and caching"
   }
 
-  fast_output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"fast-channel-b"}' \
+  fast_output=$(test_projection "fast-channel-b" \
     | FM_BUZZ_LOCK_TIMEOUT_S=1 run_publish "$home" "ws://127.0.0.1:1" \
       --channel-label fast-channel-b 2>&1)
   assert_contains "$fast_output" "signed event" \
@@ -513,7 +543,7 @@ test_reconnect_replays_the_identical_event_id() {
 $(start_stub --drop-after-event)
 EOF
   port=${relay##*:}
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"mid-publish"}' \
+  test_projection "mid-publish" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   stop_stub "$STUB_PID"
 
@@ -527,7 +557,7 @@ EOF
   read -r STUB_PID relay <<EOF
 $(start_stub --port "$port")
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"after-reconnect"}' \
+  test_projection "after-reconnect" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
 
   stored=$(node -e '
@@ -569,7 +599,7 @@ $(start_stub)
 EOF
   port=${relay##*:}
   stop_stub "$STUB_PID"
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"first"}' \
+  test_projection "first" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   [ "$(replay_count "$home")" = "1" ] || fail "the first event was not cached"
   cached=$(find "$home/state/buzz-replay" -name '*.json' | head -1)
@@ -580,7 +610,7 @@ EOF
   read -r STUB_PID relay <<EOF
 $(start_stub --port "$port" "$@")
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"second"}' \
+  test_projection "second" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   [ "$(replay_count "$home")" = "0" ] || fail "the cache did not drain against a live relay"
 
@@ -588,7 +618,7 @@ EOF
   # relay answers `duplicate:`, which must count as DELIVERED and evict the entry
   # rather than being retained and replayed forever.
   cp "$stashed" "$cached"
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"third"}' \
+  output=$(test_projection "third" \
     | run_publish "$home" "$relay" 2>&1)
 
   assert_contains "$output" "delivered=2" \
@@ -638,7 +668,7 @@ test_an_unacknowledged_publish_does_not_starve_the_drain() {
   read -r STUB_PID relay <<EOF
 $(start_stub --silent-ok)
 EOF
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"starve"}' \
+  output=$(test_projection "starve" \
     | run_publish "$home" "$relay" 2>&1)
   kill "$STUB_PID" 2>/dev/null
   STUB_PID=""
@@ -667,7 +697,7 @@ test_a_late_auth_challenge_is_still_answered() {
   read -r STUB_PID relay <<EOF
 $(start_stub --challenge --challenge-delay-ms 250)
 EOF
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"late-challenge"}' \
+  output=$(test_projection "late-challenge" \
     | run_publish "$home" "$relay" 2>&1)
   kill "$STUB_PID" 2>/dev/null
   STUB_PID=""
@@ -698,7 +728,7 @@ test_a_challenge_past_the_handshake_window_still_lands_the_event() {
   read -r STUB_PID relay <<EOF
 $(start_stub --challenge --challenge-delay-ms 800)
 EOF
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"past-window"}' \
+  output=$(test_projection "past-window" \
     | run_publish "$home" "$relay" 2>&1)
   kill "$STUB_PID" 2>/dev/null
   STUB_PID=""
@@ -731,7 +761,7 @@ EOF
     "$home" "$relay" "$foreign_private" 1700000400 "$channel" foreign-author-cache) \
     || fail "could not seed a foreign-author cache entry"
 
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"current-publisher"}' \
+  output=$(test_projection "current-publisher" \
     | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
@@ -753,7 +783,7 @@ test_permanent_rejection_is_not_replayed_forever() {
   read -r STUB_PID relay <<EOF
 $(start_stub --reject "invalid: malformed event")
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[]}' | run_publish "$home" "$relay" >/dev/null 2>&1
+  test_projection | run_publish "$home" "$relay" >/dev/null 2>&1
   kill "$STUB_PID" 2>/dev/null
   STUB_PID=""
 
@@ -770,7 +800,7 @@ test_retryable_rejection_is_kept() {
   read -r STUB_PID relay <<EOF
 $(start_stub --reject "restricted: not a channel member")
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[]}' | run_publish "$home" "$relay" >/dev/null 2>&1
+  test_projection | run_publish "$home" "$relay" >/dev/null 2>&1
   kill "$STUB_PID" 2>/dev/null
   STUB_PID=""
 
@@ -787,7 +817,7 @@ test_truthy_non_boolean_ok_is_not_accepted() {
   read -r STUB_PID relay <<EOF
 $(start_stub --truthy-ok --reject "invalid: malformed acknowledgement fixture")
 EOF
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"truthy-ok"}' \
+  output=$(test_projection "truthy-ok" \
     | run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
@@ -801,9 +831,9 @@ EOF
   read -r STUB_PID relay <<EOF
 $(start_stub --truthy-ok --duplicate-refused)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"truthy-duplicate-first"}' \
+  test_projection "truthy-duplicate-first" \
     | run_publish "$duplicate_home" "$relay" >/dev/null 2>&1
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"truthy-duplicate-second"}' \
+  output=$(test_projection "truthy-duplicate-second" \
     | run_publish "$duplicate_home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
@@ -824,7 +854,7 @@ test_publish_lock_acquisition_is_validated_bounded_and_interruptible() {
   out_file="$home/publish-lock.out"
   ready="$home/publish-lock-ready"
   run_keypair "$home" >/dev/null 2>&1 || fail "publish-lock fixture setup failed"
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"publish-lock"}' > "$projection"
+  test_projection "publish-lock" > "$projection"
 
   for invalid in 0 -1 abc 2147483648; do
     result=$(FM_BUZZ_LOCK_TIMEOUT_S=$invalid run_publish "$home" "ws://127.0.0.1:1" \
@@ -1104,7 +1134,7 @@ test_unknown_publish_options_are_safe_non_events() {
   local home output code
   home=$(make_home unknown-publish-option)
   run_keypair "$home" >/dev/null 2>&1 || fail "unknown-option keypair setup failed"
-  output=$(printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"must-not-publish"}' \
+  output=$(test_projection "must-not-publish" \
     | run_publish "$home" ws://127.0.0.1:9 --relai ws://127.0.0.1:3000 2>&1)
   code=$?
   expect_code 0 "$code" "unknown publish option through the fire-and-forget wrapper"
@@ -1304,6 +1334,7 @@ test_replayed_events_are_tracked_before_delivery
 test_malformed_projection_is_rejected_before_signing
 test_missing_projection_schema_is_rejected_before_signing
 test_malformed_projection_omitted_is_rejected_before_signing
+test_required_projection_fields_are_validated_before_signing
 test_refresh_preserves_the_snapshot_bytes_including_its_trailing_newline
 test_publish_without_a_keypair_still_exits_zero
 test_non_loopback_env_relay_is_rejected_before_network

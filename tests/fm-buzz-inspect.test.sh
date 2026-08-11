@@ -21,7 +21,7 @@ test_the_inspector_rejects_a_tampered_event() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"authentic"}' \
+  test_projection "authentic" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   clean=$(run_inspect "$home" "$relay" 2>&1)
   kill "$STUB_PID" 2>/dev/null
@@ -35,7 +35,7 @@ EOF
   read -r STUB_PID relay <<EOF
 $(start_stub --tamper-on-read)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"authentic"}' \
+  test_projection "authentic" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   tampered=$(run_inspect "$home" "$relay" 2>&1)
   kill "$STUB_PID" 2>/dev/null
@@ -151,7 +151,7 @@ test_an_anonymous_read_that_returns_events_reports_the_breach() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"readable-by-a-stranger"}' \
+  test_projection "readable-by-a-stranger" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   breached=$(run_inspect "$home" "$relay" --anonymous 2>&1)
   stop_stub "$STUB_PID"
@@ -177,7 +177,7 @@ test_multiline_current_key_record_cannot_expand_authorship() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"authorship-needs-singular-record"}' \
+  test_projection "authorship-needs-singular-record" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   printf '%s\n%s\n' "$current" "$appended" > "$home/data/buzz-keypair.public"
 
@@ -209,7 +209,7 @@ test_an_anonymous_read_of_unverifiable_events_claims_no_breach() {
   read -r STUB_PID relay <<EOF
 $(start_stub --tamper-on-read)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"readable-by-a-stranger"}' \
+  test_projection "readable-by-a-stranger" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   tampered=$(run_inspect "$home" "$relay" --anonymous 2>&1)
   stop_stub "$STUB_PID"
@@ -236,7 +236,7 @@ test_malformed_relay_events_are_assessed_independently() {
   read -r STUB_PID relay <<EOF
 $(start_stub --malform-on-read)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"malformed-on-read"}' \
+  test_projection "malformed-on-read" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   malformed=$(run_inspect "$home" "$relay" --anonymous 2>&1)
   code=$?
@@ -266,7 +266,7 @@ test_wrong_kind_event_cannot_produce_a_privacy_breach_verdict() {
   read -r STUB_PID relay <<EOF
 $(start_stub --wrong-kind-on-read)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"wrong-kind"}' \
+  test_projection "wrong-kind" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   inspected=$(run_inspect "$home" "$relay" --anonymous 2>&1)
   stop_stub "$STUB_PID"
@@ -307,7 +307,7 @@ test_an_anonymous_read_of_a_foreign_authors_event_claims_no_breach() {
 $(start_stub)
 EOF
   # A different home, a different key, aimed at this home's channel.
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"planted-by-a-stranger"}' \
+  test_projection "planted-by-a-stranger" \
     | run_publish "$other" "$relay" --channel-label "$label" >/dev/null 2>&1
   foreign=$(run_inspect "$home" "$relay" --anonymous 2>&1)
   stop_stub "$STUB_PID"
@@ -474,7 +474,7 @@ test_an_anonymous_read_of_a_foreign_channel_claims_no_verdict() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"another-homes-projection"}' \
+  test_projection "another-homes-projection" \
     | run_publish "$other" "$relay" >/dev/null 2>&1
   foreign=$(run_inspect "$home" "$relay" --anonymous --channel-label "$label" 2>&1)
   stop_stub "$STUB_PID"
@@ -536,7 +536,7 @@ test_an_anonymous_read_of_this_homes_own_label_still_reaches_a_verdict() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"own-label-spelled-out"}' \
+  test_projection "own-label-spelled-out" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   explicit=$(run_inspect "$home" "$relay" --anonymous --channel-label "$label" 2>&1)
   stop_stub "$STUB_PID"
@@ -591,7 +591,7 @@ test_compose_relay_signer_survives_restart_but_not_volume_teardown() {
   BUZZ_LOOPBACK_PORT=$port docker compose -p "$project" \
     -f "$ROOT/docker-compose.buzz-loopback.yml" up -d --wait --wait-timeout 240 \
     || fail "could not start the disposable Buzz integration stack"
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"signer-before-restart"}' \
+  test_projection "signer-before-restart" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   first=$(query_membership_signer "$old_private" "$relay" "$channel") \
     || fail "could not read the initial compose membership signer"
@@ -612,7 +612,7 @@ test_compose_relay_signer_survives_restart_but_not_volume_teardown() {
   BUZZ_LOOPBACK_PORT=$port docker compose -p "$project" \
     -f "$ROOT/docker-compose.buzz-loopback.yml" up -d --wait --wait-timeout 240 >/dev/null \
     || fail "could not recreate the disposable Buzz integration stack"
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"signer-after-volume-teardown"}' \
+  test_projection "signer-after-volume-teardown" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   third=$(query_membership_signer "$old_private" "$relay" "$channel") \
     || fail "could not read the recreated compose membership signer"

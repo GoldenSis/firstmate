@@ -96,6 +96,56 @@ log() {
   printf 'fm-buzz-publish: %s\n' "$1" >&2
 }
 
+validate_projection_contract() {
+  local projection=$1
+  jq -e 'type == "object"' "$projection" >/dev/null 2>&1 || {
+    log "the projection root must be an object"
+    return 1
+  }
+  jq -e '.schema == "fm-bearings.v1"' "$projection" >/dev/null 2>&1 || {
+    log 'the projection field schema must equal "fm-bearings.v1"'
+    return 1
+  }
+  jq -e 'has("home") and (.home | type == "string")' "$projection" >/dev/null 2>&1 || {
+    log "the projection field home must be a string"
+    return 1
+  }
+  jq -e 'has("generated") and (.generated | type == "string")' "$projection" >/dev/null 2>&1 || {
+    log "the projection field generated must be a string"
+    return 1
+  }
+  jq -e 'has("prs") and (.prs | type == "string")' "$projection" >/dev/null 2>&1 || {
+    log "the projection field prs must be a string"
+    return 1
+  }
+  jq -e '
+    has("in_flight")
+      and (.in_flight | type == "array")
+      and all(.in_flight[];
+        type == "object"
+          and ((keys | sort) == ["doing", "id", "kind", "state"])
+          and (.id | type == "string")
+          and (.kind | type == "string")
+          and (.state | type == "string")
+          and (.doing | type == "string"))
+  ' "$projection" >/dev/null 2>&1 || {
+    log "the projection field in_flight must be an array of {id,kind,state,doing} strings"
+    return 1
+  }
+  jq -e '
+    has("omitted")
+      and (.omitted | type == "array")
+      and all(.omitted[];
+        type == "object"
+          and ((keys | sort) == ["reveal", "surface"])
+          and (.surface | type == "string" and length > 0)
+          and (.reveal | type == "string" and length > 0))
+  ' "$projection" >/dev/null 2>&1 || {
+    log "the projection field omitted must be an array of {surface,reveal} non-empty strings"
+    return 1
+  }
+}
+
 # The projection spool holds the bearings projection - task ids, project names,
 # blockers, PR URLs - in a shared temp directory, so it must not outlive the run
 # that created it. The in-line `rm` covers the ordinary returns; this covers the
@@ -304,27 +354,8 @@ publish() {
     log "the projection is not one valid JSON value; skipping publish"
     return 2
   }
-  jq -e 'type == "object"' "$STDIN_SPOOL" >/dev/null 2>&1 || {
+  validate_projection_contract "$STDIN_SPOOL" || {
     drop_stdin_spool
-    log "the projection root must be an object"
-    return 2
-  }
-  jq -e '.schema == "fm-bearings.v1"' "$STDIN_SPOOL" >/dev/null 2>&1 || {
-    drop_stdin_spool
-    log 'the projection field schema must equal "fm-bearings.v1"'
-    return 2
-  }
-  jq -e '
-    has("omitted")
-      and (.omitted | type == "array")
-      and all(.omitted[];
-        type == "object"
-          and ((keys | sort) == ["reveal", "surface"])
-          and (.surface | type == "string" and length > 0)
-          and (.reveal | type == "string" and length > 0))
-  ' "$STDIN_SPOOL" >/dev/null 2>&1 || {
-    drop_stdin_spool
-    log "the projection field omitted must be an array of {surface,reveal} non-empty strings"
     return 2
   }
 

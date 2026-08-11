@@ -371,7 +371,7 @@ test_rotation_refuses_an_existing_private_channel_before_mutation() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"membership-must-survive"}' \
+  test_projection "membership-must-survive" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   resolved_home=$(cd "$home" && pwd -P)
   channel=$(node -e '
@@ -548,7 +548,7 @@ test_publisher_target_overrides_are_recorded_and_guard_rotation() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"tracked-override"}' \
+  test_projection "tracked-override" \
     | run_publish "$home" "$relay" --channel-label "$label" >/dev/null 2>&1
   targets="$home/data/buzz-publisher-targets.jsonl"
   assert_present "$targets" "publish did not create the publisher-target registry"
@@ -705,7 +705,7 @@ test_forget_target_attests_exact_retirement() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"target-retirement"}' \
+  test_projection "target-retirement" \
     | run_publish "$home" "$relay" --channel-label "$label" >/dev/null 2>&1
   normalized_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
     || fail "could not normalize the retired target relay"
@@ -1261,7 +1261,7 @@ test_orphan_identity_evidence_requires_compromised_recovery() {
   public_file="$home/data/buzz-keypair.public"
   targets="$home/data/buzz-publisher-targets.jsonl"
   relay="ws://127.0.0.1:1/orphan-evidence"
-  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"orphan-evidence"}' \
+  test_projection "orphan-evidence" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   cache_file=$(find "$home/state/buzz-replay" -type f -name '*.json' | head -1)
   assert_present "$cache_file" "orphan-evidence setup did not create a replay entry"
@@ -2601,7 +2601,7 @@ test_publish_signing_is_serialized_with_compromised_rotation() {
 $(start_stub --reject "restricted: channel fixture stays uncreated")
 EOF
 
-  (printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"signed-before-compromised-rotation"}' \
+  (test_projection "signed-before-compromised-rotation" \
     | PATH="$tools:$PATH" FM_DELAY_BUZZ_PUBLISH_READY="$ready" \
       FM_DELAY_BUZZ_PUBLISH_RELEASE="$release" \
       FM_DELAY_BUZZ_REMOVE_TARGETS="$home/data/buzz-publisher-targets.jsonl" \
@@ -2660,7 +2660,7 @@ test_target_and_relay_retirement_wait_for_inflight_delivery() {
   read -r STUB_PID relay <<EOF
 $(start_stub --challenge --challenge-delay-ms 2000)
 EOF
-  (printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"target-retirement-delivery"}' \
+  (test_projection "target-retirement-delivery" \
     | FM_BUZZ_LOCK_TIMEOUT_S=5 run_publish "$home" "$relay" --channel-label target-retirement-delivery) \
     > "$publish_output" 2>&1 &
   publish_pid=$!
@@ -2701,7 +2701,7 @@ EOF
     "$relay_endpoint" "$relay_channel" "$relay_authority" \
     || fail "could not seed relay-retirement authority"
   delivery_lock=$(delivery_lock_path "$relay_home" "$relay_endpoint" "$relay_channel")
-  (printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"relay-retirement-delivery"}' \
+  (test_projection "relay-retirement-delivery" \
     | FM_TEST_BUZZ_TARGET_UPDATE_DELAY_MS=1500 FM_BUZZ_LOCK_TIMEOUT_S=5 \
       run_publish "$relay_home" "$relay_endpoint" --channel-label relay-retirement-delivery) \
     > "$relay_output" 2>&1 &
@@ -2748,7 +2748,7 @@ EOF
     || fail "could not seed the pre-delivery retirement target"
   target_hex=$(node "$ROOT/bin/fm-buzz-targets.mjs" list-with-ids "$targets" | awk -F '\t' 'NR == 1 { print $1 }')
 
-  (printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"pre-delivery-retirement"}' \
+  (test_projection "pre-delivery-retirement" \
     | FM_TEST_BUZZ_BEFORE_DELIVERY_LOCK_READY="$ready" \
       FM_TEST_BUZZ_BEFORE_DELIVERY_LOCK_RELEASE="$release" \
       FM_BUZZ_LOCK_TIMEOUT_S=5 run_publish "$home" "$relay" --channel-label pre-delivery-retirement) \

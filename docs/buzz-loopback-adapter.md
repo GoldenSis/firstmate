@@ -46,7 +46,7 @@ Each one is the reason a specific failure mode cannot occur, and breaching any o
 3. **Publishing is fire-and-forget.**
    `bin/fm-buzz-publish.sh` converts runtime publication failures into logged exit-0 non-events.
    A missing declared filesystem-safety prerequisite fails before publication with a non-zero startup error.
-   An input that is not an `fm-bearings.v1` object with a well-formed `omitted[]` disclosure fails before signing or caching.
+   An input that lacks the required `fm-bearings.v1` base fields, their documented types, the `in_flight[]` item shape, or a well-formed `omitted[]` disclosure fails before signing or caching.
 4. **No canvas for state.**
    Append-only messages only.
    A Buzz canvas is a single mutable TEXT column overwritten with no compare-and-set and no base hash, so publishing state into one would silently destroy concurrent captain edits with no error to either party.
