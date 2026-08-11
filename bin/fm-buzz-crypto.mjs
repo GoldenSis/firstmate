@@ -10,7 +10,7 @@
 // node_modules - it ships shell plus a few dependency-free .mjs policy modules.
 // Adding an npm dependency tree to a repo that deliberately has none, for a
 // proof of concept, is the worse trade. So the curve arithmetic lives here,
-// self-contained, and tests/fm-buzz-publish.test.sh proves it correct against the
+// self-contained, and tests/fm-buzz-keypair.test.sh proves it correct against the
 // official BIP-340 test vectors rather than asserting it by inspection - every
 // 32-byte-message vector, signing and verification, including all ten negative
 // cases. The variable-length-message vectors (15-18) are deliberately excluded

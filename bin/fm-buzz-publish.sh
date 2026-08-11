@@ -52,8 +52,8 @@
 # Cache ownership waits at most FM_BUZZ_LOCK_TIMEOUT_S seconds (default 30).
 # Invalid deadlines, acquisition timeouts, and interrupted waits are logged and
 # converted to the same exit-0 non-event as every other publishing failure.
-# Lock ordering is replay-cache ownership first and the per-home key transaction
-# second; the publishing key is loaded and spent while both are held.
+# bin/fm-buzz-key-lib.sh owns the lock ordering and phase-boundary contract used
+# to isolate whole-tree migration, per-channel delivery, signing, and rotation.
 #
 # Relay host note: the default is ws://localhost:3000, not ws://127.0.0.1:3000.
 # Buzz resolves its tenant from the HTTP Host header and the bundled deployment
@@ -403,7 +403,7 @@ publish() {
     return 1
   fi
 
-  local key load_status rc
+  local key load_status rc preparation
   key=$(fm_buzz_key_load "$FM_HOME")
   load_status=$?
   if [ "$load_status" -ne 0 ]; then
@@ -421,9 +421,10 @@ publish() {
   # which would put it in jq's world-readable argv. The key reaches jq through a
   # file descriptor, while --rawfile reads the projection spool's bytes verbatim.
   # The remaining --arg values - relay URL, channel id, cache path - are not secrets.
-  jq -n \
+  preparation=$(jq -n \
     --rawfile privateKey <(printf '%s' "$key") \
     --rawfile content "$STDIN_SPOOL" \
+    --arg phase prepare \
     --arg relay "$RELAY" \
     --arg channelId "$channel" \
     --arg replayDir "$REPLAY_DIR" \
@@ -431,13 +432,37 @@ publish() {
     --argjson timeoutMs "$TIMEOUT_MS" \
     --argjson maxCache "$MAX_CACHE" \
     --argjson migration "$migration" \
-    '{privateKey:$privateKey, content:$content, relay:$relay, channelId:$channelId,
+    '{phase:$phase, privateKey:$privateKey, content:$content, relay:$relay, channelId:$channelId,
       replayDir:$replayDir, targetsFile:$targetsFile, migration:$migration,
       timeoutMs:$timeoutMs, maxCache:$maxCache}' \
-    | node "$SCRIPT_DIR/fm-buzz-publish.mjs"
+    | node "$SCRIPT_DIR/fm-buzz-publish.mjs")
   rc=$?
   fm_lock_release "$KEYPAIR_LOCK"
   KEYPAIR_LOCK=""
+  if [ "$rc" -ne 0 ]; then
+    fm_lock_release "$DELIVERY_LOCK"
+    DELIVERY_LOCK=""
+    drop_stdin_spool
+    return "$rc"
+  fi
+
+  jq -n \
+    --rawfile privateKey <(printf '%s' "$key") \
+    --rawfile content "$STDIN_SPOOL" \
+    --arg phase deliver \
+    --arg relay "$RELAY" \
+    --arg channelId "$channel" \
+    --arg replayDir "$REPLAY_DIR" \
+    --arg targetsFile "$TARGETS_FILE" \
+    --argjson timeoutMs "$TIMEOUT_MS" \
+    --argjson maxCache "$MAX_CACHE" \
+    --argjson migration "$migration" \
+    --argjson preparation "$preparation" \
+    '{phase:$phase, privateKey:$privateKey, content:$content, relay:$relay, channelId:$channelId,
+      replayDir:$replayDir, targetsFile:$targetsFile, migration:$migration,
+      preparation:$preparation, timeoutMs:$timeoutMs, maxCache:$maxCache}' \
+    | node "$SCRIPT_DIR/fm-buzz-publish.mjs"
+  rc=$?
   fm_lock_release "$DELIVERY_LOCK"
   DELIVERY_LOCK=""
   drop_stdin_spool

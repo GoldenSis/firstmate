@@ -705,7 +705,7 @@ if [ -e "$ROTATION_STAGE_FILE" ] || [ -L "$ROTATION_STAGE_FILE" ]; then
     exit 1
   }
 fi
-if [ "$ROTATION_STAGE_PHASE" = committable ]; then
+if [ "$ROTATION_STAGE_PHASE" = committable ] && [ "$PUBLIC_ONLY" -eq 0 ]; then
   finish_committable_rotation_stage
   stage_finish_status=$?
   if [ "$stage_finish_status" -eq 0 ]; then

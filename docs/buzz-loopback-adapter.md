@@ -146,7 +146,7 @@ Run on 2026-07-30 against `ghcr.io/block/buzz:main`, Docker server 29.5.2 under 
 | Boundary respected | **pass** - no change to `AGENTS.md`, `projects/`, or the `state/*.meta` schema |
 
 The independence check is structural as well as behavioral: no operational Firstmate path outside the `bin/fm-buzz-*` family invokes the adapter, so a stopped relay has no path by which to reach supervision.
-`tests/fm-buzz-publish.test.sh` asserts that as a standing regression test.
+`tests/fm-buzz-inspect.test.sh` asserts that as a standing regression test.
 With the relay stopped, `bin/fm-bearings-snapshot.sh --json`, `bin/fm-fleet-snapshot.sh --json` and `tasks-axi list` all exited 0 against an isolated home, and publishing exited 0 while enqueueing the signed event.
 
 The exit-gate runs used an isolated `FM_HOME` rather than the live one.

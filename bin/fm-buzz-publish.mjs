@@ -27,15 +27,15 @@
 // The whole-tree half of a run - quarantine and endpoint-to-channel migration -
 // is migrateReplayCache, a separate entry point so its caller can hold the
 // whole-tree lock across a filesystem walk instead of across a relay round trip.
-// main() therefore never walks outside the queue it was invoked for, and takes
-// that step's failures through the envelope so they still reach this run's
-// accounting. bin/fm-buzz-key-lib.sh owns the lock ordering the two steps assume.
+// main() therefore never walks outside the queue it was invoked for, and its
+// prepare phase signs, caches, prunes, and tracks before its deliver phase makes
+// network calls. bin/fm-buzz-key-lib.sh owns the lock ordering those phases use.
 //
 // Reads one JSON envelope on stdin so that neither the private key nor the
 // projection - which carries task ids, project names, blockers and PR URLs -
 // appears in a command line or in the process environment. Fields: privateKey,
-// content, relay, channelId, channelName, timeoutMs, replayDir, targetsFile,
-// migration, maxCache.
+// phase, content, relay, channelId, channelName, timeoutMs, replayDir,
+// targetsFile, migration, preparation, maxCache.
 //
 // Legacy and explicitly discarded rotation entries are retained under
 // _legacy-quarantine with payloads and manifests rather than silently deleted.
@@ -72,7 +72,7 @@ import {
   unlinkSync,
   renameSync,
 } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -233,9 +233,11 @@ function cacheRenameSync(source, destination) {
   // rename(2) moves the directory inode itself and is atomic, so a crash leaves it
   // at one end or the other, never at both.
   if (sourceMetadata.isDirectory()) {
-    const moved = withPinnedCacheDirectory(destinationParent, () => renameSync(
-      resolvedSource,
-      path.basename(resolvedDestination),
+    const moved = withPinnedCacheDirectory(destinationParent, () => (
+      withPinnedCacheDirectory(sourceParent, () => renameSync(
+        path.basename(resolvedSource),
+        resolvedDestination,
+      ))
     ));
     pinCacheDirectory(resolvedDestination);
     return moved;
@@ -1436,6 +1438,31 @@ function legacyReplayPublisherEntries(cacheRoot) {
   return evidence;
 }
 
+function endpointReplayPublisherEntries(cacheRoot) {
+  const topology = cacheEndpointDirectories(cacheRoot);
+  if (topology.failures.length > 0) {
+    throw new Error(`could not inspect endpoint replay partitions:\n${topology.failures.map((file) => `  ${file}`).join("\n")}`);
+  }
+  const evidence = [];
+  for (const directory of topology.directories) {
+    const inventory = cacheEntries(directory);
+    if (inventory.failures.length > 0) {
+      throw new Error(`could not inspect endpoint replay entries:\n${inventory.failures.map((file) => `  ${file}`).join("\n")}`);
+    }
+    for (const entry of inventory.entries) {
+      if (entry.malformed) throw new Error(`endpoint replay entry ${entry.file} is invalid: ${entry.reason}`);
+      let event;
+      try {
+        event = cachedEventFromFrame(readRegularFile(entry.file).bytes.toString("utf8"), entry);
+      } catch (error) {
+        throw new Error(`endpoint replay entry ${entry.file} is invalid: ${error.message}`);
+      }
+      evidence.push({ path: entry.file, publisherPubkey: event.pubkey });
+    }
+  }
+  return evidence;
+}
+
 export function inspectActiveReplayPublisherCache(replayDir) {
   let metadata;
   try {
@@ -1448,11 +1475,11 @@ export function inspectActiveReplayPublisherCache(replayDir) {
     throw new Error(`replay cache path ${replayDir} is not a regular directory`);
   }
   const cacheRoot = prepareCacheRoot(replayDir);
-  const migration = migrateEndpointReplayEntries(cacheRoot);
-  if (migration.failures.length > 0) {
-    throw new Error(`could not migrate endpoint-only replay entries:\n${migration.failures.map((file) => `  ${file}`).join("\n")}`);
-  }
-  return [...activeReplayPublisherEntries(cacheRoot), ...legacyReplayPublisherEntries(cacheRoot)]
+  return [
+    ...activeReplayPublisherEntries(cacheRoot),
+    ...endpointReplayPublisherEntries(cacheRoot),
+    ...legacyReplayPublisherEntries(cacheRoot),
+  ]
     .sort((left, right) => left.path.localeCompare(right.path));
 }
 
@@ -1786,6 +1813,47 @@ function normalizeMigrationFailures(migration) {
   return { legacy: read("legacy"), endpoint: read("endpoint") };
 }
 
+function normalizePreparation(preparation, relayCacheDir) {
+  if (preparation === null || typeof preparation !== "object" || Array.isArray(preparation)) {
+    throw new Error("invalid envelope field: preparation");
+  }
+  if (!Number.isSafeInteger(preparation.failed) || preparation.failed < 0) {
+    throw new Error("invalid envelope field: preparation.failed");
+  }
+  if (!Array.isArray(preparation.entries) || !Array.isArray(preparation.outcomes)) {
+    throw new Error("invalid envelope field: preparation cache state");
+  }
+  const directory = path.resolve(relayCacheDir);
+  const entries = preparation.entries.map((entry) => {
+    if (
+      entry === null ||
+      typeof entry !== "object" ||
+      Array.isArray(entry) ||
+      typeof entry.name !== "string" ||
+      !Number.isSafeInteger(entry.createdAt) ||
+      typeof entry.id !== "string" ||
+      !CACHE_PARTITION.test(entry.id) ||
+      typeof entry.file !== "string" ||
+      path.dirname(path.resolve(entry.file)) !== directory
+    ) {
+      throw new Error("invalid envelope field: preparation.entries");
+    }
+    return { ...entry, malformed: false };
+  });
+  const outcomes = preparation.outcomes.map((entry) => {
+    if (
+      !Array.isArray(entry) ||
+      entry.length !== 2 ||
+      typeof entry[0] !== "string" ||
+      ![DELIVERED, PERMANENT, RETRYABLE].includes(entry[1])
+    ) {
+      throw new Error("invalid envelope field: preparation.outcomes");
+    }
+    return entry;
+  });
+  return { entries, outcomes, failed: preparation.failed };
+}
+
 async function main() {
   const envelope = JSON.parse(await readStdin());
   const {
@@ -1798,6 +1866,7 @@ async function main() {
     replayDir,
     targetsFile,
     maxCache = 100,
+    phase,
   } = envelope;
 
   for (const [name, value] of Object.entries({ privateKey, content, relay, channelId, replayDir, targetsFile })) {
@@ -1810,38 +1879,44 @@ async function main() {
     throw new Error(`invalid relay timeout ${JSON.stringify(timeoutMs)}: expected an integer from 1 to 2147483647`);
   }
   if (!CHANNEL_PARTITION.test(channelId)) throw new Error("channel id must be a canonical UUID");
-  // Migration ran in migrateReplayCache under the whole-tree lock, which the
-  // caller has already dropped; this step owns one queue and must not walk paths
-  // outside it. Its failures still belong in this run's accounting, so they
-  // arrive here rather than being recomputed.
-  const migrationFailures = normalizeMigrationFailures(envelope.migration);
+  if (phase !== "prepare" && phase !== "deliver") throw new Error("invalid envelope field: phase");
   resolveLoopbackRelayHost(relay);
-  const event = buildBearingsEvent(channelId, content, privateKey, [
-    ["fm-schema", "fm-bearings.v1"],
-  ]);
   const cacheRoot = prepareCacheRoot(replayDir);
   const relayCacheDir = prepareRelayCacheDirectory(cacheRoot, relay, channelId);
 
-  // Cache the signed event before network access: from here on it survives a
-  // crash, a kill, or a relay that is not running at all.
-  const currentFile = cacheEvent(relayCacheDir, event);
-  const cacheMaintenance = pruneCache(relayCacheDir, maxCache, currentFile);
-  recordPublisherTarget(targetsFile, {
-    relay,
-    channel_id: channelId,
-    publisher_pubkey: event.pubkey,
-  });
-  let cleanupFailures = cacheMaintenance.failed
+  if (phase === "prepare") {
+    const event = buildBearingsEvent(channelId, content, privateKey, [
+      ["fm-schema", "fm-bearings.v1"],
+      ["nonce", randomBytes(16).toString("hex")],
+    ]);
+    const currentFile = cacheEvent(relayCacheDir, event);
+    const cacheMaintenance = pruneCache(relayCacheDir, maxCache, currentFile);
+    recordPublisherTarget(targetsFile, {
+      relay,
+      channel_id: channelId,
+      publisher_pubkey: event.pubkey,
+    });
+    log(`signed event ${event.id} (${Buffer.byteLength(content, "utf8")} bytes) for channel ${channelId}`);
+    process.stdout.write(JSON.stringify({
+      entries: cacheMaintenance.entries,
+      outcomes: [...cacheMaintenance.outcomes],
+      failed: cacheMaintenance.failed,
+    }));
+    return 0;
+  }
+
+  const preparation = normalizePreparation(envelope.preparation, relayCacheDir);
+  const migrationFailures = normalizeMigrationFailures(envelope.migration);
+  let cleanupFailures = preparation.failed
     + migrationFailures.legacy.length
     + migrationFailures.endpoint.length;
-  log(`signed event ${event.id} (${Buffer.byteLength(content, "utf8")} bytes) for channel ${channelId}`);
 
-  const pending = cacheMaintenance.entries;
+  const pending = preparation.entries;
   // Final verdict per cache entry rather than running counters, because an entry
   // can be attempted twice: a pass that ran before a late NIP-42 handshake
   // completed is superseded by the one that ran after it, and incrementing
   // counters would report the same event as both retained and delivered.
-  const outcome = new Map(cacheMaintenance.outcomes);
+  const outcome = new Map(preparation.outcomes);
   for (const file of migrationFailures.legacy) outcome.set(`legacy:${file}`, RETRYABLE);
   for (const file of migrationFailures.endpoint) outcome.set(`endpoint-migration:${file}`, RETRYABLE);
   const authRefused = new Set();
