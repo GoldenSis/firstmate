@@ -355,12 +355,13 @@ check_rotation_target_membership() {  # <keychain|file> <public-key> <target-hex
   printf '%s\n' "${checked_rotation_targets:-}" | grep -Fqx -- "$check_key" && return 0
   checked_rotation_targets="${checked_rotation_targets:+$checked_rotation_targets
 }$check_key"
-  check=$(publisher_is_current_channel_member \
-    "$store" "$relay" "$channel" "$rotation_timeout" 2>&1)
+  fm_buzz_capture publisher_is_current_channel_member \
+    "$store" "$relay" "$channel" "$rotation_timeout"
   check_status=$?
+  check=$FM_BUZZ_CAPTURED_OUTPUT
   if [ "$check_status" -ne 0 ]; then
     rotation_membership_errors="${rotation_membership_errors:+$rotation_membership_errors
-}fm-buzz-keypair.sh: could not verify current membership for target $target_hex, relay $relay, channel $channel: $check; nothing was rotated"
+}fm-buzz-keypair.sh: could not verify current membership for target $target_hex, relay $relay, channel $channel: $FM_BUZZ_CAPTURED_DIAGNOSTIC; nothing was rotated"
     rotation_membership_error_targets="${rotation_membership_error_targets:+$rotation_membership_error_targets
 }$target_hex"$'\t'"$relay"$'\t'"$channel"
     return 0
@@ -609,12 +610,13 @@ run_forget_relay_identity_operation() {
     printf 'fm-buzz-keypair.sh: --forget-relay-identity wants a relay endpoint\n' >&2
     exit 2
   fi
-  forgotten_relay=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" forget-relay-identity \
-    "$TARGETS_FILE" "$AUTHORITIES_FILE" "$FORGET_RELAY_IDENTITY" 2>&1)
+  fm_buzz_capture node "$SCRIPT_DIR/fm-buzz-targets.mjs" forget-relay-identity \
+    "$TARGETS_FILE" "$AUTHORITIES_FILE" "$FORGET_RELAY_IDENTITY"
   forgotten_relay_status=$?
+  forgotten_relay=$FM_BUZZ_CAPTURED_OUTPUT
   if [ "$forgotten_relay_status" -ne 0 ]; then
     printf 'fm-buzz-keypair.sh: could not forget relay identity: %s; nothing was changed\n' \
-      "$forgotten_relay" >&2
+      "$FM_BUZZ_CAPTURED_DIAGNOSTIC" >&2
     exit 1
   fi
   IFS=$'\t' read -r forgotten_relay_endpoint forgotten_relay_count <<EOF
@@ -636,12 +638,13 @@ run_forget_target_operation() {
     printf 'fm-buzz-keypair.sh: --forget-target wants a canonical 64-character lowercase target hex\n' >&2
     exit 2
   fi
-  forgotten_target=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" forget-target \
-    "$TARGETS_FILE" "$FORGET_TARGET" 2>&1)
+  fm_buzz_capture node "$SCRIPT_DIR/fm-buzz-targets.mjs" forget-target \
+    "$TARGETS_FILE" "$FORGET_TARGET"
   forgotten_target_status=$?
+  forgotten_target=$FM_BUZZ_CAPTURED_OUTPUT
   if [ "$forgotten_target_status" -ne 0 ]; then
     printf 'fm-buzz-keypair.sh: could not forget publisher target %s: %s; nothing was changed\n' \
-      "$FORGET_TARGET" "$forgotten_target" >&2
+      "$FORGET_TARGET" "$FM_BUZZ_CAPTURED_DIAGNOSTIC" >&2
     exit 1
   fi
   IFS=$'\t' read -r forgotten_hex forgotten_public forgotten_relay forgotten_channel <<EOF
@@ -817,18 +820,20 @@ run_rotate_operation() {
     add_recovery_reason "the recorded public key in $PUBLIC_FILE has no stored private key"
   fi
 
-  rotation_targets=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" list-with-ids "$TARGETS_FILE" 2>&1)
+  fm_buzz_capture node "$SCRIPT_DIR/fm-buzz-targets.mjs" list-with-ids "$TARGETS_FILE"
   rotation_targets_status=$?
+  rotation_targets=$FM_BUZZ_CAPTURED_OUTPUT
   if [ "$rotation_targets_status" -ne 0 ]; then
     printf 'fm-buzz-keypair.sh: could not validate %s: %s; nothing was rotated\n' \
-      "$TARGETS_FILE" "$rotation_targets" >&2
+      "$TARGETS_FILE" "$FM_BUZZ_CAPTURED_DIAGNOSTIC" >&2
     exit 1
   fi
-  rotation_replay_evidence=$(inspect_replay_identity_evidence 2>&1)
+  fm_buzz_capture inspect_replay_identity_evidence
   rotation_replay_status=$?
+  rotation_replay_evidence=$FM_BUZZ_CAPTURED_OUTPUT
   if [ "$rotation_replay_status" -ne 0 ]; then
     printf 'fm-buzz-keypair.sh: could not inspect replay identity evidence: %s; nothing was rotated\n' \
-      "$rotation_replay_evidence" >&2
+      "$FM_BUZZ_CAPTURED_DIAGNOSTIC" >&2
     exit 1
   fi
   orphan_identity_mode=0
@@ -853,12 +858,12 @@ run_rotate_operation() {
     printf 'rotating compromised key: %s; no outgoing public key will be retained\n' "$recovery_reason" >&2
   fi
 
-  rotation_relay=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" normalize-relay \
-    "${FM_BUZZ_RELAY:-ws://localhost:3000}" 2>&1)
+  fm_buzz_capture node "$SCRIPT_DIR/fm-buzz-targets.mjs" normalize-relay \
+    "${FM_BUZZ_RELAY:-ws://localhost:3000}"
   rotation_relay_status=$?
   if [ "$rotation_relay_status" -ne 0 ]; then
     printf 'fm-buzz-keypair.sh: configured relay is invalid: %s; nothing was rotated\n' \
-      "$rotation_relay" >&2
+      "$FM_BUZZ_CAPTURED_DIAGNOSTIC" >&2
     exit 1
   fi
   rotation_timeout=${FM_BUZZ_TIMEOUT_MS:-15000}
@@ -894,9 +899,10 @@ $(printf '%s\n' "$rotation_replay_evidence" | cut -f1)"
 $rotation_candidate_publics
 EOF
   if [ "${#rotation_publics[@]}" -gt 0 ]; then
-    cache_preflight=$(protect_rotation_replay_cache \
-      "$DISCARD_PENDING_CACHE" "${rotation_publics[@]}" 2>&1)
+    fm_buzz_capture protect_rotation_replay_cache \
+      "$DISCARD_PENDING_CACHE" "${rotation_publics[@]}"
     cache_preflight_status=$?
+    cache_preflight=$FM_BUZZ_CAPTURED_OUTPUT
     if [ "$cache_preflight_status" -eq 3 ]; then
       printf 'fm-buzz-keypair.sh: %s\nnothing was rotated; drain the queue or retry with --discard-pending-cache\n' \
         "$cache_preflight" >&2
@@ -904,7 +910,7 @@ EOF
     fi
     if [ "$cache_preflight_status" -ne 0 ]; then
       printf 'fm-buzz-keypair.sh: could not verify outgoing replay cache state: %s; nothing was rotated\n' \
-        "$cache_preflight" >&2
+        "$FM_BUZZ_CAPTURED_DIAGNOSTIC" >&2
       exit 1
     fi
     [ -n "$cache_preflight" ] && printf '%s\n' "$cache_preflight" >&2
@@ -916,7 +922,7 @@ EOF
       exit 1
     }
   fi
-  for candidate_public in "${rotation_publics[@]}"; do
+  for candidate_public in ${rotation_publics[@]+"${rotation_publics[@]}"}; do
     if [ "$candidate_public" = "$ROTATION_STAGE_PUBLIC" ]; then
       # Discard the offending stage, but only while the outgoing key is still
       # stored: keeping it would make every retry re-read the same collision and
@@ -936,7 +942,7 @@ EOF
     while IFS=$'\t' read -r _target_hex target_public _target_relay _target_channel; do
       [ -n "$target_public" ] || continue
       implicated_public=0
-      for known_public in "${rotation_publics[@]}"; do
+      for known_public in ${rotation_publics[@]+"${rotation_publics[@]}"}; do
         [ "$known_public" = "$target_public" ] && implicated_public=1
       done
       [ "$implicated_public" -eq 1 ] || continue
@@ -954,13 +960,14 @@ $rotation_targets
 EOF
   fi
   if [ "${#unverifiable_publics[@]}" -gt 0 ]; then
-    unverifiable_pairs=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" retire-unverifiable \
+    fm_buzz_capture node "$SCRIPT_DIR/fm-buzz-targets.mjs" retire-unverifiable \
       "$TARGETS_FILE" "$UNVERIFIABLE_FILE" "$recovery_reason" \
-      "${unverifiable_publics[@]}" 2>&1)
+      "${unverifiable_publics[@]}"
     unverifiable_status=$?
+    unverifiable_pairs=$FM_BUZZ_CAPTURED_OUTPUT
     if [ "$unverifiable_status" -ne 0 ]; then
       printf 'fm-buzz-keypair.sh: could not retire unverifiable compromised memberships into %s: %s; nothing was rotated\n' \
-        "$UNVERIFIABLE_FILE" "$unverifiable_pairs" >&2
+        "$UNVERIFIABLE_FILE" "$FM_BUZZ_CAPTURED_DIAGNOSTIC" >&2
       exit 1
     fi
   fi
@@ -971,7 +978,7 @@ EOF
   # and permanently cost the probe its attribution. A rotation that stops now is
   # simply retryable - nothing has changed yet.
   if [ "$COMPROMISED" -eq 1 ]; then
-    purge_public_set "${rotation_publics[@]}" || {
+    purge_public_set ${rotation_publics[@]+"${rotation_publics[@]}"} || {
       printf 'fm-buzz-keypair.sh: could not drop the compromised public keys from %s; nothing was rotated\n' "$HISTORY_FILE" >&2
       exit 1
     }
@@ -1079,18 +1086,20 @@ if [ "$OPERATION" = public ]; then
 fi
 
 if [ "$OPERATION" = ensure ]; then
-  ensure_targets=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" list-with-ids "$TARGETS_FILE" 2>&1)
+  fm_buzz_capture node "$SCRIPT_DIR/fm-buzz-targets.mjs" list-with-ids "$TARGETS_FILE"
   ensure_targets_status=$?
+  ensure_targets=$FM_BUZZ_CAPTURED_OUTPUT
   if [ "$ensure_targets_status" -ne 0 ]; then
     printf 'fm-buzz-keypair.sh: could not validate %s: %s; no replacement identity was minted\n' \
-      "$TARGETS_FILE" "$ensure_targets" >&2
+      "$TARGETS_FILE" "$FM_BUZZ_CAPTURED_DIAGNOSTIC" >&2
     exit 1
   fi
-  ensure_replay_evidence=$(inspect_replay_identity_evidence 2>&1)
+  fm_buzz_capture inspect_replay_identity_evidence
   ensure_replay_status=$?
+  ensure_replay_evidence=$FM_BUZZ_CAPTURED_OUTPUT
   if [ "$ensure_replay_status" -ne 0 ]; then
     printf 'fm-buzz-keypair.sh: could not inspect replay identity evidence: %s; no replacement identity was minted\n' \
-      "$ensure_replay_evidence" >&2
+      "$FM_BUZZ_CAPTURED_DIAGNOSTIC" >&2
     exit 1
   fi
   if [ -n "$ensure_targets" ] || [ -n "$ensure_replay_evidence" ]; then

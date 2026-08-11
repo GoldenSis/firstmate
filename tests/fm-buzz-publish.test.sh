@@ -554,6 +554,31 @@ EOF
   pass "delivery ownership is scoped per endpoint and channel, not per home"
 }
 
+test_helper_diagnostics_do_not_change_the_delivery_queue_identity() {
+  local home relay shim channel lock holder output
+  home=$(make_home helper-stderr-delivery-queue)
+  run_keypair "$home" >/dev/null 2>&1 || fail "noisy-helper publish keypair setup failed"
+  shim=$(noisy_node_shim "$home") || fail "could not build a noisy node shim"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  channel=$(default_channel_id "$home")
+  lock=$(delivery_lock_path "$home" "$relay" "$channel")
+  mkdir -p "$home/state"
+  holder=$(hold_lock "$lock") || fail "could not hold this home's delivery lock"
+
+  # The queue this publish owns is named after the normalized relay. A helper
+  # diagnostic folded into that value would name a different queue, so a publish
+  # would walk straight past an owned one instead of waiting for it.
+  output=$(test_projection "helper-stderr-delivery-queue" \
+    | PATH="$shim:$PATH" FM_BUZZ_LOCK_TIMEOUT_S=2 run_publish "$home" "$relay" 2>&1)
+  release_lock "$holder"
+  stop_stub "$STUB_PID"
+  assert_contains "$output" "could not acquire this queue's delivery ownership" \
+    "an unrelated helper diagnostic changed which delivery queue this publish owned"
+  pass "unrelated helper diagnostics do not change which delivery queue a publish owns"
+}
+
 test_network_delivery_does_not_hold_the_key_transaction_lock() {
   local home relay slow_output slow waited fast_output
   home=$(make_home network-key-lock)
@@ -1404,6 +1429,7 @@ test_rotation_rejects_credential_relays_without_logging_credentials
 test_publish_with_relay_up_delivers_and_lands
 test_same_endpoint_channel_queues_are_isolated
 test_channel_delivery_locks_do_not_share_one_home_wide_queue
+test_helper_diagnostics_do_not_change_the_delivery_queue_identity
 test_network_delivery_does_not_hold_the_key_transaction_lock
 test_reconnect_replays_the_identical_event_id
 test_replaying_a_known_event_is_deduped_and_evicted

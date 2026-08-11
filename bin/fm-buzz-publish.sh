@@ -459,10 +459,11 @@ publish() {
   # normalization the cache digest uses, which also rejects credential-bearing
   # URLs before any of them can reach a lock name, a log line, or the network.
   local normalized_relay
-  normalized_relay=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" normalize-relay "$RELAY" 2>&1) || {
-    log "$normalized_relay"
+  fm_buzz_capture node "$SCRIPT_DIR/fm-buzz-targets.mjs" normalize-relay "$RELAY" || {
+    log "$FM_BUZZ_CAPTURED_DIAGNOSTIC"
     return 1
   }
+  normalized_relay=$FM_BUZZ_CAPTURED_OUTPUT
 
   if [ -L "$REPLAY_DIR" ] || { [ -e "$REPLAY_DIR" ] && [ ! -d "$REPLAY_DIR" ]; }; then
     log "replay cache path $REPLAY_DIR is not a regular directory"

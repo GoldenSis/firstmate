@@ -2029,6 +2029,70 @@ test_committable_ordinary_rotation_rejects_late_compromised_intent() {
   pass "committable ordinary rotation intent cannot be upgraded after retirement"
 }
 
+test_rotation_without_any_prior_identity_mints_a_replacement() {
+  local home output code minted stage
+
+  # A home with no stored key, no recorded public key, no publisher targets and no
+  # replay evidence has nothing to retire, and rotating it is still a supported
+  # request. The set of outgoing identities is empty there, and on bash 3.2 - what
+  # /usr/bin/env bash resolves to on macOS - expanding an empty array under `set -u`
+  # aborts the script, so this path has to be walked rather than reasoned about.
+  home=$(make_home rotate-no-prior-identity)
+  stage=$(rotation_stage_file "$home")
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 0 "$code" "rotating a home that has no identity to retire"
+  assert_contains "$output" "there is nothing to retire" \
+    "rotation without a prior identity did not say so"
+  minted=$(printf '%s\n' "$output" | tail -1)
+  [ "${#minted}" -eq 64 ] || fail "rotation without a prior identity minted no key: $output"
+  assert_absent "$stage" "a rotation with nothing to retire left its replacement staged"
+  [ "$(run_keypair "$home" --public 2>/dev/null)" = "$minted" ] \
+    || fail "the replacement was recorded without being stored"
+
+  # Same shape through the compromised branch, which additionally withdraws the
+  # empty outgoing set from history.
+  home=$(make_home rotate-no-prior-identity-compromised)
+  output=$(run_keypair "$home" --rotate --compromised 2>&1)
+  code=$?
+  expect_code 0 "$code" "compromised rotation of a home that has no identity to retire"
+  minted=$(printf '%s\n' "$output" | tail -1)
+  [ "${#minted}" -eq 64 ] \
+    || fail "compromised rotation without a prior identity minted no key: $output"
+  [ "$(run_keypair "$home" --public 2>/dev/null)" = "$minted" ] \
+    || fail "the compromised replacement was recorded without being stored"
+  pass "rotation with nothing to retire mints and stores a replacement"
+}
+
+test_helper_diagnostics_never_become_identity_evidence() {
+  local home shim output code minted rotated history
+  home=$(make_home helper-stderr-identity)
+  shim=$(noisy_node_shim "$home") || fail "could not build a noisy node shim"
+
+  # An unrelated line on a helper's stderr is a diagnostic, never a target record
+  # or a replay entry. Mistaking one for identity evidence would wedge this home
+  # out of ever minting a key.
+  output=$(PATH="$shim:$PATH" run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 0 "$code" "minting a key while a helper writes an unrelated diagnostic"
+  assert_not_contains "$output" "orphan identity evidence" \
+    "an unrelated helper diagnostic was read as orphan identity evidence"
+  minted=$(run_keypair "$home" --public 2>/dev/null) \
+    || fail "the key minted alongside helper diagnostics was not stored"
+  [ "${#minted}" -eq 64 ] || fail "the recorded identity is not a public key: $minted"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$minted" ] \
+    || fail "a helper diagnostic reached the recorded public key"
+
+  rotated=$(PATH="$shim:$PATH" run_keypair "$home" --rotate 2>/dev/null) \
+    || fail "rotation failed while a helper wrote an unrelated diagnostic"
+  [ "${#rotated}" -eq 64 ] || fail "the rotated identity is not a public key: $rotated"
+  [ "$rotated" != "$minted" ] || fail "rotation did not replace the identity"
+  history=$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null)
+  [ "$history" = "$minted" ] \
+    || fail "a helper diagnostic reached the retired-key history: $history"
+  pass "unrelated helper diagnostics never become recorded identity data"
+}
+
 test_orphan_gate_sees_legacy_replay_publisher_evidence() {
   local home relay foreign_private foreign_public seeded channel flat host_dir
   local output code recovered
@@ -2921,6 +2985,8 @@ test_rotation_stages_the_replacement_before_clearing_the_outgoing_key
 test_compromised_rotation_stage_preserves_withdrawal_intent
 test_committable_compromised_rotation_stage_preserves_withdrawal_intent
 test_committable_ordinary_rotation_rejects_late_compromised_intent
+test_rotation_without_any_prior_identity_mints_a_replacement
+test_helper_diagnostics_never_become_identity_evidence
 test_orphan_gate_sees_legacy_replay_publisher_evidence
 test_orphan_gate_sees_nested_legacy_replay_publisher_evidence
 test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine

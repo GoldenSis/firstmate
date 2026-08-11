@@ -144,6 +144,36 @@ fm_buzz_key_sha256() {
   fi
 }
 
+# Run a helper and keep its two streams apart: stdout becomes the captured value
+# and stderr becomes the captured diagnostic. `$(helper 2>&1)` is the shape this
+# replaces, and it is wrong for anything whose stdout is data - a single unrelated
+# line on stderr, an interpreter warning from a globally set NODE_OPTIONS being the
+# realistic one, would otherwise become part of a public key, a target record, a
+# relay name or a lock digest on the SUCCESS path, where no caller inspects it.
+# Both results are assigned in the caller's shell, so this is invoked as a plain
+# command rather than inside a command substitution. A failing helper that says
+# nothing on stderr still gets a message: its stdout stands in, which is what the
+# merged form used to report.
+FM_BUZZ_CAPTURED_OUTPUT=""
+FM_BUZZ_CAPTURED_DIAGNOSTIC=""
+fm_buzz_capture() {  # <command> [argument...]
+  local status stderr_file
+  FM_BUZZ_CAPTURED_OUTPUT=""
+  FM_BUZZ_CAPTURED_DIAGNOSTIC=""
+  stderr_file=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-stderr.XXXXXX") || {
+    FM_BUZZ_CAPTURED_DIAGNOSTIC="could not create a temporary file for helper diagnostics"
+    return 1
+  }
+  FM_BUZZ_CAPTURED_OUTPUT=$("$@" 2>"$stderr_file")
+  status=$?
+  FM_BUZZ_CAPTURED_DIAGNOSTIC=$(cat -- "$stderr_file" 2>/dev/null)
+  rm -f -- "$stderr_file"
+  if [ "$status" -ne 0 ] && [ -z "$FM_BUZZ_CAPTURED_DIAGNOSTIC" ]; then
+    FM_BUZZ_CAPTURED_DIAGNOSTIC=$FM_BUZZ_CAPTURED_OUTPUT
+  fi
+  return "$status"
+}
+
 fm_buzz_normalize_public_key() {
   local key
   key=$(printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr 'A-F' 'a-f')

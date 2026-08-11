@@ -294,6 +294,23 @@ write_rotation_stage() {  # <home> <phase> <private-key> <public-key> [ordinary|
   ( . "$ROOT/bin/fm-buzz-key-lib.sh"; fm_buzz_key_stage_write "$1/data" "$2" "$3" "$4" "${5:-ordinary}" )
 }
 
+# A `node` that writes one unrelated line to stderr before doing its real work,
+# the way a globally set NODE_OPTIONS warning does. Callers put the returned
+# directory first on PATH: a helper's stderr must never end up inside a value the
+# adapter then treats as a key, a target record or a queue identity.
+noisy_node_shim() {  # <home> -> directory to prepend to PATH
+  local home=$1 shim="$1/noisy-node" real
+  real=$(command -v node) || return 1
+  mkdir -p "$shim" || return 1
+  {
+    printf '#!/bin/sh\n'
+    printf 'printf "(node:1) ExperimentalWarning: unrelated helper diagnostic\\n" >&2\n'
+    printf 'exec %s "$@"\n' "$real"
+  } > "$shim/node" || return 1
+  chmod +x "$shim/node" || return 1
+  printf '%s\n' "$shim"
+}
+
 delivery_lock_path() {  # <home> <relay> <channel>
   local normalized
   normalized=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$2") || return 1
