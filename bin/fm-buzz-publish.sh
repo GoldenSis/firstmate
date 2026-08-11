@@ -2,14 +2,16 @@
 # fm-buzz-publish.sh - publish one bearings projection to the loopback Buzz relay.
 #
 # ============================ FIRE-AND-FORGET ==============================
-# RUNTIME PUBLISH FAILURES EXIT 0. A MISSING REQUIRED PYTHON3 EXITS NON-ZERO.
+# RUNTIME PUBLISH FAILURES EXIT 0. PREREQUISITE AND INPUT-CONTRACT FAILURES EXIT NON-ZERO.
 #
 # Every failure path - relay down, connection refused, timeout, NIP-42 auth
 # failure, event rejected, signing error, missing keypair, missing node or its
-# WebSocket API, missing jq, unreadable replay cache, or malformed snapshot - is caught, logged to
+# WebSocket API, missing jq, or unreadable replay cache - is caught, logged to
 # stderr, and followed by exit 0. Python 3 is the declared prerequisite for the
 # descriptor-relative filesystem operations that enforce the cache boundary, so
 # its absence is a loud startup error rather than an optional publish failure.
+# An invalid fm-bearings.v1 input is also loud because signing data outside the
+# projection contract would make the publisher attest to content it did not check.
 #
 # Why the contract is this absolute: Buzz is an additive reporting surface and
 # nothing in Firstmate's operation may depend on it. If this script could fail, a
@@ -21,8 +23,8 @@
 # Consequences that follow from the contract, for anyone editing this file:
 #   - Do not add `set -e`. It is absent on purpose.
 #   - Do not add another `|| exit 1`, an `exit $?`, or a bare `exit` path.
-#   - A failure the operator needs to see is a stderr line, never an exit code.
-#     Missing Python 3 is the single prerequisite exception.
+#   - A failure the operator needs to see is a stderr line, never an exit code,
+#     except for missing Python 3 or an invalid fm-bearings.v1 projection.
 #   - The engine (bin/fm-buzz-publish.mjs) MAY exit non-zero; converting that into
 #     a logged success is this wrapper's whole job.
 # tests/fm-buzz-publish.test.sh asserts exit 0 with the relay stopped, and also
@@ -300,7 +302,30 @@ publish() {
   jq -s -e 'length == 1' "$STDIN_SPOOL" >/dev/null 2>&1 || {
     drop_stdin_spool
     log "the projection is not one valid JSON value; skipping publish"
-    return 1
+    return 2
+  }
+  jq -e 'type == "object"' "$STDIN_SPOOL" >/dev/null 2>&1 || {
+    drop_stdin_spool
+    log "the projection root must be an object"
+    return 2
+  }
+  jq -e '.schema == "fm-bearings.v1"' "$STDIN_SPOOL" >/dev/null 2>&1 || {
+    drop_stdin_spool
+    log 'the projection field schema must equal "fm-bearings.v1"'
+    return 2
+  }
+  jq -e '
+    has("omitted")
+      and (.omitted | type == "array")
+      and all(.omitted[];
+        type == "object"
+          and ((keys | sort) == ["reveal", "surface"])
+          and (.surface | type == "string" and length > 0)
+          and (.reveal | type == "string" and length > 0))
+  ' "$STDIN_SPOOL" >/dev/null 2>&1 || {
+    drop_stdin_spool
+    log "the projection field omitted must be an array of {surface,reveal} non-empty strings"
+    return 2
   }
 
   local label=$CHANNEL_LABEL
@@ -549,7 +574,17 @@ if [ "$PREREQUISITE_STATUS" -eq 2 ]; then
   exit 1
 fi
 
-if [ "$ARGUMENT_ERROR" -eq 1 ] || [ "$PREREQUISITE_STATUS" -ne 0 ] || ! publish; then
+PUBLISH_STATUS=0
+if [ "$ARGUMENT_ERROR" -eq 1 ] || [ "$PREREQUISITE_STATUS" -ne 0 ]; then
+  PUBLISH_STATUS=1
+else
+  publish
+  PUBLISH_STATUS=$?
+fi
+if [ "$PUBLISH_STATUS" -eq 2 ]; then
+  exit 1
+fi
+if [ "$PUBLISH_STATUS" -ne 0 ]; then
   # The single conversion point: a real failure becomes a logged non-event.
   log "publish did not complete; Firstmate is unaffected"
 fi

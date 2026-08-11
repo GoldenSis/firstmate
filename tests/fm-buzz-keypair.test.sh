@@ -371,7 +371,7 @@ test_rotation_refuses_an_existing_private_channel_before_mutation() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","note":"membership-must-survive"}' \
+  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"membership-must-survive"}' \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   resolved_home=$(cd "$home" && pwd -P)
   channel=$(node -e '
@@ -548,7 +548,7 @@ test_publisher_target_overrides_are_recorded_and_guard_rotation() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","note":"tracked-override"}' \
+  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"tracked-override"}' \
     | run_publish "$home" "$relay" --channel-label "$label" >/dev/null 2>&1
   targets="$home/data/buzz-publisher-targets.jsonl"
   assert_present "$targets" "publish did not create the publisher-target registry"
@@ -705,7 +705,7 @@ test_forget_target_attests_exact_retirement() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  printf '%s' '{"schema":"fm-bearings.v1","note":"target-retirement"}' \
+  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"target-retirement"}' \
     | run_publish "$home" "$relay" --channel-label "$label" >/dev/null 2>&1
   normalized_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
     || fail "could not normalize the retired target relay"
@@ -1259,7 +1259,7 @@ test_orphan_identity_evidence_requires_compromised_recovery() {
   public_file="$home/data/buzz-keypair.public"
   targets="$home/data/buzz-publisher-targets.jsonl"
   relay="ws://127.0.0.1:1/orphan-evidence"
-  printf '%s' '{"schema":"fm-bearings.v1","note":"orphan-evidence"}' \
+  printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"orphan-evidence"}' \
     | run_publish "$home" "$relay" >/dev/null 2>&1
   cache_file=$(find "$home/state/buzz-replay" -type f -name '*.json' | head -1)
   assert_present "$cache_file" "orphan-evidence setup did not create a replay entry"
@@ -1913,6 +1913,34 @@ test_compromised_rotation_stage_preserves_withdrawal_intent() {
   pass "staged compromised rotation intent survives an interrupted history withdrawal"
 }
 
+test_committable_compromised_rotation_stage_preserves_withdrawal_intent() {
+  local home old stage staged_private staged_public output code recovered
+  home=$(make_home committable-compromised-rotation-stage)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "committable compromised-stage setup failed"
+  stage=$(rotation_stage_file "$home")
+  staged_private=$(new_private_key) || fail "could not mint the committable compromised replacement"
+  staged_public=$(public_from_private "$staged_private") \
+    || fail "could not derive the committable compromised replacement"
+  write_rotation_stage "$home" committable "$staged_private" "$staged_public" compromised
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "a plain retry of a committable compromised rotation"
+  assert_contains "$output" "retry with --rotate --compromised" \
+    "a committable compromised rotation lost its withdrawal intent"
+  assert_not_contains "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null)" "$old" \
+    "a plain committable retry re-trusted the compromised outgoing identity"
+  assert_present "$stage" "a rejected committable retry discarded the staged replacement"
+
+  recovered=$(run_keypair "$home" --rotate --compromised 2>/dev/null) \
+    || fail "the committable compromised rotation could not resume with its original intent"
+  [ "$recovered" = "$staged_public" ] \
+    || fail "the committable compromised retry replaced its staged identity"
+  assert_not_contains "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null)" "$old" \
+    "the resumed committable compromised rotation retained the withdrawn identity"
+  pass "committable compromised rotation intent survives an interrupted key replacement"
+}
+
 test_orphan_gate_sees_legacy_replay_publisher_evidence() {
   local home relay foreign_private foreign_public seeded channel flat host_dir
   local output code recovered
@@ -2128,6 +2156,48 @@ test_orphan_gate_includes_interrupted_corrupt_quarantine_transactions() {
   assert_absent "$(key_file "$home" "$home/xdg")" \
     "default ensure minted over interrupted corrupt quarantine evidence"
   pass "interrupted corrupt quarantine transactions remain visible to orphan recovery"
+}
+
+test_orphan_gate_inventories_signed_frames_inside_quarantined_directories() {
+  local home private publisher relay channel seeded endpoint nested replay manifest payload output code
+  home=$(make_home orphan-quarantined-directory)
+  publisher=$(run_keypair "$home" 2>/dev/null) || fail "quarantined-directory setup failed"
+  private=$(jq -r '.private_key' "$(key_file "$home" "$home/xdg")")
+  relay="ws://127.0.0.1:1/quarantined-directory"
+  channel=$(default_channel_id "$home")
+  seeded=$(seed_replay_event "$home" "$relay" "$private" 1700000205 "$channel" nested-quarantine) \
+    || fail "could not seed nested quarantine publisher evidence"
+  endpoint=$(relay_cache_dir "$home" "$relay")
+  nested="$endpoint/not-a-channel/deep/signed-frame.bin"
+  mkdir -p "$(dirname "$nested")"
+  mv "$seeded" "$nested"
+  rmdir "$(dirname "$seeded")"
+  replay="$home/state/buzz-replay"
+  node -e '
+    import(process.argv[1]).then(({ migrateReplayCache }) => {
+      const result = migrateReplayCache(process.argv[2]);
+      if (result.legacy.length || result.endpoint.length) process.exitCode = 1;
+    });
+  ' "$ROOT/bin/fm-buzz-publish.mjs" "$replay" \
+    || fail "could not quarantine the nested publisher fixture"
+  manifest=$(grep -l '"corrupt_type": "directory"' \
+    "$replay/_legacy-quarantine/manifests"/*.json 2>/dev/null | head -1)
+  [ -n "$manifest" ] || fail "nested publisher directory has no quarantine manifest"
+  payload="$replay/_legacy-quarantine/$(jq -r '.payload_reference' "$manifest")"
+  nested="$payload/deep/signed-frame.bin"
+  assert_present "$nested" "quarantine did not retain the nested signed frame"
+  rm -f -- "$(key_file "$home" "$home/xdg")" "$home/data/buzz-keypair.public"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with nested quarantined publisher evidence"
+  assert_contains "$output" "$publisher" \
+    "the orphan gate ignored the publisher inside a quarantined directory"
+  assert_contains "$output" "$nested" \
+    "the orphan gate did not name the nested quarantined signed frame"
+  assert_absent "$(key_file "$home" "$home/xdg")" \
+    "default ensure minted over nested quarantined publisher evidence"
+  pass "quarantined directories preserve nested publisher identity evidence"
 }
 
 test_orphan_gate_validates_quarantine_payloads_without_filename_trust() {
@@ -2413,7 +2483,7 @@ test_publish_signing_is_serialized_with_compromised_rotation() {
 $(start_stub --reject "restricted: channel fixture stays uncreated")
 EOF
 
-  (printf '%s' '{"schema":"fm-bearings.v1","note":"signed-before-compromised-rotation"}' \
+  (printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"signed-before-compromised-rotation"}' \
     | PATH="$tools:$PATH" FM_DELAY_BUZZ_PUBLISH_READY="$ready" \
       FM_DELAY_BUZZ_PUBLISH_RELEASE="$release" \
       FM_DELAY_BUZZ_REMOVE_TARGETS="$home/data/buzz-publisher-targets.jsonl" \
@@ -2472,7 +2542,7 @@ test_target_and_relay_retirement_wait_for_inflight_delivery() {
   read -r STUB_PID relay <<EOF
 $(start_stub --challenge --challenge-delay-ms 2000)
 EOF
-  (printf '%s' '{"schema":"fm-bearings.v1","note":"target-retirement-delivery"}' \
+  (printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"target-retirement-delivery"}' \
     | FM_BUZZ_LOCK_TIMEOUT_S=5 run_publish "$home" "$relay" --channel-label target-retirement-delivery) \
     > "$publish_output" 2>&1 &
   publish_pid=$!
@@ -2513,7 +2583,7 @@ EOF
     "$relay_endpoint" "$relay_channel" "$relay_authority" \
     || fail "could not seed relay-retirement authority"
   delivery_lock=$(delivery_lock_path "$relay_home" "$relay_endpoint" "$relay_channel")
-  (printf '%s' '{"schema":"fm-bearings.v1","note":"relay-retirement-delivery"}' \
+  (printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"relay-retirement-delivery"}' \
     | FM_TEST_BUZZ_TARGET_UPDATE_DELAY_MS=1500 FM_BUZZ_LOCK_TIMEOUT_S=5 \
       run_publish "$relay_home" "$relay_endpoint" --channel-label relay-retirement-delivery) \
     > "$relay_output" 2>&1 &
@@ -2560,7 +2630,7 @@ EOF
     || fail "could not seed the pre-delivery retirement target"
   target_hex=$(node "$ROOT/bin/fm-buzz-targets.mjs" list-with-ids "$targets" | awk -F '\t' 'NR == 1 { print $1 }')
 
-  (printf '%s' '{"schema":"fm-bearings.v1","note":"pre-delivery-retirement"}' \
+  (printf '%s' '{"schema":"fm-bearings.v1","omitted":[],"note":"pre-delivery-retirement"}' \
     | FM_TEST_BUZZ_BEFORE_DELIVERY_LOCK_READY="$ready" \
       FM_TEST_BUZZ_BEFORE_DELIVERY_LOCK_RELEASE="$release" \
       FM_BUZZ_LOCK_TIMEOUT_S=5 run_publish "$home" "$relay" --channel-label pre-delivery-retirement) \
@@ -2630,11 +2700,13 @@ test_public_key_history_is_normalized_consistently
 test_public_flag_fails_before_a_keypair_exists
 test_rotation_stages_the_replacement_before_clearing_the_outgoing_key
 test_compromised_rotation_stage_preserves_withdrawal_intent
+test_committable_compromised_rotation_stage_preserves_withdrawal_intent
 test_orphan_gate_sees_legacy_replay_publisher_evidence
 test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine
 test_orphan_gate_includes_quarantine_manifest_temporaries
 test_orphan_gate_preserves_corrupt_partition_publisher_evidence
 test_orphan_gate_includes_interrupted_corrupt_quarantine_transactions
+test_orphan_gate_inventories_signed_frames_inside_quarantined_directories
 test_orphan_gate_validates_quarantine_payloads_without_filename_trust
 test_orphan_gate_fails_closed_on_unreadable_quarantine_payloads
 test_orphan_gate_validates_quarantine_manifest_variants

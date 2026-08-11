@@ -739,12 +739,14 @@ if [ -e "$ROTATION_STAGE_FILE" ] || [ -L "$ROTATION_STAGE_FILE" ]; then
     exit 1
   }
 fi
-if [ "$ROTATION_STAGE_PHASE" = prepared ] && [ "$OPERATION" = rotate ]; then
+if { [ "$ROTATION_STAGE_PHASE" = prepared ] || [ "$ROTATION_STAGE_PHASE" = committable ]; } \
+  && [ "$OPERATION" = rotate ]; then
   if [ "$ROTATION_STAGE_INTENT" = compromised ] && [ "$COMPROMISED" -eq 0 ]; then
     printf 'fm-buzz-keypair.sh: staged replacement belongs to a compromised rotation; retry with --rotate --compromised\n' >&2
     exit 1
   fi
-  if [ "$ROTATION_STAGE_INTENT" = ordinary ] && [ "$COMPROMISED" -eq 1 ]; then
+  if [ "$ROTATION_STAGE_PHASE" = prepared ] \
+    && [ "$ROTATION_STAGE_INTENT" = ordinary ] && [ "$COMPROMISED" -eq 1 ]; then
     fm_buzz_key_stage_write "$DATA" prepared "$ROTATION_STAGE_PRIVATE" \
       "$ROTATION_STAGE_PUBLIC" compromised || {
         printf 'fm-buzz-keypair.sh: could not persist compromised rotation intent; nothing was rotated\n' >&2

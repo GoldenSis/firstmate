@@ -44,9 +44,9 @@
 // Legacy and explicitly discarded rotation entries are retained under
 // _legacy-quarantine with payloads and manifests rather than silently deleted.
 // Each claimed regular file moves through staging/<token>/{source,origin.json}
-// into payloads/<token>.json, while corrupt cache nodes remain under
-// corrupt/<token>/entry and invalid recovery residue remains under
-// recovery-corrupt/<token>.invalid.
+// into payloads/<token>.json, while corrupt cache nodes move through a prepared
+// corrupt/<token>/origin.json record before becoming corrupt/<token>/entry, and
+// invalid recovery residue remains under recovery-corrupt/<token>.invalid.
 // Every manifests/<token>.json variant requires original_path,
 // payload_reference, original_timestamps, and quarantine_timestamp.
 // Regular-entry manifests additionally require legacy_host, source_device,
@@ -931,8 +931,29 @@ function corruptPartitionRecord(record, layout, transactionDir) {
   if (recordToken !== expectedToken) {
     throw new Error("quarantine transaction token does not match its source provenance");
   }
+  const phase = record.phase ?? "retained";
+  if (phase !== "prepared" && phase !== "retained") {
+    throw new Error("corrupt quarantine transaction has an invalid phase");
+  }
+  if (phase === "prepared") {
+    if (
+      record.manifest.payload_device !== null ||
+      record.manifest.payload_inode !== null ||
+      record.manifest.payload_mode !== null
+    ) {
+      throw new Error("prepared corrupt quarantine transaction already claims a retained payload identity");
+    }
+    quarantineManifestVariant({
+      ...record.manifest,
+      payload_device: record.manifest.source_device,
+      payload_inode: record.manifest.source_inode,
+      payload_mode: record.manifest.source_mode,
+    }, recordToken);
+  } else if (quarantineManifestVariant(record.manifest, recordToken) !== "corrupt") {
+    throw new Error("corrupt quarantine transaction has the wrong manifest variant");
+  }
   assertCacheDirectory(transactionDir);
-  return { token: recordToken, manifest: record.manifest };
+  return { token: recordToken, phase, manifest: record.manifest };
 }
 
 function quarantineManifestIdentity(manifest) {
@@ -1559,6 +1580,9 @@ function finalizeCorruptPartitionRecord(layout, transactionDir) {
   const originFile = path.join(transactionDir, "origin.json");
   const record = readQuarantineManifest(originFile);
   const validated = corruptPartitionRecord(record, layout, transactionDir);
+  if (validated.phase !== "retained") {
+    throw new Error("corrupt quarantine transaction has not retained its payload");
+  }
   quarantineManifestPayload(layout, validated.manifest, validated.token);
   const final = quarantineManifestPath(layout.manifestsDir, validated.token);
   finalizeQuarantineRecord(final, validated.manifest);
@@ -1567,6 +1591,86 @@ function finalizeCorruptPartitionRecord(layout, transactionDir) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
+}
+
+function corruptPartitionSource(layout, manifest) {
+  const source = path.resolve(path.join(layout.replayDir, manifest.original_path));
+  if (
+    !containedCachePath(layout.replayDir, source) ||
+    containedCachePath(layout.quarantineDir, source) ||
+    path.relative(layout.replayDir, source) !== manifest.original_path
+  ) {
+    throw new Error("corrupt quarantine source path is invalid");
+  }
+  return source;
+}
+
+function retainPreparedCorruptPartition(layout, transactionDir, record) {
+  const validated = corruptPartitionRecord(record, layout, transactionDir);
+  if (validated.phase === "retained") return validated;
+  const source = corruptPartitionSource(layout, validated.manifest);
+  const entry = path.join(transactionDir, "entry");
+  let sourceMetadata;
+  try {
+    sourceMetadata = cacheLstatSync(source);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  let entryMetadata;
+  try {
+    entryMetadata = cacheLstatSync(entry);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (sourceMetadata !== undefined) {
+    if (
+      sourceMetadata.dev !== validated.manifest.source_device ||
+      sourceMetadata.ino !== validated.manifest.source_inode ||
+      sourceMetadata.mode !== validated.manifest.source_mode
+    ) {
+      throw new Error("corrupt partition source identity changed before quarantine");
+    }
+    pinCacheDirectory(path.dirname(source));
+    if (entryMetadata === undefined) {
+      cacheRenameSync(source, entry);
+    } else if (sourceMetadata.isDirectory() && !sourceMetadata.isSymbolicLink()) {
+      if (entryMetadata.isSymbolicLink() || !entryMetadata.isDirectory()) {
+        throw new Error(`corrupt partition quarantine collision at ${entry}`);
+      }
+      cacheMoveDirectoryTree(source, entry);
+    } else if (sourceMetadata.isSymbolicLink()) {
+      const sourceTarget = runPinnedCacheOperation(path.dirname(source), "readlink", {
+        name: path.basename(source),
+      });
+      const entryTarget = runPinnedCacheOperation(transactionDir, "readlink", { name: "entry" });
+      if (!entryMetadata.isSymbolicLink() || entryTarget !== sourceTarget) {
+        throw new Error(`corrupt partition quarantine collision at ${entry}`);
+      }
+      cacheUnlinkSync(source);
+    } else if (
+      entryMetadata.dev === sourceMetadata.dev &&
+      entryMetadata.ino === sourceMetadata.ino
+    ) {
+      cacheUnlinkSync(source);
+    } else {
+      throw new Error(`corrupt partition quarantine collision at ${entry}`);
+    }
+  } else if (entryMetadata === undefined) {
+    throw new Error(`corrupt quarantine payload ${entry} is missing`);
+  }
+  const retained = cacheLstatSync(entry);
+  const retainedRecord = {
+    token: validated.token,
+    phase: "retained",
+    manifest: {
+      ...validated.manifest,
+      payload_device: retained.dev,
+      payload_inode: retained.ino,
+      payload_mode: retained.mode,
+    },
+  };
+  writeJsonAtomically(path.join(transactionDir, "origin.json"), retainedRecord);
+  return corruptPartitionRecord(retainedRecord, layout, transactionDir);
 }
 
 function recoverCorruptPartitionNodes(layout, failures) {
@@ -1581,8 +1685,6 @@ function recoverCorruptPartitionNodes(layout, failures) {
       }
       pinCacheDirectory(transactionDir);
       const originFile = path.join(transactionDir, "origin.json");
-      const entry = path.join(transactionDir, "entry");
-      cacheLstatSync(entry);
       const record = recoverAtomicJson(originFile, recovery);
       if (record === undefined) {
         const final = quarantineManifestPath(layout.manifestsDir, token);
@@ -1590,6 +1692,7 @@ function recoverCorruptPartitionNodes(layout, failures) {
         quarantineManifestPayload(layout, manifest, token);
         continue;
       }
+      retainPreparedCorruptPartition(layout, transactionDir, record);
       finalizeCorruptPartitionRecord(layout, transactionDir);
     } catch (error) {
       log(`could not recover corrupt cache partition ${transactionDir}: ${error.message}`);
@@ -1608,7 +1711,6 @@ function quarantineCorruptPartitionNode(layout, file, metadata) {
     mode: metadata.mode,
   })));
   const transactionDir = prepareCacheDirectory(layout.corruptDir, token);
-  const entry = path.join(transactionDir, "entry");
   const originFile = path.join(transactionDir, "origin.json");
   const payloadReference = path.join("corrupt", token, "entry");
   let contentSha256 = null;
@@ -1645,32 +1747,9 @@ function quarantineCorruptPartitionNode(layout, file, metadata) {
     corrupt_type: type,
     publisher_pubkey: publisherPubkey,
   };
-  try {
-    const existing = cacheLstatSync(entry);
-    if (existing.dev !== metadata.dev || existing.ino !== metadata.ino) {
-      throw new Error(`corrupt partition quarantine collision at ${entry}`);
-    }
-    cacheUnlinkSync(file);
-    try {
-      cacheLstatSync(originFile);
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-      manifest.payload_device = existing.dev;
-      manifest.payload_inode = existing.ino;
-      manifest.payload_mode = existing.mode;
-      writeJsonAtomically(originFile, { token, manifest });
-    }
-    finalizeCorruptPartitionRecord(layout, transactionDir);
-    return;
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
-  cacheRenameSync(file, entry);
-  const retained = cacheLstatSync(entry);
-  manifest.payload_device = retained.dev;
-  manifest.payload_inode = retained.ino;
-  manifest.payload_mode = retained.mode;
-  writeJsonAtomically(originFile, { token, manifest });
+  const prepared = { token, phase: "prepared", manifest };
+  writeJsonAtomically(originFile, prepared);
+  retainPreparedCorruptPartition(layout, transactionDir, prepared);
   finalizeCorruptPartitionRecord(layout, transactionDir);
   log(`quarantined corrupt cache partition path ${file} (${type}) at ${path.join(layout.quarantineDir, payloadReference)}`);
 }
@@ -2116,6 +2195,37 @@ function stagedQuarantinePublisherEntries(layout) {
   return evidence;
 }
 
+function quarantinedDirectoryPublisherEntries(directory) {
+  const evidence = [];
+  pinCacheDirectory(directory);
+  for (const name of cacheReaddirSync(directory)) {
+    const candidate = path.join(directory, name);
+    const metadata = cacheLstatSync(candidate);
+    if (metadata.isSymbolicLink()) {
+      throw new Error(`quarantined directory contains a symbolic link: ${candidate}`);
+    }
+    if (metadata.isDirectory()) {
+      evidence.push(...quarantinedDirectoryPublisherEntries(candidate));
+      continue;
+    }
+    if (!metadata.isFile()) continue;
+    const publisherPubkey = validatedSignedPublisher(candidate);
+    if (publisherPubkey !== null) evidence.push({ path: candidate, publisherPubkey });
+  }
+  return evidence;
+}
+
+function quarantinedPayloadPublisherEntries(retained) {
+  if (retained.metadata.isFile()) {
+    const publisherPubkey = validatedSignedPublisher(retained.payload);
+    return publisherPubkey === null ? [] : [{ path: retained.payload, publisherPubkey }];
+  }
+  if (retained.metadata.isDirectory() && !retained.metadata.isSymbolicLink()) {
+    return quarantinedDirectoryPublisherEntries(retained.payload);
+  }
+  return [];
+}
+
 function corruptQuarantinePublisherEntries(layout, manifestsPresent) {
   let metadata;
   try {
@@ -2169,9 +2279,7 @@ function corruptQuarantinePublisherEntries(layout, manifestsPresent) {
       evidence.push({ path: originFile, publisherPubkey: recorded });
       continue;
     }
-    if (!retained.metadata.isFile()) continue;
-    const publisherPubkey = validatedSignedPublisher(retained.payload);
-    if (publisherPubkey !== null) evidence.push({ path: retained.payload, publisherPubkey });
+    evidence.push(...quarantinedPayloadPublisherEntries(retained));
   }
   return evidence;
 }
@@ -2234,9 +2342,8 @@ function quarantinedReplayPublisherEntries(cacheRoot) {
       evidence.push({ path: manifestFile, publisherPubkey: recorded });
       continue;
     }
-    if (retained.variant === "recovery-residue" || !retained.metadata.isFile()) continue;
-    const publisherPubkey = validatedSignedPublisher(retained.payload);
-    if (publisherPubkey !== null) evidence.push({ path: retained.payload, publisherPubkey });
+    if (retained.variant === "recovery-residue") continue;
+    evidence.push(...quarantinedPayloadPublisherEntries(retained));
   }
   return evidence;
 }
