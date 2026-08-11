@@ -54,6 +54,26 @@ const ownChannel = envelope.ownChannel !== false;
 // see the branches below.
 const anonymous = !envelope.privateKey;
 const privateKey = anonymous ? generateKeypair().privateKey : envelope.privateKey;
+const CONTENT_BYTE_LIMIT = 600;
+const TRUNCATION_MARKER =
+  "... (truncated at 600 bytes; run with --full to see the complete projection)";
+
+function escapeTerminalControls(value) {
+  return value.replace(/[\u0000-\u001f\u007f-\u009f]/gu, (character) =>
+    `\\u${character.codePointAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
+function contentForDisplay(content) {
+  const bytes = Buffer.from(content, "utf8");
+  if (full || bytes.length <= CONTENT_BYTE_LIMIT) {
+    return escapeTerminalControls(content);
+  }
+
+  let end = CONTENT_BYTE_LIMIT;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  return `${escapeTerminalControls(bytes.subarray(0, end).toString("utf8"))}${TRUNCATION_MARKER}`;
+}
 
 function assessEvent(event, index, attributable, expectedAuthors, channelId) {
   const validation = validateSignedEvent(event);
@@ -129,7 +149,8 @@ try {
   process.stdout.write(
     `relay:    ${relay}\nchannel:  ${channelId}\nidentity: ${anonymous ? "ephemeral non-member" : "channel member"}\nevents:   ${events.length}\n`,
   );
-  if (refusal) process.stdout.write(`refused:  ${refusal}\n`);
+  const refusalDisplay = refusal ? escapeTerminalControls(refusal) : "";
+  if (refusal) process.stdout.write(`refused:  ${refusalDisplay}\n`);
 
   // Both halves, and neither on its own is worth anything here. The signature
   // proves the author committed to this ID; recomputing the id proves the ID is
@@ -235,7 +256,7 @@ try {
     } else if (refusal) {
       process.stdout.write(
         "\nINCONCLUSIVE: the relay refused this subscription, but not on membership\n" +
-          `grounds. It said: ${refusal}\n` +
+          `grounds. It said: ${refusalDisplay}\n` +
           "That reason is not machine-tagged as a membership refusal, so it cannot be\n" +
           "read as one.\n" +
           ambiguous,
@@ -272,16 +293,7 @@ try {
         `    author    ${entry.authorDisplay} (${authorVerdict})\n` +
         `    signature ${verdict}\n    channel   ${channelVerdict}\n\n`,
     );
-    {
-      const content = entry.contentDisplay;
-      if (full || content.length <= 600) {
-        process.stdout.write(`${content}\n`);
-      } else {
-        process.stdout.write(
-          `${content.slice(0, 600)}... (truncated at 600 bytes; run with --full to see the complete projection)\n`,
-        );
-      }
-    }
+    process.stdout.write(`${contentForDisplay(entry.contentDisplay)}\n`);
   }
 } catch (error) {
   process.stderr.write(`fm-buzz-inspect: ${error.message}\n`);

@@ -15,7 +15,7 @@
 # by hand, and a failure to reach the relay should be visible in its exit status.
 #
 # With no flags, the diagnostic reads up to three events from this home's channel
-# with this home's publishing identity and prints at most 600 content characters
+# with this home's publishing identity and prints at most 600 content bytes
 # per event. Content longer than that ends with an explicit truncation marker
 # (`... (truncated at 600 bytes; run with --full to see the complete projection)`);
 # --full prints complete event content with no marker, and --limit changes the

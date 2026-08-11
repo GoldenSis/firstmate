@@ -682,9 +682,9 @@ EOF
 test_inspect_content_truncation_is_marked() {
   # Silent truncation of signed projection content (especially omitted[] near the
   # end) is the anti-overclaim failure mode this tool must not hide. Default
-  # display caps at 600 characters with an explicit marker; --full is the only
+  # display caps at 600 UTF-8 bytes with an explicit marker; --full is the only
   # path that prints the complete projection.
-  local home relay short long full_out marker pad
+  local home relay short long full_out marker
   home=$(make_home inspect-truncation)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
   marker='... (truncated at 600 bytes; run with --full to see the complete projection)'
@@ -702,10 +702,8 @@ EOF
     "short content must not emit the truncation marker"
   assert_contains "$short" "signature verified" "short read was not verified"
 
-  # Build a projection whose JSON is well over 600 characters, with omitted[]
+  # Build a projection whose JSON is well over 600 bytes, with omitted[]
   # carrying a unique token near the end so --full can prove the tail survived.
-  pad=$(python3 -c 'print("X" * 700)')
-  long_note="pad-${pad}"
   # Use a custom projection via node/jq-free printf through test_projection style:
   # test_projection only takes a short note; publish a large note via raw JSON.
   printf '%s' "$(python3 -c '
@@ -723,7 +721,7 @@ print(json.dumps({
 
   long=$(run_inspect "$home" "$relay" --limit 1 2>&1)
   assert_contains "$long" "$marker" \
-    "content over 600 chars must print the exact truncation marker"
+    "content over 600 bytes must print the exact truncation marker"
   assert_not_contains "$long" "tail-token-OMITTED-NEAR-END" \
     "default inspect must not silently show the tail after truncation"
   assert_contains "$long" "pad-" "truncated body should still show the start of the content"
@@ -740,7 +738,93 @@ print(json.dumps({
   pass "inspect truncation is explicit and --full prints the complete projection"
 }
 
+test_inspect_truncation_preserves_utf8_boundaries() {
+  local home relay bounded full_out marker
+  home=$(make_home inspect-utf8-boundary)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  marker='... (truncated at 600 bytes; run with --full to see the complete projection)'
+
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+
+  python3 -c '
+import json
+
+projection = {
+    "schema": "fm-bearings.v1",
+    "home": "test/home",
+    "generated": "2026-08-10T00:00:00Z",
+    "prs": "not_requested (run: /bearings include PRs)",
+    "in_flight": [],
+    "note": "éTAIL",
+    "omitted": [],
+}
+raw = json.dumps(projection, ensure_ascii=False, separators=(",", ":"))
+projection["note"] = ("X" * (599 - raw.index("é"))) + projection["note"]
+print(json.dumps(projection, ensure_ascii=False, separators=(",", ":")))
+' | run_publish "$home" "$relay" >/dev/null 2>&1
+
+  bounded=$(run_inspect "$home" "$relay" --limit 1 2>&1)
+  assert_contains "$bounded" "$marker" \
+    "a multibyte character crossing the byte limit must emit the marker"
+  assert_not_contains "$bounded" "éTAIL" \
+    "the default display crossed the 600-byte boundary"
+  assert_not_contains "$bounded" "�" \
+    "UTF-8 truncation split a multibyte character"
+
+  full_out=$(run_inspect "$home" "$relay" --limit 1 --full 2>&1)
+  assert_contains "$full_out" "éTAIL" \
+    "--full did not preserve content beyond the UTF-8 byte boundary"
+  assert_not_contains "$full_out" "$marker" \
+    "--full emitted the truncation marker"
+
+  stop_stub "$STUB_PID"
+  pass "inspect truncation preserves UTF-8 character boundaries"
+}
+
+test_inspect_escapes_terminal_controls() {
+  local home relay inspected refused control_note unsafe_refusal private channel
+  home=$(make_home inspect-terminal-controls)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  private=$(jq -r '.private_key' "$(key_file "$home" "$home/xdg")")
+  channel=$(default_channel_id "$home") \
+    || fail "could not derive the terminal-control fixture channel"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  control_note=$'\302\23331mrelay-color\302\2330m'
+  publish_signed_fixture "$private" "$relay" "$channel" "$control_note" \
+    || fail "could not publish the terminal-control fixture"
+  private=""
+  inspected=$(run_inspect "$home" "$relay" --full 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_not_contains "$inspected" $'\302\233' \
+    "relay content reached the terminal with a C1 control character"
+  assert_contains "$inspected" '\u009b31mrelay-color\u009b0m' \
+    "relay content controls were not rendered visibly"
+
+  unsafe_refusal=$'error: \033]52;c;Y2xpcGJvYXJk\a\033[31mrelay-color\033[0m'
+  read -r STUB_PID relay <<EOF
+$(start_stub --refuse-req "$unsafe_refusal")
+EOF
+  refused=$(run_inspect "$home" "$relay" --anonymous 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_not_contains "$refused" $'\033' \
+    "relay refusal text reached the terminal with an escape character"
+  assert_not_contains "$refused" $'\a' \
+    "relay refusal text reached the terminal with a bell character"
+  assert_contains "$refused" '\u001b]52;c;Y2xpcGJvYXJk\u0007\u001b[31mrelay-color\u001b[0m' \
+    "relay refusal controls were not rendered visibly"
+  pass "inspect escapes terminal controls in content and refusals"
+}
+
 test_inspect_content_truncation_is_marked
+test_inspect_truncation_preserves_utf8_boundaries
+test_inspect_escapes_terminal_controls
 test_the_inspector_rejects_a_tampered_event
 test_an_anonymous_read_only_claims_privacy_when_the_relay_refuses
 test_an_anonymous_read_that_returns_events_reports_the_breach
