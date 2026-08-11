@@ -18,6 +18,9 @@
 // relay/channel pair, with exactly relay, channel_id, and signer_pubkey fields.
 // The first verified kind-39002 snapshot records its signer unless strict mode
 // requires an existing pin, and every later snapshot must match that signer.
+// Relay identity retirement normalizes one complete endpoint, refuses while any
+// publisher target still names it, and atomically removes every authority pin
+// for that endpoint while preserving pins for every other endpoint.
 // data/buzz-compromised-unverifiable-pairs.jsonl records relay/channel pairs
 // that a compromised recovery could not authenticate because the recorded
 // publisher identity no longer had matching readable private material.
@@ -31,6 +34,7 @@
 //   node bin/fm-buzz-targets.mjs normalize-relay URL
 //   node bin/fm-buzz-targets.mjs record-unverifiable TARGETS_FILE OUTPUT_FILE PUBKEY REASON
 //   node bin/fm-buzz-targets.mjs forget-target FILE TARGET_HEX
+//   node bin/fm-buzz-targets.mjs forget-relay-identity TARGETS_FILE AUTHORITIES_FILE ENDPOINT
 //   node bin/fm-buzz-targets.mjs retire-unverifiable TARGETS_FILE OUTPUT_FILE REASON PUBKEY...
 
 import {
@@ -255,6 +259,22 @@ export function verifyOrRecordRelayAuthority(file, value, options = {}) {
   return { authority, recorded: true };
 }
 
+export function forgetRelayIdentity(targetsFile, authoritiesFile, endpoint) {
+  const relay = normalizeRelayEndpoint(endpoint);
+  const targets = readPublisherTargets(targetsFile).filter((target) => target.relay === relay);
+  if (targets.length > 0) {
+    const selectors = targets.map(publisherTargetHex).sort();
+    throw new Error(
+      `publisher targets still exist for relay ${relay}: ${selectors.join(", ")}`,
+    );
+  }
+  const existing = readRelayAuthorities(authoritiesFile);
+  const retiring = existing.filter((authority) => authority.relay === relay);
+  const remaining = existing.filter((authority) => authority.relay !== relay);
+  if (retiring.length > 0) replaceRegistry(authoritiesFile, remaining, "relay authority");
+  return { relay, removed: retiring };
+}
+
 export function normalizeCompromisedUnverifiablePair(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("compromised unverifiable pair must be an object");
@@ -326,7 +346,7 @@ export function retirePublisherTargetsAsUnverifiable(targetsFile, outputFile, pu
 
 function usage() {
   process.stderr.write(
-    "usage: fm-buzz-targets.mjs <list FILE|list-with-ids FILE|normalize-relay URL|record-unverifiable TARGETS_FILE OUTPUT_FILE PUBKEY REASON|forget-target FILE TARGET_HEX|retire-unverifiable TARGETS_FILE OUTPUT_FILE REASON PUBKEY...>\n",
+    "usage: fm-buzz-targets.mjs <list FILE|list-with-ids FILE|normalize-relay URL|record-unverifiable TARGETS_FILE OUTPUT_FILE PUBKEY REASON|forget-target FILE TARGET_HEX|forget-relay-identity TARGETS_FILE AUTHORITIES_FILE ENDPOINT|retire-unverifiable TARGETS_FILE OUTPUT_FILE REASON PUBKEY...>\n",
   );
 }
 
@@ -366,6 +386,12 @@ async function cli() {
     process.stdout.write(
       `${publisherTargetHex(target)}\t${target.publisher_pubkey}\t${target.relay}\t${target.channel_id}\n`,
     );
+    return;
+  }
+  if (operation === "forget-relay-identity" && value && rest.length === 2) {
+    const [authoritiesFile, endpoint] = rest;
+    const result = forgetRelayIdentity(value, authoritiesFile, endpoint);
+    process.stdout.write(`${result.relay}\t${result.removed.length}\n`);
     return;
   }
   if (operation === "retire-unverifiable" && value && rest.length >= 3) {

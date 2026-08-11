@@ -19,11 +19,13 @@
 #   fm-buzz-keypair.sh --rotate --discard-pending-cache  quarantine outgoing pending events first
 #   fm-buzz-keypair.sh --forget-key <hex>    withdraw one already-retired public key
 #   fm-buzz-keypair.sh --forget-target <hex> attest one retired relay/channel target
+#   fm-buzz-keypair.sh --forget-relay-identity <endpoint>  attest one retired relay identity
 #   fm-buzz-keypair.sh --help                this text
 #
 # Exit status: 0 when ensure or --rotate leaves a recorded keypair, when --public
 # prints an existing stored identity, or when --forget-key completes even if the
-# named key was not recorded, or when --forget-target removes its exact record.
+# named key was not recorded, when --forget-target removes its exact record, or
+# when --forget-relay-identity retires every authority pin for its exact endpoint.
 # Exit status 1 reports an operational or inconsistent-state failure, and 2
 # reports invalid or contradictory arguments.
 # Unlike bin/fm-buzz-publish.sh this script is NOT fire-and-forget: it is run
@@ -92,9 +94,11 @@
 # Compromised recovery that cannot authenticate a recorded identity's tracked
 # memberships records every affected pair in
 # data/buzz-compromised-unverifiable-pairs.jsonl before replacing the key.
-# When a channel or relay is truly retired, first destroy its disposable relay
-# state with `docker compose down -v`, then attest exactly one retired tracked
-# target with `--forget-target <target-hex>`, and only then run `--rotate`.
+# When a channel or relay is truly retired, run
+# `docker compose -f docker-compose.buzz-loopback.yml down -v`, run
+# `fm-buzz-keypair.sh --forget-target <hex>` for every tracked target, run
+# `fm-buzz-keypair.sh --forget-relay-identity <endpoint>` for every relay whose
+# signer will change, and then run `fm-buzz-keypair.sh --rotate`.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -104,6 +108,7 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 # shellcheck source=bin/fm-buzz-key-lib.sh
+# shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-buzz-key-lib.sh"
 
 REPLAY_DIR=$(fm_buzz_replay_cache_dir "$STATE") || {
@@ -124,6 +129,8 @@ FORGET_KEY=""
 FORGETTING=0
 FORGET_TARGET=""
 TARGET_FORGETTING=0
+FORGET_RELAY_IDENTITY=""
+RELAY_IDENTITY_FORGETTING=0
 STRICT_RELAY_AUTHORITY=${FM_BUZZ_REQUIRE_PINNED_RELAY_AUTHORITY:-0}
 
 while [ "$#" -gt 0 ]; do
@@ -137,6 +144,7 @@ while [ "$#" -gt 0 ]; do
     # through into the default "ensure a keypair exists" behaviour.
     --forget-key) FORGETTING=1; shift; FORGET_KEY=${1:-} ;;
     --forget-target) TARGET_FORGETTING=1; shift; FORGET_TARGET=${1:-} ;;
+    --forget-relay-identity) RELAY_IDENTITY_FORGETTING=1; shift; FORGET_RELAY_IDENTITY=${1:-} ;;
     --help|-h) awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; exit 0 ;;
     *) printf 'fm-buzz-keypair.sh: unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
@@ -158,13 +166,18 @@ if [ "$DISCARD_PENDING_CACHE" -eq 1 ] && [ "$ROTATE" -eq 0 ]; then
   exit 2
 fi
 
-if [ "$FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ] || [ "$TARGET_FORGETTING" -eq 1 ]; }; then
+if [ "$FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ] || [ "$TARGET_FORGETTING" -eq 1 ] || [ "$RELAY_IDENTITY_FORGETTING" -eq 1 ]; }; then
   printf 'fm-buzz-keypair.sh: --forget-key is its own operation; run it on its own\n' >&2
   exit 2
 fi
 
-if [ "$TARGET_FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ] || [ "$COMPROMISED" -eq 1 ] || [ "$DISCARD_PENDING_CACHE" -eq 1 ]; }; then
+if [ "$TARGET_FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ] || [ "$COMPROMISED" -eq 1 ] || [ "$DISCARD_PENDING_CACHE" -eq 1 ] || [ "$RELAY_IDENTITY_FORGETTING" -eq 1 ]; }; then
   printf 'fm-buzz-keypair.sh: --forget-target is its own operation; run it on its own\n' >&2
+  exit 2
+fi
+
+if [ "$RELAY_IDENTITY_FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ] || [ "$COMPROMISED" -eq 1 ] || [ "$DISCARD_PENDING_CACHE" -eq 1 ]; }; then
+  printf 'fm-buzz-keypair.sh: --forget-relay-identity is its own operation; run it on its own\n' >&2
   exit 2
 fi
 
@@ -195,9 +208,10 @@ if [ "$PUBLIC_ONLY" -eq 0 ]; then
   mkdir -p "$DATA" 2>/dev/null || {
     printf 'fm-buzz-keypair.sh: could not create %s\n' "$DATA" >&2
     exit 1
-  }
-  # shellcheck source=bin/fm-wake-lib.sh
-  . "$SCRIPT_DIR/fm-wake-lib.sh"
+    }
+    # shellcheck source=bin/fm-wake-lib.sh
+    # shellcheck disable=SC1091
+    . "$SCRIPT_DIR/fm-wake-lib.sh"
   trap release_keypair_lock EXIT
   trap 'exit 1' HUP INT TERM
   if [ "$ROTATE" -eq 1 ]; then
@@ -320,8 +334,11 @@ refuse_rotation_for_current_membership() {  # <keychain|file> <public-key> <targ
   printf 'fm-buzz-keypair.sh: outgoing publisher target %s has current membership on relay %s, channel %s; nothing was rotated\n' \
     "$target_hex" "$relay" "$channel" >&2
   printf '%s\n' 'Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity.' >&2
-  printf 'If this relay or channel is truly retired, run docker compose down -v, then fm-buzz-keypair.sh --forget-target %s, then fm-buzz-keypair.sh --rotate.\n' \
-    "$target_hex" >&2
+  printf '%s\n' 'If this relay or channel is truly retired, run this full recovery sequence:' >&2
+  printf '%s\n' '  docker compose -f docker-compose.buzz-loopback.yml down -v' >&2
+  printf '  fm-buzz-keypair.sh --forget-target %s\n' "$target_hex" >&2
+  printf '  fm-buzz-keypair.sh --forget-relay-identity %s\n' "$relay" >&2
+  printf '%s\n' '  fm-buzz-keypair.sh --rotate' >&2
   printf '%s\n' 'Reference: https://github.com/block/buzz/blob/main/ARCHITECTURE.md' >&2
   printf '%s\n' 'Reference: https://github.com/block/buzz/blob/main/NOSTR.md' >&2
   return 1
@@ -447,6 +464,27 @@ purge_public_set() {  # <public keys to withdraw...>
 purge_public() {  # <public key to withdraw>
   purge_public_set "$1"
 }
+
+if [ "$RELAY_IDENTITY_FORGETTING" -eq 1 ]; then
+  if [ -z "$FORGET_RELAY_IDENTITY" ]; then
+    printf 'fm-buzz-keypair.sh: --forget-relay-identity wants a relay endpoint\n' >&2
+    exit 2
+  fi
+  forgotten_relay=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" forget-relay-identity \
+    "$TARGETS_FILE" "$AUTHORITIES_FILE" "$FORGET_RELAY_IDENTITY" 2>&1)
+  forgotten_relay_status=$?
+  if [ "$forgotten_relay_status" -ne 0 ]; then
+    printf 'fm-buzz-keypair.sh: could not forget relay identity: %s; nothing was changed\n' \
+      "$forgotten_relay" >&2
+    exit 1
+  fi
+  IFS=$'\t' read -r forgotten_relay_endpoint forgotten_relay_count <<EOF
+$forgotten_relay
+EOF
+  printf 'forgotten relay identity: %s (%s authority record(s))\n' \
+    "$forgotten_relay_endpoint" "$forgotten_relay_count" >&2
+  exit 0
+fi
 
 if [ "$TARGET_FORGETTING" -eq 1 ]; then
   case $FORGET_TARGET in
@@ -709,7 +747,7 @@ EOF
   # and permanently cost the probe its attribution. A rotation that stops now is
   # simply retryable - nothing has changed yet.
   if [ "$COMPROMISED" -eq 1 ]; then
-    purge_public_set "$recorded" "$keychain_public" "$file_public" || {
+    purge_public_set "${rotation_publics[@]}" || {
       printf 'fm-buzz-keypair.sh: could not drop the compromised public keys from %s; nothing was rotated\n' "$HISTORY_FILE" >&2
       exit 1
     }

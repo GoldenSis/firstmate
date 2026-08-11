@@ -235,6 +235,7 @@ seed_replay_event() {  # <home> <relay> <private-key> <created-at> <channel> <no
 # the name here: the per-home derivation is the thing under test, and a test that
 # recomputed it would agree with a broken library by construction.
 key_file() {  # <home> <xdg>
+  # shellcheck disable=SC2030
   ( XDG_DATA_HOME=$2 FM_BUZZ_FORCE_FILE_STORE=1
     # shellcheck disable=SC1091
     . "$ROOT/bin/fm-buzz-key-lib.sh"
@@ -840,10 +841,12 @@ EOF
   expect_code 1 "$code" "rotation before target retirement"
   assert_contains "$output" "target $target_hex" \
     "rotation refusal did not expose the exact target identifier"
-  assert_contains "$output" "docker compose down -v" \
+  assert_contains "$output" "docker compose -f docker-compose.buzz-loopback.yml down -v" \
     "rotation refusal omitted the disposable-relay retirement step"
   assert_contains "$output" "--forget-target $target_hex" \
     "rotation refusal omitted its exact target-retirement command"
+  assert_contains "$output" "--forget-relay-identity $normalized_relay" \
+    "rotation refusal omitted its exact relay-identity retirement command"
   [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
     || fail "pre-retirement refusal changed the publishing identity"
 
@@ -862,6 +865,135 @@ EOF
     || fail "rotation did not proceed after exact target retirement"
   [ "$replacement" != "$old" ] || fail "post-retirement rotation kept the old identity"
   pass "exact target retirement unblocks rotation without dropping unrelated targets"
+}
+
+test_forget_relay_identity_requires_exact_target_retirement() {
+  local home other old other_public relay normalized_relay port targets authorities
+  local channel_a channel_b other_channel other_relay target_a target_b output code
+  local first_private first_signer second_private second_signer other_signer
+  home=$(make_home forget-relay-identity)
+  other=$(make_home forget-relay-identity-other)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "relay-identity keypair setup failed"
+  other_public=$(run_keypair "$other" 2>/dev/null) || fail "relay-identity unrelated publisher setup failed"
+  first_private=$(printf '%064d' 4)
+  first_signer=$(public_from_private "$first_private") || fail "could not derive the first relay signer"
+  second_private=$(printf '%064d' 5)
+  second_signer=$(public_from_private "$second_private") || fail "could not derive the replacement relay signer"
+  other_signer=$(public_from_private "$(printf '%064d' 6)") || fail "could not derive the unrelated relay signer"
+  channel_a="13131313-2424-5353-8464-757575757575"
+  channel_b="14141414-2525-5656-8787-989898989898"
+  other_channel="15151515-2626-5757-8888-a9a9a9a9a9a9"
+  other_relay="ws://127.0.0.1:65534/unrelated"
+  read -r STUB_PID relay <<EOF
+$(start_stub --membership-private-key "$first_private")
+EOF
+  normalized_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
+    || fail "could not normalize the relay identity"
+  other_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$other_relay") \
+    || fail "could not normalize the unrelated relay identity"
+  port=${relay##*:}
+  publish_membership_fixture "$relay" "$channel_a" "$old" \
+    || fail "could not seed the first retired channel"
+  publish_membership_fixture "$relay" "$channel_b" "$old" \
+    || fail "could not seed the second retired channel"
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  authorities="$home/data/buzz-relay-authorities.jsonl"
+  node -e '
+    import(process.argv[2]).then(({ recordPublisherTarget }) => {
+      const file = process.argv[3];
+      for (let index = 4; index < process.argv.length; index += 3) {
+        recordPublisherTarget(file, {
+          relay: process.argv[index],
+          channel_id: process.argv[index + 1],
+          publisher_pubkey: process.argv[index + 2],
+        });
+      }
+    });
+  ' target-fixture "$ROOT/bin/fm-buzz-targets.mjs" "$targets" \
+    "$normalized_relay" "$channel_a" "$old" \
+    "$normalized_relay" "$channel_b" "$old" \
+    "$other_relay" "$other_channel" "$other_public" \
+    || fail "could not seed relay-retirement targets"
+  {
+    jq -cn --arg relay "$normalized_relay" --arg channel "$channel_a" --arg signer "$first_signer" \
+      '{relay:$relay,channel_id:$channel,signer_pubkey:$signer}'
+    jq -cn --arg relay "$normalized_relay" --arg channel "$channel_b" --arg signer "$first_signer" \
+      '{relay:$relay,channel_id:$channel,signer_pubkey:$signer}'
+    jq -cn --arg relay "$other_relay" --arg channel "$other_channel" --arg signer "$other_signer" \
+      '{relay:$relay,channel_id:$channel,signer_pubkey:$signer}'
+  } > "$authorities"
+  target_a=$(node "$ROOT/bin/fm-buzz-targets.mjs" list-with-ids "$targets" \
+    | awk -F '\t' -v channel="$channel_a" '$4 == channel { print $1 }')
+  target_b=$(node "$ROOT/bin/fm-buzz-targets.mjs" list-with-ids "$targets" \
+    | awk -F '\t' -v channel="$channel_b" '$4 == channel { print $1 }')
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation before relay retirement"
+  assert_contains "$output" "docker compose -f docker-compose.buzz-loopback.yml down -v" \
+    "rotation refusal named the wrong compose retirement command"
+  assert_contains "$output" "--forget-target $target_a" \
+    "rotation refusal omitted the blocking target selector"
+  assert_contains "$output" "--forget-relay-identity $normalized_relay" \
+    "rotation refusal omitted the blocking relay endpoint"
+
+  run_keypair "$home" --forget-target "$target_a" >/dev/null 2>&1 \
+    || fail "could not attest the first target retirement"
+  [ "$(jq -s --arg relay "$normalized_relay" '[.[] | select(.relay == $relay)] | length' "$authorities")" = "2" ] \
+    || fail "target retirement implicitly removed relay authority pins"
+  output=$(run_keypair "$home" --forget-relay-identity "$normalized_relay" 2>&1)
+  code=$?
+  expect_code 1 "$code" "relay identity retirement with a remaining target"
+  assert_contains "$output" "$target_b" \
+    "relay identity retirement did not name the remaining target"
+  [ "$(jq -s --arg relay "$normalized_relay" '[.[] | select(.relay == $relay)] | length' "$authorities")" = "2" ] \
+    || fail "refused relay identity retirement changed authority pins"
+
+  run_keypair "$home" --forget-target "$target_b" >/dev/null 2>&1 \
+    || fail "could not attest the second target retirement"
+  output=$(run_keypair "$home" --forget-relay-identity "$normalized_relay" 2>&1)
+  code=$?
+  expect_code 0 "$code" "relay identity retirement after every target"
+  assert_contains "$output" "forgotten relay identity: $normalized_relay (2 authority record(s))" \
+    "relay identity retirement did not report the exact endpoint and pin count"
+  [ "$(jq -s --arg relay "$normalized_relay" '[.[] | select(.relay == $relay)] | length' "$authorities")" = "0" ] \
+    || fail "relay identity retirement left an authority pin for the retired endpoint"
+  jq -e --arg relay "$other_relay" --arg signer "$other_signer" \
+    'select(.relay == $relay and .signer_pubkey == $signer)' "$authorities" >/dev/null \
+    || fail "relay identity retirement removed an unrelated endpoint pin"
+  assert_grep "$other_public" "$targets" \
+    "relay identity retirement removed an unrelated publisher target"
+
+  stop_stub "$STUB_PID"
+  read -r STUB_PID relay <<EOF
+$(start_stub --port "$port" --membership-private-key "$second_private")
+EOF
+  publish_membership_fixture "$relay" "$channel_a" "$old" \
+    || fail "could not seed the recreated relay membership"
+  node -e '
+    import(process.argv[2]).then(({ recordPublisherTarget }) => {
+      recordPublisherTarget(process.argv[3], {
+        relay: process.argv[4],
+        channel_id: process.argv[5],
+        publisher_pubkey: process.argv[6],
+      });
+    });
+  ' target-fixture "$ROOT/bin/fm-buzz-targets.mjs" "$targets" "$normalized_relay" "$channel_a" "$old" \
+    || fail "could not record the recreated relay target"
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  stop_stub "$STUB_PID"
+  expect_code 1 "$code" "rotation after recreated relay TOFU"
+  assert_contains "$output" "current membership" \
+    "the recreated relay did not reach the membership guard"
+  jq -e --arg relay "$normalized_relay" --arg channel "$channel_a" --arg signer "$second_signer" \
+    'select(.relay == $relay and .channel_id == $channel and .signer_pubkey == $signer)' \
+    "$authorities" >/dev/null \
+    || fail "the recreated relay did not pin its replacement signer"
+  jq -e --arg relay "$other_relay" --arg signer "$other_signer" \
+    'select(.relay == $relay and .signer_pubkey == $signer)' "$authorities" >/dev/null \
+    || fail "re-pinning the recreated relay changed an unrelated endpoint pin"
+  pass "relay identity retirement requires exact target retirement and permits TOFU re-pinning"
 }
 
 test_rotation_checks_authoritative_current_membership() {
@@ -1192,7 +1324,7 @@ test_compromised_orphan_recovery_records_unverifiable_memberships() {
 
 test_orphan_identity_evidence_requires_compromised_recovery() {
   local home relay old keyfile public_file targets cache_file cache_name targets_before cache_before
-  local output code replacement artifact manifest
+  local output code replacement artifact manifest history unrelated_history_key
   home=$(make_home orphan-identity-evidence)
   old=$(run_keypair "$home" 2>/dev/null) || fail "orphan-evidence keypair setup failed"
   keyfile=$(key_file "$home" "$home/xdg")
@@ -1207,6 +1339,10 @@ test_orphan_identity_evidence_requires_compromised_recovery() {
   targets_before=$(cat "$targets")
   cache_before=$(cat "$cache_file")
   rm "$keyfile" "$public_file"
+  history="$home/data/buzz-keypair.public-history"
+  unrelated_history_key=$(public_from_private "$(printf '%064d' 8)") \
+    || fail "could not derive unrelated orphan-history fixture key"
+  printf '%s\n%s\n' "$old" "$unrelated_history_key" > "$history"
 
   output=$(run_keypair "$home" 2>&1)
   code=$?
@@ -1249,6 +1385,10 @@ test_orphan_identity_evidence_requires_compromised_recovery() {
   manifest=$(grep -l 'pending-key-rotation' \
     "$home/state/buzz-replay/_legacy-quarantine/manifests"/*.json 2>/dev/null | head -1)
   [ -n "$manifest" ] || fail "compromised orphan recovery did not quarantine pending replay evidence"
+  assert_not_contains "$(cat "$history" 2>/dev/null)" "$old" \
+    "compromised orphan recovery left the orphan publisher trusted in history"
+  assert_contains "$(cat "$history" 2>/dev/null)" "$unrelated_history_key" \
+    "compromised orphan recovery removed an unrelated historical key"
   assert_contains "$output" "they may be stranded and are recorded in $artifact" \
     "compromised orphan recovery omitted its stranded-pair warning"
   pass "orphan identity evidence requires explicit compromised recovery"
@@ -1503,8 +1643,8 @@ test_key_record_targets_reject_non_files() {
   fallback=$(key_file "$fallback_home" "$fallback_home/xdg")
   mkdir -p "$fallback"
   output=$(
-    XDG_DATA_HOME="$fallback_home/xdg"
-    FM_BUZZ_FORCE_FILE_STORE=1
+    # shellcheck disable=SC2031
+    export XDG_DATA_HOME="$fallback_home/xdg" FM_BUZZ_FORCE_FILE_STORE=1
     # shellcheck disable=SC1091
     . "$ROOT/bin/fm-buzz-key-lib.sh"
     fm_buzz_key_store "$fallback_home" \
@@ -4332,6 +4472,12 @@ test_quarantine_lifecycle_has_one_pinned_cache_owner() {
     "the pinned cache owner does not own legacy quarantine orchestration"
   assert_grep "function recoverStagedLegacyEntries" "$ROOT/bin/fm-buzz-publish.mjs" \
     "the pinned cache owner does not own quarantine recovery"
+  assert_grep "staging/<token>/{source,origin.json}" "$ROOT/bin/fm-buzz-publish.mjs" \
+    "the quarantine owner does not document its staging and payload layout"
+  assert_grep "A manifest at manifests/<token>.json identifies a record" "$ROOT/bin/fm-buzz-publish.mjs" \
+    "the quarantine owner does not document manifest identity"
+  assert_grep "Startup first accounts for invalid recovery residue" "$ROOT/bin/fm-buzz-publish.mjs" \
+    "the quarantine owner does not document recovery order"
   assert_no_grep "runLegacyQuarantineLifecycle" "$ROOT/bin/fm-buzz-publish.mjs" \
     "the publisher still delegates through the callback facade"
   pass "quarantine lifecycle and pinned mutations have one owner"
@@ -4364,6 +4510,7 @@ test_rotation_refuses_an_existing_private_channel_before_mutation
 test_publisher_target_overrides_are_recorded_and_guard_rotation
 test_publisher_target_updates_are_concurrent_and_fail_closed
 test_forget_target_attests_exact_retirement
+test_forget_relay_identity_requires_exact_target_retirement
 test_rotation_checks_authoritative_current_membership
 test_rotation_fails_closed_on_unverifiable_membership
 test_rotation_pins_and_verifies_relay_membership_authority

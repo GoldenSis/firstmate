@@ -22,7 +22,20 @@
 //
 // Legacy and explicitly discarded rotation entries are retained under
 // _legacy-quarantine with payloads and manifests rather than silently deleted.
-// The schema and lifecycle below define that durable quarantine contract.
+// Each claimed regular file moves through staging/<token>/{source,origin.json}
+// into payloads/<token>.json, while corrupt cache nodes remain under
+// corrupt/<token>/entry and invalid recovery residue remains under
+// recovery-corrupt/<token>.invalid.
+// A manifest at manifests/<token>.json identifies a record by original_path,
+// legacy_host, payload_reference, source device and inode, corrupt_type,
+// quarantine_reason, and publisher_pubkey, and records original timestamps,
+// quarantine time, plus observed content evidence when the payload is readable.
+// A lowercase SHA-256 token binds stable source provenance: original path,
+// device, inode, ctime, and birthtime for regular files, or mode for corrupt
+// partition nodes, without using access time.
+// Startup first accounts for invalid recovery residue, then completes manifest
+// temporaries, staged regular files, and corrupt nodes before discovering new
+// legacy entries, and it reports every unsettled mutation as a cleanup failure.
 
 import {
   closeSync,
