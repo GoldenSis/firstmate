@@ -153,11 +153,8 @@ The stub verifies every event's id and Schnorr signature before accepting it, so
 
 ## Known limitations
 
-The Schnorr implementation in `bin/fm-buzz-crypto.mjs` is pure BigInt and therefore not constant time.
-It exists because this host has no secp256k1 binding and the repo deliberately carries no npm dependency tree.
-It is checked against the official BIP-340 vectors for 32-byte messages, including all ten negative cases, but it must not be reused for a key that guards anything.
-That is the whole of NIP-01's usage and the whole of the coverage: the variable-length-message vectors (15-18) are excluded, and the signer rejects such messages outright rather than signing them.
-That is acceptable for exactly this key: it signs fleet-status projections on a loopback relay, grants no authority, and is cheap to re-mint.
+The purpose-limited Schnorr implementation is not constant time and must not protect an authoritative or privileged key.
+The header of `bin/fm-buzz-crypto.mjs` owns its implementation limits, permitted scope, and vector-coverage contract.
 
 Buzz documents no key-rotation procedure, so this adapter supplies one to keep historical projections attributable without trusting compromised identities.
 Rotation must stay adapter-owned rather than manual because custody location varies by host and the fallback path is derived from the operational home.

@@ -35,6 +35,9 @@
 // an existing payload or manifest is accepted only when its identity matches.
 // Partition-shaped non-directories are moved under _legacy-quarantine/corrupt,
 // recorded by the same manifest set, and never opened as replay data.
+// Invalid recovery temporaries move intact under recovery-corrupt and receive a
+// manifest from the same set; residue that cannot be quarantined is counted as a
+// cleanup failure.
 
 import {
   closeSync,
@@ -75,6 +78,7 @@ function log(message) {
 }
 
 let replayRootPin = null;
+const replayDirectoryPins = new Map();
 
 function assertReplayRoot() {
   if (replayRootPin === null) return;
@@ -93,37 +97,167 @@ function assertReplayRoot() {
   }
 }
 
-function mutateReplayState(operation) {
+function assertCacheDirectory(directory) {
+  const resolved = path.resolve(directory);
+  const pin = replayDirectoryPins.get(resolved);
+  if (!pin) throw new Error(`cache directory is not pinned: ${resolved}`);
+  const descriptorMetadata = fstatSync(pin.descriptor);
+  const pathMetadata = lstatSync(resolved);
+  if (
+    pathMetadata.isSymbolicLink() ||
+    !pathMetadata.isDirectory() ||
+    pathMetadata.dev !== pin.dev ||
+    pathMetadata.ino !== pin.ino ||
+    descriptorMetadata.dev !== pin.dev ||
+    descriptorMetadata.ino !== pin.ino ||
+    realpathSync(resolved) !== resolved
+  ) {
+    throw new Error(`cache directory identity changed during publication: ${resolved}`);
+  }
+  return pin;
+}
+
+function pinCacheDirectory(directory) {
   assertReplayRoot();
+  const resolved = path.resolve(directory);
+  if (resolved !== replayRootPin.path && !containedCachePath(replayRootPin.path, resolved)) {
+    throw new Error("cache directory escapes replay cache");
+  }
+  const existing = replayDirectoryPins.get(resolved);
+  if (existing) {
+    assertCacheDirectory(resolved);
+    return resolved;
+  }
+  const pathMetadata = lstatSync(resolved);
+  if (pathMetadata.isSymbolicLink() || !pathMetadata.isDirectory() || realpathSync(resolved) !== resolved) {
+    throw new Error(`cache path ${resolved} is not a regular directory`);
+  }
+  const descriptor = openSync(
+    resolved,
+    constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
+  );
+  const descriptorMetadata = fstatSync(descriptor);
+  if (
+    !descriptorMetadata.isDirectory() ||
+    descriptorMetadata.dev !== pathMetadata.dev ||
+    descriptorMetadata.ino !== pathMetadata.ino
+  ) {
+    closeSync(descriptor);
+    throw new Error(`cache directory identity changed while it was being pinned: ${resolved}`);
+  }
+  replayDirectoryPins.set(resolved, {
+    path: resolved,
+    descriptor,
+    dev: descriptorMetadata.dev,
+    ino: descriptorMetadata.ino,
+  });
+  assertCacheDirectory(resolved);
+  return resolved;
+}
+
+function withPinnedCacheDirectory(directory, operation) {
+  const resolved = path.resolve(directory);
+  const pin = assertCacheDirectory(resolved);
+  const previous = process.cwd();
+  process.chdir(resolved);
+  try {
+    const current = lstatSync(".");
+    const descriptorMetadata = fstatSync(pin.descriptor);
+    if (
+      !current.isDirectory() ||
+      current.dev !== pin.dev ||
+      current.ino !== pin.ino ||
+      descriptorMetadata.dev !== pin.dev ||
+      descriptorMetadata.ino !== pin.ino
+    ) {
+      throw new Error(`cache directory identity changed during publication: ${resolved}`);
+    }
+    return operation();
+  } finally {
+    process.chdir(previous);
+    assertReplayRoot();
+    assertCacheDirectory(resolved);
+  }
+}
+
+function mutateReplayState(operation, directories = []) {
+  assertReplayRoot();
+  for (const directory of directories) assertCacheDirectory(directory);
   try {
     return operation();
   } finally {
     assertReplayRoot();
+    for (const directory of directories) assertCacheDirectory(directory);
   }
 }
 
-function cacheMkdirSync(...args) {
-  return mutateReplayState(() => mkdirSync(...args));
+function cacheMkdirSync(directory, options) {
+  const resolved = path.resolve(directory);
+  const parent = path.dirname(resolved);
+  const result = withPinnedCacheDirectory(parent, () => mkdirSync(path.basename(resolved), options));
+  pinCacheDirectory(resolved);
+  return result;
 }
 
-function cacheWriteFileSync(...args) {
-  return mutateReplayState(() => writeFileSync(...args));
+function cacheWriteFileSync(file, ...args) {
+  const resolved = path.resolve(file);
+  return withPinnedCacheDirectory(path.dirname(resolved), () => writeFileSync(path.basename(resolved), ...args));
 }
 
-function cacheRenameSync(...args) {
-  return mutateReplayState(() => renameSync(...args));
+function cacheRenameSync(source, destination) {
+  const resolvedSource = path.resolve(source);
+  const resolvedDestination = path.resolve(destination);
+  const sourceParent = path.dirname(resolvedSource);
+  const destinationParent = path.dirname(resolvedDestination);
+  if (sourceParent === destinationParent) {
+    return withPinnedCacheDirectory(sourceParent, () => renameSync(
+      path.basename(resolvedSource),
+      path.basename(resolvedDestination),
+    ));
+  }
+  return mutateReplayState(
+    () => renameSync(resolvedSource, resolvedDestination),
+    [sourceParent, destinationParent],
+  );
 }
 
-function cacheUnlinkSync(...args) {
-  return mutateReplayState(() => unlinkSync(...args));
+function cacheUnlinkSync(file) {
+  const resolved = path.resolve(file);
+  return withPinnedCacheDirectory(path.dirname(resolved), () => unlinkSync(path.basename(resolved)));
 }
 
-function cacheLinkSync(...args) {
-  return mutateReplayState(() => linkSync(...args));
+function cacheLinkSync(source, destination) {
+  const resolvedSource = path.resolve(source);
+  const resolvedDestination = path.resolve(destination);
+  const parent = path.dirname(resolvedSource);
+  if (parent !== path.dirname(resolvedDestination)) {
+    throw new Error("cache hard-link endpoints must share one pinned directory");
+  }
+  return withPinnedCacheDirectory(parent, () => linkSync(
+    path.basename(resolvedSource),
+    path.basename(resolvedDestination),
+  ));
 }
 
-function cacheRmdirSync(...args) {
-  return mutateReplayState(() => rmdirSync(...args));
+function cacheRmdirSync(directory) {
+  const resolved = path.resolve(directory);
+  const result = withPinnedCacheDirectory(
+    path.dirname(resolved),
+    () => rmdirSync(path.basename(resolved)),
+  );
+  const pin = replayDirectoryPins.get(resolved);
+  if (pin) closeSync(pin.descriptor);
+  replayDirectoryPins.delete(resolved);
+  return result;
+}
+
+function cacheLstatSync(file) {
+  const resolved = path.resolve(file);
+  return withPinnedCacheDirectory(path.dirname(resolved), () => lstatSync(path.basename(resolved)));
+}
+
+function cacheReaddirSync(directory) {
+  return withPinnedCacheDirectory(directory, () => readdirSync("."));
 }
 
 function cachedEventFromFrame(raw, entry) {
@@ -166,17 +300,18 @@ function sha256(value) {
 }
 
 function readRegularFile(file) {
-  assertReplayRoot();
-  const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
-  const descriptor = openSync(file, flags);
-  try {
-    const metadata = fstatSync(descriptor);
-    if (!metadata.isFile()) throw new Error(`cache entry ${file} is not a regular file`);
-    return { bytes: readFileSync(descriptor), metadata };
-  } finally {
-    closeSync(descriptor);
-    assertReplayRoot();
-  }
+  const resolved = path.resolve(file);
+  return withPinnedCacheDirectory(path.dirname(resolved), () => {
+    const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+    const descriptor = openSync(path.basename(resolved), flags);
+    try {
+      const metadata = fstatSync(descriptor);
+      if (!metadata.isFile()) throw new Error(`cache entry ${file} is not a regular file`);
+      return { bytes: readFileSync(descriptor), metadata };
+    } finally {
+      closeSync(descriptor);
+    }
+  });
 }
 
 function removeCacheFile(replayDir, file, description) {
@@ -228,6 +363,7 @@ function prepareCacheRoot(replayDir) {
     throw new Error("replay cache root identity changed while it was being pinned");
   }
   replayRootPin = { path: resolved, descriptor, dev: pinned.dev, ino: pinned.ino };
+  replayDirectoryPins.set(resolved, replayRootPin);
   assertReplayRoot();
   return resolved;
 }
@@ -236,7 +372,7 @@ function prepareCacheDirectory(replayDir, name) {
   const directory = path.join(replayDir, name);
   if (!containedCachePath(replayDir, directory)) throw new Error("cache directory escapes replay cache");
   try {
-    const metadata = lstatSync(directory);
+    const metadata = cacheLstatSync(directory);
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
       throw new Error(`cache path ${directory} is not a regular directory`);
     }
@@ -244,16 +380,14 @@ function prepareCacheDirectory(replayDir, name) {
     if (error.code !== "ENOENT") throw error;
     cacheMkdirSync(directory, { mode: 0o700 });
   }
-  const resolved = realpathSync(directory);
-  if (!containedCachePath(replayDir, resolved)) throw new Error("cache directory escapes replay cache");
-  return directory;
+  return pinCacheDirectory(directory);
 }
 
 function prepareRelayCacheDirectory(replayDir, relay) {
   const directory = relayCacheDirectory(replayDir, relay);
   if (!containedCachePath(replayDir, directory)) throw new Error("relay cache path escapes replay cache");
   try {
-    const metadata = lstatSync(directory);
+    const metadata = cacheLstatSync(directory);
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
       throw new Error(`relay cache path ${directory} is not a regular directory`);
     }
@@ -261,17 +395,70 @@ function prepareRelayCacheDirectory(replayDir, relay) {
     if (error.code !== "ENOENT") throw error;
     cacheMkdirSync(directory, { mode: 0o700 });
   }
-  const metadata = lstatSync(directory);
+  const metadata = cacheLstatSync(directory);
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
     throw new Error(`relay cache path ${directory} is not a regular directory`);
   }
-  const resolved = realpathSync(directory);
-  if (!containedCachePath(replayDir, resolved)) throw new Error("relay cache path escapes replay cache");
-  return directory;
+  return pinCacheDirectory(directory);
 }
 
 const CACHE_PARTITION = /^[0-9a-f]{64}$/;
 const LEGACY_QUARANTINE = "_legacy-quarantine";
+const QUARANTINE_TOKEN = /^[0-9a-f]{64}$/;
+
+function requireQuarantineToken(value) {
+  if (typeof value !== "string" || !QUARANTINE_TOKEN.test(value)) {
+    throw new Error("invalid quarantine transaction token");
+  }
+  return value;
+}
+
+function quarantineManifestPath(manifestsDir, token) {
+  const canonical = requireQuarantineToken(token);
+  const final = path.resolve(path.join(manifestsDir, `${canonical}.json`));
+  if (!containedCachePath(manifestsDir, final) || path.dirname(final) !== path.resolve(manifestsDir)) {
+    throw new Error("quarantine manifest path escapes manifest directory");
+  }
+  return final;
+}
+
+function stagedLegacyOrigin(origin, quarantineDir, payloadsDir, transactionDir) {
+  const directoryToken = requireQuarantineToken(path.basename(transactionDir));
+  const originToken = requireQuarantineToken(origin?.transaction_token);
+  if (originToken !== directoryToken) throw new Error("quarantine transaction token does not match its directory");
+  const payload = path.resolve(path.join(payloadsDir, `${originToken}.json`));
+  const referenced = path.resolve(path.join(quarantineDir, origin?.payload_reference ?? ""));
+  if (referenced !== payload || !containedCachePath(payloadsDir, payload)) {
+    throw new Error("quarantine payload reference does not match its transaction token");
+  }
+  if (
+    !Number.isSafeInteger(origin?.source_device) ||
+    !Number.isSafeInteger(origin?.source_inode) ||
+    origin.source_device < 0 ||
+    origin.source_inode < 0
+  ) {
+    throw new Error("quarantine source identity is malformed");
+  }
+  assertCacheDirectory(transactionDir);
+  return { token: originToken, payload };
+}
+
+function corruptPartitionRecord(record, quarantineDir, transactionDir) {
+  const directoryToken = requireQuarantineToken(path.basename(transactionDir));
+  const recordToken = requireQuarantineToken(record?.token);
+  if (recordToken !== directoryToken) throw new Error("quarantine transaction token does not match its directory");
+  if (record.manifest === null || typeof record.manifest !== "object" || Array.isArray(record.manifest)) {
+    throw new Error("corrupt quarantine manifest is malformed");
+  }
+  const expectedReference = path.join("corrupt", recordToken, "entry");
+  const referenced = path.resolve(path.join(quarantineDir, record.manifest.payload_reference ?? ""));
+  const expected = path.resolve(path.join(quarantineDir, expectedReference));
+  if (record.manifest.payload_reference !== expectedReference || referenced !== expected) {
+    throw new Error("corrupt quarantine payload reference does not match its transaction token");
+  }
+  assertCacheDirectory(transactionDir);
+  return { token: recordToken, manifest: record.manifest };
+}
 
 function quarantineManifestIdentity(manifest) {
   return JSON.stringify({
@@ -344,11 +531,100 @@ function finalizeQuarantineRecord(final, expected) {
   return expected;
 }
 
-function recoverAtomicJson(file) {
+function quarantineInvalidRecoveryResidue(
+  quarantineDir,
+  manifestsDir,
+  recoveryCorruptDir,
+  source,
+  reason,
+) {
+  const metadata = cacheLstatSync(source);
+  const originalPath = path.relative(quarantineDir, source);
+  const token = requireQuarantineToken(sha256(JSON.stringify({
+    original_path: originalPath,
+    device: metadata.dev,
+    inode: metadata.ino,
+    ctime_ms: metadata.ctimeMs,
+    birthtime_ms: metadata.birthtimeMs,
+  })));
+  const destination = path.join(recoveryCorruptDir, `${token}.invalid`);
+  try {
+    const existing = cacheLstatSync(destination);
+    if (existing.dev !== metadata.dev || existing.ino !== metadata.ino) {
+      throw new Error(`recovery-residue quarantine collision at ${destination}`);
+    }
+    cacheUnlinkSync(source);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    cacheRenameSync(source, destination);
+  }
+  const manifest = {
+    original_path: originalPath,
+    legacy_host: null,
+    original_timestamps: metadataTimestamps(metadata),
+    quarantine_timestamp: new Date().toISOString(),
+    payload_reference: path.relative(quarantineDir, destination),
+    source_device: metadata.dev,
+    source_inode: metadata.ino,
+    corrupt_type: "invalid-quarantine-recovery-residue",
+    recovery_error: String(reason),
+  };
+  finalizeQuarantineRecord(quarantineManifestPath(manifestsDir, token), manifest);
+  log(`quarantined invalid recovery residue ${source} at ${destination}`);
+}
+
+function recoverInvalidRecoveryResidues(quarantineDir, manifestsDir, recoveryCorruptDir, failures) {
+  for (const name of cacheReaddirSync(recoveryCorruptDir)) {
+    const match = /^([0-9a-f]{64})\.invalid$/.exec(name);
+    const residue = path.join(recoveryCorruptDir, name);
+    if (!match) {
+      log(`could not account for invalid recovery residue ${residue}: invalid residue name`);
+      failures.push(residue);
+      continue;
+    }
+    const final = quarantineManifestPath(manifestsDir, match[1]);
+    const expectedReference = path.relative(quarantineDir, residue);
+    try {
+      let existing;
+      try {
+        existing = readQuarantineManifest(final);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      if (existing !== undefined) {
+        if (
+          existing.corrupt_type !== "invalid-quarantine-recovery-residue" ||
+          existing.payload_reference !== expectedReference
+        ) {
+          throw new Error("recovery-residue manifest does not match its payload");
+        }
+        continue;
+      }
+      const metadata = cacheLstatSync(residue);
+      finalizeQuarantineRecord(final, {
+        original_path: expectedReference,
+        legacy_host: null,
+        original_timestamps: metadataTimestamps(metadata),
+        quarantine_timestamp: new Date().toISOString(),
+        payload_reference: expectedReference,
+        source_device: metadata.dev,
+        source_inode: metadata.ino,
+        corrupt_type: "invalid-quarantine-recovery-residue",
+        recovery_error: "recovered incomplete residue transaction",
+      });
+      log(`recovered invalid recovery residue ${residue}`);
+    } catch (error) {
+      log(`could not account for invalid recovery residue ${residue}: ${error.message}`);
+      failures.push(residue);
+    }
+  }
+}
+
+function recoverAtomicJson(file, recovery) {
   const directory = path.dirname(file);
   const basename = path.basename(file);
   const temporaryPattern = new RegExp(`^${basename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\.\\d+)?\\.tmp$`);
-  const temporaries = readdirSync(directory)
+  const temporaries = cacheReaddirSync(directory)
     .filter((name) => temporaryPattern.test(name))
     .sort();
   let existing;
@@ -363,8 +639,18 @@ function recoverAtomicJson(file) {
     try {
       candidate = readQuarantineManifest(temporary);
     } catch (error) {
-      log(`discarding invalid quarantine temporary ${temporary}: ${error.message}`);
-      cacheUnlinkSync(temporary);
+      try {
+        quarantineInvalidRecoveryResidue(
+          recovery.quarantineDir,
+          recovery.manifestsDir,
+          recovery.recoveryCorruptDir,
+          temporary,
+          error.message,
+        );
+      } catch (quarantineError) {
+        log(`could not quarantine invalid recovery residue ${temporary}: ${quarantineError.message}`);
+        recovery.failures.push(temporary);
+      }
       continue;
     }
     if (existing === undefined) {
@@ -373,20 +659,39 @@ function recoverAtomicJson(file) {
       continue;
     }
     if (JSON.stringify(existing) !== JSON.stringify(candidate)) {
-      throw new Error(`quarantine temporary collision at ${temporary}`);
+      try {
+        quarantineInvalidRecoveryResidue(
+          recovery.quarantineDir,
+          recovery.manifestsDir,
+          recovery.recoveryCorruptDir,
+          temporary,
+          "quarantine temporary collision",
+        );
+      } catch (error) {
+        log(`could not quarantine conflicting recovery residue ${temporary}: ${error.message}`);
+        recovery.failures.push(temporary);
+      }
+      continue;
     }
     cacheUnlinkSync(temporary);
   }
   return existing;
 }
 
-function recoverQuarantineTransactions(manifestsDir, payloadsDir) {
-  const temporaryPattern = /^(.+\.json)(?:\.\d+)?\.tmp$/;
-  for (const name of readdirSync(manifestsDir).filter((candidate) => temporaryPattern.test(candidate))) {
+function recoverQuarantineTransactions(
+  quarantineDir,
+  manifestsDir,
+  payloadsDir,
+  recoveryCorruptDir,
+  failures,
+) {
+  const temporaryPattern = /^([0-9a-f]{64})\.json(?:\.\d+)?\.tmp$/;
+  for (const name of cacheReaddirSync(manifestsDir).filter((candidate) => candidate.endsWith(".tmp"))) {
     const stage = path.join(manifestsDir, name);
-    let manifest;
     try {
-      manifest = readQuarantineManifest(stage);
+      const match = temporaryPattern.exec(name);
+      if (!match) throw new Error("invalid quarantine temporary name");
+      const manifest = readQuarantineManifest(stage);
       const payload = path.resolve(path.join(path.dirname(manifestsDir), manifest.payload_reference));
       if (!containedCachePath(payloadsDir, payload)) {
         throw new Error("quarantine transaction path escapes replay cache");
@@ -395,10 +700,21 @@ function recoverQuarantineTransactions(manifestsDir, payloadsDir) {
       if (typeof manifest.content_sha256 === "string" && sha256(bytes) !== manifest.content_sha256) {
         throw new Error("quarantine payload digest mismatch");
       }
-      const final = path.join(manifestsDir, temporaryPattern.exec(name)[1]);
+      const final = quarantineManifestPath(manifestsDir, match[1]);
       finalizeQuarantineManifest(stage, final, manifest);
     } catch (error) {
-      log(`could not recover legacy cache quarantine transaction ${stage}: ${error.message}`);
+      try {
+        quarantineInvalidRecoveryResidue(
+          quarantineDir,
+          manifestsDir,
+          recoveryCorruptDir,
+          stage,
+          error.message,
+        );
+      } catch (quarantineError) {
+        log(`could not recover legacy cache quarantine transaction ${stage}: ${quarantineError.message}`);
+        failures.push(stage);
+      }
     }
   }
 }
@@ -407,13 +723,12 @@ function completeStagedLegacyEntry(quarantineDir, manifestsDir, payloadsDir, tra
   const originFile = path.join(transactionDir, "origin.json");
   const stagedFile = path.join(transactionDir, "source");
   const origin = readQuarantineManifest(originFile);
-  const payload = path.resolve(path.join(quarantineDir, origin.payload_reference));
-  if (!containedCachePath(payloadsDir, payload)) throw new Error("quarantine payload escapes payload directory");
+  const { token, payload } = stagedLegacyOrigin(origin, quarantineDir, payloadsDir, transactionDir);
   try {
-    const stagedMetadata = lstatSync(stagedFile);
+    const stagedMetadata = cacheLstatSync(stagedFile);
     let payloadMetadata;
     try {
-      payloadMetadata = lstatSync(payload);
+      payloadMetadata = cacheLstatSync(payload);
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
@@ -428,7 +743,7 @@ function completeStagedLegacyEntry(quarantineDir, manifestsDir, payloadsDir, tra
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  const payloadMetadata = lstatSync(payload);
+  const payloadMetadata = cacheLstatSync(payload);
   if (
     !payloadMetadata.isFile() ||
     payloadMetadata.dev !== origin.source_device ||
@@ -437,7 +752,7 @@ function completeStagedLegacyEntry(quarantineDir, manifestsDir, payloadsDir, tra
     throw new Error(`quarantine payload identity mismatch at ${payload}`);
   }
   const { bytes } = readRegularFile(payload);
-  const final = path.join(manifestsDir, `${origin.transaction_token}.json`);
+  const final = quarantineManifestPath(manifestsDir, token);
   const manifest = {
     original_path: origin.original_path,
     legacy_host: origin.legacy_host,
@@ -454,28 +769,37 @@ function completeStagedLegacyEntry(quarantineDir, manifestsDir, payloadsDir, tra
   cacheRmdirSync(transactionDir);
 }
 
-function recoverStagedLegacyEntries(quarantineDir, manifestsDir, payloadsDir, stagingDir) {
-  for (const name of readdirSync(stagingDir)) {
+function recoverStagedLegacyEntries(
+  quarantineDir,
+  manifestsDir,
+  payloadsDir,
+  stagingDir,
+  recoveryCorruptDir,
+  failures,
+) {
+  const recovery = { quarantineDir, manifestsDir, recoveryCorruptDir, failures };
+  for (const name of cacheReaddirSync(stagingDir)) {
     const transactionDir = path.join(stagingDir, name);
     try {
-      const metadata = lstatSync(transactionDir);
+      const metadata = cacheLstatSync(transactionDir);
       if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
         throw new Error("staging transaction is not a regular directory");
       }
+      pinCacheDirectory(transactionDir);
       const originFile = path.join(transactionDir, "origin.json");
-      const origin = recoverAtomicJson(originFile);
+      const origin = recoverAtomicJson(originFile, recovery);
       const stagedFile = path.join(transactionDir, "source");
       if (origin !== undefined) {
-        const payload = path.resolve(path.join(quarantineDir, origin.payload_reference));
+        const { payload } = stagedLegacyOrigin(origin, quarantineDir, payloadsDir, transactionDir);
         let claimed = false;
         try {
-          lstatSync(stagedFile);
+          cacheLstatSync(stagedFile);
           claimed = true;
         } catch (error) {
           if (error.code !== "ENOENT") throw error;
         }
         try {
-          lstatSync(payload);
+          cacheLstatSync(payload);
           claimed = true;
         } catch (error) {
           if (error.code !== "ENOENT") throw error;
@@ -490,12 +814,13 @@ function recoverStagedLegacyEntries(quarantineDir, manifestsDir, payloadsDir, st
       } catch (error) {
         if (error.code !== "ENOENT") throw error;
       }
-      for (const temporary of readdirSync(transactionDir).filter((name) => name.startsWith("origin.json") && name.endsWith(".tmp"))) {
+      for (const temporary of cacheReaddirSync(transactionDir).filter((name) => name.startsWith("origin.json") && name.endsWith(".tmp"))) {
         cacheUnlinkSync(path.join(transactionDir, temporary));
       }
       cacheRmdirSync(transactionDir);
     } catch (error) {
       log(`could not recover staged legacy cache entry ${transactionDir}: ${error.message}`);
+      failures.push(transactionDir);
     }
   }
 }
@@ -511,15 +836,15 @@ function quarantineLegacyEntry(
 ) {
   const originalPath = path.relative(replayDir, file);
   if (!containedCachePath(replayDir, file)) throw new Error("legacy cache entry escapes replay cache");
-  const metadata = lstatSync(file);
+  const metadata = cacheLstatSync(file);
   if (!metadata.isFile()) throw new Error("legacy cache entry is not a regular file");
-  const transactionToken = sha256(JSON.stringify({
+  const transactionToken = requireQuarantineToken(sha256(JSON.stringify({
     original_path: originalPath,
     device: metadata.dev,
     inode: metadata.ino,
     ctime_ms: metadata.ctimeMs,
     birthtime_ms: metadata.birthtimeMs,
-  }));
+  })));
   const transactionDir = prepareCacheDirectory(stagingDir, transactionToken);
   const originFile = path.join(transactionDir, "origin.json");
   const stagedFile = path.join(transactionDir, "source");
@@ -564,11 +889,12 @@ function corruptNodeType(metadata) {
   return "non-directory";
 }
 
-function finalizeCorruptPartitionRecord(manifestsDir, transactionDir) {
+function finalizeCorruptPartitionRecord(quarantineDir, manifestsDir, transactionDir) {
   const originFile = path.join(transactionDir, "origin.json");
   const record = readQuarantineManifest(originFile);
-  const final = path.join(manifestsDir, `${record.token}.json`);
-  finalizeQuarantineRecord(final, record.manifest);
+  const validated = corruptPartitionRecord(record, quarantineDir, transactionDir);
+  const final = quarantineManifestPath(manifestsDir, validated.token);
+  finalizeQuarantineRecord(final, validated.manifest);
   try {
     cacheUnlinkSync(originFile);
   } catch (error) {
@@ -576,20 +902,22 @@ function finalizeCorruptPartitionRecord(manifestsDir, transactionDir) {
   }
 }
 
-function recoverCorruptPartitionNodes(corruptDir, manifestsDir) {
-  for (const name of readdirSync(corruptDir)) {
+function recoverCorruptPartitionNodes(quarantineDir, corruptDir, manifestsDir, failures) {
+  for (const name of cacheReaddirSync(corruptDir)) {
     const transactionDir = path.join(corruptDir, name);
     try {
-      const metadata = lstatSync(transactionDir);
+      const metadata = cacheLstatSync(transactionDir);
       if (metadata.isSymbolicLink() || !metadata.isDirectory()) continue;
+      pinCacheDirectory(transactionDir);
       const originFile = path.join(transactionDir, "origin.json");
       const entry = path.join(transactionDir, "entry");
-      lstatSync(originFile);
-      lstatSync(entry);
-      finalizeCorruptPartitionRecord(manifestsDir, transactionDir);
+      cacheLstatSync(originFile);
+      cacheLstatSync(entry);
+      finalizeCorruptPartitionRecord(quarantineDir, manifestsDir, transactionDir);
     } catch (error) {
       if (error.code !== "ENOENT") {
         log(`could not recover corrupt cache partition ${transactionDir}: ${error.message}`);
+        failures.push(transactionDir);
       }
     }
   }
@@ -598,12 +926,12 @@ function recoverCorruptPartitionNodes(corruptDir, manifestsDir) {
 function quarantineCorruptPartitionNode(replayDir, quarantineDir, corruptDir, manifestsDir, file, metadata) {
   const originalPath = path.relative(replayDir, file);
   const type = corruptNodeType(metadata);
-  const token = sha256(JSON.stringify({
+  const token = requireQuarantineToken(sha256(JSON.stringify({
     original_path: originalPath,
     device: metadata.dev,
     inode: metadata.ino,
     mode: metadata.mode,
-  }));
+  })));
   const transactionDir = prepareCacheDirectory(corruptDir, token);
   const entry = path.join(transactionDir, "entry");
   const originFile = path.join(transactionDir, "origin.json");
@@ -618,28 +946,28 @@ function quarantineCorruptPartitionNode(replayDir, quarantineDir, corruptDir, ma
     corrupt_type: type,
   };
   try {
-    const existing = lstatSync(entry);
+    const existing = cacheLstatSync(entry);
     if (existing.dev !== metadata.dev || existing.ino !== metadata.ino) {
       throw new Error(`corrupt partition quarantine collision at ${entry}`);
     }
     cacheUnlinkSync(file);
-    finalizeCorruptPartitionRecord(manifestsDir, transactionDir);
+    finalizeCorruptPartitionRecord(quarantineDir, manifestsDir, transactionDir);
     return;
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
   writeJsonAtomically(originFile, { token, manifest });
   cacheRenameSync(file, entry);
-  finalizeCorruptPartitionRecord(manifestsDir, transactionDir);
+  finalizeCorruptPartitionRecord(quarantineDir, manifestsDir, transactionDir);
   log(`quarantined corrupt cache partition path ${file} (${type}) at ${path.join(quarantineDir, payloadReference)}`);
 }
 
 function quarantineManifestCount(manifestsDir) {
   let count = 0;
-  for (const name of readdirSync(manifestsDir)) {
+  for (const name of cacheReaddirSync(manifestsDir)) {
     if (!name.endsWith(".json")) continue;
     try {
-      if (lstatSync(path.join(manifestsDir, name)).isFile()) count += 1;
+      if (cacheLstatSync(path.join(manifestsDir, name)).isFile()) count += 1;
     } catch (error) {
       if (error.code !== "ENOENT") log(`could not inspect legacy quarantine manifest ${name}: ${error.message}`);
     }
@@ -648,18 +976,33 @@ function quarantineManifestCount(manifestsDir) {
 }
 
 function quarantineLegacyEntries(replayDir) {
+  const failures = [];
   const quarantineDir = prepareCacheDirectory(replayDir, LEGACY_QUARANTINE);
   const manifestsDir = prepareCacheDirectory(quarantineDir, "manifests");
   const payloadsDir = prepareCacheDirectory(quarantineDir, "payloads");
   const stagingDir = prepareCacheDirectory(quarantineDir, "staging");
   const corruptDir = prepareCacheDirectory(quarantineDir, "corrupt");
-  recoverQuarantineTransactions(manifestsDir, payloadsDir);
-  recoverStagedLegacyEntries(quarantineDir, manifestsDir, payloadsDir, stagingDir);
-  recoverCorruptPartitionNodes(corruptDir, manifestsDir);
-  const failures = [];
+  const recoveryCorruptDir = prepareCacheDirectory(quarantineDir, "recovery-corrupt");
+  recoverInvalidRecoveryResidues(quarantineDir, manifestsDir, recoveryCorruptDir, failures);
+  recoverQuarantineTransactions(
+    quarantineDir,
+    manifestsDir,
+    payloadsDir,
+    recoveryCorruptDir,
+    failures,
+  );
+  recoverStagedLegacyEntries(
+    quarantineDir,
+    manifestsDir,
+    payloadsDir,
+    stagingDir,
+    recoveryCorruptDir,
+    failures,
+  );
+  recoverCorruptPartitionNodes(quarantineDir, corruptDir, manifestsDir, failures);
   let names;
   try {
-    names = readdirSync(replayDir);
+    names = cacheReaddirSync(replayDir);
   } catch (error) {
     log(`could not inspect replay cache for legacy entries: ${error.message}`);
     return { failures: [replayDir], count: quarantineManifestCount(manifestsDir) };
@@ -671,7 +1014,7 @@ function quarantineLegacyEntries(replayDir) {
     const candidate = path.join(replayDir, name);
     let metadata;
     try {
-      metadata = lstatSync(candidate);
+      metadata = cacheLstatSync(candidate);
     } catch (error) {
       if (error.code === "ENOENT") continue;
       log(`could not inspect cache path ${candidate}: ${error.message}`);
@@ -709,15 +1052,10 @@ function quarantineLegacyEntries(replayDir) {
       continue;
     }
     if (!metadata.isDirectory()) continue;
-    const resolved = realpathSync(candidate);
-    if (!containedCachePath(replayDir, resolved)) {
-      log(`could not inspect legacy cache directory ${candidate}: path escapes replay cache`);
-      failures.push(candidate);
-      continue;
-    }
+    pinCacheDirectory(candidate);
     let legacyNames;
     try {
-      legacyNames = readdirSync(candidate);
+      legacyNames = cacheReaddirSync(candidate);
     } catch (error) {
       log(`could not inspect legacy cache directory ${candidate}: ${error.message}`);
       failures.push(candidate);
@@ -727,7 +1065,7 @@ function quarantineLegacyEntries(replayDir) {
     for (const legacyName of legacyNames.filter((entry) => entry.endsWith(".json"))) {
       const legacyFile = path.join(candidate, legacyName);
       try {
-        if (lstatSync(legacyFile).isFile()) candidates.push({ file: legacyFile, legacyHost });
+        if (cacheLstatSync(legacyFile).isFile()) candidates.push({ file: legacyFile, legacyHost });
         else {
           log(`legacy cache entry ${legacyFile} is not a regular file; left in place`);
           failures.push(legacyFile);
@@ -764,7 +1102,7 @@ function quarantineLegacyEntries(replayDir) {
 function cacheEntries(replayDir) {
   let names;
   try {
-    names = readdirSync(replayDir);
+    names = cacheReaddirSync(replayDir);
   } catch (error) {
     if (error.code === "ENOENT") return { entries: [], failures: [] };
     log(`could not inspect cache directory ${replayDir}: ${error.message}`);
@@ -780,7 +1118,7 @@ function cacheEntries(replayDir) {
     }
     let metadata;
     try {
-      metadata = lstatSync(file);
+      metadata = cacheLstatSync(file);
     } catch (error) {
       if (error.code === "ENOENT") continue;
       log(`could not inspect cache entry ${file}: ${error.message}`);
@@ -818,7 +1156,7 @@ function cacheEntries(replayDir) {
 function cacheDirectories(replayDir) {
   let names;
   try {
-    names = readdirSync(replayDir);
+    names = cacheReaddirSync(replayDir);
   } catch (error) {
     if (error.code === "ENOENT") return { directories: [], failures: [] };
     log(`could not inspect cache directory ${replayDir}: ${error.message}`);
@@ -830,12 +1168,12 @@ function cacheDirectories(replayDir) {
     if (!CACHE_PARTITION.test(name)) continue;
     const directory = path.join(replayDir, name);
     try {
-      const metadata = lstatSync(directory);
+      const metadata = cacheLstatSync(directory);
       if (metadata.isSymbolicLink()) {
         log(`rejected cache directory symlink ${directory}`);
         failures.push(directory);
       } else if (metadata.isDirectory()) {
-        directories.push(directory);
+        directories.push(pinCacheDirectory(directory));
       }
     } catch (error) {
       if (error.code === "ENOENT") continue;
@@ -858,7 +1196,7 @@ const ORPHAN_TMP_AGE_MS = 60000;
 function sweepOrphanTemporaries(replayDir, now) {
   let names;
   try {
-    names = readdirSync(replayDir);
+    names = cacheReaddirSync(replayDir);
   } catch (error) {
     if (error.code === "ENOENT") return { swept: 0, failed: 0 };
     log(`could not inspect cache directory ${replayDir}: ${error.message}`);
@@ -871,7 +1209,7 @@ function sweepOrphanTemporaries(replayDir, now) {
     const file = path.join(replayDir, name);
     let modified;
     try {
-      modified = lstatSync(file).mtimeMs;
+      modified = cacheLstatSync(file).mtimeMs;
     } catch (error) {
       if (error.code !== "ENOENT") {
         log(`could not inspect interrupted cache write ${name}: ${error.message}`);
@@ -947,7 +1285,7 @@ function pruneCache(replayDir, maxCache, protectedFile) {
 // Write the frame atomically so a crash mid-write cannot leave a truncated event
 // in the cache that would be replayed forever and rejected every time.
 function cacheEvent(replayDir, event) {
-  const metadata = lstatSync(replayDir);
+  const metadata = cacheLstatSync(replayDir);
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
     throw new Error(`relay cache path ${replayDir} is not a regular directory`);
   }

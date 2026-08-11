@@ -10,6 +10,10 @@
 // whole-file exact-destination replacement is atomic, concurrent publishes are
 // serialized, duplicate tuples collapse, and an earlier target is never lost.
 // Any malformed, non-regular, or symlinked existing registry fails closed.
+//
+// Usage:
+//   node bin/fm-buzz-targets.mjs list FILE
+//   node bin/fm-buzz-targets.mjs normalize-relay URL
 
 import {
   lstatSync,

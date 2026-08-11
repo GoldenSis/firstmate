@@ -27,12 +27,19 @@
 //                                          [--tamper-on-read] [--malform-on-read]
 //                                          [--wrong-kind-on-read]
 //                                          [--refuse-req <msg>]
+//                                          [--malform-membership]
+//                                          [--ambiguous-membership]
 // Prints "listening <port>" on stdout once ready, so a caller can use port 0 and
 // learn the ephemeral port.
 
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
-import { computeEventId, KIND_NIP42_AUTH } from "../bin/fm-buzz-lib.mjs";
+import {
+  computeEventId,
+  KIND_NIP42_AUTH,
+  nowSeconds,
+  signEvent,
+} from "../bin/fm-buzz-lib.mjs";
 import { schnorrVerify } from "../bin/fm-buzz-crypto.mjs";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -79,6 +86,8 @@ let wrongKindOnRead = false;
 // stored" and never "you are not a member" - the exact ambiguity the inspector
 // must not report as an assurance.
 let refuseReq = null;
+let malformMembership = false;
+let ambiguousMembership = false;
 for (let i = 0; i < argv.length; i += 1) {
   if (argv[i] === "--port") port = Number(argv[++i]);
   else if (argv[i] === "--reject") reject = argv[++i];
@@ -92,11 +101,63 @@ for (let i = 0; i < argv.length; i += 1) {
   else if (argv[i] === "--malform-on-read") malformOnRead = true;
   else if (argv[i] === "--wrong-kind-on-read") wrongKindOnRead = true;
   else if (argv[i] === "--refuse-req") refuseReq = argv[++i];
+  else if (argv[i] === "--malform-membership") malformMembership = true;
+  else if (argv[i] === "--ambiguous-membership") ambiguousMembership = true;
 }
 
 // The event store: id -> event. A Map gives us exactly the relay's
 // `ON CONFLICT DO NOTHING` semantics - a second insert of a known id is a no-op.
 const store = new Map();
+const channelMembers = new Map();
+const relayPrivateKey = "3".padStart(64, "0");
+const KIND_NIP29_ADD_USER = 9000;
+const KIND_NIP29_CREATE_GROUP = 9007;
+const KIND_NIP29_GROUP_MEMBERS = 39002;
+
+function eventTag(event, name) {
+  return event.tags.find((tag) => tag[0] === name)?.[1] ?? null;
+}
+
+function applyMembershipEvent(event) {
+  const channel = eventTag(event, "h");
+  if (!channel) return;
+  if (event.kind === KIND_NIP29_CREATE_GROUP) {
+    channelMembers.set(channel, new Set([event.pubkey]));
+    return;
+  }
+  if (event.kind === KIND_NIP29_ADD_USER) {
+    const member = eventTag(event, "p");
+    if (!member) return;
+    const members = channelMembers.get(channel) ?? new Set();
+    members.add(member);
+    channelMembers.set(channel, members);
+  }
+}
+
+function currentMembershipEvents(filter) {
+  if (!Array.isArray(filter.kinds) || !filter.kinds.includes(KIND_NIP29_GROUP_MEMBERS)) return [];
+  const channels = Array.isArray(filter["#d"]) ? filter["#d"] : [];
+  return channels.flatMap((channel) => {
+    const members = channelMembers.get(channel);
+    if (!members) return [];
+    const event = signEvent({
+      created_at: nowSeconds(),
+      kind: KIND_NIP29_GROUP_MEMBERS,
+      tags: [["d", channel], ...[...members].sort().map((member) => ["p", member])],
+      content: "",
+    }, relayPrivateKey);
+    if (malformMembership) return [{ ...event, id: { malformed: true } }];
+    if (ambiguousMembership) {
+      return [event, signEvent({
+        created_at: event.created_at + 1,
+        kind: KIND_NIP29_GROUP_MEMBERS,
+        tags: event.tags,
+        content: "",
+      }, relayPrivateKey)];
+    }
+    return [event];
+  });
+}
 
 function encodeFrame(text) {
   const payload = Buffer.from(text, "utf8");
@@ -278,6 +339,7 @@ server.on("upgrade", (req, socket) => {
           continue;
         }
         store.set(event.id, event);
+        applyMembershipEvent(event);
         send(["OK", event.id, truthyOk ? "false" : true, ""]);
       } else if (type === "REQ") {
         const [, subId, filter = {}] = parsed;
@@ -287,7 +349,7 @@ server.on("upgrade", (req, socket) => {
           send(["CLOSED", subId, refuseReq]);
           continue;
         }
-        const found = [...store.values()]
+        const found = [...store.values(), ...currentMembershipEvents(filter)]
           .filter((event) =>
             wrongKindOnRead
               ? Array.isArray(filter.kinds) &&

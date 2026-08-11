@@ -66,7 +66,9 @@ export function relayCacheKey(relay) {
 
 // Buzz kind numbers, from crates/buzz-core/src/kind.rs at commit 7fb008f9.
 export const KIND_STREAM_MESSAGE = 9; // NIP-29 channel chat message (append-only)
+export const KIND_NIP29_ADD_USER = 9000;
 export const KIND_NIP29_CREATE_GROUP = 9007; // creates a channel; creator becomes owner
+export const KIND_NIP29_GROUP_MEMBERS = 39002;
 export const KIND_NIP42_AUTH = 22242; // NIP-42 challenge response
 
 const HEX_64 = /^[0-9a-f]{64}$/;
@@ -225,7 +227,7 @@ export function buildBearingsEvent(channelId, content, privateKeyHex, extraTags 
   );
 }
 
-export async function publisherOwnsPrivateChannel(relay, privateKeyHex, channelId, timeoutMs) {
+export async function publisherIsCurrentChannelMember(relay, privateKeyHex, channelId, timeoutMs) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) {
     throw new Error(`invalid relay timeout ${JSON.stringify(timeoutMs)}: expected an integer from 1 to 2147483647`);
   }
@@ -233,25 +235,33 @@ export async function publisherOwnsPrivateChannel(relay, privateKeyHex, channelI
   const { events, refusal } = await withRelay(relay, privateKeyHex, timeoutMs, async (api) => {
     await api.authenticateIfChallenged();
     return api.query({
-      kinds: [KIND_NIP29_CREATE_GROUP],
-      authors: [publisher],
-      "#h": [channelId],
-      limit: 20,
+      kinds: [KIND_NIP29_GROUP_MEMBERS],
+      "#d": [channelId],
+      limit: 2,
     }, "fm-rotation-check");
   });
-  if (refusal) throw new Error(`relay refused the channel check: ${refusal}`);
-  return events.some((event) => {
-    const validation = validateSignedEvent(event);
-    return validation.eventObject &&
-      validation.validKind &&
-      event.kind === KIND_NIP29_CREATE_GROUP &&
-      validation.idMatches &&
-      validation.signatureValid &&
-      event.pubkey === publisher &&
-      validation.validTags &&
-      event.tags.some((tag) => tag[0] === "h" && tag[1] === channelId) &&
-      event.tags.some((tag) => tag[0] === "visibility" && tag[1] === "private");
-  });
+  if (refusal) throw new Error(`relay refused the current membership check: ${refusal}`);
+  if (events.length === 0) return false;
+  if (events.length !== 1) throw new Error("relay returned ambiguous current membership state");
+  const event = events[0];
+  const validation = validateSignedEvent(event);
+  const channelTags = validation.validTags
+    ? event.tags.filter((tag) => tag[0] === "d")
+    : [];
+  const memberTags = validation.validTags
+    ? event.tags.filter((tag) => tag[0] === "p")
+    : [];
+  const validMembership = validation.eventObject &&
+    validation.validKind &&
+    event.kind === KIND_NIP29_GROUP_MEMBERS &&
+    validation.idMatches &&
+    validation.signatureValid &&
+    validation.validTags &&
+    channelTags.length === 1 &&
+    channelTags[0][1] === channelId &&
+    memberTags.every((tag) => HEX_64.test(tag[1]));
+  if (!validMembership) throw new Error("relay returned malformed current membership state");
+  return memberTags.some((tag) => tag[1] === publisher);
 }
 
 // --- relay response classification ------------------------------------------

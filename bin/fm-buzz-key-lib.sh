@@ -11,10 +11,12 @@
 # CUSTODY MODEL
 # Preferred store is the OS keychain, matching what Buzz's own desktop client
 # does. On macOS that is `security add-generic-password` against the login
-# keychain. When no keychain is reachable - headless Linux, CI, a locked keychain -
-# the fallback is a 0600 file under ${XDG_DATA_HOME:-~/.local/share}/firstmate/.
-# The fallback is written only after the keychain path has been tried and failed,
-# and it is never consulted in preference to a keychain entry that exists.
+# keychain. Normal loading fails closed when that keychain is present but
+# inaccessible, and does not consult the file fallback in that state.
+# FM_BUZZ_FORCE_FILE_STORE=1 explicitly selects the fallback for normal loads and
+# stores. A normal write tries the keychain first and uses the 0600 file under
+# ${XDG_DATA_HOME:-~/.local/share}/firstmate/ only when keychain storage is
+# unavailable. Rotation inspects and clears both stores independently.
 #
 # ONE KEY PER HOME
 # Both stores key on the resolved FM_HOME path - the keychain through its account

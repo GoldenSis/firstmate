@@ -100,6 +100,41 @@ publish_signed_fixture() {  # <private-key> <relay> <channel> <note>
   ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay" "$channel" "$note"
 }
 
+publish_membership_fixture() {  # <relay> <channel> <member-pubkey>
+  local relay=$1 channel=$2 member=$3
+  printf '%s' "2" | node -e '
+    let privateKey = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { privateKey += chunk; });
+    process.stdin.on("end", async () => {
+      privateKey = privateKey.trim().padStart(64, "0");
+      const {
+        nowSeconds,
+        signEvent,
+        withRelay,
+      } = await import(process.argv[1]);
+      const created = signEvent({
+        created_at: nowSeconds(),
+        kind: 9007,
+        tags: [["h", process.argv[3]], ["name", "membership-fixture"], ["visibility", "private"]],
+        content: "",
+      }, privateKey);
+      const added = signEvent({
+        created_at: nowSeconds() + 1,
+        kind: 9000,
+        tags: [["h", process.argv[3]], ["p", process.argv[4]]],
+        content: "",
+      }, privateKey);
+      await withRelay(process.argv[2], privateKey, 8000, async (api) => {
+        for (const event of [created, added]) {
+          const response = await api.publish(event);
+          if (response.accepted !== true) throw new Error(response.message);
+        }
+      });
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay" "$channel" "$member"
+}
+
 # Start the stub on an ephemeral port and echo "<pid> <url>".
 start_stub() {  # [stub args...]
   local out pid port line
@@ -518,8 +553,8 @@ EOF
   output=$(FM_BUZZ_KEYPAIR_RELAY="$relay" run_keypair "$home" --rotate 2>&1)
   code=$?
   expect_code 1 "$code" "rotation of an identity owning an existing private channel"
-  assert_contains "$output" "channel $channel already belongs to the outgoing publisher" \
-    "rotation refusal did not name the existing private channel"
+  assert_contains "$output" "current membership on relay $relay, channel $channel" \
+    "rotation refusal did not name the existing private-channel membership"
   assert_contains "$output" "Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity." \
     "rotation refusal omitted the required membership explanation"
   assert_contains "$output" "https://github.com/block/buzz/blob/main/ARCHITECTURE.md" \
@@ -617,6 +652,85 @@ EOF
   [ "$(cat "$home/data/buzz-keypair.public")" = "$publisher" ] \
     || fail "malformed publisher-target state allowed key mutation"
   pass "publisher target updates serialize and malformed state fails closed"
+}
+
+test_rotation_checks_authoritative_current_membership() {
+  local home relay old channel keyfile private_before targets normalized_relay output code
+  home=$(make_home current-membership-rotation)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "current-membership keypair setup failed"
+  keyfile=$(key_file "$home" "$home/xdg")
+  private_before=$(cat "$keyfile")
+  channel="11111111-2222-5333-8444-555555555555"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  publish_membership_fixture "$relay" "$channel" "$old" \
+    || fail "could not seed creator-independent current membership"
+  normalized_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
+    || fail "could not normalize the membership relay"
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  jq -cn \
+    --arg relay "$normalized_relay" \
+    --arg channel "$channel" \
+    --arg publisher "$old" \
+    '{relay:$relay,channel_id:$channel,publisher_pubkey:$publisher}' > "$targets"
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  stop_stub "$STUB_PID"
+  expect_code 1 "$code" "rotation of a publisher added by another channel creator"
+  assert_contains "$output" "relay $normalized_relay" \
+    "current-membership refusal did not name the normalized relay"
+  assert_contains "$output" "channel $channel" \
+    "current-membership refusal did not name the channel"
+  assert_contains "$output" "Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity." \
+    "current-membership refusal omitted the required M1 explanation"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "current-membership refusal changed the recorded public key"
+  [ "$(cat "$keyfile")" = "$private_before" ] \
+    || fail "current-membership refusal changed the stored private key"
+  pass "rotation checks current membership independently of channel creation"
+}
+
+test_rotation_fails_closed_on_unverifiable_membership() {
+  local mode expected home relay old channel keyfile private_before targets normalized_relay output code
+  for mode in --malform-membership --ambiguous-membership; do
+    case $mode in
+      --malform-membership) expected="malformed current membership state" ;;
+      --ambiguous-membership) expected="ambiguous current membership state" ;;
+    esac
+    home=$(make_home "membership-${mode#--}")
+    old=$(run_keypair "$home" 2>/dev/null) || fail "unverifiable-membership keypair setup failed"
+    keyfile=$(key_file "$home" "$home/xdg")
+    private_before=$(cat "$keyfile")
+    channel="22222222-3333-5444-8555-666666666666"
+    read -r STUB_PID relay <<EOF
+$(start_stub "$mode")
+EOF
+    publish_membership_fixture "$relay" "$channel" "$old" \
+      || fail "could not seed unverifiable current membership"
+    normalized_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
+      || fail "could not normalize the unverifiable-membership relay"
+    targets="$home/data/buzz-publisher-targets.jsonl"
+    jq -cn \
+      --arg relay "$normalized_relay" \
+      --arg channel "$channel" \
+      --arg publisher "$old" \
+      '{relay:$relay,channel_id:$channel,publisher_pubkey:$publisher}' > "$targets"
+
+    output=$(run_keypair "$home" --rotate 2>&1)
+    code=$?
+    stop_stub "$STUB_PID"
+    expect_code 1 "$code" "rotation with $expected"
+    assert_contains "$output" "$expected" "rotation did not diagnose $expected"
+    assert_contains "$output" "relay $normalized_relay, channel $channel" \
+      "unverifiable-membership refusal did not name its target pair"
+    [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+      || fail "unverifiable-membership refusal changed the recorded public key"
+    [ "$(cat "$keyfile")" = "$private_before" ] \
+      || fail "unverifiable-membership refusal changed the stored private key"
+  done
+  pass "rotation fails closed on malformed or ambiguous membership"
 }
 
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable() {
@@ -1483,7 +1597,7 @@ EOF
 }
 
 test_quarantine_recovers_atomic_manifest_temporaries() {
-  local home relay replay quarantine payload content digest temporary final
+  local home relay replay quarantine payload content digest token temporary final
   home=$(make_home quarantine-temporary-recovery)
   run_keypair "$home" >/dev/null 2>&1 || fail "quarantine temporary keypair setup failed"
   replay="$home/state/buzz-replay"
@@ -1496,8 +1610,9 @@ test_quarantine_recovers_atomic_manifest_temporaries() {
     const { createHash } = require("node:crypto");
     process.stdout.write(createHash("sha256").update(process.argv[1]).digest("hex"));
   ' "$content")
-  temporary="$quarantine/manifests/recovered-manifest.json.4242.tmp"
-  final="$quarantine/manifests/recovered-manifest.json"
+  token=$(printf '%064d' 6)
+  temporary="$quarantine/manifests/$token.json.4242.tmp"
+  final="$quarantine/manifests/$token.json"
   jq -n \
     --arg digest "$digest" \
     '{original_path:"localhost%3A3000/legacy.json",
@@ -1517,6 +1632,89 @@ EOF
   [ "$(jq -r '.payload_reference' "$final")" = "payloads/recovered-payload.json" ] \
     || fail "recovered quarantine manifest changed its payload reference"
   pass "quarantine recovers current and historical atomic temporary names"
+}
+
+test_quarantine_recovery_rejects_noncanonical_tokens() {
+  local home replay quarantine staging corrupt token source output
+  home=$(make_home quarantine-token-validation)
+  run_keypair "$home" >/dev/null 2>&1 || fail "quarantine-token keypair setup failed"
+  replay="$home/state/buzz-replay"
+  quarantine="$replay/_legacy-quarantine"
+  token=$(printf '%064d' 4)
+  staging="$quarantine/staging/$token"
+  corrupt="$quarantine/corrupt/$token"
+  mkdir -p "$quarantine/manifests" "$quarantine/payloads" "$staging" "$corrupt"
+  source="$staging/source"
+  printf '%s' 'staged-payload' > "$source"
+  node -e '
+    const fs = require("node:fs");
+    const metadata = fs.lstatSync(process.argv[1]);
+    fs.writeFileSync(process.argv[2], JSON.stringify({
+      original_path: "localhost%3A3000/legacy.json",
+      legacy_host: "localhost:3000",
+      original_timestamps: { atime_ms: 1, mtime_ms: 2, ctime_ms: 3, birthtime_ms: 4 },
+      transaction_token: "../../../../escaped-staged",
+      payload_reference: "payloads/" + process.argv[3] + ".json",
+      source_device: metadata.dev,
+      source_inode: metadata.ino,
+    }));
+  ' "$source" "$staging/origin.json" "$token"
+  printf '%s' 'corrupt-entry' > "$corrupt/entry"
+  jq -n '{
+    token:"../../../../escaped-corrupt",
+    manifest:{
+      original_path:"corrupt-entry",
+      legacy_host:null,
+      original_timestamps:{atime_ms:1,mtime_ms:2,ctime_ms:3,birthtime_ms:4},
+      quarantine_timestamp:"2026-08-11T00:00:00.000Z",
+      payload_reference:"corrupt/entry",
+      corrupt_type:"regular-file"
+    }
+  }' > "$corrupt/origin.json"
+
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"token-validation"}' \
+    | run_publish "$home" "ws://127.0.0.1:1" 2>&1)
+  assert_absent "$home/escaped-staged.json" \
+    "a persisted staging token escaped the quarantine directory"
+  assert_absent "$home/escaped-corrupt.json" \
+    "a persisted corrupt-record token escaped the quarantine directory"
+  assert_contains "$output" "quarantine transaction token" \
+    "invalid recovery tokens were not diagnosed"
+  pass "quarantine recovery rejects noncanonical transaction tokens"
+}
+
+test_invalid_quarantine_temporaries_are_accounted_for() {
+  local home replay quarantine token temporary output second residue manifest
+  home=$(make_home invalid-quarantine-temporary)
+  run_keypair "$home" >/dev/null 2>&1 || fail "invalid-quarantine-temporary keypair setup failed"
+  replay="$home/state/buzz-replay"
+  quarantine="$replay/_legacy-quarantine"
+  token=$(printf '%064d' 5)
+  mkdir -p "$quarantine/manifests" "$quarantine/payloads" "$quarantine/staging" \
+    "$quarantine/corrupt" "$quarantine/recovery-corrupt"
+  temporary="$quarantine/manifests/$token.json.tmp"
+  printf '%s' '{"truncated":' > "$temporary"
+
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"invalid-quarantine-temp"}' \
+    | run_publish "$home" "ws://127.0.0.1:1" 2>&1)
+  assert_absent "$temporary" "an invalid quarantine temporary remained active"
+  residue=$(find "$quarantine/recovery-corrupt" -type f -print -quit 2>/dev/null)
+  [ -n "$residue" ] || fail "an invalid quarantine temporary was not retained as corrupt evidence"
+  manifest=$(grep -l 'invalid-quarantine-recovery-residue' \
+    "$quarantine/manifests"/*.json 2>/dev/null | head -1)
+  [ -n "$manifest" ] || fail "invalid quarantine residue was omitted from manifest accounting"
+  assert_contains "$output" "quarantined invalid recovery residue" \
+    "invalid quarantine residue was not diagnosed"
+  rm "$manifest"
+  second=$(printf '%s' '{"schema":"fm-bearings.v1","note":"recover-invalid-residue"}' \
+    | run_publish "$home" "ws://127.0.0.1:1" 2>&1)
+  manifest=$(grep -l 'invalid-quarantine-recovery-residue' \
+    "$quarantine/manifests"/*.json 2>/dev/null | head -1)
+  [ -n "$manifest" ] || fail "an interrupted residue transaction was not recovered"
+  assert_present "$residue" "residue recovery discarded the retained invalid bytes"
+  assert_contains "$second" "recovered invalid recovery residue" \
+    "residue recovery did not report deterministic completion"
+  pass "invalid quarantine temporaries move into accounted corrupt state"
 }
 
 # --- (d) reconnect replays the identical event id --------------------------
@@ -1927,7 +2125,7 @@ EOF
 }
 
 test_publish_lock_acquisition_is_validated_bounded_and_interruptible() {
-  local home lock projection out_file result invalid code pid waited ready holder
+  local home lock projection out_file result invalid code pid waited ready holder tools real_mktemp mktemp_log
   home=$(make_home bounded-publish-lock)
   lock="$home/state/.buzz-replay-publish.lock"
   projection="$home/projection.json"
@@ -1969,6 +2167,47 @@ test_publish_lock_acquisition_is_validated_bounded_and_interruptible() {
     "an uncreatable publish lock did not report its bounded refusal"
 
   rm -rf "$lock"
+  tools="$home/uncreatable-lock-tools"
+  real_mktemp=$(command -v mktemp)
+  mktemp_log="$home/uncreatable-lock-mktemp.log"
+  mkdir -p "$tools"
+  cat > "$tools/mktemp" <<'EOF'
+#!/usr/bin/env bash
+for argument in "$@"; do
+  case $argument in
+    *'.buzz-replay-publish.lock'*.owner.*)
+      printf '%s\n' "$argument" >> "$FM_TEST_MKTEMP_LOG"
+      exit 1
+      ;;
+  esac
+done
+exec "$FM_TEST_REAL_MKTEMP" "$@"
+EOF
+  chmod +x "$tools/mktemp"
+  env PATH="$tools:$PATH" FM_TEST_REAL_MKTEMP="$real_mktemp" FM_TEST_MKTEMP_LOG="$mktemp_log" \
+    FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$home/state" \
+    XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 FM_BUZZ_TIMEOUT_MS=8000 \
+    FM_BUZZ_LOCK_TIMEOUT_S=1 "$PUBLISH" --relay "ws://127.0.0.1:1" \
+    < "$projection" > "$out_file" 2>&1 &
+  pid=$!
+  waited=0
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    fail "an uncreatable lock parent bypassed the acquisition deadline"
+  fi
+  wait "$pid"
+  code=$?
+  expect_code 0 "$code" "uncreatable lock parent through the fire-and-forget wrapper"
+  assert_no_grep '.steal.steal' "$mktemp_log" \
+    "lock acquisition recursively descended through nested steal locks"
+  assert_contains "$(cat "$out_file")" "could not acquire replay cache ownership within 1s" \
+    "an uncreatable lock parent did not report its bounded refusal"
+
   (
     # shellcheck disable=SC1091
     . "$ROOT/bin/fm-wake-lib.sh"
@@ -2174,9 +2413,10 @@ test_replay_cache_pins_the_root_before_mutation() {
   preload="$home/replay-root-swap.mjs"
   mkdir -p "$replay" "$outside"
   cat > "$preload" <<'EOF'
-import fs from "node:fs";
 import path from "node:path";
-import { syncBuiltinESMExports } from "node:module";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+
+const fs = createRequire(import.meta.url)("node:fs");
 
 const originalRealpathSync = fs.realpathSync;
 let swapped = false;
@@ -2203,6 +2443,73 @@ EOF
   [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
     || fail "a replay-root symlink swap redirected a cache mutation outside the pinned root"
   pass "replay cache root identity is pinned before mutation"
+}
+
+test_replay_cache_pins_descendant_directories() {
+  local home relay replay digest partition held outside preload escape_log swap_log output
+  home=$(make_home replay-descendant-pin)
+  run_keypair "$home" >/dev/null 2>&1 || fail "replay-descendant keypair setup failed"
+  relay="ws://127.0.0.1:1/descendant"
+  replay="$home/state/buzz-replay"
+  digest=$(node -e '
+    import(process.argv[1]).then(({ relayCacheKey }) => process.stdout.write(relayCacheKey(process.argv[2])));
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay")
+  partition="$replay/$digest"
+  held="$home/held-replay-partition"
+  outside="$home/outside-replay-partition"
+  preload="$home/replay-descendant-swap.mjs"
+  escape_log="$home/replay-descendant-escape.log"
+  swap_log="$home/replay-descendant-swap.log"
+  mkdir -p "$partition" "$outside"
+  cat > "$preload" <<'EOF'
+import path from "node:path";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+
+const fs = createRequire(import.meta.url)("node:fs");
+
+const originalWriteFileSync = fs.writeFileSync;
+const replayRoot = fs.realpathSync(process.env.FM_TEST_REPLAY_ROOT);
+let swapped = false;
+fs.writeFileSync = function guardedWriteFileSync(file, ...args) {
+  const absolute = path.resolve(String(file));
+  const parent = path.dirname(absolute);
+  originalWriteFileSync(process.env.FM_TEST_CACHE_SWAP_LOG, `write ${absolute} root ${replayRoot}\n`, { flag: "a" });
+  if (
+    !swapped &&
+    parent.startsWith(`${replayRoot}${path.sep}`) &&
+    path.basename(absolute).endsWith(".json.tmp")
+  ) {
+    swapped = true;
+    fs.renameSync(parent, process.env.FM_TEST_CACHE_HELD);
+    fs.symlinkSync(process.env.FM_TEST_CACHE_OUTSIDE, parent, "dir");
+    originalWriteFileSync(process.env.FM_TEST_CACHE_SWAP_LOG, `swapped ${parent}\n`, { flag: "a" });
+  }
+  const result = originalWriteFileSync.call(fs, file, ...args);
+  const escaped = path.join(process.env.FM_TEST_CACHE_OUTSIDE, path.basename(String(file)));
+  if (fs.existsSync(escaped)) {
+    originalWriteFileSync(process.env.FM_TEST_CACHE_ESCAPE_LOG, `${escaped}\n`, { flag: "a" });
+  }
+  return result;
+};
+syncBuiltinESMExports();
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"descendant-pin"}' \
+    | NODE_OPTIONS="--import=$preload" \
+      FM_TEST_REPLAY_ROOT="$replay" \
+      FM_TEST_CACHE_HELD="$held" \
+      FM_TEST_CACHE_OUTSIDE="$outside" \
+      FM_TEST_CACHE_ESCAPE_LOG="$escape_log" \
+      FM_TEST_CACHE_SWAP_LOG="$swap_log" \
+      run_publish "$home" "$relay" 2>&1)
+  grep -F 'swapped ' "$swap_log" >/dev/null \
+    || fail "the descendant-swap fixture did not exercise a cache mutation: $(cat "$swap_log" 2>/dev/null)"
+  assert_absent "$escape_log" \
+    "a descendant-directory swap redirected a cache mutation outside the replay root"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "a descendant-directory swap left replay data outside the pinned cache"
+  assert_contains "$output" "cache directory identity changed" \
+    "a descendant-directory swap was not diagnosed"
+  pass "replay cache descendant directories stay pinned during mutation"
 }
 
 test_partition_shaped_special_nodes_are_quarantined_and_unblocked() {
@@ -3361,6 +3668,8 @@ test_a_compromised_rotation_does_not_keep_the_retired_key
 test_rotation_refuses_an_existing_private_channel_before_mutation
 test_publisher_target_overrides_are_recorded_and_guard_rotation
 test_publisher_target_updates_are_concurrent_and_fail_closed
+test_rotation_checks_authoritative_current_membership
+test_rotation_fails_closed_on_unverifiable_membership
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable
 test_rotation_compares_the_recorded_key_with_stored_private_material
 test_rotation_detects_and_cleans_up_divergent_stores
@@ -3388,6 +3697,8 @@ test_legacy_replay_entries_are_quarantined_with_a_manifest
 test_legacy_quarantine_claims_the_source_before_reading
 test_legacy_quarantine_retains_open_writer_appends
 test_quarantine_recovers_atomic_manifest_temporaries
+test_quarantine_recovery_rejects_noncanonical_tokens
+test_invalid_quarantine_temporaries_are_accounted_for
 test_reconnect_replays_the_identical_event_id
 test_replaying_a_known_event_is_deduped_and_evicted
 test_an_unacknowledged_publish_does_not_starve_the_drain
@@ -3404,6 +3715,7 @@ test_publish_lock_acquisition_is_validated_bounded_and_interruptible
 test_publish_signing_is_serialized_with_compromised_rotation
 test_replay_cache_rejects_symlink_boundaries
 test_replay_cache_pins_the_root_before_mutation
+test_replay_cache_pins_descendant_directories
 test_partition_shaped_special_nodes_are_quarantined_and_unblocked
 test_replay_cache_never_reads_non_regular_entries
 test_relay_timeout_must_fit_the_node_timer_range

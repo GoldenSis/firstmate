@@ -248,6 +248,27 @@ fm_lock_recheck_stale_owner() {
   return 0
 }
 
+fm_lock_try_acquire_guard() {
+  local lockdir=$1 pid owner
+  FM_LOCK_HELD_PID=
+  FM_LOCK_OWNER_DIR=
+  if fm_lock_try_create "$lockdir"; then
+    return 0
+  fi
+  pid=$(cat "$lockdir/pid" 2>/dev/null || true)
+  if fm_pid_alive "$pid" || fm_lock_mid_acquire_is_fresh "$lockdir" "$pid"; then
+    FM_LOCK_HELD_PID=$pid
+    return 1
+  fi
+  owner=
+  if [ -L "$lockdir" ]; then
+    owner=$(fm_lock_link_owner "$lockdir" 2>/dev/null || true)
+  fi
+  fm_lock_recheck_stale_owner "$lockdir" "$owner" "$pid" || return 1
+  fm_lock_remove_path "$lockdir" || return 1
+  fm_lock_try_create "$lockdir"
+}
+
 fm_lock_try_acquire() {
   local lockdir=$1 pid steal cur rc steal_owner primary_owner
   FM_LOCK_HELD_PID=
@@ -268,7 +289,7 @@ fm_lock_try_acquire() {
   fi
 
   steal="$lockdir.steal"
-  if ! fm_lock_try_acquire "$steal"; then
+  if ! fm_lock_try_acquire_guard "$steal"; then
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=
     return 1

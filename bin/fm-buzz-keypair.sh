@@ -33,8 +33,8 @@
 # file - plus data/buzz-keypair.public, then mints a fresh keypair and prints the
 # new public key. Before mutation it checks the default target and every used
 # relay/channel pair recorded by bin/fm-buzz-targets.mjs, refusing when the
-# outgoing publisher owns an existing private channel because M1 has no
-# membership-transfer operation. It never prints the private key, old or new.
+# outgoing publisher appears in the relay's current membership state because M1
+# has no membership-transfer operation. It never prints the private key, old or new.
 #
 # The retired PUBLIC key is appended to data/buzz-keypair.public-history first, so
 # events this home signed before the rotation stay attributable to it.
@@ -200,7 +200,7 @@ derive_public() {
   derive_public_from_store selected
 }
 
-publisher_owns_private_channel() {  # <keychain|file> <relay> <channel> <timeout-ms>
+publisher_is_current_channel_member() {  # <keychain|file> <relay> <channel> <timeout-ms>
   local store=$1 relay=$2 channel=$3 timeout_ms=$4
   case $store in
     keychain) fm_buzz_key_load_keychain "$FM_HOME" ;;
@@ -212,16 +212,16 @@ publisher_owns_private_channel() {  # <keychain|file> <relay> <channel> <timeout
     process.stdin.on("data", (chunk) => { input += chunk; });
     process.stdin.on("end", async () => {
       try {
-        const { publisherOwnsPrivateChannel } = await import(process.argv[1]);
+        const { publisherIsCurrentChannelMember } = await import(process.argv[1]);
         const privateKey = input.trim();
         if (!privateKey) throw new Error("stored publishing key is empty");
-        const owned = await publisherOwnsPrivateChannel(
+        const member = await publisherIsCurrentChannelMember(
           process.argv[2],
           privateKey,
           process.argv[3],
           Number(process.argv[4]),
         );
-        process.stdout.write(owned ? "owned\n" : "absent\n");
+        process.stdout.write(member ? "member\n" : "absent\n");
       } catch (error) {
         process.stderr.write(String(error.message) + "\n");
         process.exitCode = 1;
@@ -230,24 +230,24 @@ publisher_owns_private_channel() {  # <keychain|file> <relay> <channel> <timeout
   ' "$SCRIPT_DIR/fm-buzz-lib.mjs" "$relay" "$channel" "$timeout_ms"
 }
 
-refuse_rotation_for_owned_channel() {  # <keychain|file> <public-key> <relay> <channel>
+refuse_rotation_for_current_membership() {  # <keychain|file> <public-key> <relay> <channel>
   local store=$1 public=$2 relay=$3 channel=$4 check check_key
   [ -n "$public" ] || return 0
   check_key="$public"$'\t'"$relay"$'\t'"$channel"
   printf '%s\n' "${checked_rotation_targets:-}" | grep -Fqx -- "$check_key" && return 0
   checked_rotation_targets="${checked_rotation_targets:+$checked_rotation_targets
 }$check_key"
-  check=$(publisher_owns_private_channel \
+  check=$(publisher_is_current_channel_member \
     "$store" "$relay" "$channel" "$rotation_timeout" 2>&1)
   check_status=$?
   if [ "$check_status" -ne 0 ]; then
-    printf 'fm-buzz-keypair.sh: could not verify whether channel %s exists on %s: %s; nothing was rotated\n' \
-      "$channel" "$relay" "$check" >&2
+    printf 'fm-buzz-keypair.sh: could not verify current membership for relay %s, channel %s: %s; nothing was rotated\n' \
+      "$relay" "$channel" "$check" >&2
     return 1
   fi
-  [ "$check" = "owned" ] || return 0
-  printf 'fm-buzz-keypair.sh: channel %s already belongs to the outgoing publisher on relay %s; nothing was rotated\n' \
-    "$channel" "$relay" >&2
+  [ "$check" = "member" ] || return 0
+  printf 'fm-buzz-keypair.sh: outgoing publisher has current membership on relay %s, channel %s; nothing was rotated\n' \
+    "$relay" "$channel" >&2
   printf '%s\n' 'Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity.' >&2
   printf '%s\n' 'Reference: https://github.com/block/buzz/blob/main/ARCHITECTURE.md' >&2
   printf '%s\n' 'Reference: https://github.com/block/buzz/blob/main/NOSTR.md' >&2
@@ -256,12 +256,12 @@ refuse_rotation_for_owned_channel() {  # <keychain|file> <public-key> <relay> <c
 
 check_rotation_targets_for_store() {  # <keychain|file> <public-key>
   local store=$1 public=$2 target_public target_relay target_channel
-  refuse_rotation_for_owned_channel \
+  refuse_rotation_for_current_membership \
     "$store" "$public" "$rotation_relay" "$rotation_channel" || return 1
   while IFS=$'\t' read -r target_public target_relay target_channel; do
     [ -n "$target_public" ] || continue
     [ "$target_public" = "$public" ] || continue
-    refuse_rotation_for_owned_channel \
+    refuse_rotation_for_current_membership \
       "$store" "$public" "$target_relay" "$target_channel" || return 1
   done <<EOF
 $rotation_targets
