@@ -334,8 +334,11 @@ publisher_is_current_channel_member() {  # <keychain|file> <relay> <channel> <ti
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", (chunk) => { input += chunk; });
     process.stdin.on("end", async () => {
+      let escapeTerminalControls = String;
       try {
-        const { queryCurrentChannelMembership } = await import(process.argv[1]);
+        const buzz = await import(process.argv[1]);
+        escapeTerminalControls = buzz.escapeTerminalControls;
+        const { queryCurrentChannelMembership } = buzz;
         const { verifyOrRecordRelayAuthority } = await import(process.argv[2]);
         const privateKey = input.trim();
         if (!privateKey) throw new Error("stored publishing key is empty");
@@ -352,7 +355,7 @@ publisher_is_current_channel_member() {  # <keychain|file> <relay> <channel> <ti
         }, { strict: process.argv[7] === "1" });
         process.stdout.write(membership.member ? "member\n" : "absent\n");
       } catch (error) {
-        process.stderr.write(String(error.message) + "\n");
+        process.stderr.write(escapeTerminalControls(error.message) + "\n");
         process.exitCode = 1;
       }
     });

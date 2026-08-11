@@ -892,6 +892,29 @@ EOF
   pass "a retryable rejection keeps the event cached"
 }
 
+test_relay_rejection_diagnostics_escape_terminal_controls() {
+  local home relay unsafe_rejection output
+  home=$(make_home rejection-terminal-controls)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  unsafe_rejection=$'restricted: retry\n\033]52;c;Y2xpcGJvYXJk\a'
+
+  read -r STUB_PID relay <<EOF
+$(start_stub --reject "$unsafe_rejection")
+EOF
+  output=$(test_projection | run_publish "$home" "$relay" 2>&1)
+  stop_stub "$STUB_PID"
+
+  assert_not_contains "$output" $'\033' \
+    "relay rejection diagnostics reached the terminal with an escape character"
+  assert_not_contains "$output" $'\a' \
+    "relay rejection diagnostics reached the terminal with a bell character"
+  assert_contains "$output" 'restricted: retry\u000a\u001b]52;c;Y2xpcGJvYXJk\u0007' \
+    "relay rejection controls were not rendered visibly"
+  [ "$(replay_count "$home")" = "1" ] \
+    || fail "sanitizing a retryable rejection changed its protocol classification"
+  pass "relay rejection diagnostics escape terminal controls"
+}
+
 test_truthy_non_boolean_ok_is_not_accepted() {
   local home duplicate_home relay output
   home=$(make_home truthy-ok-permanent)
@@ -1439,6 +1462,7 @@ test_a_challenge_past_the_handshake_window_still_lands_the_event
 test_foreign_author_cache_entries_are_not_drained_by_the_current_publisher
 test_permanent_rejection_is_not_replayed_forever
 test_retryable_rejection_is_kept
+test_relay_rejection_diagnostics_escape_terminal_controls
 test_truthy_non_boolean_ok_is_not_accepted
 test_publish_lock_acquisition_is_validated_bounded_and_interruptible
 test_a_writer_that_never_closes_does_not_hang_the_publish

@@ -10,11 +10,9 @@
 # commit 7fb008f9 (Apache-2.0), reduced to four runtime services plus two
 # one-shot initialization jobs and re-pointed at loopback.
 #
-# Usage:
-#   colima start                                                        # if needed
-#   docker compose -f docker-compose.buzz-loopback.yml up -d
-#   bin/fm-buzz-publish.sh --refresh
-#   docker compose -f docker-compose.buzz-loopback.yml down -v          # clean slate
+# Setup and usage:
+# See docs/buzz-loopback-adapter.md#prerequisites for the complete native Docker
+# and Colima procedures, including key setup and both loopback tunnels.
 
 name: buzz-loopback
 

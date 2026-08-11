@@ -85,6 +85,7 @@ import {
   buildBearingsEvent,
   buildChannelCreateEvent,
   classifyOkResponse,
+  escapeTerminalControls,
   readStdin,
   relayCacheKey,
   resolveLoopbackRelayHost,
@@ -3051,7 +3052,7 @@ async function main() {
         const response = await api.publish(create);
         const message = String(response.message);
         if (classifyOkResponse(response.accepted, message) !== DELIVERED) {
-          log(`channel provisioning refused: ${message}`);
+          log(`channel provisioning refused: ${escapeTerminalControls(message)}`);
           return response.accepted === false && message.startsWith("auth-required:");
         }
       } catch (error) {
@@ -3126,9 +3127,10 @@ async function main() {
           const response = await api.publish(parsed, raw);
           const message = String(response.message);
           verdict = classifyOkResponse(response.accepted, message);
-          if (verdict === PERMANENT) log(`permanently rejected ${entry.id}: ${message}`);
+          const displayMessage = escapeTerminalControls(message);
+          if (verdict === PERMANENT) log(`permanently rejected ${entry.id}: ${displayMessage}`);
           if (verdict !== DELIVERED && verdict !== PERMANENT) {
-            log(`retryable rejection for ${entry.id}: ${message}`);
+            log(`retryable rejection for ${entry.id}: ${displayMessage}`);
             if (response.accepted === false && message.startsWith("auth-required:")) {
               authBlocked = true;
               authRefused.add(entry.id);

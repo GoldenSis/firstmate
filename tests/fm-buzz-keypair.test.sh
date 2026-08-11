@@ -506,6 +506,39 @@ test_rotation_query_errors_report_every_target_on_the_endpoint() {
   pass "membership query errors report every target needed to retire the endpoint"
 }
 
+test_rotation_diagnostics_escape_membership_refusal_controls() {
+  local home old relay normalized_relay channel targets unsafe_refusal output code
+  home=$(make_home membership-refusal-terminal-controls)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "membership-refusal keypair setup failed"
+  channel="35353535-4646-5757-8868-797979797979"
+  unsafe_refusal=$'error: retry\n\033]52;c;Y2xpcGJvYXJk\a'
+  read -r STUB_PID relay <<EOF
+$(start_stub --refuse-req "$unsafe_refusal")
+EOF
+  normalized_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
+    || fail "could not normalize the membership-refusal relay"
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  jq -cn \
+    --arg relay "$normalized_relay" \
+    --arg channel "$channel" \
+    --arg publisher "$old" \
+    '{relay:$relay,channel_id:$channel,publisher_pubkey:$publisher}' > "$targets"
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  stop_stub "$STUB_PID"
+  expect_code 1 "$code" "rotation with a relay-controlled membership refusal"
+  assert_not_contains "$output" $'\033' \
+    "membership refusal diagnostics reached the terminal with an escape character"
+  assert_not_contains "$output" $'\a' \
+    "membership refusal diagnostics reached the terminal with a bell character"
+  assert_contains "$output" 'error: retry\u000a\u001b]52;c;Y2xpcGJvYXJk\u0007' \
+    "membership refusal controls were not rendered visibly"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "membership refusal diagnostics changed the publishing identity"
+  pass "rotation diagnostics escape membership refusal controls"
+}
+
 test_retirement_commands_quote_special_relay_endpoints() {
   local home publisher relay normalized quoted channel targets output code
   home=$(make_home quoted-retirement-endpoint)
@@ -2952,6 +2985,7 @@ test_rotation_refuses_or_quarantines_outgoing_pending_events
 test_rotation_refuses_an_existing_private_channel_before_mutation
 test_rotation_reports_every_membership_blocker
 test_rotation_query_errors_report_every_target_on_the_endpoint
+test_rotation_diagnostics_escape_membership_refusal_controls
 test_retirement_commands_quote_special_relay_endpoints
 test_publisher_target_overrides_are_recorded_and_guard_rotation
 test_publisher_target_updates_are_concurrent_and_fail_closed

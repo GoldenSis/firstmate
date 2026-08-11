@@ -24,6 +24,7 @@
 import {
   channelIdForLabel,
   classifyRefusalReason,
+  escapeTerminalControls,
   readStdin,
   validateSignedEvent,
   withRelay,
@@ -57,12 +58,6 @@ const privateKey = anonymous ? generateKeypair().privateKey : envelope.privateKe
 const CONTENT_BYTE_LIMIT = 600;
 const TRUNCATION_MARKER =
   "... (truncated at 600 bytes; run with --full to see the complete projection)";
-
-function escapeTerminalControls(value) {
-  return value.replace(/[\u0000-\u001f\u007f-\u009f]/gu, (character) =>
-    `\\u${character.codePointAt(0).toString(16).padStart(4, "0")}`,
-  );
-}
 
 function contentForDisplay(content) {
   const bytes = Buffer.from(content, "utf8");

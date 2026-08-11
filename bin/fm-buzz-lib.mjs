@@ -36,6 +36,12 @@ import {
 
 const LOOPBACK_RELAY_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
 
+export function escapeTerminalControls(value) {
+  return String(value).replace(/[\u0000-\u001f\u007f-\u009f]/gu, (character) =>
+    `\\u${character.codePointAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
 export function resolveLoopbackRelayHost(relay) {
   const normalized = normalizeRelayEndpoint(relay);
   const url = new URL(normalized);

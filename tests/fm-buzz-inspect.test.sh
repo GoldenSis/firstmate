@@ -656,6 +656,9 @@ test_quarantine_lifecycle_has_one_pinned_cache_owner() {
   assert_grep 'The header of `bin/fm-buzz-publish.sh` owns input, option, default, and termination mechanics' \
     "$ROOT/docs/buzz-loopback-adapter.md" \
     "the adapter guide does not point runtime mechanics to their owner"
+  assert_grep "docs/buzz-loopback-adapter.md#prerequisites" \
+    "$ROOT/docker-compose.buzz-loopback.yml" \
+    "the Compose header does not point to the complete native Docker and Colima guide"
   assert_no_grep "runLegacyQuarantineLifecycle" "$ROOT/bin/fm-buzz-publish.mjs" \
     "the publisher still delegates through the callback facade"
   pass "quarantine lifecycle and pinned mutations have one owner"
