@@ -1111,12 +1111,6 @@ EOF
 }
 
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable() {
-  # data/buzz-keypair.public is a cache, not the authority. A half-written one
-  # holds something that is not a key at all, and retaining that would leave a
-  # history entry no reader can attribute while looking exactly like retention
-  # that worked - the stored private half is what settles it. And when neither
-  # source can name the outgoing key, the rotation must STOP: the very next step
-  # forgets the private half, after which nothing can derive that key again.
   local home first second third history keyfile output code targets artifact unrelated
   local current_channel unrelated_channel current_relay unrelated_relay
   home=$(make_home rotate-unusable)
@@ -1125,11 +1119,19 @@ test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable() {
 
   first=$(run_keypair "$home" 2>/dev/null) || fail "keypair creation failed"
   printf 'deadbeefdeadbeef\n' > "$home/data/buzz-keypair.public"
-  second=$(run_keypair "$home" --rotate 2>/dev/null) || fail "rotation failed"
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "ordinary rotation with a truncated public record"
+  assert_contains "$output" "not exactly one canonical lowercase key" \
+    "truncated public record was not diagnosed"
+  output=$(run_keypair "$home" --rotate --compromised 2>&1)
+  code=$?
+  expect_code 0 "$code" "compromised rotation with a truncated public record"
+  second=$(printf '%s\n' "$output" | tail -1)
   [ "$first" != "$second" ] || fail "rotation did not replace the key"
-  assert_grep "$first" "$history" \
-    "a truncated recorded file cost the rotation the key it was retiring"
-  assert_no_grep "deadbeefdeadbeef" "$history" \
+  assert_not_contains "$(cat "$history" 2>/dev/null)" "$first" \
+    "compromised truncated-record recovery retained the outgoing key"
+  assert_not_contains "$(cat "$history" 2>/dev/null)" "deadbeefdeadbeef" \
     "a truncated recorded file was recorded as though it were a key"
 
   targets="$home/data/buzz-publisher-targets.jsonl"
@@ -1164,8 +1166,8 @@ test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable() {
   expect_code 1 "$code" "a rotation that cannot name its outgoing key"
   assert_contains "$output" "$keyfile" \
     "the rotation failed without naming the unreadable private key file"
-  assert_grep "$first" "$history" \
-    "a refused rotation still rewrote the recorded key set"
+  assert_not_contains "$(cat "$history" 2>/dev/null)" "$first" \
+    "a refused rotation re-trusted an earlier compromised key"
   assert_grep "$second" "$home/data/buzz-keypair.public" \
     "a refused rotation disturbed the recorded current public key"
 
@@ -1180,8 +1182,8 @@ test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable() {
   [ "$third" != "$second" ] || fail "compromised recovery did not replace the unreadable key"
   assert_not_contains "$(cat "$history" 2>/dev/null)" "$second" \
     "compromised recovery retained the unreadable outgoing key"
-  assert_grep "$first" "$history" \
-    "compromised recovery disturbed an earlier uncompromised retired key"
+  assert_not_contains "$(cat "$history" 2>/dev/null)" "$first" \
+    "compromised recovery re-trusted an earlier compromised key"
   assert_grep "$unrelated" "$history" \
     "compromised recovery purged an unrelated historical publisher"
   jq -e --arg publisher "$unrelated" 'select(.publisher_pubkey == $publisher)' "$targets" >/dev/null \
@@ -1410,6 +1412,60 @@ test_rotation_compares_the_recorded_key_with_stored_private_material() {
   assert_not_contains "$(cat "$history" 2>/dev/null)" "$mismatched" \
     "compromised mismatch recovery retained the mismatched recorded key"
   pass "rotation compares recorded and derived public keys before retiring either"
+}
+
+test_rotation_requires_one_canonical_current_public_record() {
+  local home other public_file first first_upper other_public before output replacement code
+
+  home=$(make_home rotate-uppercase-current-record)
+  first=$(run_keypair "$home" 2>/dev/null) || fail "uppercase current-record setup failed"
+  public_file="$home/data/buzz-keypair.public"
+  first_upper=$(printf '%s' "$first" | tr 'a-f' 'A-F')
+  printf '%s\n' "$first_upper" > "$public_file"
+  before=$(cat "$public_file")
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation with a noncanonical uppercase current public record"
+  assert_contains "$output" "not exactly one canonical lowercase key" \
+    "uppercase current public record was not diagnosed"
+  [ "$(cat "$public_file")" = "$before" ] \
+    || fail "uppercase current-record refusal changed the record"
+
+  replacement=$(run_keypair "$home" --rotate --compromised 2>/dev/null) \
+    || fail "compromised recovery of an uppercase current record failed"
+  [ "$replacement" != "$first" ] || fail "uppercase current-record recovery reused the old key"
+  assert_not_contains "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null)" "$first" \
+    "uppercase current-record recovery retained the compromised key"
+
+  home=$(make_home rotate-multiline-current-record)
+  other=$(make_home rotate-multiline-current-record-other)
+  first=$(run_keypair "$home" 2>/dev/null) || fail "multiline current-record setup failed"
+  other_public=$(run_keypair "$other" 2>/dev/null) || fail "multiline second-key setup failed"
+  public_file="$home/data/buzz-keypair.public"
+  printf '%s\n%s\n' "$first" "$other_public" > "$public_file"
+  before=$(cat "$public_file")
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation with a multiline current public record"
+  assert_contains "$output" "not exactly one canonical lowercase key" \
+    "multiline current public record was not diagnosed"
+  [ "$(cat "$public_file")" = "$before" ] \
+    || fail "multiline current-record refusal changed the record"
+
+  home=$(make_home rotate-malformed-current-record)
+  run_keypair "$home" >/dev/null 2>&1 || fail "malformed current-record setup failed"
+  public_file="$home/data/buzz-keypair.public"
+  printf '%s\n' "not-a-public-key" > "$public_file"
+  before=$(cat "$public_file")
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation with a malformed current public record"
+  assert_contains "$output" "not exactly one canonical lowercase key" \
+    "malformed current public record was not diagnosed"
+  [ "$(cat "$public_file")" = "$before" ] \
+    || fail "malformed current-record refusal changed the record"
+  pass "rotation requires one canonical lowercase current public record"
 }
 
 test_rotation_detects_and_cleans_up_divergent_stores() {
@@ -1941,6 +1997,38 @@ test_committable_compromised_rotation_stage_preserves_withdrawal_intent() {
   pass "committable compromised rotation intent survives an interrupted key replacement"
 }
 
+test_committable_ordinary_rotation_rejects_late_compromised_intent() {
+  local home old history stage staged_private staged_public output recovered code
+  home=$(make_home committable-ordinary-late-compromised)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "committable ordinary-stage setup failed"
+  history="$home/data/buzz-keypair.public-history"
+  stage=$(rotation_stage_file "$home")
+  staged_private=$(new_private_key) || fail "could not mint the committable ordinary replacement"
+  staged_public=$(public_from_private "$staged_private") \
+    || fail "could not derive the committable ordinary replacement"
+  printf '%s\n' "$old" > "$history"
+  write_rotation_stage "$home" committable "$staged_private" "$staged_public" ordinary
+
+  output=$(run_keypair "$home" --rotate --compromised 2>&1)
+  code=$?
+  expect_code 1 "$code" "a late compromised retry of a committable ordinary rotation"
+  assert_contains "$output" "--forget-key" \
+    "a rejected late compromised retry omitted withdrawal guidance"
+  assert_present "$stage" "a rejected late compromised retry discarded the staged replacement"
+  assert_contains "$(cat "$history")" "$old" \
+    "a rejected late compromised retry rewrote ordinary retirement history"
+
+  recovered=$(run_keypair "$home" --rotate 2>/dev/null) \
+    || fail "the committable ordinary rotation could not resume with its original intent"
+  [ "$recovered" = "$staged_public" ] \
+    || fail "the ordinary retry replaced its staged identity"
+  run_keypair "$home" --forget-key "$old" >/dev/null 2>&1 \
+    || fail "the late compromise could not be withdrawn after ordinary recovery"
+  assert_not_contains "$(cat "$history" 2>/dev/null)" "$old" \
+    "explicit withdrawal left the late-compromised key in history"
+  pass "committable ordinary rotation intent cannot be upgraded after retirement"
+}
+
 test_orphan_gate_sees_legacy_replay_publisher_evidence() {
   local home relay foreign_private foreign_public seeded channel flat host_dir
   local output code recovered
@@ -1983,6 +2071,36 @@ test_orphan_gate_sees_legacy_replay_publisher_evidence() {
   assert_not_contains "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null)" "$foreign_public" \
     "compromised recovery retained the legacy orphan identity"
   pass "orphan identity inspection covers flat and host-keyed legacy replay entries"
+}
+
+test_orphan_gate_sees_nested_legacy_replay_publisher_evidence() {
+  local home relay foreign_private foreign_public seeded channel nested_file output code
+  home=$(make_home orphan-nested-legacy-replay)
+  run_keypair "$home" >/dev/null 2>&1 || fail "nested legacy orphan setup failed"
+  relay="ws://127.0.0.1:1"
+  channel=$(default_channel_id "$home")
+  foreign_private=$(new_private_key) || fail "could not mint a nested legacy publisher"
+  foreign_public=$(public_from_private "$foreign_private") \
+    || fail "could not derive the nested legacy publisher"
+  seeded=$(seed_replay_event "$home" "$relay" "$foreign_private" 1700000001 \
+    "$channel" nested-legacy-orphan) || fail "could not seed nested legacy replay evidence"
+  nested_file="$home/state/buzz-replay/127.0.0.1%3A1/nested/frame.bin"
+  mkdir -p "$(dirname "$nested_file")"
+  mv "$seeded" "$nested_file"
+  rm -f -- "$(key_file "$home" "$home/xdg")" "$home/data/buzz-keypair.public"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default key creation over nested legacy replay evidence"
+  assert_contains "$output" "orphan identity evidence exists" \
+    "the orphan gate ignored nested legacy replay evidence"
+  assert_contains "$output" "$foreign_public" \
+    "the orphan gate did not recover the nested legacy publisher"
+  assert_contains "$output" "$nested_file" \
+    "the orphan gate did not name the nested legacy replay entry"
+  assert_absent "$(key_file "$home" "$home/xdg")" \
+    "default ensure minted over nested legacy replay evidence"
+  pass "orphan identity inspection recursively covers legacy replay directories"
 }
 
 test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine() {
@@ -2685,6 +2803,7 @@ test_compromised_orphan_recovery_records_unverifiable_memberships
 test_orphan_identity_evidence_requires_compromised_recovery
 test_complete_cache_temporaries_protect_publisher_identity
 test_rotation_compares_the_recorded_key_with_stored_private_material
+test_rotation_requires_one_canonical_current_public_record
 test_rotation_detects_and_cleans_up_divergent_stores
 test_orphaned_public_record_requires_compromised_recovery
 test_forget_key_refuses_when_history_cannot_be_read
@@ -2701,7 +2820,9 @@ test_public_flag_fails_before_a_keypair_exists
 test_rotation_stages_the_replacement_before_clearing_the_outgoing_key
 test_compromised_rotation_stage_preserves_withdrawal_intent
 test_committable_compromised_rotation_stage_preserves_withdrawal_intent
+test_committable_ordinary_rotation_rejects_late_compromised_intent
 test_orphan_gate_sees_legacy_replay_publisher_evidence
+test_orphan_gate_sees_nested_legacy_replay_publisher_evidence
 test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine
 test_orphan_gate_includes_quarantine_manifest_temporaries
 test_orphan_gate_preserves_corrupt_partition_publisher_evidence

@@ -2057,7 +2057,7 @@ function activeReplayPublisherEntries(cacheRoot) {
 function legacyReplayPublisherEntries(cacheRoot) {
   const evidence = [];
   const inspectedFiles = new Set();
-  const collect = (directory) => {
+  const collect = (directory, recursive = false) => {
     let names;
     try {
       names = cacheReaddirSync(directory);
@@ -2077,6 +2077,13 @@ function legacyReplayPublisherEntries(cacheRoot) {
       const expectedFile = name.endsWith(".json") || name.endsWith(".json.tmp");
       if (!metadata.isFile()) {
         if (expectedFile) throw new Error(`legacy replay entry ${file} is not a regular file`);
+        if (recursive && metadata.isSymbolicLink()) {
+          throw new Error(`legacy replay path ${file} is a symbolic link`);
+        }
+        if (recursive && metadata.isDirectory()) {
+          pinCacheDirectory(file);
+          collect(file, true);
+        }
         continue;
       }
       inspectedFiles.add(file);
@@ -2121,7 +2128,7 @@ function legacyReplayPublisherEntries(cacheRoot) {
     }
     if (!metadata.isDirectory()) continue;
     pinCacheDirectory(candidate);
-    collect(candidate);
+    collect(candidate, true);
   }
   return evidence;
 }

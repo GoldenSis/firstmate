@@ -306,6 +306,15 @@ EOF
   [ -z "$history" ] || printf '%s\n' "$history"
 }
 
+read_current_public_record() {
+  local record
+  record=$(sed -n 1p "$PUBLIC_FILE") || return 1
+  [ "${#record}" -eq 64 ] || return 1
+  case $record in *[!0-9a-f]*) return 1 ;; esac
+  printf '%s\n' "$record" | cmp -s - "$PUBLIC_FILE" || return 1
+  printf '%s\n' "$record"
+}
+
 # Derive the public key from the stored private key without the private key ever
 # reaching a command line or this script's own output: it goes straight down a
 # pipe into node's stdin.
@@ -754,6 +763,11 @@ if { [ "$ROTATION_STAGE_PHASE" = prepared ] || [ "$ROTATION_STAGE_PHASE" = commi
       }
     ROTATION_STAGE_INTENT=compromised
   fi
+  if [ "$ROTATION_STAGE_PHASE" = committable ] \
+    && [ "$ROTATION_STAGE_INTENT" = ordinary ] && [ "$COMPROMISED" -eq 1 ]; then
+    printf 'fm-buzz-keypair.sh: staged ordinary rotation already retained its outgoing key; retry with --rotate, then withdraw that retired key with --forget-key\n' >&2
+    exit 1
+  fi
 fi
 if [ "$ROTATION_STAGE_PHASE" = committable ] && [ "$OPERATION" != public ]; then
   finish_committable_rotation_stage
@@ -780,12 +794,16 @@ run_rotate_operation() {
     printf 'fm-buzz-keypair.sh: public key history target %s is not a regular file; nothing was rotated\n' "$HISTORY_FILE" >&2
     exit 1
   }
-  recorded=$(fm_buzz_normalize_public_key "$(sed -n 1p "$PUBLIC_FILE" 2>/dev/null)" 2>/dev/null) || recorded=""
+  recorded=""
+  recovery_reason=""
+  if [ -e "$PUBLIC_FILE" ] || [ -L "$PUBLIC_FILE" ]; then
+    recorded=$(read_current_public_record 2>/dev/null) \
+      || add_recovery_reason "the recorded public key in $PUBLIC_FILE is not exactly one canonical lowercase key"
+  fi
   keychain_public=""
   file_public=""
   derived=""
   retiring=""
-  recovery_reason=""
   fm_buzz_key_load_keychain "$FM_HOME" >/dev/null 2>&1
   keychain_status=$?
   fm_buzz_key_load_file "$FM_HOME" >/dev/null 2>&1
