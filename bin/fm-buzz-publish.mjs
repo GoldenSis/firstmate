@@ -54,8 +54,8 @@
 // corrupt_type, and recovery_error, while legacy_host, quarantine_reason, and
 // publisher_pubkey are not part of that variant.
 // A lowercase SHA-256 token binds stable source provenance: original path,
-// device, inode, and birthtime for regular files, or mode for corrupt partition
-// nodes, without using access or link-mutated change time.
+// device, and inode for regular files, or mode for corrupt partition nodes,
+// without using access or link-mutated change time.
 // Startup first accounts for invalid recovery residue, then completes manifest
 // temporaries, staged regular files, and corrupt nodes before discovering new
 // legacy entries, and it reports every unsettled mutation as a cleanup failure.
@@ -966,7 +966,6 @@ function quarantineInvalidRecoveryResidue(
     original_path: originalPath,
     device: metadata.dev,
     inode: metadata.ino,
-    birthtime_ms: metadata.birthtimeMs,
   })));
   const destination = path.join(recoveryCorruptDir, `${token}.invalid`);
   try {
@@ -1270,7 +1269,6 @@ function quarantineLegacyEntry(
     original_path: originalPath,
     device: metadata.dev,
     inode: metadata.ino,
-    birthtime_ms: metadata.birthtimeMs,
   })));
   const transactionDir = prepareCacheDirectory(stagingDir, transactionToken);
   const originFile = path.join(transactionDir, "origin.json");
@@ -1366,6 +1364,7 @@ function quarantineCorruptPartitionNode(replayDir, quarantineDir, corruptDir, ma
   const entry = path.join(transactionDir, "entry");
   const originFile = path.join(transactionDir, "origin.json");
   const payloadReference = path.join("corrupt", token, "entry");
+  const publisherPubkey = metadata.isFile() ? validatedSignedPublisher(file) : null;
   const manifest = {
     original_path: originalPath,
     legacy_host: null,
@@ -1374,6 +1373,7 @@ function quarantineCorruptPartitionNode(replayDir, quarantineDir, corruptDir, ma
     quarantine_timestamp: new Date().toISOString(),
     payload_reference: payloadReference,
     corrupt_type: type,
+    publisher_pubkey: publisherPubkey,
   };
   try {
     const existing = cacheLstatSync(entry);
@@ -1729,6 +1729,7 @@ function activeReplayPublisherEntries(cacheRoot) {
       }
       active.push({ path: entry.file, publisherPubkey: event.pubkey });
     }
+    active.push(...temporaryReplayPublisherEntries(directory, "active replay"));
   }
   return active.sort((left, right) => left.path.localeCompare(right.path));
 }
@@ -1763,6 +1764,7 @@ function legacyReplayPublisherEntries(cacheRoot) {
       }
       evidence.push({ path: entry.file, publisherPubkey: event.pubkey });
     }
+    evidence.push(...temporaryReplayPublisherEntries(directory, "legacy replay"));
   };
   collect(cacheRoot);
   let names;
@@ -1773,7 +1775,7 @@ function legacyReplayPublisherEntries(cacheRoot) {
     return evidence;
   }
   for (const name of names) {
-    if (name === LEGACY_QUARANTINE || CACHE_PARTITION.test(name) || name.endsWith(".json")) continue;
+    if (name === LEGACY_QUARANTINE || name.endsWith(".json") || name.endsWith(".json.tmp")) continue;
     const candidate = path.join(cacheRoot, name);
     let metadata;
     try {
@@ -1784,6 +1786,13 @@ function legacyReplayPublisherEntries(cacheRoot) {
     }
     if (metadata.isSymbolicLink()) {
       throw new Error(`legacy replay path ${candidate} is a symbolic link`);
+    }
+    if (CACHE_PARTITION.test(name)) {
+      if (metadata.isFile()) {
+        const publisherPubkey = validatedSignedPublisher(candidate);
+        if (publisherPubkey !== null) evidence.push({ path: candidate, publisherPubkey });
+      }
+      continue;
     }
     if (!metadata.isDirectory()) continue;
     pinCacheDirectory(candidate);
@@ -1907,19 +1916,46 @@ function quarantinedReplayPublisherEntries(cacheRoot) {
       continue;
     }
     if (typeof manifest?.original_path !== "string" || typeof manifest?.payload_reference !== "string") continue;
+    const regularReference = path.join("payloads", `${match[1]}.json`);
+    const corruptReference = path.join("corrupt", match[1], "entry");
+    let payloadParent;
+    if (manifest.payload_reference === regularReference) {
+      payloadParent = path.join(quarantineDir, "payloads");
+    } else if (manifest.payload_reference === corruptReference) {
+      const corruptDir = path.join(quarantineDir, "corrupt");
+      try {
+        metadata = cacheLstatSync(corruptDir);
+      } catch (error) {
+        if (error.code === "ENOENT") continue;
+        throw error;
+      }
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+        throw new Error(`legacy quarantine corrupt path ${corruptDir} is not a regular directory`);
+      }
+      pinCacheDirectory(corruptDir);
+      payloadParent = path.join(quarantineDir, "corrupt", match[1]);
+    } else {
+      continue;
+    }
     const payload = path.resolve(path.join(quarantineDir, manifest.payload_reference));
-    const payloadsDir = path.join(quarantineDir, "payloads");
-    if (!containedCachePath(payloadsDir, payload) || path.dirname(payload) !== path.resolve(payloadsDir)) continue;
+    if (!containedCachePath(payloadParent, payload) || path.dirname(payload) !== path.resolve(payloadParent)) continue;
     try {
-      metadata = cacheLstatSync(payloadsDir);
+      metadata = cacheLstatSync(payloadParent);
     } catch (error) {
       if (error.code === "ENOENT") continue;
       throw error;
     }
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-      throw new Error(`legacy quarantine payload path ${payloadsDir} is not a regular directory`);
+      throw new Error(`legacy quarantine payload path ${payloadParent} is not a regular directory`);
     }
-    pinCacheDirectory(payloadsDir);
+    pinCacheDirectory(payloadParent);
+    try {
+      metadata = cacheLstatSync(payload);
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      throw error;
+    }
+    if (!metadata.isFile()) continue;
     const publisherPubkey = validatedSignedPublisher(payload);
     if (publisherPubkey !== null) evidence.push({ path: payload, publisherPubkey });
   }
@@ -1947,6 +1983,7 @@ function endpointReplayPublisherEntries(cacheRoot) {
       }
       evidence.push({ path: entry.file, publisherPubkey: event.pubkey });
     }
+    evidence.push(...temporaryReplayPublisherEntries(directory, "endpoint replay"));
   }
   return evidence;
 }
@@ -1994,7 +2031,11 @@ export function protectOutgoingPublisherCache(replayDir, publisherPubkeys, optio
       `could not migrate endpoint-only replay entries:\n${endpointMigration.failures.map((file) => `  ${file}`).join("\n")}`,
     );
   }
-  const blocking = activeReplayPublisherEntries(cacheRoot)
+  const blocking = [
+    ...activeReplayPublisherEntries(cacheRoot),
+    ...endpointReplayPublisherEntries(cacheRoot),
+    ...legacyReplayPublisherEntries(cacheRoot),
+  ]
     .filter((entry) => publisherSet.has(entry.publisherPubkey));
   const paths = blocking.map((entry) => entry.path);
   if (!options.discard || blocking.length === 0) {
@@ -2075,6 +2116,33 @@ function cacheEntries(replayDir) {
       return (a.createdAt - b.createdAt) || a.id.localeCompare(b.id);
     });
   return { entries, failures };
+}
+
+function temporaryReplayPublisherEntries(replayDir, description) {
+  let names;
+  try {
+    names = cacheReaddirSync(replayDir);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw new Error(`could not inspect ${description} temporaries in ${replayDir}: ${error.message}`);
+  }
+  const evidence = [];
+  for (const name of names.filter((candidate) => candidate.endsWith(".json.tmp"))) {
+    const file = path.join(replayDir, name);
+    let metadata;
+    try {
+      metadata = cacheLstatSync(file);
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      throw new Error(`could not inspect ${description} temporary ${file}: ${error.message}`);
+    }
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      throw new Error(`${description} temporary ${file} is not a regular file`);
+    }
+    const publisherPubkey = validatedSignedPublisher(file);
+    if (publisherPubkey !== null) evidence.push({ path: file, publisherPubkey });
+  }
+  return evidence;
 }
 
 function cacheEndpointDirectories(replayDir) {

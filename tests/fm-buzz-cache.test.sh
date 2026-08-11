@@ -376,7 +376,6 @@ test_quarantine_retry_reuses_link_stable_transaction_identity() {
       original_path: originalPath,
       device: metadata.dev,
       inode: metadata.ino,
-      birthtime_ms: metadata.birthtimeMs,
     })).digest("hex");
     const transaction = path.join(quarantine, "staging", token);
     fs.mkdirSync(transaction);

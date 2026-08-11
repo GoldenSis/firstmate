@@ -1305,6 +1305,60 @@ test_orphan_identity_evidence_requires_compromised_recovery() {
   pass "orphan identity evidence requires explicit compromised recovery"
 }
 
+test_complete_cache_temporaries_protect_publisher_identity() {
+  local rotate_home ensure_home relay channel old private cached temporary output code manifest
+  rotate_home=$(make_home complete-temporary-rotation)
+  old=$(run_keypair "$rotate_home" 2>/dev/null) || fail "temporary rotation setup failed"
+  private=$(jq -r '.private_key' "$(key_file "$rotate_home" "$rotate_home/xdg")")
+  relay="ws://127.0.0.1:1/complete-temporary-rotation"
+  channel=$(default_channel_id "$rotate_home")
+  cached=$(seed_replay_event "$rotate_home" "$relay" "$private" 1700000200 "$channel" complete-temporary) \
+    || fail "could not seed the complete temporary rotation fixture"
+  temporary="$cached.tmp"
+  mv "$cached" "$temporary"
+
+  output=$(run_keypair "$rotate_home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "plain rotation with a fresh complete cache temporary"
+  assert_contains "$output" "$temporary" \
+    "rotation ignored a complete cache temporary during its identity check"
+  [ "$(cat "$rotate_home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "rotation changed the identity despite a complete cache temporary"
+  assert_present "$temporary" "rotation removed a complete cache temporary without explicit disposition"
+
+  output=$(run_keypair "$rotate_home" --rotate --discard-pending-cache 2>&1)
+  code=$?
+  expect_code 0 "$code" "explicit rotation disposition for a complete cache temporary"
+  assert_absent "$temporary" "explicit rotation disposition left a complete cache temporary active"
+  manifest=$(grep -l 'pending-key-rotation' \
+    "$rotate_home/state/buzz-replay/_legacy-quarantine/manifests"/*.json 2>/dev/null | head -1)
+  [ -n "$manifest" ] || fail "explicit rotation disposition did not quarantine the complete temporary"
+
+  ensure_home=$(make_home complete-temporary-ensure)
+  old=$(run_keypair "$ensure_home" 2>/dev/null) || fail "temporary ensure setup failed"
+  private=$(jq -r '.private_key' "$(key_file "$ensure_home" "$ensure_home/xdg")")
+  relay="ws://127.0.0.1:1/complete-temporary-ensure"
+  channel=$(default_channel_id "$ensure_home")
+  cached=$(seed_replay_event "$ensure_home" "$relay" "$private" 1700000201 "$channel" complete-temporary) \
+    || fail "could not seed the complete temporary ensure fixture"
+  temporary="$cached.tmp"
+  mv "$cached" "$temporary"
+  rm -f -- "$(key_file "$ensure_home" "$ensure_home/xdg")" "$ensure_home/data/buzz-keypair.public"
+
+  output=$(run_keypair "$ensure_home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with a fresh complete cache temporary"
+  assert_contains "$output" "orphan identity evidence exists" \
+    "default ensure ignored a complete cache temporary"
+  assert_contains "$output" "$old" \
+    "default ensure did not recover publisher identity from a complete temporary"
+  assert_contains "$output" "$temporary" \
+    "default ensure did not name the complete temporary identity evidence"
+  assert_absent "$(key_file "$ensure_home" "$ensure_home/xdg")" \
+    "default ensure minted over a complete cache temporary"
+  pass "complete cache temporaries protect publisher identity before cleanup age"
+}
+
 test_rotation_compares_the_recorded_key_with_stored_private_material() {
   local home other first mismatched history output recovered code
   home=$(make_home rotate-mismatch)
@@ -1876,6 +1930,54 @@ test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine() {
   pass "legacy quarantine preserves publisher identity for orphan recovery"
 }
 
+test_orphan_gate_preserves_corrupt_partition_publisher_evidence() {
+  local home relay private publisher channel seeded replay corrupt_name corrupt_path manifest payload output code
+  home=$(make_home orphan-corrupt-partition-publisher)
+  publisher=$(run_keypair "$home" 2>/dev/null) || fail "corrupt partition publisher setup failed"
+  private=$(jq -r '.private_key' "$(key_file "$home" "$home/xdg")")
+  relay="ws://127.0.0.1:1/corrupt-partition-publisher"
+  channel=$(default_channel_id "$home")
+  seeded=$(seed_replay_event "$home" "$relay" "$private" 1700000202 "$channel" corrupt-partition-publisher) \
+    || fail "could not seed corrupt partition publisher evidence"
+  replay="$home/state/buzz-replay"
+  corrupt_name=$(printf '%064d' 7)
+  corrupt_path="$replay/$corrupt_name"
+  mv "$seeded" "$corrupt_path"
+  node -e '
+    import(process.argv[1]).then(({ migrateReplayCache }) => {
+      const result = migrateReplayCache(process.argv[2]);
+      if (result.legacy.length || result.endpoint.length) process.exitCode = 1;
+    });
+  ' "$ROOT/bin/fm-buzz-publish.mjs" "$replay" \
+    || fail "could not quarantine the partition-shaped signed payload"
+  manifest=$(find "$replay/_legacy-quarantine/manifests" -type f -name '*.json' -print \
+    | while IFS= read -r candidate; do
+        jq -e --arg publisher "$publisher" '.publisher_pubkey == $publisher and .corrupt_type == "regular-file"' \
+          "$candidate" >/dev/null 2>&1 && { printf '%s\n' "$candidate"; break; }
+      done)
+  [ -n "$manifest" ] || fail "corrupt partition quarantine dropped validated publisher metadata"
+  payload="$replay/_legacy-quarantine/$(jq -r '.payload_reference' "$manifest")"
+  assert_present "$payload" "corrupt partition manifest does not reference retained publisher evidence"
+  if ! jq '.publisher_pubkey = null' "$manifest" > "$manifest.tmp"; then
+    fail "could not rewrite the corrupt-partition manifest fixture"
+  fi
+  if ! mv "$manifest.tmp" "$manifest"; then
+    fail "could not simulate an older corrupt-partition manifest without publisher metadata"
+  fi
+  rm -f -- "$(key_file "$home" "$home/xdg")" "$home/data/buzz-keypair.public"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with corrupt-partition quarantine evidence"
+  assert_contains "$output" "orphan identity evidence exists" \
+    "the orphan gate ignored corrupt-partition quarantine evidence"
+  assert_contains "$output" "$publisher" \
+    "the orphan gate did not recover the publisher from the retained corrupt payload"
+  assert_absent "$(key_file "$home" "$home/xdg")" \
+    "default ensure minted over corrupt-partition publisher evidence"
+  pass "corrupt partition quarantine preserves validated publisher identity"
+}
+
 test_orphan_gate_validates_quarantine_payloads_without_filename_trust() {
   local home relay private publisher channel seeded flat replay manifest payload output code
   home=$(make_home orphan-quarantine-payload)
@@ -2277,6 +2379,7 @@ test_empty_relay_authority_registry_fails_closed
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable
 test_compromised_orphan_recovery_records_unverifiable_memberships
 test_orphan_identity_evidence_requires_compromised_recovery
+test_complete_cache_temporaries_protect_publisher_identity
 test_rotation_compares_the_recorded_key_with_stored_private_material
 test_rotation_detects_and_cleans_up_divergent_stores
 test_orphaned_public_record_requires_compromised_recovery
@@ -2293,6 +2396,7 @@ test_public_flag_fails_before_a_keypair_exists
 test_rotation_stages_the_replacement_before_clearing_the_outgoing_key
 test_orphan_gate_sees_legacy_replay_publisher_evidence
 test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine
+test_orphan_gate_preserves_corrupt_partition_publisher_evidence
 test_orphan_gate_validates_quarantine_payloads_without_filename_trust
 test_orphan_gate_fails_closed_on_unreadable_quarantine_payloads
 test_orphan_gate_includes_recoverable_quarantine_staging
