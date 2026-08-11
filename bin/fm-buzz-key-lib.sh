@@ -50,24 +50,29 @@
 FM_BUZZ_KEYCHAIN_SERVICE=firstmate-buzz
 
 # LOCK ORDERING
-# Three locks guard this adapter, and every holder takes them in this order and
+# Four locks guard this adapter, and every holder takes them in this order and
 # releases them in the reverse one. Anything else can deadlock publishing against
 # rotation, both of which need more than one of them.
 #
 #   1. fm_buzz_replay_transaction_lock  - the whole replay tree. Migration and
 #      quarantine walk paths no single channel owns, so they need it; publishing
 #      holds it only for that walk and drops it before the network.
-#   2. fm_buzz_replay_delivery_lock     - one endpoint-and-channel queue. Held
+#   2. fm_buzz_replay_delivery_intent   - one invocation entering a queue. It is
+#      registered under the whole-tree barrier and retained until delivery ends,
+#      so retirement sees publishers waiting behind an already-busy queue without
+#      forcing those waiters to convoy unrelated channels on the whole-tree lock.
+#   3. fm_buzz_replay_delivery_lock     - one endpoint-and-channel queue. Held
 #      across signing, caching, and delivery, which is the slow part. Scoping it
 #      per queue is the point: a channel whose relay is unreachable must not spend
 #      another channel's bounded acquisition deadline.
-#   3. fm_buzz_key_transaction_lock     - this home's key material. Rotation and
+#   4. fm_buzz_key_transaction_lock     - this home's key material. Rotation and
 #      the publisher's key capture are mutually exclusive, so a compromised
 #      rotation cannot withdraw an identity a delayed publish is about to sign as.
 #
-# Rotation takes all three, holding 1 for its whole run so no queue can appear
-# behind its back. Publishing takes 1, releases it, then takes 2 and 3 - dropping
-# a lower-numbered lock early is safe, re-taking one while holding a higher one is
+# Rotation holds 1 while it waits for every existing 2 and 3, so no invocation can
+# appear behind its inventory. Publishing takes 1 and 2, releases 1 before waiting
+# for 3, then takes 4 only through signing and durable caching. Dropping a
+# lower-numbered lock early is safe; re-taking one while holding a higher one is
 # not.
 fm_buzz_key_transaction_lock() {  # <data directory>
   local data=${1:?data directory required}
@@ -77,6 +82,15 @@ fm_buzz_key_transaction_lock() {  # <data directory>
 fm_buzz_replay_transaction_lock() {  # <state directory>
   local state=${1:?state directory required}
   printf '%s/.buzz-replay-publish.lock\n' "$state"
+}
+
+fm_buzz_replay_delivery_intent() {  # <state directory> <normalized relay> <channel id> <pid>
+  local state=${1:?state directory required} relay=${2:?normalized relay required}
+  local channel=${3:?channel id required} owner=${4:?owner pid required} digest
+  digest=$(printf '%s\n%s' "$relay" "$channel" | fm_buzz_key_sha256) || return 1
+  [ -n "$digest" ] || return 1
+  case $owner in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s/.buzz-replay-intent-%s-%s.lock\n' "$state" "$digest" "$owner"
 }
 
 # The digest covers the complete normalized endpoint AND the channel id, matching
@@ -180,12 +194,18 @@ fm_buzz_key_load_keychain() {
 # Print the fallback private key. Return 1 when the file is absent, and 3 when it
 # exists but cannot be read as a key.
 fm_buzz_key_load_file() {
-  local home=${1:?home required} file value
+  local home=${1:?home required} file value mode
   file=$(fm_buzz_key_fallback_file "$home") || return 1
   if [ ! -e "$file" ] && [ ! -L "$file" ]; then
     return 1
   fi
-  [ -f "$file" ] || return 3
+  [ ! -L "$file" ] && [ -f "$file" ] || return 3
+  if [ "$(uname -s)" = "Darwin" ]; then
+    mode=$(stat -f '%Lp' "$file" 2>/dev/null) || return 3
+  else
+    mode=$(stat -c '%a' "$file" 2>/dev/null) || return 3
+  fi
+  [ "$mode" = "600" ] || return 3
   value=$(sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p' "$file") || return 3
   [ -n "$value" ] || return 3
   [ "${#value}" -eq 64 ] || return 3

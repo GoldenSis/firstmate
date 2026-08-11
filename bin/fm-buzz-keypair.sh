@@ -204,6 +204,7 @@ fi
 KEYPAIR_LOCK=""
 PUBLISH_LOCK=""
 DELIVERY_LOCKS=()
+DELIVERY_INTENT_LOCKS=()
 release_keypair_lock() {
   if [ -n "$KEYPAIR_LOCK" ]; then
     fm_lock_release "$KEYPAIR_LOCK"
@@ -215,6 +216,13 @@ release_keypair_lock() {
       fm_lock_release "${DELIVERY_LOCKS[$index]}"
     done
     DELIVERY_LOCKS=()
+  fi
+  if [ "${#DELIVERY_INTENT_LOCKS[@]}" -gt 0 ]; then
+    local intent_index
+    for ((intent_index=${#DELIVERY_INTENT_LOCKS[@]}-1; intent_index>=0; intent_index--)); do
+      fm_lock_release "${DELIVERY_INTENT_LOCKS[$intent_index]}"
+    done
+    DELIVERY_INTENT_LOCKS=()
   fi
   if [ -n "$PUBLISH_LOCK" ]; then
     fm_lock_release "$PUBLISH_LOCK"
@@ -247,6 +255,13 @@ if [ "$PUBLIC_ONLY" -eq 0 ]; then
   }
   fm_lock_acquire_wait "$PUBLISH_LOCK"
   if [ "$ROTATE" -eq 1 ] || [ "$TARGET_FORGETTING" -eq 1 ] || [ "$RELAY_IDENTITY_FORGETTING" -eq 1 ]; then
+    for delivery_intent in "$STATE"/.buzz-replay-intent-*.lock; do
+      if [ ! -e "$delivery_intent" ] && [ ! -L "$delivery_intent" ]; then
+        continue
+      fi
+      fm_lock_acquire_wait "$delivery_intent"
+      DELIVERY_INTENT_LOCKS+=("$delivery_intent")
+    done
     for delivery_lock in "$STATE"/.buzz-replay-delivery-*.lock; do
       if [ ! -e "$delivery_lock" ] && [ ! -L "$delivery_lock" ]; then
         continue

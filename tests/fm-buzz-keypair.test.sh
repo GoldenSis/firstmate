@@ -86,6 +86,38 @@ test_keypair_is_idempotent_and_never_prints_the_private_key() {
   pass "keypair generation is idempotent and never prints the private key"
 }
 
+test_fallback_key_load_requires_private_regular_custody() {
+  local home keyfile stored moved output code
+  home=$(make_home fallback-key-custody)
+  run_keypair "$home" >/dev/null 2>&1 || fail "fallback custody setup failed"
+  keyfile=$(key_file "$home" "$home/xdg")
+  stored=$(cat "$keyfile")
+
+  chmod 0644 "$keyfile"
+  output=$(run_keypair "$home" --public 2>&1)
+  code=$?
+  expect_code 1 "$code" "a group/world-readable fallback private key"
+  assert_contains "$output" "publishing key file" \
+    "a group/world-readable fallback key was not diagnosed"
+  assert_contains "$output" "could not be read" \
+    "a group/world-readable fallback key failure was ambiguous"
+  [ "$(cat "$keyfile")" = "$stored" ] || fail "fallback custody refusal changed the key"
+
+  chmod 0600 "$keyfile"
+  moved="$keyfile.regular"
+  mv "$keyfile" "$moved"
+  ln -s "$moved" "$keyfile"
+  output=$(run_keypair "$home" --public 2>&1)
+  code=$?
+  expect_code 1 "$code" "a symbolic-link fallback private key"
+  assert_contains "$output" "publishing key file" \
+    "a symbolic-link fallback key was not diagnosed"
+  assert_contains "$output" "could not be read" \
+    "a symbolic-link fallback key failure was ambiguous"
+  [ "$(cat "$moved")" = "$stored" ] || fail "fallback symlink refusal changed the key"
+  pass "fallback key loading requires a private regular file"
+}
+
 # --- one key per home, in the store that cannot enforce it ------------------
 
 test_two_homes_sharing_one_xdg_get_separate_keys() {
@@ -1786,6 +1818,98 @@ test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine() {
   pass "legacy quarantine preserves publisher identity for orphan recovery"
 }
 
+test_orphan_gate_validates_quarantine_payloads_without_filename_trust() {
+  local home relay private publisher channel seeded flat replay manifest payload output code
+  home=$(make_home orphan-quarantine-payload)
+  run_keypair "$home" >/dev/null 2>&1 || fail "quarantine payload setup failed"
+  relay="ws://127.0.0.1:1/quarantine-payload"
+  private=$(new_private_key) || fail "could not mint a quarantine payload publisher"
+  publisher=$(public_from_private "$private") || fail "could not derive the quarantine payload publisher"
+  channel=$(default_channel_id "$home")
+  seeded=$(seed_replay_event "$home" "$relay" "$private" 1700000000 "$channel" quarantine-payload) \
+    || fail "could not seed quarantine payload evidence"
+  replay="$home/state/buzz-replay"
+  flat="$replay/not-a-cache-filename.json"
+  mv "$seeded" "$flat"
+  node -e '
+    import(process.argv[1]).then(({ migrateReplayCache }) => {
+      const result = migrateReplayCache(process.argv[2]);
+      if (result.legacy.length || result.endpoint.length) process.exitCode = 1;
+    });
+  ' "$ROOT/bin/fm-buzz-publish.mjs" "$replay" \
+    || fail "could not quarantine the mismatched-filename payload"
+  manifest=$(find "$replay/_legacy-quarantine/manifests" -type f -name '*.json' -print | head -1)
+  [ -n "$manifest" ] || fail "mismatched-filename payload has no quarantine manifest"
+  payload="$replay/_legacy-quarantine/$(jq -r '.payload_reference' "$manifest")"
+  # shellcheck disable=SC2016
+  node -e '
+    const fs = require("fs");
+    const file = process.argv[1];
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    value.publisher_pubkey = null;
+    value.original_path = "not-a-cache-filename.json";
+    fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+  ' "$manifest"
+  rm -f -- "$(key_file "$home" "$home/xdg")" "$home/data/buzz-keypair.public"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with filename-independent quarantine evidence"
+  assert_contains "$output" "$publisher" \
+    "the orphan gate trusted a quarantine filename instead of the signed payload"
+  assert_contains "$output" "$payload" \
+    "the orphan gate did not name the signed quarantine payload"
+  assert_absent "$(key_file "$home" "$home/xdg")" \
+    "default ensure minted over filename-independent quarantine evidence"
+  pass "quarantine payload authorship does not depend on cache filenames"
+}
+
+test_orphan_gate_includes_recoverable_quarantine_staging() {
+  local home relay private publisher channel seeded replay token transaction origin output code
+  home=$(make_home orphan-quarantine-staging)
+  run_keypair "$home" >/dev/null 2>&1 || fail "quarantine staging setup failed"
+  relay="ws://127.0.0.1:1/quarantine-staging"
+  private=$(new_private_key) || fail "could not mint a quarantine staging publisher"
+  publisher=$(public_from_private "$private") || fail "could not derive the quarantine staging publisher"
+  channel=$(default_channel_id "$home")
+  seeded=$(seed_replay_event "$home" "$relay" "$private" 1700000000 "$channel" quarantine-staging) \
+    || fail "could not seed quarantine staging evidence"
+  replay="$home/state/buzz-replay"
+  token=$(printf '%s' quarantine-staging | shasum -a 256 | awk '{print $1}')
+  transaction="$replay/_legacy-quarantine/staging/$token"
+  origin="$transaction/origin.json"
+  mkdir -p "$transaction" "$replay/_legacy-quarantine/payloads"
+  mv "$seeded" "$transaction/source"
+  # shellcheck disable=SC2016
+  node -e '
+    const fs = require("fs");
+    const source = process.argv[1];
+    const origin = process.argv[2];
+    const token = process.argv[3];
+    const metadata = fs.statSync(source);
+    fs.writeFileSync(origin, `${JSON.stringify({
+      transaction_token: token,
+      payload_reference: `payloads/${token}.json`,
+      source_device: metadata.dev,
+      source_inode: metadata.ino,
+      publisher_pubkey: null,
+    }, null, 2)}\n`);
+  ' "$transaction/source" "$origin" "$token"
+  rm -f -- "$(key_file "$home" "$home/xdg")" "$home/data/buzz-keypair.public"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with staged quarantine identity evidence"
+  assert_contains "$output" "$publisher" \
+    "the orphan gate ignored the publisher in a recoverable staging transaction"
+  assert_contains "$output" "$transaction/source" \
+    "the orphan gate did not name the staged signed payload"
+  assert_present "$transaction/source" "read-only orphan inspection completed or removed staging"
+  assert_absent "$(key_file "$home" "$home/xdg")" \
+    "default ensure minted over staged quarantine identity evidence"
+  pass "recoverable quarantine staging remains visible to orphan inspection"
+}
+
 test_orphan_identity_inspection_does_not_mutate_endpoint_replay() {
   local home relay channel seeded endpoint_file before output code
   home=$(make_home orphan-read-only-replay)
@@ -2011,6 +2135,7 @@ EOF
 
 test_bip340_official_vectors
 test_keypair_is_idempotent_and_never_prints_the_private_key
+test_fallback_key_load_requires_private_regular_custody
 test_two_homes_sharing_one_xdg_get_separate_keys
 test_rotation_replaces_the_key_in_whichever_store_holds_it
 test_a_compromised_rotation_does_not_keep_the_retired_key
@@ -2047,6 +2172,8 @@ test_public_flag_fails_before_a_keypair_exists
 test_rotation_stages_the_replacement_before_clearing_the_outgoing_key
 test_orphan_gate_sees_legacy_replay_publisher_evidence
 test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine
+test_orphan_gate_validates_quarantine_payloads_without_filename_trust
+test_orphan_gate_includes_recoverable_quarantine_staging
 test_orphan_identity_inspection_does_not_mutate_endpoint_replay
 test_publish_signing_is_serialized_with_compromised_rotation
 test_target_and_relay_retirement_wait_for_inflight_delivery

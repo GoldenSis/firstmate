@@ -43,10 +43,16 @@
 // into payloads/<token>.json, while corrupt cache nodes remain under
 // corrupt/<token>/entry and invalid recovery residue remains under
 // recovery-corrupt/<token>.invalid.
-// A manifest at manifests/<token>.json identifies a record by original_path,
-// legacy_host, payload_reference, source device and inode, corrupt_type,
-// quarantine_reason, and publisher_pubkey, and records original timestamps,
-// quarantine time, plus observed content evidence when the payload is readable.
+// Every manifests/<token>.json variant requires original_path,
+// payload_reference, original_timestamps, and quarantine_timestamp.
+// Regular-entry manifests additionally require legacy_host, source_device,
+// source_inode, observed content hash and size, quarantine_reason, and the
+// validated publisher_pubkey when the payload contains a signed event.
+// Corrupt-node manifests additionally require corrupt_type and may carry a
+// content hash when their retained node is readable.
+// Recovery-residue manifests additionally require source_device, source_inode,
+// corrupt_type, and recovery_error, while legacy_host, quarantine_reason, and
+// publisher_pubkey are not part of that variant.
 // A lowercase SHA-256 token binds stable source provenance: original path,
 // device, inode, and birthtime for regular files, or mode for corrupt partition
 // nodes, without using access or link-mutated change time.
@@ -72,6 +78,7 @@ import {
   unlinkSync,
   renameSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -299,10 +306,7 @@ function cacheRenameSync(source, destination) {
       path.basename(resolvedDestination),
     ));
   } else {
-    withPinnedCacheDirectory(destinationParent, () => linkSync(
-      resolvedSource,
-      path.basename(resolvedDestination),
-    ));
+    cacheLinkAcrossPinnedDirectories(resolvedSource, resolvedDestination);
   }
   let destinationMetadata;
   try {
@@ -340,6 +344,45 @@ function cacheRenameSync(source, destination) {
     throw new Error("cross-directory cache move source identity changed before removal");
   }
   cacheUnlinkSync(resolvedSource);
+}
+
+const DIRECTORY_RELATIVE_LINK = String.raw`
+import os
+import sys
+
+os.link(sys.argv[1], sys.argv[2], src_dir_fd=3, dst_dir_fd=4, follow_symlinks=False)
+`;
+
+function cacheLinkAcrossPinnedDirectories(source, destination) {
+  const resolvedSource = path.resolve(source);
+  const resolvedDestination = path.resolve(destination);
+  const sourceParent = path.dirname(resolvedSource);
+  const destinationParent = path.dirname(resolvedDestination);
+  const sourcePin = assertCacheDirectory(sourceParent);
+  const destinationPin = assertCacheDirectory(destinationParent);
+  const result = spawnSync(
+    "python3",
+    [
+      "-c",
+      DIRECTORY_RELATIVE_LINK,
+      path.basename(resolvedSource),
+      path.basename(resolvedDestination),
+    ],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe", sourcePin.descriptor, destinationPin.descriptor],
+    },
+  );
+  if (result.error) {
+    throw new Error(`directory-relative cache link is unavailable: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    const detail = result.stderr.trim();
+    throw new Error(`directory-relative cache link failed${detail === "" ? "" : `: ${detail}`}`);
+  }
+  assertReplayRoot();
+  assertCacheDirectory(sourceParent);
+  assertCacheDirectory(destinationParent);
 }
 
 function cacheUnlinkSync(file) {
@@ -381,7 +424,7 @@ function cacheReaddirSync(directory) {
   return withPinnedCacheDirectory(directory, () => readdirSync("."));
 }
 
-function cachedEventFromFrame(raw, entry) {
+function signedEventFromFrame(raw) {
   let frame;
   try {
     frame = JSON.parse(raw);
@@ -401,13 +444,18 @@ function cachedEventFromFrame(raw, entry) {
   if (event.kind !== KIND_STREAM_MESSAGE) throw new Error("unexpected event kind");
   if (!validation.validTags) throw new Error("malformed event tags");
   if (!validation.validContent) throw new Error("malformed event content");
-  if (event.id !== entry.id || event.created_at !== entry.createdAt) {
-    throw new Error("cache filename does not match the event");
-  }
   if (validation.idError) throw new Error("event id could not be computed");
   if (!validation.idMatches) throw new Error("event id does not match its content");
   if (validation.signatureError) throw new Error("event signature could not be checked");
   if (!validation.signatureValid) throw new Error("invalid event signature");
+  return event;
+}
+
+function cachedEventFromFrame(raw, entry) {
+  const event = signedEventFromFrame(raw);
+  if (event.id !== entry.id || event.created_at !== entry.createdAt) {
+    throw new Error("cache filename does not match the event");
+  }
   return event;
 }
 
@@ -432,6 +480,14 @@ function validatedCachedPublisher(file) {
   if (entry === null) return null;
   try {
     return cachedEventFromFrame(readRegularFile(file).bytes.toString("utf8"), entry).pubkey;
+  } catch {
+    return null;
+  }
+}
+
+function validatedSignedPublisher(file) {
+  try {
+    return signedEventFromFrame(readRegularFile(file).bytes.toString("utf8")).pubkey;
   } catch {
     return null;
   }
@@ -485,85 +541,94 @@ function relayChannelCacheDirectory(replayDir, relay, channelId) {
   return path.join(relayCacheDirectory(replayDir, relay), channelId);
 }
 
-function assertNoSymlinkPathComponents(candidate) {
-  const resolved = path.resolve(candidate);
-  const root = path.parse(resolved).root;
-  let current = root;
-  for (const name of path.relative(root, resolved).split(path.sep).filter(Boolean)) {
-    current = path.join(current, name);
-    let metadata;
-    try {
-      metadata = lstatSync(current);
-    } catch (error) {
-      if (error.code === "ENOENT") return;
-      throw error;
+const DIRECTORY_RELATIVE_ROOT_PREPARATION = String.raw`
+import json
+import os
+import stat
+import sys
+
+descriptor = 3
+try:
+    for name in sys.argv[1:]:
+        try:
+            metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            os.mkdir(name, 0o700, dir_fd=descriptor)
+            metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(f"replay cache ancestor {name} is not a regular directory")
+        child = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=descriptor,
+        )
+        if descriptor != 3:
+            os.close(descriptor)
+        descriptor = child
+    metadata = os.fstat(descriptor)
+    print(json.dumps({"dev": metadata.st_dev, "ino": metadata.st_ino}))
+finally:
+    if descriptor != 3:
+        os.close(descriptor)
+`;
+
+function prepareReplayRootRelativeToPinnedRoot(requested) {
+  const filesystemRoot = path.parse(requested).root;
+  const rootDescriptor = openSync(
+    filesystemRoot,
+    constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const components = path.relative(filesystemRoot, requested).split(path.sep).filter(Boolean);
+    const result = spawnSync(
+      "python3",
+      ["-c", DIRECTORY_RELATIVE_ROOT_PREPARATION, ...components],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe", rootDescriptor] },
+    );
+    if (result.error) {
+      throw new Error(`directory-relative replay cache preparation is unavailable: ${result.error.message}`);
     }
-    if (metadata.isSymbolicLink() || (!metadata.isDirectory() && current !== resolved)) {
-      throw new Error(`replay cache ancestor ${current} is not a regular directory`);
+    if (result.status !== 0) {
+      const detail = result.stderr.trim();
+      throw new Error(detail === "" ? "could not prepare replay cache root safely" : detail);
     }
+    const identity = JSON.parse(result.stdout);
+    if (!Number.isSafeInteger(identity.dev) || !Number.isSafeInteger(identity.ino)) {
+      throw new Error("directory-relative replay cache preparation returned an invalid identity");
+    }
+    return identity;
+  } finally {
+    closeSync(rootDescriptor);
   }
 }
 
 function prepareCacheRoot(replayDir) {
   const requested = path.resolve(replayDir);
-  assertNoSymlinkPathComponents(requested);
-  const missing = [];
-  let ancestor = requested;
-  for (;;) {
-    try {
-      const metadata = lstatSync(ancestor);
-      if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-        throw new Error(`replay cache ancestor ${ancestor} is not a regular directory`);
-      }
-      break;
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-      const parent = path.dirname(ancestor);
-      if (parent === ancestor) throw error;
-      missing.push(path.basename(ancestor));
-      ancestor = parent;
-    }
-  }
-  for (const name of missing.reverse()) {
-    ancestor = path.join(ancestor, name);
-    try {
-      mkdirSync(ancestor, { mode: 0o700 });
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-    }
-    const metadata = lstatSync(ancestor);
-    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-      throw new Error(`replay cache ancestor ${ancestor} is not a regular directory`);
-    }
-  }
-  assertNoSymlinkPathComponents(requested);
+  const expected = prepareReplayRootRelativeToPinnedRoot(requested);
   const before = lstatSync(requested);
   if (before.isSymbolicLink() || !before.isDirectory()) {
     throw new Error(`replay cache path ${replayDir} is not a regular directory`);
   }
-  const resolved = realpathSync(requested);
-  const after = lstatSync(requested);
-  if (
-    after.isSymbolicLink() ||
-    !after.isDirectory() ||
-    before.dev !== after.dev ||
-    before.ino !== after.ino
-  ) {
-    throw new Error("replay cache root identity changed while it was being opened");
-  }
   const descriptor = openSync(
-    resolved,
+    requested,
     constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
   );
   const pinned = fstatSync(descriptor);
-  if (!pinned.isDirectory() || pinned.dev !== after.dev || pinned.ino !== after.ino) {
+  if (
+    !pinned.isDirectory() ||
+    pinned.dev !== expected.dev ||
+    pinned.ino !== expected.ino ||
+    before.dev !== expected.dev ||
+    before.ino !== expected.ino ||
+    realpathSync(requested) !== requested
+  ) {
     closeSync(descriptor);
     throw new Error("replay cache root identity changed while it was being pinned");
   }
-  replayRootPin = { path: resolved, descriptor, dev: pinned.dev, ino: pinned.ino };
-  replayDirectoryPins.set(resolved, replayRootPin);
+  replayRootPin = { path: requested, descriptor, dev: pinned.dev, ino: pinned.ino };
+  replayDirectoryPins.set(requested, replayRootPin);
   assertReplayRoot();
-  return resolved;
+  return requested;
 }
 
 function prepareCacheDirectory(replayDir, name) {
@@ -1312,7 +1377,7 @@ function quarantineLegacyEntries(replayDir) {
         stagingDir,
         candidate.file,
         candidate.legacyHost,
-        { publisherPubkey: validatedCachedPublisher(candidate.file) },
+        { publisherPubkey: validatedSignedPublisher(candidate.file) },
       );
     } catch (error) {
       log(`could not quarantine legacy cache entry ${candidate.file}: ${error.message}`);
@@ -1556,6 +1621,77 @@ function legacyReplayPublisherEntries(cacheRoot) {
   return evidence;
 }
 
+function stagedQuarantinePublisherEntries(quarantineDir) {
+  const stagingDir = path.join(quarantineDir, "staging");
+  let metadata;
+  try {
+    metadata = cacheLstatSync(stagingDir);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`legacy quarantine staging path ${stagingDir} is not a regular directory`);
+  }
+  pinCacheDirectory(stagingDir);
+  const payloadsDir = path.join(quarantineDir, "payloads");
+  const evidence = [];
+  for (const name of cacheReaddirSync(stagingDir)) {
+    if (!QUARANTINE_TOKEN.test(name)) {
+      throw new Error(`legacy quarantine staging transaction ${name} has a noncanonical name`);
+    }
+    const transactionDir = path.join(stagingDir, name);
+    metadata = cacheLstatSync(transactionDir);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new Error(`legacy quarantine staging transaction ${transactionDir} is not a regular directory`);
+    }
+    pinCacheDirectory(transactionDir);
+    const originFile = path.join(transactionDir, "origin.json");
+    const sourceFile = path.join(transactionDir, "source");
+    let origin = null;
+    let payload = null;
+    try {
+      origin = readQuarantineManifest(originFile);
+      ({ payload } = stagedLegacyOrigin(origin, quarantineDir, payloadsDir, transactionDir));
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        throw new Error(`could not read legacy quarantine staging record ${originFile}: ${error.message}`);
+      }
+    }
+    const recorded = origin?.publisher_pubkey;
+    if (recorded !== null && recorded !== undefined) {
+      if (typeof recorded !== "string" || !CACHE_PARTITION.test(recorded)) {
+        throw new Error(`legacy quarantine staging record ${originFile} has an invalid publisher identity`);
+      }
+      evidence.push({ path: originFile, publisherPubkey: recorded });
+      continue;
+    }
+    let candidate = sourceFile;
+    try {
+      metadata = cacheLstatSync(sourceFile);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      candidate = payload;
+    }
+    if (candidate === null) continue;
+    if (candidate === payload) {
+      try {
+        metadata = cacheLstatSync(payloadsDir);
+      } catch (error) {
+        if (error.code === "ENOENT") continue;
+        throw error;
+      }
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+        throw new Error(`legacy quarantine payload path ${payloadsDir} is not a regular directory`);
+      }
+      pinCacheDirectory(payloadsDir);
+    }
+    const publisherPubkey = validatedSignedPublisher(candidate);
+    if (publisherPubkey !== null) evidence.push({ path: candidate, publisherPubkey });
+  }
+  return evidence;
+}
+
 function quarantinedReplayPublisherEntries(cacheRoot) {
   const quarantineDir = path.join(cacheRoot, LEGACY_QUARANTINE);
   let metadata;
@@ -1569,18 +1705,18 @@ function quarantinedReplayPublisherEntries(cacheRoot) {
     throw new Error(`legacy quarantine path ${quarantineDir} is not a regular directory`);
   }
   pinCacheDirectory(quarantineDir);
+  const evidence = stagedQuarantinePublisherEntries(quarantineDir);
   const manifestsDir = path.join(quarantineDir, "manifests");
   try {
     metadata = cacheLstatSync(manifestsDir);
   } catch (error) {
-    if (error.code === "ENOENT") return [];
+    if (error.code === "ENOENT") return evidence;
     throw error;
   }
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
     throw new Error(`legacy quarantine manifest path ${manifestsDir} is not a regular directory`);
   }
   pinCacheDirectory(manifestsDir);
-  const evidence = [];
   for (const name of cacheReaddirSync(manifestsDir).filter((candidate) => candidate.endsWith(".json"))) {
     const match = /^([0-9a-f]{64})\.json$/.exec(name);
     if (!match) throw new Error(`legacy quarantine manifest ${name} has a noncanonical name`);
@@ -1613,14 +1749,8 @@ function quarantinedReplayPublisherEntries(cacheRoot) {
       throw new Error(`legacy quarantine payload path ${payloadsDir} is not a regular directory`);
     }
     pinCacheDirectory(payloadsDir);
-    const entry = cacheEntryDescriptor(path.join(path.dirname(payload), path.basename(manifest.original_path)));
-    if (entry === null) continue;
-    try {
-      const event = cachedEventFromFrame(readRegularFile(payload).bytes.toString("utf8"), entry);
-      evidence.push({ path: payload, publisherPubkey: event.pubkey });
-    } catch {
-      continue;
-    }
+    const publisherPubkey = validatedSignedPublisher(payload);
+    if (publisherPubkey !== null) evidence.push({ path: payload, publisherPubkey });
   }
   return evidence;
 }

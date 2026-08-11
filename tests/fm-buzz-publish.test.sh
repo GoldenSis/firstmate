@@ -332,7 +332,7 @@ EOF
 }
 
 test_channel_delivery_locks_do_not_share_one_home_wide_queue() {
-  local home relay port channel_a channel_b lock_a lock_b holder output
+  local home relay port channel_a channel_b lock_a lock_b holder output waiter waiter_output waited intent
   home=$(make_home channel-delivery-locks)
   run_keypair "$home" >/dev/null 2>&1 || fail "delivery lock keypair setup failed"
   read -r STUB_PID relay <<EOF
@@ -355,6 +355,27 @@ EOF
     "channel B could not publish while channel A's queue was held"
   assert_not_contains "$output" "could not acquire" \
     "channel B waited on ownership channel A was holding"
+
+  waiter_output="$home/channel-a-waiter.out"
+  (printf '%s' '{"schema":"fm-bearings.v1","note":"delivery-lock-a-waiter"}' \
+    | FM_BUZZ_LOCK_TIMEOUT_S=2 run_publish "$home" "$relay" --channel-label delivery-lock-a) \
+    > "$waiter_output" 2>&1 &
+  waiter=$!
+  waited=0
+  intent=""
+  while [ -z "$intent" ] && [ "$waited" -lt 200 ]; do
+    intent=$(find "$home/state" -maxdepth 1 -name '.buzz-replay-intent-*.lock' -print -quit 2>/dev/null)
+    [ -n "$intent" ] || sleep 0.01
+    waited=$((waited + 1))
+  done
+  [ -n "$intent" ] || fail "the channel-A waiter did not register delivery intent"
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"delivery-lock-b-during-a-wait"}' \
+    | FM_BUZZ_LOCK_TIMEOUT_S=1 run_publish "$home" "$relay" --channel-label delivery-lock-b 2>&1)
+  assert_contains "$output" "delivered=1" \
+    "a channel-A waiter convoyed channel B on whole-tree ownership"
+  assert_not_contains "$output" "replay cache ownership" \
+    "a channel-A waiter retained whole-tree ownership"
+  wait "$waiter" || fail "the channel-A waiter violated fire-and-forget"
 
   output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"delivery-lock-a"}' \
     | FM_BUZZ_LOCK_TIMEOUT_S=1 run_publish "$home" "$relay" --channel-label delivery-lock-a 2>&1)

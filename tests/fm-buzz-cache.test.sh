@@ -551,19 +551,20 @@ test_invalid_quarantine_residue_retries_use_link_stable_identity() {
   cat > "$preload" <<'EOF'
 import { createRequire, syncBuiltinESMExports } from "node:module";
 const fs = createRequire(import.meta.url)("node:fs");
-const originalLinkSync = fs.linkSync;
-fs.linkSync = function guardedLinkSync(source, destination, ...args) {
+const childProcess = createRequire(import.meta.url)("node:child_process");
+const originalSpawnSync = childProcess.spawnSync;
+childProcess.spawnSync = function guardedSpawnSync(command, args, options) {
+  const result = originalSpawnSync.call(childProcess, command, args, options);
   if (
-    String(destination).endsWith(".invalid") &&
+    command === "python3" &&
+    String(args?.[1]).includes("os.link") &&
+    String(args?.[3]).endsWith(".invalid") &&
     !fs.existsSync(process.env.FM_TEST_RESIDUE_SENTINEL)
   ) {
-    originalLinkSync.call(fs, source, destination, ...args);
     fs.writeFileSync(process.env.FM_TEST_RESIDUE_SENTINEL, "interrupted\n");
-    const error = new Error("simulated residue hard-link interruption");
-    error.code = "EACCES";
-    throw error;
+    return { ...result, status: 1, stderr: "simulated residue hard-link interruption\n" };
   }
-  return originalLinkSync.call(fs, source, destination, ...args);
+  return result;
 };
 syncBuiltinESMExports();
 EOF
@@ -960,21 +961,20 @@ test_cross_directory_quarantine_claims_cannot_follow_swapped_sources() {
   printf '%s' '["EVENT",{"legacy":"original"}]' > "$legacy/1700000000-$(printf '%064d' 6).json"
   printf '%s' 'outside-must-remain' > "$outside/1700000000-$(printf '%064d' 6).json"
   cat > "$preload" <<'EOF'
-import path from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 
 const fs = createRequire(import.meta.url)("node:fs");
-const originalLinkSync = fs.linkSync;
+const childProcess = createRequire(import.meta.url)("node:child_process");
+const originalSpawnSync = childProcess.spawnSync;
 let swapped = false;
-fs.linkSync = function guardedLinkSync(source, destination, ...args) {
-  const absoluteSource = path.resolve(String(source));
-  if (!swapped && path.basename(String(destination)) === "source") {
+childProcess.spawnSync = function guardedSpawnSync(command, args, options) {
+  if (!swapped && command === "python3" && String(args?.[1]).includes("os.link")) {
     swapped = true;
-    const sourceParent = path.dirname(absoluteSource);
+    const sourceParent = process.env.FM_TEST_CACHE_SOURCE;
     fs.renameSync(sourceParent, process.env.FM_TEST_CACHE_HELD);
     fs.symlinkSync(process.env.FM_TEST_CACHE_OUTSIDE, sourceParent, "dir");
   }
-  return originalLinkSync.call(fs, source, destination, ...args);
+  return originalSpawnSync.call(childProcess, command, args, options);
 };
 syncBuiltinESMExports();
 EOF
@@ -982,8 +982,9 @@ EOF
     | NODE_OPTIONS="--import=$preload" \
       FM_TEST_CACHE_HELD="$held" \
       FM_TEST_CACHE_OUTSIDE="$outside" \
+      FM_TEST_CACHE_SOURCE="$legacy" \
       run_publish "$home" ws://127.0.0.1:1 2>&1)
-  assert_contains "$output" "unexpected source identity" \
+  assert_contains "$output" "cache directory identity changed" \
     "a swapped cross-directory source was not rejected"
   assert_present "$outside/1700000000-$(printf '%064d' 6).json" \
     "quarantine moved a swapped external source into the replay cache"
@@ -992,6 +993,66 @@ EOF
   assert_present "$held/1700000000-$(printf '%064d' 6).json" \
     "quarantine lost the originally claimed legacy inode"
   pass "cross-directory quarantine claims reject swapped source paths"
+}
+
+test_replay_root_creation_rejects_an_ancestor_swap_before_pinning() {
+  local home replay state held outside preload swap_log output code
+  home=$(make_home replay-root-ancestor-swap)
+  state="$home/state"
+  replay="$state/buzz-replay"
+  held="$home/held-state"
+  outside="$home/outside-state"
+  preload="$home/replay-root-ancestor-swap.mjs"
+  swap_log="$home/replay-root-ancestor-swap.log"
+  mkdir -p "$outside/buzz-replay"
+  cat > "$preload" <<'EOF'
+import { createRequire, syncBuiltinESMExports } from "node:module";
+
+const fs = createRequire(import.meta.url)("node:fs");
+const childProcess = createRequire(import.meta.url)("node:child_process");
+const originalSpawnSync = childProcess.spawnSync;
+let swapped = false;
+childProcess.spawnSync = function guardedSpawnSync(command, args, options) {
+  const result = originalSpawnSync.call(childProcess, command, args, options);
+  if (!swapped && command === "python3" && String(args?.[1]).includes("replay cache ancestor")) {
+    swapped = true;
+    fs.renameSync(process.env.FM_TEST_CACHE_STATE, process.env.FM_TEST_CACHE_HELD);
+    fs.symlinkSync(process.env.FM_TEST_CACHE_OUTSIDE, process.env.FM_TEST_CACHE_STATE, "dir");
+    fs.writeFileSync(process.env.FM_TEST_CACHE_SWAP_LOG, "swapped\n");
+  }
+  return result;
+};
+syncBuiltinESMExports();
+EOF
+  output=$(NODE_OPTIONS="--import=$preload" \
+    FM_TEST_CACHE_STATE="$state" \
+    FM_TEST_CACHE_HELD="$held" \
+    FM_TEST_CACHE_OUTSIDE="$outside" \
+    FM_TEST_CACHE_SWAP_LOG="$swap_log" \
+    node -e '
+      import(process.argv[1]).then(({ migrateReplayCache }) => migrateReplayCache(process.argv[2]));
+    ' "$ROOT/bin/fm-buzz-publish.mjs" "$replay" 2>&1)
+  code=$?
+  expect_code 1 "$code" "a replay-root ancestor swap during safe creation"
+  assert_present "$swap_log" "the replay-root ancestor swap fixture did not run"
+  assert_contains "$output" "replay cache root identity changed" \
+    "an ancestor swap was not rejected before the replay root was pinned"
+  [ -z "$(find "$outside/buzz-replay" -mindepth 1 -print -quit)" ] \
+    || fail "an ancestor swap redirected replay mutation outside the requested boundary"
+  assert_present "$held/buzz-replay" "the safely created replay root was not retained"
+  pass "replay-root creation stays bound to pinned ancestor handles"
+}
+
+test_quarantine_header_defines_each_manifest_variant() {
+  assert_grep 'Every manifests/<token>.json variant requires' "$ROOT/bin/fm-buzz-publish.mjs" \
+    "the quarantine header does not define common manifest fields"
+  assert_grep 'Regular-entry manifests additionally require' "$ROOT/bin/fm-buzz-publish.mjs" \
+    "the quarantine header does not define regular-entry fields"
+  assert_grep 'Corrupt-node manifests additionally require' "$ROOT/bin/fm-buzz-publish.mjs" \
+    "the quarantine header does not define corrupt-node fields"
+  assert_grep 'Recovery-residue manifests additionally require' "$ROOT/bin/fm-buzz-publish.mjs" \
+    "the quarantine header does not define recovery-residue fields"
+  pass "the quarantine producer documents each manifest variant"
 }
 
 test_cross_directory_quarantine_directory_moves_pin_both_parents() {
@@ -1353,9 +1414,11 @@ test_cache_limit_one_preserves_the_pending_event
 test_concurrent_publishers_serialize_the_cache_lifecycle
 test_replay_cache_rejects_symlink_boundaries
 test_replay_cache_pins_the_root_before_mutation
+test_replay_root_creation_rejects_an_ancestor_swap_before_pinning
 test_replay_cache_pins_descendant_directories
 test_cross_directory_quarantine_claims_cannot_follow_swapped_sources
 test_cross_directory_quarantine_directory_moves_pin_both_parents
+test_quarantine_header_defines_each_manifest_variant
 test_partition_shaped_special_nodes_are_quarantined_and_unblocked
 test_replay_cache_never_reads_non_regular_entries
 test_relay_timeout_must_fit_the_node_timer_range

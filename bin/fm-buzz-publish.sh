@@ -112,6 +112,7 @@ log() {
 STDIN_SPOOL=""
 STDIN_READER=""
 PUBLISH_LOCK=""
+DELIVERY_INTENT_LOCK=""
 DELIVERY_LOCK=""
 KEYPAIR_LOCK=""
 PUBLISH_INTERRUPTED=0
@@ -132,6 +133,10 @@ drop_stdin_spool() {
   if [ -n "$DELIVERY_LOCK" ]; then
     fm_lock_release "$DELIVERY_LOCK"
     DELIVERY_LOCK=""
+  fi
+  if [ -n "$DELIVERY_INTENT_LOCK" ]; then
+    fm_lock_release "$DELIVERY_INTENT_LOCK"
+    DELIVERY_INTENT_LOCK=""
   fi
   if [ -n "$PUBLISH_LOCK" ]; then
     fm_lock_release "$PUBLISH_LOCK"
@@ -366,6 +371,18 @@ publish() {
     drop_stdin_spool
     return 1
   }
+  DELIVERY_INTENT_LOCK=$(fm_buzz_replay_delivery_intent "$STATE" "$normalized_relay" "$channel" "$$") || {
+    log "could not resolve this queue's delivery intent"
+    drop_stdin_spool
+    return 1
+  }
+  if ! fm_lock_try_acquire "$DELIVERY_INTENT_LOCK"; then
+    log "could not register this queue's delivery intent"
+    drop_stdin_spool
+    return 1
+  fi
+  fm_lock_release "$PUBLISH_LOCK"
+  PUBLISH_LOCK=""
   if [ -n "${FM_TEST_BUZZ_BEFORE_DELIVERY_LOCK_READY:-}" ]; then
     : > "$FM_TEST_BUZZ_BEFORE_DELIVERY_LOCK_READY"
     while [ ! -e "${FM_TEST_BUZZ_BEFORE_DELIVERY_LOCK_RELEASE:-}" ]; do
@@ -384,8 +401,6 @@ publish() {
     drop_stdin_spool
     return 1
   fi
-  fm_lock_release "$PUBLISH_LOCK"
-  PUBLISH_LOCK=""
 
   mkdir -p "$DATA" 2>/dev/null || {
     log "could not create $DATA"
@@ -471,6 +486,8 @@ publish() {
   rc=$?
   fm_lock_release "$DELIVERY_LOCK"
   DELIVERY_LOCK=""
+  fm_lock_release "$DELIVERY_INTENT_LOCK"
+  DELIVERY_INTENT_LOCK=""
   drop_stdin_spool
   return "$rc"
 }
