@@ -419,6 +419,7 @@ FM_BUZZ_MAX_CACHE=100               # positive-integer replay-cache cap before t
 FM_BUZZ_STDIN_TIMEOUT_S=30          # deadline for reading the projection on stdin; an expired read is discarded rather than published
 FM_BUZZ_LOCK_TIMEOUT_S=30           # deadline for acquiring replay-cache ownership; timeout and interruption remain logged exit-0 non-events
 FM_BUZZ_FORCE_FILE_STORE=           # set to 1 to select the 0600 fallback for normal loads and stores; rotation still inspects and clears every store per `fm-buzz-keypair.sh --help`
+FM_BUZZ_REQUIRE_PINNED_RELAY_AUTHORITY=0 # set to 1 to refuse rotation membership checks until the relay/channel signer is already pinned
 # sub-supervisor (bin/fm-supervise-daemon.sh); presence-gated via /afk
 FM_SUPERVISOR_BACKEND=             # optional supervisor pane backend override; tmux/herdr only, otherwise detects $TMUX_PANE then HERDR_ENV/HERDR_PANE_ID before tmux fallback
 FM_SUPERVISOR_TARGET=              # optional supervisor pane target override; tmux target or herdr <session>:<pane-id>, otherwise auto-detected
@@ -497,8 +498,9 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   <id>/brief.md      per-task crewmate brief, or per-secondmate charter brief when kind=secondmate
   <id>/report.md     scout task deliverable, written by the crewmate; survives teardown
   buzz-keypair.public  this home's loopback Buzz publishing PUBLIC key; LOCAL, gitignored; written by fm-buzz-keypair.sh, which never records the private half here (docs/buzz-loopback-adapter.md)
-  buzz-keypair.public-history  public keys this home still trusts for pre-rotation event attribution, one per line; LOCAL, gitignored; exact lifecycle owned by fm-buzz-keypair.sh --help
+  buzz-keypair.public-history  public keys this home still trusts for pre-rotation event attribution; LOCAL, gitignored; exact lifecycle owned by fm-buzz-keypair.sh --help
   buzz-publisher-targets.jsonl  used relay/channel/publisher tuples that protect private-channel membership during rotation; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs
+  buzz-relay-authorities.jsonl  pinned kind-39002 membership signers by relay/channel pair; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs
 projects/            cloned repos; gitignored; READ-ONLY for you
 state/               volatile runtime signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth

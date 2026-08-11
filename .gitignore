@@ -27,3 +27,4 @@ run/**/*.log
 state/buzz-replay/
 data/buzz-keypair.*
 data/buzz-publisher-targets.jsonl
+data/buzz-relay-authorities.jsonl

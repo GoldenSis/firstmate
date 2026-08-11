@@ -22,9 +22,11 @@
 // LEGACY QUARANTINE CONTRACT
 // Active replay entries from the former flat and host-keyed layouts are never
 // delivered or deleted because their complete endpoint cannot be recovered.
-// Each source is atomically renamed below _legacy-quarantine/staging before it
-// is read, then that claimed inode is moved intact to payloads/<source-token>.json
-// and paired with manifests/<source-token>.json.
+// Each source is claimed before it is read, then regular and special-file inodes
+// move intact to payloads/<source-token>.json and pair with manifests/<source-token>.json.
+// Cross-directory moves hard-link into a pinned destination before unlinking
+// through the pinned source directory, while symlinks are recreated without
+// following their targets, so pathname swaps cannot redirect data.
 // A manifest records original_path, a decoded legacy_host when valid,
 // original_timestamps, the source device and inode, an observed payload digest
 // and size, quarantine_timestamp, and payload_reference.
@@ -48,10 +50,12 @@ import {
   writeFileSync,
   mkdirSync,
   openSync,
+  readlinkSync,
   readdirSync,
   lstatSync,
   realpathSync,
   rmdirSync,
+  symlinkSync,
   unlinkSync,
   renameSync,
 } from "node:fs";
@@ -180,17 +184,6 @@ function withPinnedCacheDirectory(directory, operation) {
   }
 }
 
-function mutateReplayState(operation, directories = []) {
-  assertReplayRoot();
-  for (const directory of directories) assertCacheDirectory(directory);
-  try {
-    return operation();
-  } finally {
-    assertReplayRoot();
-    for (const directory of directories) assertCacheDirectory(directory);
-  }
-}
-
 function cacheMkdirSync(directory, options) {
   const resolved = path.resolve(directory);
   const parent = path.dirname(resolved);
@@ -215,10 +208,55 @@ function cacheRenameSync(source, destination) {
       path.basename(resolvedDestination),
     ));
   }
-  return mutateReplayState(
-    () => renameSync(resolvedSource, resolvedDestination),
-    [sourceParent, destinationParent],
-  );
+  const sourceMetadata = cacheLstatSync(resolvedSource);
+  if (sourceMetadata.isSymbolicLink()) {
+    const target = withPinnedCacheDirectory(sourceParent, () => readlinkSync(path.basename(resolvedSource)));
+    withPinnedCacheDirectory(destinationParent, () => symlinkSync(
+      target,
+      path.basename(resolvedDestination),
+    ));
+  } else {
+    withPinnedCacheDirectory(destinationParent, () => linkSync(
+      resolvedSource,
+      path.basename(resolvedDestination),
+    ));
+  }
+  let destinationMetadata;
+  try {
+    destinationMetadata = cacheLstatSync(resolvedDestination);
+    if (sourceMetadata.isSymbolicLink()) {
+      const sourceTarget = withPinnedCacheDirectory(sourceParent, () => readlinkSync(path.basename(resolvedSource)));
+      const destinationTarget = withPinnedCacheDirectory(
+        destinationParent,
+        () => readlinkSync(path.basename(resolvedDestination)),
+      );
+      if (!destinationMetadata.isSymbolicLink() || destinationTarget !== sourceTarget) {
+        throw new Error("cross-directory cache move copied an unexpected symbolic link");
+      }
+    } else if (
+      destinationMetadata.dev !== sourceMetadata.dev ||
+      destinationMetadata.ino !== sourceMetadata.ino
+    ) {
+      throw new Error("cross-directory cache move linked an unexpected source identity");
+    }
+  } catch (error) {
+    try {
+      cacheUnlinkSync(resolvedDestination);
+    } catch (cleanupError) {
+      if (cleanupError.code !== "ENOENT") {
+        log(`could not remove failed cross-directory cache link ${resolvedDestination}: ${cleanupError.message}`);
+      }
+    }
+    throw error;
+  }
+  const currentSourceMetadata = cacheLstatSync(resolvedSource);
+  if (
+    currentSourceMetadata.dev !== sourceMetadata.dev ||
+    currentSourceMetadata.ino !== sourceMetadata.ino
+  ) {
+    throw new Error("cross-directory cache move source identity changed before removal");
+  }
+  cacheUnlinkSync(resolvedSource);
 }
 
 function cacheUnlinkSync(file) {

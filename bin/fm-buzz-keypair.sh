@@ -31,10 +31,12 @@
 # Rotation: Buzz documents no key-rotation procedure, so `--rotate` is this
 # adapter's. It clears BOTH stores - the keychain entry and the 0600 fallback
 # file - plus data/buzz-keypair.public, then mints a fresh keypair and prints the
-# new public key. Before mutation it checks the default target and every used
-# relay/channel pair recorded by bin/fm-buzz-targets.mjs, refusing when the
+# new public key. Before mutation it checks every used relay/channel pair
+# recorded by bin/fm-buzz-targets.mjs, refusing when the
 # outgoing publisher appears in the relay's current membership state because M1
-# has no membership-transfer operation. It never prints the private key, old or new.
+# has no membership-transfer operation. The first valid membership snapshot pins
+# its signer in data/buzz-relay-authorities.jsonl, and later checks require that
+# same signer. It never prints the private key, old or new.
 #
 # The retired PUBLIC key is appended to data/buzz-keypair.public-history first, so
 # events this home signed before the rotation stay attributable to it.
@@ -94,11 +96,13 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 PUBLIC_FILE="$DATA/buzz-keypair.public"
 HISTORY_FILE="$DATA/buzz-keypair.public-history"
 TARGETS_FILE="$DATA/buzz-publisher-targets.jsonl"
+AUTHORITIES_FILE="$DATA/buzz-relay-authorities.jsonl"
 PUBLIC_ONLY=0
 ROTATE=0
 COMPROMISED=0
 FORGET_KEY=""
 FORGETTING=0
+STRICT_RELAY_AUTHORITY=${FM_BUZZ_REQUIRE_PINNED_RELAY_AUTHORITY:-0}
 
 while [ "$#" -gt 0 ]; do
   case $1 in
@@ -128,6 +132,16 @@ fi
 if [ "$FORGETTING" -eq 1 ] && { [ "$ROTATE" -eq 1 ] || [ "$PUBLIC_ONLY" -eq 1 ]; }; then
   printf 'fm-buzz-keypair.sh: --forget-key is its own operation; run it on its own\n' >&2
   exit 2
+fi
+
+if [ "$ROTATE" -eq 1 ]; then
+  case $STRICT_RELAY_AUTHORITY in
+    0|1) ;;
+    *)
+      printf 'fm-buzz-keypair.sh: FM_BUZZ_REQUIRE_PINNED_RELAY_AUTHORITY must be 0 or 1\n' >&2
+      exit 1
+      ;;
+  esac
 fi
 
 KEYPAIR_LOCK=""
@@ -212,22 +226,29 @@ publisher_is_current_channel_member() {  # <keychain|file> <relay> <channel> <ti
     process.stdin.on("data", (chunk) => { input += chunk; });
     process.stdin.on("end", async () => {
       try {
-        const { publisherIsCurrentChannelMember } = await import(process.argv[1]);
+        const { queryCurrentChannelMembership } = await import(process.argv[1]);
+        const { verifyOrRecordRelayAuthority } = await import(process.argv[2]);
         const privateKey = input.trim();
         if (!privateKey) throw new Error("stored publishing key is empty");
-        const member = await publisherIsCurrentChannelMember(
-          process.argv[2],
-          privateKey,
+        const membership = await queryCurrentChannelMembership(
           process.argv[3],
-          Number(process.argv[4]),
+          privateKey,
+          process.argv[4],
+          Number(process.argv[5]),
         );
-        process.stdout.write(member ? "member\n" : "absent\n");
+        verifyOrRecordRelayAuthority(process.argv[6], {
+          relay: process.argv[3],
+          channel_id: process.argv[4],
+          signer_pubkey: membership.signerPubkey,
+        }, { strict: process.argv[7] === "1" });
+        process.stdout.write(membership.member ? "member\n" : "absent\n");
       } catch (error) {
         process.stderr.write(String(error.message) + "\n");
         process.exitCode = 1;
       }
     });
-  ' "$SCRIPT_DIR/fm-buzz-lib.mjs" "$relay" "$channel" "$timeout_ms"
+  ' "$SCRIPT_DIR/fm-buzz-lib.mjs" "$SCRIPT_DIR/fm-buzz-targets.mjs" \
+    "$relay" "$channel" "$timeout_ms" "$AUTHORITIES_FILE" "$STRICT_RELAY_AUTHORITY"
 }
 
 refuse_rotation_for_current_membership() {  # <keychain|file> <public-key> <relay> <channel>
@@ -256,8 +277,6 @@ refuse_rotation_for_current_membership() {  # <keychain|file> <public-key> <rela
 
 check_rotation_targets_for_store() {  # <keychain|file> <public-key>
   local store=$1 public=$2 target_public target_relay target_channel
-  refuse_rotation_for_current_membership \
-    "$store" "$public" "$rotation_relay" "$rotation_channel" || return 1
   while IFS=$'\t' read -r target_public target_relay target_channel; do
     [ -n "$target_public" ] || continue
     [ "$target_public" = "$public" ] || continue
@@ -467,11 +486,6 @@ if [ "$ROTATE" -eq 1 ]; then
     exit 1
   fi
   rotation_timeout=${FM_BUZZ_TIMEOUT_MS:-15000}
-  rotation_label=$(fm_buzz_key_account "$FM_HOME")
-  rotation_channel=$(fm_buzz_channel_id "$SCRIPT_DIR" "$rotation_label") || {
-    printf 'fm-buzz-keypair.sh: could not derive the channel id; nothing was rotated\n' >&2
-    exit 1
-  }
   rotation_targets=$(node "$SCRIPT_DIR/fm-buzz-targets.mjs" list "$TARGETS_FILE" 2>&1)
   rotation_targets_status=$?
   if [ "$rotation_targets_status" -ne 0 ]; then

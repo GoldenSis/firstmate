@@ -227,7 +227,7 @@ export function buildBearingsEvent(channelId, content, privateKeyHex, extraTags 
   );
 }
 
-export async function publisherIsCurrentChannelMember(relay, privateKeyHex, channelId, timeoutMs) {
+export async function queryCurrentChannelMembership(relay, privateKeyHex, channelId, timeoutMs) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) {
     throw new Error(`invalid relay timeout ${JSON.stringify(timeoutMs)}: expected an integer from 1 to 2147483647`);
   }
@@ -241,7 +241,7 @@ export async function publisherIsCurrentChannelMember(relay, privateKeyHex, chan
     }, "fm-rotation-check");
   });
   if (refusal) throw new Error(`relay refused the current membership check: ${refusal}`);
-  if (events.length === 0) return false;
+  if (events.length === 0) throw new Error("relay returned no current membership state");
   if (events.length !== 1) throw new Error("relay returned ambiguous current membership state");
   const event = events[0];
   const validation = validateSignedEvent(event);
@@ -258,10 +258,16 @@ export async function publisherIsCurrentChannelMember(relay, privateKeyHex, chan
     validation.signatureValid &&
     validation.validTags &&
     channelTags.length === 1 &&
+    channelTags[0].length === 2 &&
     channelTags[0][1] === channelId &&
-    memberTags.every((tag) => HEX_64.test(tag[1]));
+    memberTags.length > 0 &&
+    memberTags.every((tag) => tag.length === 2 && HEX_64.test(tag[1])) &&
+    new Set(memberTags.map((tag) => tag[1])).size === memberTags.length;
   if (!validMembership) throw new Error("relay returned malformed current membership state");
-  return memberTags.some((tag) => tag[1] === publisher);
+  return {
+    member: memberTags.some((tag) => tag[1] === publisher),
+    signerPubkey: event.pubkey,
+  };
 }
 
 // --- relay response classification ------------------------------------------

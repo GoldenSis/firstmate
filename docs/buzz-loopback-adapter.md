@@ -127,7 +127,8 @@ docker run -i --rm -v /var/run/docker.sock:/var/run/docker.sock docker:cli \
 ## Idempotency, and why re-signing is the trap
 
 The header of `bin/fm-buzz-lib.mjs` owns the signed-event identity and byte-preserving replay contract.
-The header and implementation of `bin/fm-buzz-publish.mjs` own the exact cache layout, write ordering, validation, pruning, cleanup, acknowledgement classification, and late-authentication state machine.
+The header and implementation of `bin/fm-buzz-publish.mjs` own the exact cache layout, write ordering, validation, pruning, and cleanup.
+The header and implementation of `bin/fm-buzz-lib.mjs` own relay acknowledgement classification and the late-authentication state machine.
 
 ## Verification evidence
 
@@ -141,7 +142,7 @@ Run on 2026-07-30 against `ghcr.io/block/buzz:main`, Docker server 29.5.2 under 
 | Firstmate operational with Buzz down | **pass** - see below |
 | Boundary respected | **pass** - no change to `AGENTS.md`, `projects/`, or the `state/*.meta` schema |
 
-The independence check is structural as well as behavioral, which is the stronger form: nothing outside the `bin/fm-buzz-*` family references the adapter at all, so a stopped relay has no path by which to reach supervision.
+The independence check is structural as well as behavioral: no operational Firstmate path outside the `bin/fm-buzz-*` family invokes the adapter, so a stopped relay has no path by which to reach supervision.
 `tests/fm-buzz-publish.test.sh` asserts that as a standing regression test.
 With the relay stopped, `bin/fm-bearings-snapshot.sh --json`, `bin/fm-fleet-snapshot.sh --json` and `tasks-axi list` all exited 0 against an isolated home, and publishing exited 0 while enqueueing the signed event.
 

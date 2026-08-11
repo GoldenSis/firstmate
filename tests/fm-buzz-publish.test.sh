@@ -190,6 +190,18 @@ key_file() {  # <home> <xdg>
     fm_buzz_key_fallback_file "$1" )
 }
 
+public_from_private() {  # <private-key>
+  printf '%s' "$1" | node -e '
+    let privateKey = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { privateKey += chunk; });
+    process.stdin.on("end", async () => {
+      const { publicKeyFromPrivate } = await import(process.argv[1]);
+      process.stdout.write(`${publicKeyFromPrivate(privateKey)}\n`);
+    });
+  ' "$ROOT/bin/fm-buzz-crypto.mjs"
+}
+
 make_fake_keychain_tools() {
   local tools="$TMP_ROOT/fake-keychain-tools"
   mkdir -p "$tools"
@@ -303,9 +315,11 @@ make_delayed_publish_tools() {
   real_node=$(command -v node)
   cat > "$tools/node" <<EOF
 #!/usr/bin/env bash
+delayed=0
 for arg in "\$@"; do
   case \$arg in
     */fm-buzz-publish.mjs)
+      delayed=1
       : > "\$FM_DELAY_BUZZ_PUBLISH_READY"
       waited=0
       while [ ! -e "\$FM_DELAY_BUZZ_PUBLISH_RELEASE" ] && [ "\$waited" -lt 1000 ]; do
@@ -317,6 +331,12 @@ for arg in "\$@"; do
       ;;
   esac
 done
+if [ "\$delayed" -eq 1 ] && [ -n "\${FM_DELAY_BUZZ_REMOVE_TARGETS:-}" ]; then
+  "$real_node" "\$@"
+  status=\$?
+  rm -f -- "\$FM_DELAY_BUZZ_REMOVE_TARGETS"
+  exit "\$status"
+fi
 exec "$real_node" "\$@"
 EOF
   chmod +x "$tools/node"
@@ -689,15 +709,18 @@ EOF
     || fail "current-membership refusal changed the recorded public key"
   [ "$(cat "$keyfile")" = "$private_before" ] \
     || fail "current-membership refusal changed the stored private key"
+  [ "$(jq -s 'length' "$home/data/buzz-relay-authorities.jsonl")" = "1" ] \
+    || fail "the first authoritative membership query did not pin its signer"
   pass "rotation checks current membership independently of channel creation"
 }
 
 test_rotation_fails_closed_on_unverifiable_membership() {
   local mode expected home relay old channel keyfile private_before targets normalized_relay output code
-  for mode in --malform-membership --ambiguous-membership; do
+  for mode in --malform-membership --ambiguous-membership --empty-membership; do
     case $mode in
       --malform-membership) expected="malformed current membership state" ;;
       --ambiguous-membership) expected="ambiguous current membership state" ;;
+      --empty-membership) expected="malformed current membership state" ;;
     esac
     home=$(make_home "membership-${mode#--}")
     old=$(run_keypair "$home" 2>/dev/null) || fail "unverifiable-membership keypair setup failed"
@@ -730,7 +753,114 @@ EOF
     [ "$(cat "$keyfile")" = "$private_before" ] \
       || fail "unverifiable-membership refusal changed the stored private key"
   done
-  pass "rotation fails closed on malformed or ambiguous membership"
+
+  home=$(make_home membership-missing)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "missing-membership keypair setup failed"
+  keyfile=$(key_file "$home" "$home/xdg")
+  private_before=$(cat "$keyfile")
+  channel="33333333-4444-5555-8666-777777777777"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  normalized_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
+    || fail "could not normalize the missing-membership relay"
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  jq -cn \
+    --arg relay "$normalized_relay" \
+    --arg channel "$channel" \
+    --arg publisher "$old" \
+    '{relay:$relay,channel_id:$channel,publisher_pubkey:$publisher}' > "$targets"
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  stop_stub "$STUB_PID"
+  expect_code 1 "$code" "rotation with no current membership snapshot"
+  assert_contains "$output" "no current membership state" \
+    "rotation treated a missing membership snapshot as authoritative absence"
+  assert_contains "$output" "relay $normalized_relay, channel $channel" \
+    "missing-membership refusal did not name its target pair"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "missing-membership refusal changed the recorded public key"
+  [ "$(cat "$keyfile")" = "$private_before" ] \
+    || fail "missing-membership refusal changed the stored private key"
+  pass "rotation fails closed on missing, empty, malformed, or ambiguous membership"
+}
+
+test_rotation_pins_and_verifies_relay_membership_authority() {
+  local home relay old channel keyfile private_before targets authorities normalized_relay
+  local expected_signer actual_private actual_signer output code strict_home strict_old
+  home=$(make_home membership-authority-mismatch)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "membership-authority keypair setup failed"
+  keyfile=$(key_file "$home" "$home/xdg")
+  private_before=$(cat "$keyfile")
+  channel="44444444-5555-5666-8777-888888888888"
+  actual_private=$(printf '%064d' 4)
+  actual_signer=$(public_from_private "$actual_private") \
+    || fail "could not derive the actual membership signer"
+  expected_signer=$(public_from_private "$(printf '%064d' 5)") \
+    || fail "could not derive the pinned membership signer"
+  read -r STUB_PID relay <<EOF
+$(start_stub --membership-private-key "$actual_private")
+EOF
+  publish_membership_fixture "$relay" "$channel" "$old" \
+    || fail "could not seed membership-authority state"
+  normalized_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
+    || fail "could not normalize the membership-authority relay"
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  authorities="$home/data/buzz-relay-authorities.jsonl"
+  jq -cn \
+    --arg relay "$normalized_relay" \
+    --arg channel "$channel" \
+    --arg publisher "$old" \
+    '{relay:$relay,channel_id:$channel,publisher_pubkey:$publisher}' > "$targets"
+  jq -cn \
+    --arg relay "$normalized_relay" \
+    --arg channel "$channel" \
+    --arg signer "$expected_signer" \
+    '{relay:$relay,channel_id:$channel,signer_pubkey:$signer}' > "$authorities"
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  stop_stub "$STUB_PID"
+  expect_code 1 "$code" "rotation with a changed relay membership signer"
+  assert_contains "$output" "relay $normalized_relay, channel $channel" \
+    "relay-authority mismatch did not name its target pair"
+  assert_contains "$output" "relay membership authority mismatch" \
+    "relay-authority mismatch was not diagnosed"
+  assert_contains "$output" "expected $expected_signer, received $actual_signer" \
+    "relay-authority mismatch did not identify both signers"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "relay-authority mismatch changed the recorded public key"
+  [ "$(cat "$keyfile")" = "$private_before" ] \
+    || fail "relay-authority mismatch changed the stored private key"
+
+  strict_home=$(make_home membership-authority-strict)
+  strict_old=$(run_keypair "$strict_home" 2>/dev/null) \
+    || fail "strict membership-authority keypair setup failed"
+  channel="55555555-6666-5777-8888-999999999999"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  publish_membership_fixture "$relay" "$channel" "$strict_old" \
+    || fail "could not seed strict membership-authority state"
+  normalized_relay=$(node "$ROOT/bin/fm-buzz-targets.mjs" normalize-relay "$relay") \
+    || fail "could not normalize the strict membership-authority relay"
+  jq -cn \
+    --arg relay "$normalized_relay" \
+    --arg channel "$channel" \
+    --arg publisher "$strict_old" \
+    '{relay:$relay,channel_id:$channel,publisher_pubkey:$publisher}' \
+    > "$strict_home/data/buzz-publisher-targets.jsonl"
+  output=$(FM_BUZZ_REQUIRE_PINNED_RELAY_AUTHORITY=1 run_keypair "$strict_home" --rotate 2>&1)
+  code=$?
+  stop_stub "$STUB_PID"
+  expect_code 1 "$code" "strict rotation without a pinned relay authority"
+  assert_contains "$output" "relay membership authority is not pinned in strict mode" \
+    "strict membership-authority mode trusted its first signer"
+  [ "$(cat "$strict_home/data/buzz-keypair.public")" = "$strict_old" ] \
+    || fail "strict unpinned-authority refusal changed the recorded public key"
+  assert_absent "$strict_home/data/buzz-relay-authorities.jsonl" \
+    "strict membership-authority mode recorded a first-use signer"
+  pass "rotation pins and verifies relay membership authority"
 }
 
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable() {
@@ -2301,7 +2431,9 @@ EOF
 
   (printf '%s' '{"schema":"fm-bearings.v1","note":"signed-before-compromised-rotation"}' \
     | PATH="$tools:$PATH" FM_DELAY_BUZZ_PUBLISH_READY="$ready" \
-      FM_DELAY_BUZZ_PUBLISH_RELEASE="$release" run_publish "$home" "$relay") \
+      FM_DELAY_BUZZ_PUBLISH_RELEASE="$release" \
+      FM_DELAY_BUZZ_REMOVE_TARGETS="$home/data/buzz-publisher-targets.jsonl" \
+      run_publish "$home" "$relay") \
     > "$publish_output" 2>&1 &
   publisher=$!
   waited=0
@@ -2510,6 +2642,53 @@ EOF
   assert_contains "$output" "cache directory identity changed" \
     "a descendant-directory swap was not diagnosed"
   pass "replay cache descendant directories stay pinned during mutation"
+}
+
+test_cross_directory_quarantine_claims_cannot_follow_swapped_sources() {
+  local home relay replay legacy held outside preload output
+  home=$(make_home quarantine-cross-directory-swap)
+  run_keypair "$home" >/dev/null 2>&1 || fail "cross-directory quarantine keypair setup failed"
+  replay="$home/state/buzz-replay"
+  legacy="$replay/localhost%3A3000"
+  held="$home/held-legacy-cache"
+  outside="$home/outside-legacy-cache"
+  preload="$home/quarantine-source-swap.mjs"
+  mkdir -p "$legacy" "$outside"
+  printf '%s' '["EVENT",{"legacy":"original"}]' > "$legacy/1700000000-$(printf '%064d' 6).json"
+  printf '%s' 'outside-must-remain' > "$outside/1700000000-$(printf '%064d' 6).json"
+  cat > "$preload" <<'EOF'
+import path from "node:path";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+
+const fs = createRequire(import.meta.url)("node:fs");
+const originalLinkSync = fs.linkSync;
+let swapped = false;
+fs.linkSync = function guardedLinkSync(source, destination, ...args) {
+  const absoluteSource = path.resolve(String(source));
+  if (!swapped && path.basename(String(destination)) === "source") {
+    swapped = true;
+    const sourceParent = path.dirname(absoluteSource);
+    fs.renameSync(sourceParent, process.env.FM_TEST_CACHE_HELD);
+    fs.symlinkSync(process.env.FM_TEST_CACHE_OUTSIDE, sourceParent, "dir");
+  }
+  return originalLinkSync.call(fs, source, destination, ...args);
+};
+syncBuiltinESMExports();
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"cross-directory-swap"}' \
+    | NODE_OPTIONS="--import=$preload" \
+      FM_TEST_CACHE_HELD="$held" \
+      FM_TEST_CACHE_OUTSIDE="$outside" \
+      run_publish "$home" ws://127.0.0.1:1 2>&1)
+  assert_contains "$output" "unexpected source identity" \
+    "a swapped cross-directory source was not rejected"
+  assert_present "$outside/1700000000-$(printf '%064d' 6).json" \
+    "quarantine moved a swapped external source into the replay cache"
+  [ "$(cat "$outside/1700000000-$(printf '%064d' 6).json")" = "outside-must-remain" ] \
+    || fail "quarantine mutated a swapped external source"
+  assert_present "$held/1700000000-$(printf '%064d' 6).json" \
+    "quarantine lost the originally claimed legacy inode"
+  pass "cross-directory quarantine claims reject swapped source paths"
 }
 
 test_partition_shaped_special_nodes_are_quarantined_and_unblocked() {
@@ -3670,6 +3849,7 @@ test_publisher_target_overrides_are_recorded_and_guard_rotation
 test_publisher_target_updates_are_concurrent_and_fail_closed
 test_rotation_checks_authoritative_current_membership
 test_rotation_fails_closed_on_unverifiable_membership
+test_rotation_pins_and_verifies_relay_membership_authority
 test_rotation_stops_or_recovers_when_the_outgoing_private_key_is_unusable
 test_rotation_compares_the_recorded_key_with_stored_private_material
 test_rotation_detects_and_cleans_up_divergent_stores
@@ -3716,6 +3896,7 @@ test_publish_signing_is_serialized_with_compromised_rotation
 test_replay_cache_rejects_symlink_boundaries
 test_replay_cache_pins_the_root_before_mutation
 test_replay_cache_pins_descendant_directories
+test_cross_directory_quarantine_claims_cannot_follow_swapped_sources
 test_partition_shaped_special_nodes_are_quarantined_and_unblocked
 test_replay_cache_never_reads_non_regular_entries
 test_relay_timeout_must_fit_the_node_timer_range

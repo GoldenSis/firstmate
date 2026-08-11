@@ -29,6 +29,8 @@
 //                                          [--refuse-req <msg>]
 //                                          [--malform-membership]
 //                                          [--ambiguous-membership]
+//                                          [--empty-membership]
+//                                          [--membership-private-key HEX]
 // Prints "listening <port>" on stdout once ready, so a caller can use port 0 and
 // learn the ephemeral port.
 
@@ -88,6 +90,8 @@ let wrongKindOnRead = false;
 let refuseReq = null;
 let malformMembership = false;
 let ambiguousMembership = false;
+let emptyMembership = false;
+let relayPrivateKey = "3".padStart(64, "0");
 for (let i = 0; i < argv.length; i += 1) {
   if (argv[i] === "--port") port = Number(argv[++i]);
   else if (argv[i] === "--reject") reject = argv[++i];
@@ -103,13 +107,17 @@ for (let i = 0; i < argv.length; i += 1) {
   else if (argv[i] === "--refuse-req") refuseReq = argv[++i];
   else if (argv[i] === "--malform-membership") malformMembership = true;
   else if (argv[i] === "--ambiguous-membership") ambiguousMembership = true;
+  else if (argv[i] === "--empty-membership") emptyMembership = true;
+  else if (argv[i] === "--membership-private-key") relayPrivateKey = argv[++i] ?? "";
+}
+if (!/^[0-9a-f]{64}$/.test(relayPrivateKey)) {
+  throw new Error("membership private key must be 64 lowercase hexadecimal characters");
 }
 
 // The event store: id -> event. A Map gives us exactly the relay's
 // `ON CONFLICT DO NOTHING` semantics - a second insert of a known id is a no-op.
 const store = new Map();
 const channelMembers = new Map();
-const relayPrivateKey = "3".padStart(64, "0");
 const KIND_NIP29_ADD_USER = 9000;
 const KIND_NIP29_CREATE_GROUP = 9007;
 const KIND_NIP29_GROUP_MEMBERS = 39002;
@@ -143,7 +151,10 @@ function currentMembershipEvents(filter) {
     const event = signEvent({
       created_at: nowSeconds(),
       kind: KIND_NIP29_GROUP_MEMBERS,
-      tags: [["d", channel], ...[...members].sort().map((member) => ["p", member])],
+      tags: [
+        ["d", channel],
+        ...(emptyMembership ? [] : [...members].sort().map((member) => ["p", member])),
+      ],
       content: "",
     }, relayPrivateKey);
     if (malformMembership) return [{ ...event, id: { malformed: true } }];

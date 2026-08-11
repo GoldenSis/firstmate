@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Durable publisher-target registry shared by Buzz publishing and key rotation.
+// Durable publisher-target and relay-authority registries for Buzz key rotation.
 //
 // data/buzz-publisher-targets.jsonl contains one canonical JSON object per used
 // relay/channel/publisher tuple. Each object has exactly relay, channel_id, and
@@ -10,6 +10,10 @@
 // whole-file exact-destination replacement is atomic, concurrent publishes are
 // serialized, duplicate tuples collapse, and an earlier target is never lost.
 // Any malformed, non-regular, or symlinked existing registry fails closed.
+// data/buzz-relay-authorities.jsonl contains one canonical JSON object per
+// relay/channel pair, with exactly relay, channel_id, and signer_pubkey fields.
+// The first verified kind-39002 snapshot records its signer unless strict mode
+// requires an existing pin, and every later snapshot must match that signer.
 //
 // Usage:
 //   node bin/fm-buzz-targets.mjs list FILE
@@ -62,6 +66,10 @@ function targetIdentity(target) {
   return `${target.publisher_pubkey}\u0000${target.relay}\u0000${target.channel_id}`;
 }
 
+function relayChannelIdentity(value) {
+  return `${value.relay}\u0000${value.channel_id}`;
+}
+
 function canonicalTargets(targets) {
   const unique = new Map();
   for (const target of targets) {
@@ -72,6 +80,10 @@ function canonicalTargets(targets) {
 }
 
 export function readPublisherTargets(file) {
+  return readCanonicalRegistry(file, "publisher target", normalizePublisherTarget, targetIdentity);
+}
+
+function readCanonicalRegistry(file, label, normalize, identity) {
   let metadata;
   try {
     metadata = lstatSync(file);
@@ -80,51 +92,47 @@ export function readPublisherTargets(file) {
     throw error;
   }
   if (metadata.isSymbolicLink() || !metadata.isFile()) {
-    throw new Error(`publisher target registry ${file} is not a regular file`);
+    throw new Error(`${label} registry ${file} is not a regular file`);
   }
   const raw = readFileSync(file, "utf8");
   const lines = raw.split("\n");
-  const targets = [];
+  const records = [];
   for (const [index, line] of lines.entries()) {
     if (line === "" && index === lines.length - 1) continue;
-    if (line.trim() === "") throw new Error(`publisher target registry ${file} has a blank record`);
+    if (line.trim() === "") throw new Error(`${label} registry ${file} has a blank record`);
     let parsed;
     try {
       parsed = JSON.parse(line);
     } catch {
-      throw new Error(`publisher target registry ${file} has invalid JSON on line ${index + 1}`);
+      throw new Error(`${label} registry ${file} has invalid JSON on line ${index + 1}`);
     }
     try {
-      const normalized = normalizePublisherTarget(parsed);
-      if (
-        parsed.relay !== normalized.relay ||
-        parsed.channel_id !== normalized.channel_id ||
-        parsed.publisher_pubkey !== normalized.publisher_pubkey
-      ) {
+      const normalized = normalize(parsed);
+      if (Object.entries(normalized).some(([field, value]) => parsed[field] !== value)) {
         throw new Error("record is not canonical");
       }
-      targets.push(normalized);
+      records.push(normalized);
     } catch (error) {
-      throw new Error(`publisher target registry ${file} has an invalid record on line ${index + 1}: ${error.message}`);
+      throw new Error(`${label} registry ${file} has an invalid record on line ${index + 1}: ${error.message}`);
     }
   }
-  const canonical = canonicalTargets(targets);
-  if (canonical.length !== targets.length) {
-    throw new Error(`publisher target registry ${file} contains duplicate records`);
+  const identities = new Set(records.map(identity));
+  if (identities.size !== records.length) {
+    throw new Error(`${label} registry ${file} contains duplicate records`);
   }
-  return canonical;
+  return records.sort((left, right) => identity(left).localeCompare(identity(right)));
 }
 
-function replaceRegistry(file, targets) {
+function replaceRegistry(file, records, label) {
   const directory = path.dirname(file);
   const directoryMetadata = lstatSync(directory);
   if (directoryMetadata.isSymbolicLink() || !directoryMetadata.isDirectory()) {
-    throw new Error(`publisher target registry directory ${directory} is not a regular directory`);
+    throw new Error(`${label} registry directory ${directory} is not a regular directory`);
   }
   try {
     const targetMetadata = lstatSync(file);
     if (targetMetadata.isSymbolicLink() || !targetMetadata.isFile()) {
-      throw new Error(`publisher target registry ${file} is not a regular file`);
+      throw new Error(`${label} registry ${file} is not a regular file`);
     }
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
@@ -133,7 +141,7 @@ function replaceRegistry(file, targets) {
     directory,
     `.${path.basename(file)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
   );
-  const content = targets.map((target) => JSON.stringify(target)).join("\n") + "\n";
+  const content = records.map((record) => JSON.stringify(record)).join("\n") + "\n";
   writeFileSync(temporary, content, { mode: 0o600, flag: "wx" });
   try {
     renameSync(temporary, file);
@@ -154,8 +162,47 @@ export function recordPublisherTarget(file, value) {
   if (merged.length === existing.length && existing.some((candidate) => targetIdentity(candidate) === targetIdentity(target))) {
     return target;
   }
-  replaceRegistry(file, merged);
+  replaceRegistry(file, merged, "publisher target");
   return target;
+}
+
+export function normalizeRelayAuthority(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("relay authority must be an object");
+  }
+  const fields = Object.keys(value).sort();
+  if (fields.join(",") !== "channel_id,relay,signer_pubkey") {
+    throw new Error("relay authority has unexpected fields");
+  }
+  return {
+    relay: normalizeRelayEndpoint(value.relay),
+    channel_id: normalizeChannelIdentity(value.channel_id),
+    signer_pubkey: normalizeHexIdentity(value.signer_pubkey, "signer_pubkey"),
+  };
+}
+
+export function readRelayAuthorities(file) {
+  return readCanonicalRegistry(file, "relay authority", normalizeRelayAuthority, relayChannelIdentity);
+}
+
+export function verifyOrRecordRelayAuthority(file, value, options = {}) {
+  const authority = normalizeRelayAuthority(value);
+  if (typeof options.strict !== "boolean") throw new Error("relay authority strict mode must be boolean");
+  const existing = readRelayAuthorities(file);
+  const pinned = existing.find((candidate) => relayChannelIdentity(candidate) === relayChannelIdentity(authority));
+  if (pinned !== undefined) {
+    if (pinned.signer_pubkey !== authority.signer_pubkey) {
+      throw new Error(
+        `relay membership authority mismatch: expected ${pinned.signer_pubkey}, received ${authority.signer_pubkey}`,
+      );
+    }
+    return { authority: pinned, recorded: false };
+  }
+  if (options.strict) throw new Error("relay membership authority is not pinned in strict mode");
+  const merged = [...existing, authority]
+    .sort((left, right) => relayChannelIdentity(left).localeCompare(relayChannelIdentity(right)));
+  replaceRegistry(file, merged, "relay authority");
+  return { authority, recorded: true };
 }
 
 function usage() {
