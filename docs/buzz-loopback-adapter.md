@@ -44,8 +44,8 @@ Each one is the reason a specific failure mode cannot occur, and breaching any o
    A relay container restart reuses the same volume and therefore the same kind-39002 signer, while `docker compose -f docker-compose.buzz-loopback.yml down -v` destroys the key with the other disposable data.
    The next `up -d` after that teardown creates a different relay signer and a clean trust boundary.
 3. **Publishing is fire-and-forget.**
-   `bin/fm-buzz-publish.sh` always exits 0.
-   A non-zero exit from it is a bug, and `tests/fm-buzz-publish.test.sh` asserts both the behavior and the structure that produces it.
+   `bin/fm-buzz-publish.sh` converts runtime publication failures into logged exit-0 non-events.
+   A missing declared filesystem-safety prerequisite fails before publication with a non-zero startup error.
 4. **No canvas for state.**
    Append-only messages only.
    A Buzz canvas is a single mutable TEXT column overwritten with no compare-and-set and no base hash, so publishing state into one would silently destroy concurrent captain edits with no error to either party.
@@ -58,6 +58,11 @@ Each one is the reason a specific failure mode cannot occur, and breaching any o
 ## Using it
 
 Bring the relay up, publish, read back, tear down.
+
+### Prerequisites
+
+Publishing requires Node.js, `jq`, and Python 3.
+Python 3 provides the descriptor-relative filesystem operations that keep replay-cache mutations inside pinned directories, so a missing `python3` is a loud non-zero startup error with an install-documentation pointer.
 
 ```
 colima start                                                       # if the daemon is not running

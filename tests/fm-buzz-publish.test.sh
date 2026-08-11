@@ -25,6 +25,25 @@ test_publish_with_relay_down_exits_zero_and_enqueues() {
   pass "publish with the relay down exits 0 and enqueues the signed event"
 }
 
+test_missing_python3_is_a_loud_prerequisite_failure() {
+  local home tools tool output code
+  home=$(make_home missing-python3)
+  tools="$home/prerequisite-tools"
+  mkdir -p "$tools"
+  for tool in bash dirname node jq; do
+    ln -s "$(command -v "$tool")" "$tools/$tool"
+  done
+  output=$(PATH="$tools" \
+    FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$home/state" \
+    "$PUBLISH" --relay ws://127.0.0.1:1 </dev/null 2>&1)
+  code=$?
+  expect_code 1 "$code" "publish without the required python3 runtime"
+  assert_contains "$output" \
+    "python3 is required for safe replay-cache operations; see docs/buzz-loopback-adapter.md#prerequisites" \
+    "missing python3 was silently converted into an optional publish failure"
+  pass "missing python3 fails loudly before publication"
+}
+
 test_same_second_identical_publishes_have_distinct_signed_identities() {
   local home clock cache files ids nonces
   home=$(make_home same-second-identical)
@@ -1151,7 +1170,11 @@ test_fire_and_forget_contract_is_intact() {
   assert_grep 'exit 0' "$PUBLISH" "bin/fm-buzz-publish.sh lost its unconditional exit 0"
   [ "$(tail -1 "$PUBLISH")" = "exit 0" ] \
     || fail "bin/fm-buzz-publish.sh must end with an unconditional exit 0"
-  pass "the fire-and-forget contract is structurally intact"
+  [ "$(grep -Ec '^[[:space:]]*exit 1$' "$PUBLISH")" = "1" ] \
+    || fail "bin/fm-buzz-publish.sh must reserve non-zero exit for the python3 prerequisite"
+  grep -Eq 'PREREQUISITE_STATUS.*-eq 2' "$PUBLISH" \
+    || fail "the python3 prerequisite exit is not narrowly gated"
+  pass "runtime publish failures remain fire-and-forget with one prerequisite exception"
 }
 
 test_nothing_private_reaches_a_command_line() {
@@ -1185,6 +1208,7 @@ $(start_stub)
 EOF
 
 test_publish_with_relay_down_exits_zero_and_enqueues
+test_missing_python3_is_a_loud_prerequisite_failure
 test_same_second_identical_publishes_have_distinct_signed_identities
 test_replayed_events_are_tracked_before_delivery
 test_malformed_projection_is_rejected_before_signing

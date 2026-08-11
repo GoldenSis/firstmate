@@ -4,9 +4,9 @@
 //
 // This file may exit non-zero - that is deliberate. The fire-and-forget contract
 // belongs to the shell wrapper, which is the only supported entry point and which
-// converts every failure here into a logged exit 0. Keeping the engine honest
-// about failure is what makes it testable; keeping the wrapper unconditionally
-// successful is what keeps Buzz off Firstmate's critical path.
+// converts runtime failures here into a logged exit 0. Keeping the engine honest
+// about failure is what makes it testable; isolating runtime publication failures
+// is what keeps Buzz off Firstmate's critical path.
 //
 // REPLAY CACHE LIFECYCLE
 // bin/fm-buzz-lib.mjs owns signed-event identity and byte-preserving replay
@@ -64,19 +64,9 @@ import {
   closeSync,
   constants,
   fstatSync,
-  linkSync,
-  readFileSync,
-  writeFileSync,
-  mkdirSync,
   openSync,
-  readlinkSync,
-  readdirSync,
   lstatSync,
   realpathSync,
-  rmdirSync,
-  symlinkSync,
-  unlinkSync,
-  renameSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -187,39 +177,189 @@ function pinCacheDirectory(directory) {
 function withPinnedCacheDirectory(directory, operation) {
   const resolved = path.resolve(directory);
   const pin = assertCacheDirectory(resolved);
-  const previous = process.cwd();
-  process.chdir(resolved);
   try {
-    const current = lstatSync(".");
     const descriptorMetadata = fstatSync(pin.descriptor);
     if (
-      !current.isDirectory() ||
-      current.dev !== pin.dev ||
-      current.ino !== pin.ino ||
       descriptorMetadata.dev !== pin.dev ||
       descriptorMetadata.ino !== pin.ino
     ) {
       throw new Error(`cache directory identity changed during publication: ${resolved}`);
     }
-    return operation();
+    return operation(pin);
   } finally {
-    process.chdir(previous);
     assertReplayRoot();
     assertCacheDirectory(resolved);
   }
 }
 
+const DIRECTORY_RELATIVE_OPERATION = String.raw`
+import errno
+import json
+import os
+import stat
+import sys
+
+directory = 3
+request = json.loads(sys.argv[1])
+
+def metadata(value):
+    return {
+        "dev": value.st_dev,
+        "ino": value.st_ino,
+        "mode": value.st_mode,
+        "nlink": value.st_nlink,
+        "size": value.st_size,
+        "atimeMs": value.st_atime * 1000,
+        "mtimeMs": value.st_mtime * 1000,
+        "ctimeMs": value.st_ctime * 1000,
+        "birthtimeMs": getattr(value, "st_birthtime", value.st_ctime) * 1000,
+        "file": stat.S_ISREG(value.st_mode),
+        "directory": stat.S_ISDIR(value.st_mode),
+        "symlink": stat.S_ISLNK(value.st_mode),
+        "fifo": stat.S_ISFIFO(value.st_mode),
+        "socket": stat.S_ISSOCK(value.st_mode),
+        "blockDevice": stat.S_ISBLK(value.st_mode),
+        "characterDevice": stat.S_ISCHR(value.st_mode),
+    }
+
+try:
+    operation = request["operation"]
+    name = request.get("name")
+    result = None
+    if operation == "mkdir":
+        os.mkdir(name, request["mode"], dir_fd=directory)
+    elif operation == "write":
+        flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        flags |= os.O_EXCL if request["flag"] == "wx" else os.O_TRUNC
+        descriptor = os.open(name, flags, request["mode"], dir_fd=directory)
+        try:
+            payload = sys.stdin.buffer.read()
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+        finally:
+            os.close(descriptor)
+    elif operation == "rename":
+        os.rename(request["source"], request["destination"], src_dir_fd=directory, dst_dir_fd=directory)
+    elif operation == "unlink":
+        os.unlink(name, dir_fd=directory)
+    elif operation == "link":
+        os.link(request["source"], request["destination"], src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+    elif operation == "rmdir":
+        os.rmdir(name, dir_fd=directory)
+    elif operation == "lstat":
+        result = metadata(os.stat(name, dir_fd=directory, follow_symlinks=False))
+    elif operation == "readdir":
+        result = os.listdir(directory)
+    elif operation == "readlink":
+        result = os.readlink(name, dir_fd=directory)
+    elif operation == "symlink":
+        os.symlink(request["target"], name, dir_fd=directory)
+    elif operation == "read_regular":
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(name, flags, dir_fd=directory)
+        try:
+            value = os.fstat(descriptor)
+            if not stat.S_ISREG(value.st_mode):
+                raise RuntimeError("cache entry is not a regular file")
+            sys.stderr.write(json.dumps({"ok": True, "result": metadata(value)}) + "\n")
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                sys.stdout.buffer.write(chunk)
+        finally:
+            os.close(descriptor)
+        sys.exit(0)
+    else:
+        raise RuntimeError(f"unsupported directory-relative operation: {operation}")
+    print(json.dumps({"ok": True, "result": result}))
+except OSError as error:
+    print(json.dumps({
+        "ok": False,
+        "code": errno.errorcode.get(error.errno),
+        "message": str(error),
+    }), file=sys.stderr)
+    sys.exit(1)
+except Exception as error:
+    print(json.dumps({"ok": False, "code": None, "message": str(error)}), file=sys.stderr)
+    sys.exit(1)
+`;
+
+function cacheMetadata(value) {
+  return {
+    ...value,
+    isFile: () => value.file,
+    isDirectory: () => value.directory,
+    isSymbolicLink: () => value.symlink,
+    isFIFO: () => value.fifo,
+    isSocket: () => value.socket,
+    isBlockDevice: () => value.blockDevice,
+    isCharacterDevice: () => value.characterDevice,
+  };
+}
+
+function runPinnedCacheOperation(directory, operation, request = {}, input = undefined) {
+  return withPinnedCacheDirectory(directory, (pin) => {
+    const readOperation = operation === "read_regular";
+    const result = spawnSync(
+      "python3",
+      ["-c", DIRECTORY_RELATIVE_OPERATION, JSON.stringify({ operation, ...request })],
+      {
+        encoding: readOperation ? undefined : "utf8",
+        input,
+        maxBuffer: 1024 * 1024 * 1024,
+        stdio: ["pipe", "pipe", "pipe", pin.descriptor],
+      },
+    );
+    if (result.error) {
+      throw new Error(`directory-relative cache operation is unavailable: ${result.error.message}`);
+    }
+    const errorText = readOperation ? result.stderr.toString("utf8") : result.stderr;
+    if (result.status !== 0) {
+      let detail;
+      try {
+        detail = JSON.parse(errorText.trim());
+      } catch {
+        detail = { message: errorText.trim() || `operation exited ${result.status}` };
+      }
+      const error = new Error(`directory-relative cache ${operation} failed: ${detail.message}`);
+      if (typeof detail.code === "string") error.code = detail.code;
+      throw error;
+    }
+    if (readOperation) {
+      const detail = JSON.parse(errorText.trim());
+      return { bytes: result.stdout, metadata: cacheMetadata(detail.result) };
+    }
+    const detail = JSON.parse(result.stdout);
+    return operation === "lstat" ? cacheMetadata(detail.result) : detail.result;
+  });
+}
+
 function cacheMkdirSync(directory, options) {
   const resolved = path.resolve(directory);
   const parent = path.dirname(resolved);
-  const result = withPinnedCacheDirectory(parent, () => mkdirSync(path.basename(resolved), options));
+  const result = runPinnedCacheOperation(parent, "mkdir", {
+    name: path.basename(resolved),
+    mode: options?.mode ?? 0o777,
+  });
   pinCacheDirectory(resolved);
   return result;
 }
 
-function cacheWriteFileSync(file, ...args) {
+function cacheWriteFileSync(file, data, options = {}) {
   const resolved = path.resolve(file);
-  return withPinnedCacheDirectory(path.dirname(resolved), () => writeFileSync(path.basename(resolved), ...args));
+  const input = Buffer.isBuffer(data) ? data : Buffer.from(data, options.encoding ?? "utf8");
+  return runPinnedCacheOperation(
+    path.dirname(resolved),
+    "write",
+    {
+      name: path.basename(resolved),
+      mode: options.mode ?? 0o666,
+      flag: options.flag ?? "w",
+    },
+    input,
+  );
 }
 
 function cacheMoveDirectoryTree(source, destination) {
@@ -260,14 +400,12 @@ function cacheMoveDirectoryTree(source, destination) {
       continue;
     }
     if (entryMetadata.isSymbolicLink()) {
-      const sourceTarget = withPinnedCacheDirectory(
-        resolvedSource,
-        () => readlinkSync(path.basename(sourceEntry)),
-      );
-      const destinationTarget = withPinnedCacheDirectory(
-        resolvedDestination,
-        () => readlinkSync(path.basename(destinationEntry)),
-      );
+      const sourceTarget = runPinnedCacheOperation(resolvedSource, "readlink", {
+        name: path.basename(sourceEntry),
+      });
+      const destinationTarget = runPinnedCacheOperation(resolvedDestination, "readlink", {
+        name: path.basename(destinationEntry),
+      });
       if (!destinationMetadata.isSymbolicLink() || destinationTarget !== sourceTarget) {
         throw new Error(`cross-directory cache move collision at ${resolvedDestination}`);
       }
@@ -288,10 +426,10 @@ function cacheRenameSync(source, destination) {
   const sourceParent = path.dirname(resolvedSource);
   const destinationParent = path.dirname(resolvedDestination);
   if (sourceParent === destinationParent) {
-    return withPinnedCacheDirectory(sourceParent, () => renameSync(
-      path.basename(resolvedSource),
-      path.basename(resolvedDestination),
-    ));
+    return runPinnedCacheOperation(sourceParent, "rename", {
+      source: path.basename(resolvedSource),
+      destination: path.basename(resolvedDestination),
+    });
   }
   const sourceMetadata = cacheLstatSync(resolvedSource);
   // A directory cannot be hard-linked, so its children move through their pinned
@@ -300,11 +438,13 @@ function cacheRenameSync(source, destination) {
     return cacheMoveDirectoryTree(resolvedSource, resolvedDestination);
   }
   if (sourceMetadata.isSymbolicLink()) {
-    const target = withPinnedCacheDirectory(sourceParent, () => readlinkSync(path.basename(resolvedSource)));
-    withPinnedCacheDirectory(destinationParent, () => symlinkSync(
+    const target = runPinnedCacheOperation(sourceParent, "readlink", {
+      name: path.basename(resolvedSource),
+    });
+    runPinnedCacheOperation(destinationParent, "symlink", {
       target,
-      path.basename(resolvedDestination),
-    ));
+      name: path.basename(resolvedDestination),
+    });
   } else {
     cacheLinkAcrossPinnedDirectories(resolvedSource, resolvedDestination);
   }
@@ -312,11 +452,12 @@ function cacheRenameSync(source, destination) {
   try {
     destinationMetadata = cacheLstatSync(resolvedDestination);
     if (sourceMetadata.isSymbolicLink()) {
-      const sourceTarget = withPinnedCacheDirectory(sourceParent, () => readlinkSync(path.basename(resolvedSource)));
-      const destinationTarget = withPinnedCacheDirectory(
-        destinationParent,
-        () => readlinkSync(path.basename(resolvedDestination)),
-      );
+      const sourceTarget = runPinnedCacheOperation(sourceParent, "readlink", {
+        name: path.basename(resolvedSource),
+      });
+      const destinationTarget = runPinnedCacheOperation(destinationParent, "readlink", {
+        name: path.basename(resolvedDestination),
+      });
       if (!destinationMetadata.isSymbolicLink() || destinationTarget !== sourceTarget) {
         throw new Error("cross-directory cache move copied an unexpected symbolic link");
       }
@@ -387,7 +528,9 @@ function cacheLinkAcrossPinnedDirectories(source, destination) {
 
 function cacheUnlinkSync(file) {
   const resolved = path.resolve(file);
-  return withPinnedCacheDirectory(path.dirname(resolved), () => unlinkSync(path.basename(resolved)));
+  return runPinnedCacheOperation(path.dirname(resolved), "unlink", {
+    name: path.basename(resolved),
+  });
 }
 
 function cacheLinkSync(source, destination) {
@@ -397,18 +540,17 @@ function cacheLinkSync(source, destination) {
   if (parent !== path.dirname(resolvedDestination)) {
     throw new Error("cache hard-link endpoints must share one pinned directory");
   }
-  return withPinnedCacheDirectory(parent, () => linkSync(
-    path.basename(resolvedSource),
-    path.basename(resolvedDestination),
-  ));
+  return runPinnedCacheOperation(parent, "link", {
+    source: path.basename(resolvedSource),
+    destination: path.basename(resolvedDestination),
+  });
 }
 
 function cacheRmdirSync(directory) {
   const resolved = path.resolve(directory);
-  const result = withPinnedCacheDirectory(
-    path.dirname(resolved),
-    () => rmdirSync(path.basename(resolved)),
-  );
+  const result = runPinnedCacheOperation(path.dirname(resolved), "rmdir", {
+    name: path.basename(resolved),
+  });
   const pin = replayDirectoryPins.get(resolved);
   if (pin) closeSync(pin.descriptor);
   replayDirectoryPins.delete(resolved);
@@ -417,11 +559,13 @@ function cacheRmdirSync(directory) {
 
 function cacheLstatSync(file) {
   const resolved = path.resolve(file);
-  return withPinnedCacheDirectory(path.dirname(resolved), () => lstatSync(path.basename(resolved)));
+  return runPinnedCacheOperation(path.dirname(resolved), "lstat", {
+    name: path.basename(resolved),
+  });
 }
 
 function cacheReaddirSync(directory) {
-  return withPinnedCacheDirectory(directory, () => readdirSync("."));
+  return runPinnedCacheOperation(directory, "readdir");
 }
 
 function signedEventFromFrame(raw) {
@@ -478,16 +622,28 @@ function cacheEntryDescriptor(file) {
 function validatedCachedPublisher(file) {
   const entry = cacheEntryDescriptor(file);
   if (entry === null) return null;
+  let raw;
   try {
-    return cachedEventFromFrame(readRegularFile(file).bytes.toString("utf8"), entry).pubkey;
+    raw = readRegularFile(file).bytes.toString("utf8");
+  } catch (error) {
+    throw new Error(`could not read signed cache payload ${file}: ${error.message}`);
+  }
+  try {
+    return cachedEventFromFrame(raw, entry).pubkey;
   } catch {
     return null;
   }
 }
 
 function validatedSignedPublisher(file) {
+  let raw;
   try {
-    return signedEventFromFrame(readRegularFile(file).bytes.toString("utf8")).pubkey;
+    raw = readRegularFile(file).bytes.toString("utf8");
+  } catch (error) {
+    throw new Error(`could not read signed cache payload ${file}: ${error.message}`);
+  }
+  try {
+    return signedEventFromFrame(raw).pubkey;
   } catch {
     return null;
   }
@@ -504,16 +660,8 @@ function sha256(value) {
 
 function readRegularFile(file) {
   const resolved = path.resolve(file);
-  return withPinnedCacheDirectory(path.dirname(resolved), () => {
-    const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
-    const descriptor = openSync(path.basename(resolved), flags);
-    try {
-      const metadata = fstatSync(descriptor);
-      if (!metadata.isFile()) throw new Error(`cache entry ${file} is not a regular file`);
-      return { bytes: readFileSync(descriptor), metadata };
-    } finally {
-      closeSync(descriptor);
-    }
+  return runPinnedCacheOperation(path.dirname(resolved), "read_regular", {
+    name: path.basename(resolved),
   });
 }
 
@@ -1457,7 +1605,21 @@ function migrateEndpointReplayEntries(replayDir) {
   const payloadsDir = prepareCacheDirectory(quarantineDir, "payloads");
   const stagingDir = prepareCacheDirectory(quarantineDir, "staging");
   const corruptDir = prepareCacheDirectory(quarantineDir, "corrupt");
+  const interruptedWriteQuarantine = {
+    replayDir,
+    quarantineDir,
+    manifestsDir,
+    payloadsDir,
+    stagingDir,
+  };
   for (const endpointDirectory of topology.directories) {
+    const endpointSweep = sweepOrphanTemporaries(
+      endpointDirectory,
+      Date.now(),
+      interruptedWriteQuarantine,
+    );
+    if (endpointSweep.failed > 0) failures.push(endpointDirectory);
+    quarantined += endpointSweep.quarantined;
     const inventory = cacheEntries(endpointDirectory);
     failures.push(...inventory.failures);
     for (const entry of inventory.entries) {
@@ -1515,8 +1677,6 @@ function migrateEndpointReplayEntries(replayDir) {
         failures.push(entry.file);
       }
     }
-    const sweep = sweepOrphanTemporaries(endpointDirectory, Date.now());
-    if (sweep.failed > 0) failures.push(endpointDirectory);
     quarantined += quarantineNoncanonicalEndpointChildren(
       replayDir,
       endpointDirectory,
@@ -1525,6 +1685,17 @@ function migrateEndpointReplayEntries(replayDir) {
       manifestsDir,
       failures,
     );
+    const channels = cacheChannelDirectories(endpointDirectory);
+    failures.push(...channels.failures);
+    for (const channelDirectory of channels.directories) {
+      const channelSweep = sweepOrphanTemporaries(
+        channelDirectory,
+        Date.now(),
+        interruptedWriteQuarantine,
+      );
+      if (channelSweep.failed > 0) failures.push(channelDirectory);
+      quarantined += channelSweep.quarantined;
+    }
   }
   if (migrated > 0) log(`migrated ${migrated} endpoint-only replay event(s) into channel partitions`);
   if (quarantined > 0) log(`quarantined ${quarantined} ambiguous endpoint-only replay entr${quarantined === 1 ? "y" : "ies"}`);
@@ -1989,12 +2160,12 @@ function activeCacheDirectories(replayDir) {
 // write and the rename leaves behind. It matches neither the drain's `.json`
 // filter nor the cap's accounting, so without this it is never published, never
 // counted, and never removed - one signed projection leaked per interrupted run,
-// forever. Age-gated so a concurrent run's in-flight write is not deleted out
-// from under it; an incomplete entry is dropped rather than repaired, because
-// only a completed rename means the bytes are whole enough to send.
+// forever. Age-gated so a concurrent run's in-flight write is not changed out
+// from under it; complete signed frames are recovered byte-for-byte, invalid
+// frames are discarded, and valid conflicts are preserved in quarantine.
 const ORPHAN_TMP_AGE_MS = 60000;
 
-function sweepOrphanTemporaries(replayDir, now) {
+function sweepOrphanTemporaries(replayDir, now, quarantine = null) {
   let names;
   try {
     names = cacheReaddirSync(replayDir);
@@ -2003,7 +2174,9 @@ function sweepOrphanTemporaries(replayDir, now) {
     log(`could not inspect cache directory ${replayDir}: ${error.message}`);
     return { swept: 0, failed: 1 };
   }
-  let swept = 0;
+  let recovered = 0;
+  let discarded = 0;
+  let quarantined = 0;
   let failed = 0;
   for (const name of names) {
     if (!name.endsWith(".json.tmp")) continue;
@@ -2019,12 +2192,87 @@ function sweepOrphanTemporaries(replayDir, now) {
       continue;
     }
     if (now - modified < ORPHAN_TMP_AGE_MS) continue;
-    const removal = removeCacheFile(replayDir, file, `sweep interrupted cache write ${name}`);
-    if (removal.removed) swept += 1;
-    if (removal.failed) failed += 1;
+    let raw;
+    try {
+      raw = readRegularFile(file).bytes.toString("utf8");
+    } catch (error) {
+      log(`could not inspect interrupted cache write ${name}: ${error.message}`);
+      failed += 1;
+      continue;
+    }
+    let event;
+    let channelId;
+    try {
+      event = signedEventFromFrame(raw);
+      channelId = cachedEventChannelId(event);
+    } catch (error) {
+      const removal = removeCacheFile(replayDir, file, `discard invalid interrupted cache write ${name}`);
+      if (removal.removed) discarded += 1;
+      if (removal.failed) failed += 1;
+      continue;
+    }
+    const directoryChannel = path.basename(replayDir);
+    const wrongChannel = CHANNEL_PARTITION.test(directoryChannel) && directoryChannel !== channelId;
+    const target = path.join(replayDir, `${event.created_at}-${event.id}.json`);
+    let collision = false;
+    if (!wrongChannel) {
+      try {
+        const existing = readRegularFile(target).bytes.toString("utf8");
+        if (existing === raw) {
+          cacheUnlinkSync(file);
+          recovered += 1;
+          continue;
+        }
+        collision = true;
+      } catch (error) {
+        if (error.code !== "ENOENT") {
+          log(`could not recover interrupted cache write ${name}: ${error.message}`);
+          failed += 1;
+          continue;
+        }
+      }
+    }
+    if (!wrongChannel && !collision) {
+      try {
+        cacheRenameSync(file, target);
+        recovered += 1;
+      } catch (error) {
+        log(`could not recover interrupted cache write ${name}: ${error.message}`);
+        failed += 1;
+      }
+      continue;
+    }
+    if (quarantine === null) {
+      log(`could not recover interrupted cache write ${name}: ${wrongChannel ? "channel tag does not match its cache partition" : "cache destination collision"}`);
+      failed += 1;
+      continue;
+    }
+    try {
+      quarantineLegacyEntry(
+        quarantine.replayDir,
+        quarantine.quarantineDir,
+        quarantine.manifestsDir,
+        quarantine.payloadsDir,
+        quarantine.stagingDir,
+        file,
+        null,
+        {
+          reason: wrongChannel
+            ? "interrupted-cache-write-channel-mismatch"
+            : "interrupted-cache-write-collision",
+          publisherPubkey: event.pubkey,
+        },
+      );
+      quarantined += 1;
+    } catch (error) {
+      log(`could not quarantine interrupted cache write ${name}: ${error.message}`);
+      failed += 1;
+    }
   }
-  if (swept > 0) log(`swept ${swept} interrupted cache write(s)`);
-  return { swept, failed };
+  if (recovered > 0) log(`recovered ${recovered} interrupted cache write(s)`);
+  if (discarded > 0) log(`discarded ${discarded} invalid interrupted cache write(s)`);
+  if (quarantined > 0) log(`quarantined ${quarantined} conflicted interrupted cache write(s)`);
+  return { recovered, discarded, quarantined, failed };
 }
 
 // Keep the cache bounded. An unbounded queue after a long relay outage would grow

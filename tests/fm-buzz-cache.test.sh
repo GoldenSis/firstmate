@@ -590,7 +590,7 @@ EOF
 }
 
 test_quarantine_manifest_inspection_failures_are_accounted_for() {
-  local home replay quarantine manifest preload relay output
+  local home replay quarantine manifest tools real_python relay output
   home=$(make_home quarantine-manifest-inspection)
   run_keypair "$home" >/dev/null 2>&1 || fail "quarantine-manifest keypair setup failed"
   replay="$home/state/buzz-replay"
@@ -600,28 +600,30 @@ test_quarantine_manifest_inspection_failures_are_accounted_for() {
   manifest="$quarantine/manifests/$(printf '%064d' 8).json"
   printf '%s\n' '{}' > "$manifest"
   manifest="$(cd "$(dirname "$manifest")" && pwd -P)/$(basename "$manifest")"
-  preload="$home/quarantine-manifest-failure.mjs"
-  cat > "$preload" <<'EOF'
-import path from "node:path";
-import { createRequire, syncBuiltinESMExports } from "node:module";
-
-const fs = createRequire(import.meta.url)("node:fs");
-const originalLstatSync = fs.lstatSync;
-fs.lstatSync = function guardedLstatSync(value, ...args) {
-  if (path.resolve(String(value)) === path.resolve(process.env.FM_TEST_QUARANTINE_MANIFEST)) {
-    const error = new Error("simulated manifest inspection failure");
-    error.code = "EACCES";
-    throw error;
-  }
-  return originalLstatSync.call(fs, value, ...args);
-};
-syncBuiltinESMExports();
+  tools="$home/tools"
+  mkdir -p "$tools"
+  real_python=$(command -v python3)
+  cat > "$tools/python3" <<'EOF'
+#!/usr/bin/env bash
+case ${3:-} in
+  *'"operation":"lstat"'*'"name":"'"$FM_TEST_QUARANTINE_MANIFEST_NAME"'"'*)
+    parent=$("$FM_TEST_REAL_PYTHON" -c 'import os; os.fchdir(3); print(os.getcwd())')
+    if [ "$parent/$FM_TEST_QUARANTINE_MANIFEST_NAME" = "$FM_TEST_QUARANTINE_MANIFEST" ]; then
+      printf '%s\n' '{"ok":false,"code":"EACCES","message":"simulated manifest inspection failure"}' >&2
+      exit 1
+    fi
+    ;;
+esac
+exec "$FM_TEST_REAL_PYTHON" "$@"
 EOF
+  chmod +x "$tools/python3"
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
   output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"manifest-accounting"}' \
-    | NODE_OPTIONS="--import=$preload" FM_TEST_QUARANTINE_MANIFEST="$manifest" \
+    | PATH="$tools:$PATH" FM_TEST_REAL_PYTHON="$real_python" \
+      FM_TEST_QUARANTINE_MANIFEST="$manifest" \
+      FM_TEST_QUARANTINE_MANIFEST_NAME="$(basename "$manifest")" \
       run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
   assert_contains "$output" "could not inspect legacy quarantine manifest" \
@@ -882,7 +884,7 @@ EOF
 }
 
 test_replay_cache_pins_descendant_directories() {
-  local home relay replay digest partition held outside preload escape_log swap_log output
+  local home relay replay digest channel partition held outside tools real_python escape_log swap_log output
   home=$(make_home replay-descendant-pin)
   run_keypair "$home" >/dev/null 2>&1 || fail "replay-descendant keypair setup failed"
   relay="ws://127.0.0.1:1/descendant"
@@ -890,50 +892,47 @@ test_replay_cache_pins_descendant_directories() {
   digest=$(node -e '
     import(process.argv[1]).then(({ relayCacheKey }) => process.stdout.write(relayCacheKey(process.argv[2])));
   ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay")
-  partition="$replay/$digest"
+  channel=$(default_channel_id "$home")
+  partition="$replay/$digest/$channel"
   held="$home/held-replay-partition"
   outside="$home/outside-replay-partition"
-  preload="$home/replay-descendant-swap.mjs"
+  tools="$home/tools"
+  real_python=$(command -v python3)
   escape_log="$home/replay-descendant-escape.log"
   swap_log="$home/replay-descendant-swap.log"
-  mkdir -p "$partition" "$outside"
-  cat > "$preload" <<'EOF'
-import path from "node:path";
-import { createRequire, syncBuiltinESMExports } from "node:module";
-
-const fs = createRequire(import.meta.url)("node:fs");
-
-const originalWriteFileSync = fs.writeFileSync;
-const replayRoot = fs.realpathSync(process.env.FM_TEST_REPLAY_ROOT);
-let swapped = false;
-fs.writeFileSync = function guardedWriteFileSync(file, ...args) {
-  const absolute = path.resolve(String(file));
-  const parent = path.dirname(absolute);
-  originalWriteFileSync(process.env.FM_TEST_CACHE_SWAP_LOG, `write ${absolute} root ${replayRoot}\n`, { flag: "a" });
-  if (
-    !swapped &&
-    parent.startsWith(`${replayRoot}${path.sep}`) &&
-    path.basename(absolute).endsWith(".json.tmp")
-  ) {
-    swapped = true;
-    fs.renameSync(parent, process.env.FM_TEST_CACHE_HELD);
-    fs.symlinkSync(process.env.FM_TEST_CACHE_OUTSIDE, parent, "dir");
-    originalWriteFileSync(process.env.FM_TEST_CACHE_SWAP_LOG, `swapped ${parent}\n`, { flag: "a" });
-  }
-  const result = originalWriteFileSync.call(fs, file, ...args);
-  const escaped = path.join(process.env.FM_TEST_CACHE_OUTSIDE, path.basename(String(file)));
-  if (fs.existsSync(escaped)) {
-    originalWriteFileSync(process.env.FM_TEST_CACHE_ESCAPE_LOG, `${escaped}\n`, { flag: "a" });
-  }
-  return result;
-};
-syncBuiltinESMExports();
+  mkdir -p "$partition" "$outside" "$tools"
+  cat > "$tools/python3" <<'EOF'
+#!/usr/bin/env bash
+request=${3:-}
+case $request in
+  *'"operation":"write"'*'"name":"'*'.json.tmp"'*)
+    parent=$("$FM_TEST_REAL_PYTHON" -c 'import os; os.fchdir(3); print(os.getcwd())')
+    if [ "$parent" = "$FM_TEST_CACHE_PARTITION" ] && [ ! -e "$FM_TEST_CACHE_SWAP_LOG" ]; then
+      "$FM_TEST_REAL_PYTHON" -c '
+import os
+os.rename(os.environ["FM_TEST_CACHE_PARTITION"], os.environ["FM_TEST_CACHE_HELD"])
+os.symlink(os.environ["FM_TEST_CACHE_OUTSIDE"], os.environ["FM_TEST_CACHE_PARTITION"])
+'
+      printf 'swapped %s\n' "$FM_TEST_CACHE_PARTITION" > "$FM_TEST_CACHE_SWAP_LOG"
+    fi
+    "$FM_TEST_REAL_PYTHON" "$@"
+    code=$?
+    name=${request#*'"name":"'}
+    name=${name%%'"'*}
+    if [ -e "$FM_TEST_CACHE_OUTSIDE/$name" ]; then
+      printf '%s\n' "$FM_TEST_CACHE_OUTSIDE/$name" > "$FM_TEST_CACHE_ESCAPE_LOG"
+    fi
+    exit "$code"
+    ;;
+esac
+exec "$FM_TEST_REAL_PYTHON" "$@"
 EOF
+  chmod +x "$tools/python3"
   output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"descendant-pin"}' \
-    | NODE_OPTIONS="--import=$preload" \
-      FM_TEST_REPLAY_ROOT="$replay" \
+    | PATH="$tools:$PATH" FM_TEST_REAL_PYTHON="$real_python" \
       FM_TEST_CACHE_HELD="$held" \
       FM_TEST_CACHE_OUTSIDE="$outside" \
+      FM_TEST_CACHE_PARTITION="$partition" \
       FM_TEST_CACHE_ESCAPE_LOG="$escape_log" \
       FM_TEST_CACHE_SWAP_LOG="$swap_log" \
       run_publish "$home" "$relay" 2>&1)
@@ -945,7 +944,10 @@ EOF
     || fail "a descendant-directory swap left replay data outside the pinned cache"
   assert_contains "$output" "cache directory identity changed" \
     "a descendant-directory swap was not diagnosed"
-  pass "replay cache descendant directories stay pinned during mutation"
+  if rg -q 'process\.chdir' "$ROOT/bin/fm-buzz-publish.mjs"; then
+    fail "cache mutations still change process cwd instead of using pinned descriptors"
+  fi
+  pass "replay cache mutations stay relative to pinned directory descriptors"
 }
 
 test_cross_directory_quarantine_claims_cannot_follow_swapped_sources() {
@@ -968,7 +970,11 @@ const childProcess = createRequire(import.meta.url)("node:child_process");
 const originalSpawnSync = childProcess.spawnSync;
 let swapped = false;
 childProcess.spawnSync = function guardedSpawnSync(command, args, options) {
-  if (!swapped && command === "python3" && String(args?.[1]).includes("os.link")) {
+  if (
+    !swapped &&
+    command === "python3" &&
+    String(args?.[1]).includes("os.link(sys.argv[1], sys.argv[2]")
+  ) {
     swapped = true;
     const sourceParent = process.env.FM_TEST_CACHE_SOURCE;
     fs.renameSync(sourceParent, process.env.FM_TEST_CACHE_HELD);
@@ -1056,7 +1062,7 @@ test_quarantine_header_defines_each_manifest_variant() {
 }
 
 test_cross_directory_quarantine_directory_moves_pin_both_parents() {
-  local home replay endpoint source held outside preload output swap_log
+  local home replay endpoint source held outside tools real_python output swap_log
   home=$(make_home quarantine-directory-destination-swap)
   run_keypair "$home" >/dev/null 2>&1 || fail "directory-destination quarantine keypair setup failed"
   replay="$home/state/buzz-replay"
@@ -1064,38 +1070,35 @@ test_cross_directory_quarantine_directory_moves_pin_both_parents() {
   source="$endpoint/not-a-channel"
   held="$home/held-quarantine-destination"
   outside="$home/outside-quarantine-destination"
-  preload="$home/quarantine-directory-destination-swap.mjs"
+  tools="$home/tools"
+  real_python=$(command -v python3)
   swap_log="$home/quarantine-directory-destination-swap.log"
-  mkdir -p "$source" "$outside"
+  mkdir -p "$source" "$outside" "$tools"
   printf '%s' 'original-directory' > "$source/original.txt"
-  cat > "$preload" <<'EOF'
-import path from "node:path";
-import { createRequire, syncBuiltinESMExports } from "node:module";
-
-const fs = createRequire(import.meta.url)("node:fs");
-const originalMkdirSync = fs.mkdirSync;
-const originalRenameSync = fs.renameSync;
-let swapped = false;
-function swapDestination(parent) {
-  if (swapped || !parent.includes(`${path.sep}_legacy-quarantine${path.sep}corrupt${path.sep}`)) return;
-  swapped = true;
-  originalRenameSync(parent, process.env.FM_TEST_CACHE_HELD);
-  fs.symlinkSync(process.env.FM_TEST_CACHE_OUTSIDE, parent, "dir");
-  fs.writeFileSync(process.env.FM_TEST_CACHE_SWAP_LOG, `${parent}\n`);
-}
-fs.mkdirSync = function guardedMkdirSync(directory, ...args) {
-  const absolute = path.resolve(String(directory));
-  if (path.basename(absolute) === "entry") swapDestination(path.dirname(absolute));
-  return originalMkdirSync.call(fs, directory, ...args);
-};
-fs.renameSync = function guardedRenameSync(source, destination, ...args) {
-  if (path.basename(String(source)) === "not-a-channel") swapDestination(path.dirname(path.resolve(String(destination))));
-  return originalRenameSync.call(fs, source, destination, ...args);
-};
-syncBuiltinESMExports();
+  cat > "$tools/python3" <<'EOF'
+#!/usr/bin/env bash
+case ${3:-} in
+  *'"operation":"mkdir"'*'"name":"entry"'*)
+    parent=$("$FM_TEST_REAL_PYTHON" -c 'import os; os.fchdir(3); print(os.getcwd())')
+    case $parent in
+      *'/_legacy-quarantine/corrupt/'*)
+        if [ ! -e "$FM_TEST_CACHE_SWAP_LOG" ]; then
+          FM_TEST_CACHE_DESTINATION="$parent" "$FM_TEST_REAL_PYTHON" -c '
+import os
+os.rename(os.environ["FM_TEST_CACHE_DESTINATION"], os.environ["FM_TEST_CACHE_HELD"])
+os.symlink(os.environ["FM_TEST_CACHE_OUTSIDE"], os.environ["FM_TEST_CACHE_DESTINATION"])
+'
+          printf '%s\n' "$parent" > "$FM_TEST_CACHE_SWAP_LOG"
+        fi
+        ;;
+    esac
+    ;;
+esac
+exec "$FM_TEST_REAL_PYTHON" "$@"
 EOF
+  chmod +x "$tools/python3"
   output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"directory-source-swap"}' \
-    | NODE_OPTIONS="--import=$preload" \
+    | PATH="$tools:$PATH" FM_TEST_REAL_PYTHON="$real_python" \
       FM_TEST_CACHE_HELD="$held" \
       FM_TEST_CACHE_OUTSIDE="$outside" \
       FM_TEST_CACHE_SWAP_LOG="$swap_log" \
@@ -1258,38 +1261,42 @@ EOF
   pass "cache directory inspection failures remain visible in outcome accounting"
 }
 
-test_an_interrupted_cache_write_is_swept_not_leaked() {
-  # A `.json.tmp` is the half of the atomic cache write that a kill between the
-  # write and the rename leaves behind. It matches neither the drain's filter nor
-  # the cap's accounting, so unswept it is invisible AND immortal: never sent,
-  # never counted, never removed, one leaked signed projection per interrupted
-  # run. An in-flight write from a concurrent run must survive, though, so the
-  # sweep is age-gated and this checks both halves.
-  local home relay cache_dir stale fresh count
+test_an_interrupted_cache_write_is_recovered_or_discarded_safely() {
+  local home relay cache_dir private channel complete target payload stale fresh count
   home=$(make_home orphan-tmp)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
   relay="ws://127.0.0.1:1"
-  cache_dir=$(channel_cache_dir "$home" "$relay" "$(default_channel_id "$home")") \
+  channel=$(default_channel_id "$home")
+  cache_dir=$(channel_cache_dir "$home" "$relay" "$channel") \
     || fail "could not derive cache partition"
   mkdir -p "$cache_dir"
 
+  private=$(jq -r '.private_key' "$(key_file "$home" "$home/xdg")")
+  target=$(seed_replay_event "$home" "$relay" "$private" 1700000000 "$channel" interrupted-complete) \
+    || fail "could not seed a complete interrupted cache write"
+  payload=$(cat "$target")
+  complete="$target.tmp"
+  mv "$target" "$complete"
   stale="$cache_dir/1700000001-$(printf '%064d' 1).json.tmp"
   fresh="$cache_dir/1700000002-$(printf '%064d' 2).json.tmp"
   printf '["EVENT",{"id":"%064d","created_at":1700000001}]' 1 > "$stale"
   printf '["EVENT",{"id":"%064d","created_at":1700000002}]' 2 > "$fresh"
-  touch -t 202001010000 "$stale" || fail "could not age the stale temp file"
+  touch -t 202001010000 "$complete" "$stale" || fail "could not age the interrupted writes"
 
   printf '%s' '{"schema":"fm-bearings.v1","note":"orphan"}' \
     | run_publish "$home" "$relay" >/dev/null 2>&1
 
-  assert_absent "$stale" "an interrupted cache write was left behind forever"
+  assert_absent "$complete" "a complete interrupted cache write was left stranded"
+  assert_present "$target" "a complete interrupted cache write was not recovered"
+  [ "$(cat "$target")" = "$payload" ] \
+    || fail "recovering a complete interrupted cache write changed its signed bytes"
+  assert_absent "$stale" "a provably invalid interrupted cache write was retained"
   assert_present "$fresh" "the sweep deleted a concurrent run's in-flight write"
 
-  # And the surviving temp file must not be mistaken for a deliverable entry.
   count=$(replay_count "$home")
-  [ "$count" = "1" ] \
-    || fail "a .json.tmp was counted as a cache entry (found $count, expected only the new event)"
-  pass "an interrupted cache write is swept, and a fresh one is not"
+  [ "$count" = "2" ] \
+    || fail "interrupted-write recovery produced the wrong replay count (found $count)"
+  pass "interrupted cache writes recover complete frames and discard only invalid bytes"
 }
 
 test_unreadable_cache_entry_is_retained_as_retryable() {
@@ -1424,7 +1431,7 @@ test_replay_cache_never_reads_non_regular_entries
 test_relay_timeout_must_fit_the_node_timer_range
 test_malformed_cache_names_are_discarded_or_accounted_for
 test_cache_directory_stat_failures_are_accounted_for
-test_an_interrupted_cache_write_is_swept_not_leaked
+test_an_interrupted_cache_write_is_recovered_or_discarded_safely
 test_unreadable_cache_entry_is_retained_as_retryable
 test_parseable_cache_corruption_is_discarded_without_replay
 test_cache_prune_failures_are_reported_and_accounted_for

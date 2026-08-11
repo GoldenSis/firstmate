@@ -118,6 +118,64 @@ test_fallback_key_load_requires_private_regular_custody() {
   pass "fallback key loading requires a private regular file"
 }
 
+test_private_key_reads_are_descriptor_verified() {
+  local home keyfile held replacement preload output code stage staged_private staged_public recorded
+  home=$(make_home descriptor-key-read)
+  recorded=$(run_keypair "$home" 2>/dev/null) || fail "descriptor key-read setup failed"
+  keyfile=$(key_file "$home" "$home/xdg")
+  held="$keyfile.held"
+  replacement="$keyfile.replacement"
+  preload="$home/swap-private-before-open.cjs"
+  printf '%s\n' '{"private_key":"0000000000000000000000000000000000000000000000000000000000000003"}' \
+    > "$replacement"
+  chmod 0600 "$replacement"
+  cat > "$preload" <<'EOF'
+const fs = require("node:fs");
+const { syncBuiltinESMExports } = require("node:module");
+const originalOpenSync = fs.openSync;
+let swapped = false;
+fs.openSync = function guardedOpenSync(file, flags, ...args) {
+  if (!swapped && String(file) === process.env.FM_TEST_PRIVATE_KEY_FILE) {
+    swapped = true;
+    fs.renameSync(process.env.FM_TEST_PRIVATE_KEY_FILE, process.env.FM_TEST_PRIVATE_KEY_HELD);
+    fs.symlinkSync(process.env.FM_TEST_PRIVATE_KEY_REPLACEMENT, process.env.FM_TEST_PRIVATE_KEY_FILE);
+  }
+  return originalOpenSync.call(fs, file, flags, ...args);
+};
+syncBuiltinESMExports();
+EOF
+  output=$(NODE_OPTIONS="--require=$preload" \
+    FM_TEST_PRIVATE_KEY_FILE="$keyfile" \
+    FM_TEST_PRIVATE_KEY_HELD="$held" \
+    FM_TEST_PRIVATE_KEY_REPLACEMENT="$replacement" \
+    run_keypair "$home" --public 2>&1)
+  code=$?
+  expect_code 1 "$code" "fallback key swapped to a symlink during open"
+  [ -L "$keyfile" ] || fail "the private-key open race fixture did not run"
+  assert_contains "$output" "publishing key file" \
+    "a fallback key swapped during open bypassed descriptor validation"
+  [ "$(public_from_private "$(jq -r '.private_key' "$held")")" = "$recorded" ] \
+    || fail "the rejected descriptor race changed the original private key"
+
+  rm -f -- "$keyfile"
+  mv "$held" "$keyfile"
+  stage=$(rotation_stage_file "$home")
+  staged_private=$(new_private_key) || fail "could not mint the staged-permission fixture"
+  staged_public=$(public_from_private "$staged_private") || fail "could not derive the staged-permission fixture"
+  write_rotation_stage "$home" committable "$staged_private" "$staged_public"
+  chmod 0644 "$stage"
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "a group/world-readable rotation stage"
+  assert_contains "$output" "rotation stage $stage is invalid" \
+    "a non-private rotation stage was accepted"
+  assert_present "$stage" "rejecting a non-private rotation stage removed recovery material"
+  chmod 0600 "$stage"
+  [ "$(run_keypair "$home" --public 2>/dev/null)" = "$recorded" ] \
+    || fail "rejecting a non-private rotation stage changed the current identity"
+  pass "fallback and staged private keys are verified through one opened descriptor"
+}
+
 # --- one key per home, in the store that cannot enforce it ------------------
 
 test_two_homes_sharing_one_xdg_get_separate_keys() {
@@ -1864,6 +1922,68 @@ test_orphan_gate_validates_quarantine_payloads_without_filename_trust() {
   pass "quarantine payload authorship does not depend on cache filenames"
 }
 
+test_orphan_gate_fails_closed_on_unreadable_quarantine_payloads() {
+  local home relay private channel seeded flat replay manifest payload tools real_python output code
+  home=$(make_home orphan-quarantine-read-error)
+  run_keypair "$home" >/dev/null 2>&1 || fail "quarantine read-error setup failed"
+  relay="ws://127.0.0.1:1/quarantine-read-error"
+  private=$(new_private_key) || fail "could not mint a quarantine read-error publisher"
+  channel=$(default_channel_id "$home")
+  seeded=$(seed_replay_event "$home" "$relay" "$private" 1700000000 "$channel" quarantine-read-error) \
+    || fail "could not seed quarantine read-error evidence"
+  replay="$home/state/buzz-replay"
+  flat="$replay/not-a-cache-filename.json"
+  mv "$seeded" "$flat"
+  node -e '
+    import(process.argv[1]).then(({ migrateReplayCache }) => {
+      const result = migrateReplayCache(process.argv[2]);
+      if (result.legacy.length || result.endpoint.length) process.exitCode = 1;
+    });
+  ' "$ROOT/bin/fm-buzz-publish.mjs" "$replay" \
+    || fail "could not quarantine the read-error payload"
+  manifest=$(find "$replay/_legacy-quarantine/manifests" -type f -name '*.json' -print | head -1)
+  [ -n "$manifest" ] || fail "quarantine read-error payload has no manifest"
+  payload="$replay/_legacy-quarantine/$(jq -r '.payload_reference' "$manifest")"
+  # shellcheck disable=SC2016
+  node -e '
+    const fs = require("fs");
+    const file = process.argv[1];
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    value.publisher_pubkey = null;
+    fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+  ' "$manifest"
+  tools="$home/tools"
+  mkdir -p "$tools"
+  real_python=$(command -v python3)
+  cat > "$tools/python3" <<'EOF'
+#!/usr/bin/env bash
+case ${3:-} in
+  *'"operation":"read_regular"'*'"name":"'"$FM_TEST_UNREADABLE_QUARANTINE_NAME"'"'*)
+    parent=$("$FM_TEST_REAL_PYTHON" -c 'import os; os.fchdir(3); print(os.getcwd())')
+    if [ "$parent/$FM_TEST_UNREADABLE_QUARANTINE_NAME" = "$FM_TEST_UNREADABLE_QUARANTINE_PAYLOAD" ]; then
+      printf '%s\n' '{"ok":false,"code":"EACCES","message":"simulated quarantine payload read failure"}' >&2
+      exit 1
+    fi
+    ;;
+esac
+exec "$FM_TEST_REAL_PYTHON" "$@"
+EOF
+  chmod +x "$tools/python3"
+  rm -f -- "$(key_file "$home" "$home/xdg")" "$home/data/buzz-keypair.public"
+
+  output=$(PATH="$tools:$PATH" FM_TEST_REAL_PYTHON="$real_python" \
+    FM_TEST_UNREADABLE_QUARANTINE_NAME="$(basename "$payload")" \
+    FM_TEST_UNREADABLE_QUARANTINE_PAYLOAD="$payload" \
+    run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with an unreadable quarantine payload"
+  assert_contains "$output" "could not read signed cache payload $payload" \
+    "an unreadable quarantine payload was treated as absent identity evidence"
+  assert_absent "$(key_file "$home" "$home/xdg")" \
+    "default ensure minted over uninspectable quarantine evidence"
+  pass "uninspectable quarantine payloads keep orphan recovery fail closed"
+}
+
 test_orphan_gate_includes_recoverable_quarantine_staging() {
   local home relay private publisher channel seeded replay token transaction origin output code
   home=$(make_home orphan-quarantine-staging)
@@ -2136,6 +2256,7 @@ EOF
 test_bip340_official_vectors
 test_keypair_is_idempotent_and_never_prints_the_private_key
 test_fallback_key_load_requires_private_regular_custody
+test_private_key_reads_are_descriptor_verified
 test_two_homes_sharing_one_xdg_get_separate_keys
 test_rotation_replaces_the_key_in_whichever_store_holds_it
 test_a_compromised_rotation_does_not_keep_the_retired_key
@@ -2173,6 +2294,7 @@ test_rotation_stages_the_replacement_before_clearing_the_outgoing_key
 test_orphan_gate_sees_legacy_replay_publisher_evidence
 test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine
 test_orphan_gate_validates_quarantine_payloads_without_filename_trust
+test_orphan_gate_fails_closed_on_unreadable_quarantine_payloads
 test_orphan_gate_includes_recoverable_quarantine_staging
 test_orphan_identity_inspection_does_not_mutate_endpoint_replay
 test_publish_signing_is_serialized_with_compromised_rotation

@@ -191,26 +191,54 @@ fm_buzz_key_load_keychain() {
   return 2
 }
 
+fm_buzz_private_record_read() {  # <fallback|stage> <file>
+  local kind=${1:?record kind required} file=${2:?file required}
+  # shellcheck disable=SC2016
+  node -e '
+    const { closeSync, constants, fstatSync, openSync, readFileSync } = require("node:fs");
+    const [kind, file] = process.argv.slice(1);
+    if (typeof constants.O_NOFOLLOW !== "number") process.exit(43);
+    let descriptor;
+    try {
+      descriptor = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      process.exit(error?.code === "ENOENT" ? 42 : 43);
+    }
+    try {
+      const metadata = fstatSync(descriptor);
+      if (!metadata.isFile() || (metadata.mode & 0o777) !== 0o600) process.exit(43);
+      const value = JSON.parse(readFileSync(descriptor, "utf8"));
+      if (kind === "fallback") {
+        if (!/^[0-9a-fA-F]{64}$/.test(value?.private_key ?? "")) process.exit(43);
+        process.stdout.write(`${value.private_key}\n`);
+      } else if (kind === "stage") {
+        if (!value || !["prepared", "committable"].includes(value.phase)) process.exit(43);
+        if (!/^[0-9a-f]{64}$/.test(value.private_key ?? "")) process.exit(43);
+        if (!/^[0-9a-f]{64}$/.test(value.public_key ?? "")) process.exit(43);
+        process.stdout.write(`${value.phase}\n${value.private_key}\n${value.public_key}\n`);
+      } else {
+        process.exit(43);
+      }
+    } catch {
+      process.exit(43);
+    } finally {
+      closeSync(descriptor);
+    }
+  ' "$kind" "$file"
+}
+
 # Print the fallback private key. Return 1 when the file is absent, and 3 when it
 # exists but cannot be read as a key.
 fm_buzz_key_load_file() {
-  local home=${1:?home required} file value mode
+  local home=${1:?home required} file rc
   file=$(fm_buzz_key_fallback_file "$home") || return 1
-  if [ ! -e "$file" ] && [ ! -L "$file" ]; then
-    return 1
-  fi
-  [ ! -L "$file" ] && [ -f "$file" ] || return 3
-  if [ "$(uname -s)" = "Darwin" ]; then
-    mode=$(stat -f '%Lp' "$file" 2>/dev/null) || return 3
-  else
-    mode=$(stat -c '%a' "$file" 2>/dev/null) || return 3
-  fi
-  [ "$mode" = "600" ] || return 3
-  value=$(sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p' "$file") || return 3
-  [ -n "$value" ] || return 3
-  [ "${#value}" -eq 64 ] || return 3
-  case $value in *[!0-9a-fA-F]*) return 3 ;; esac
-  printf '%s\n' "$value"
+  fm_buzz_private_record_read fallback "$file"
+  rc=$?
+  case $rc in
+    0) return 0 ;;
+    42) return 1 ;;
+    *) return 3 ;;
+  esac
 }
 
 # Print the preferred stored private key. Return 1 when none is stored, 2 when
@@ -319,21 +347,15 @@ fm_buzz_key_stage_write() {  # <data directory> <prepared|committable> <private>
 # stage exists, and 2 when one exists but is not a readable, well-formed stage.
 # Same output discipline as fm_buzz_key_load: the second line is a private key.
 fm_buzz_key_stage_read() {  # <data directory>
-  local data=${1:?data directory required} file
+  local data=${1:?data directory required} file rc
   file=$(fm_buzz_key_stage_file "$data") || return 2
-  if [ ! -e "$file" ] && [ ! -L "$file" ]; then
-    return 1
-  fi
-  [ -f "$file" ] && [ ! -L "$file" ] || return 2
-  # shellcheck disable=SC2016
-  node -e '
-    const { readFileSync } = require("node:fs");
-    const value = JSON.parse(readFileSync(process.argv[1], "utf8"));
-    if (!value || !["prepared", "committable"].includes(value.phase)) process.exit(1);
-    if (!/^[0-9a-f]{64}$/.test(value.private_key ?? "")) process.exit(1);
-    if (!/^[0-9a-f]{64}$/.test(value.public_key ?? "")) process.exit(1);
-    process.stdout.write(`${value.phase}\n${value.private_key}\n${value.public_key}\n`);
-  ' "$file" 2>/dev/null || return 2
+  fm_buzz_private_record_read stage "$file"
+  rc=$?
+  case $rc in
+    0) return 0 ;;
+    42) return 1 ;;
+    *) return 2 ;;
+  esac
 }
 
 fm_buzz_key_stage_clear() {  # <data directory>

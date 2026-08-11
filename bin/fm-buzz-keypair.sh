@@ -36,12 +36,11 @@
 # adapter's. It clears BOTH private stores - the keychain entry and the 0600
 # fallback file - while preserving data/buzz-keypair.public as recovery evidence
 # until the fresh private key is stored and that public record is atomically
-# replaced. Before mutation it checks every used relay/channel pair recorded by
-# bin/fm-buzz-targets.mjs, refusing when the
-# outgoing publisher appears in the relay's current membership state because M1
-# has no membership-transfer operation. The first valid membership snapshot pins
-# its signer in data/buzz-relay-authorities.jsonl, and later checks require that
-# same signer. It never prints the private key, old or new.
+# replaced. Before mutation it refuses identities whose tracked private-channel
+# memberships would be stranded because M1 has no membership-transfer operation.
+# bin/fm-buzz-lib.mjs owns authoritative membership queries, and
+# bin/fm-buzz-targets.mjs owns tracked targets and relay-authority trust records.
+# This command never prints the private key, old or new.
 # Rotation also refuses while any active replay partition contains a valid event
 # authored by an identity being retired, because replay authenticates only as the
 # current publisher. --discard-pending-cache explicitly moves those exact entries

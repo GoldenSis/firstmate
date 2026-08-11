@@ -2,13 +2,14 @@
 # fm-buzz-publish.sh - publish one bearings projection to the loopback Buzz relay.
 #
 # ============================ FIRE-AND-FORGET ==============================
-# THIS SCRIPT ALWAYS EXITS 0. A NON-ZERO EXIT FROM THIS SCRIPT IS A BUG.
+# RUNTIME PUBLISH FAILURES EXIT 0. A MISSING REQUIRED PYTHON3 EXITS NON-ZERO.
 #
 # Every failure path - relay down, connection refused, timeout, NIP-42 auth
 # failure, event rejected, signing error, missing keypair, missing node, missing
-# jq, unreadable replay cache, malformed snapshot, anything at all - must be
-# caught, logged to stderr, and followed by exit 0. Nothing here may ever
-# propagate a non-zero status into a caller.
+# jq, unreadable replay cache, or malformed snapshot - is caught, logged to
+# stderr, and followed by exit 0. Python 3 is the declared prerequisite for the
+# descriptor-relative filesystem operations that enforce the cache boundary, so
+# its absence is a loud startup error rather than an optional publish failure.
 #
 # Why the contract is this absolute: Buzz is an additive reporting surface and
 # nothing in Firstmate's operation may depend on it. If this script could fail, a
@@ -19,8 +20,9 @@
 #
 # Consequences that follow from the contract, for anyone editing this file:
 #   - Do not add `set -e`. It is absent on purpose.
-#   - Do not add a `|| exit 1`, an `exit $?`, or a bare `exit` on any path.
+#   - Do not add another `|| exit 1`, an `exit $?`, or a bare `exit` path.
 #   - A failure the operator needs to see is a stderr line, never an exit code.
+#     Missing Python 3 is the single prerequisite exception.
 #   - The engine (bin/fm-buzz-publish.mjs) MAY exit non-zero; converting that into
 #     a logged success is this wrapper's whole job.
 # tests/fm-buzz-publish.test.sh asserts exit 0 with the relay stopped, and also
@@ -250,8 +252,6 @@ acquire_bounded_lock() {  # <lock>
 # Everything substantive runs inside this function so the tail of the script can
 # hold the single unconditional `exit 0` that the contract above demands.
 publish() {
-  command -v node >/dev/null 2>&1 || { log "node is unavailable; skipping publish"; return 1; }
-  command -v jq >/dev/null 2>&1 || { log "jq is unavailable; skipping publish"; return 1; }
   case $MAX_CACHE in
     ''|0|*[!0-9]*|0*)
       log "invalid FM_BUZZ_MAX_CACHE value '$MAX_CACHE': expected a positive integer"
@@ -492,6 +492,15 @@ publish() {
   return "$rc"
 }
 
+check_publish_prerequisites() {
+  command -v node >/dev/null 2>&1 || { log "node is unavailable; skipping publish"; return 1; }
+  command -v jq >/dev/null 2>&1 || { log "jq is unavailable; skipping publish"; return 1; }
+  command -v python3 >/dev/null 2>&1 || {
+    log "python3 is required for safe replay-cache operations; see docs/buzz-loopback-adapter.md#prerequisites"
+    return 2
+  }
+}
+
 ARGUMENT_ERROR=0
 while [ "$#" -gt 0 ]; do
   case $1 in
@@ -526,7 +535,16 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-if [ "$ARGUMENT_ERROR" -eq 1 ] || ! publish; then
+PREREQUISITE_STATUS=0
+if [ "$ARGUMENT_ERROR" -eq 0 ]; then
+  check_publish_prerequisites
+  PREREQUISITE_STATUS=$?
+fi
+if [ "$PREREQUISITE_STATUS" -eq 2 ]; then
+  exit 1
+fi
+
+if [ "$ARGUMENT_ERROR" -eq 1 ] || [ "$PREREQUISITE_STATUS" -ne 0 ] || ! publish; then
   # The single conversion point: a real failure becomes a logged non-event.
   log "publish did not complete; Firstmate is unaffected"
 fi
