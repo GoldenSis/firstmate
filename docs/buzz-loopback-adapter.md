@@ -65,13 +65,34 @@ Bring the relay up, publish, read back, tear down.
 Publishing requires Node.js with the global WebSocket API, `jq`, and Python 3.
 Python 3 provides the descriptor-relative filesystem operations that keep replay-cache mutations inside pinned directories, so a missing `python3` is a loud non-zero startup error with an install-documentation pointer.
 
+For native Docker:
+
 ```
-colima start                                                       # if the daemon is not running
 docker compose -f docker-compose.buzz-loopback.yml up -d
 bin/fm-buzz-keypair.sh                                             # once; prints the public key
 bin/fm-buzz-publish.sh --refresh                                   # publish current bearings
 bin/fm-buzz-inspect.sh --full                                      # read it back (human diagnostic)
 docker compose -f docker-compose.buzz-loopback.yml down -v         # clean slate, volumes included
+```
+
+For Colima, create both loopback forwards before publishing:
+
+```
+colima start
+buzz_colima_config=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-colima.XXXXXX")
+buzz_colima_control="${buzz_colima_config}.sock"
+colima ssh-config > "$buzz_colima_config"
+docker compose -f docker-compose.buzz-loopback.yml up -d
+ssh -F "$buzz_colima_config" -M -S "$buzz_colima_control" -fN \
+  -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:3000:127.0.0.1:3000 \
+  -L '[::1]:3000:127.0.0.1:3000' colima
+bin/fm-buzz-keypair.sh                                             # once; prints the public key
+bin/fm-buzz-publish.sh --refresh                                   # publish current bearings
+bin/fm-buzz-inspect.sh --full                                      # read it back (human diagnostic)
+docker compose -f docker-compose.buzz-loopback.yml down -v         # clean slate, volumes included
+ssh -F "$buzz_colima_config" -S "$buzz_colima_control" -O exit colima
+rm -f "$buzz_colima_config"
 ```
 
 Bounded input and safe non-events keep optional publication from delaying or weakening Firstmate.

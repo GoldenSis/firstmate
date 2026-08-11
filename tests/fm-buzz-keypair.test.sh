@@ -2179,6 +2179,48 @@ test_orphan_gate_includes_quarantine_manifest_temporaries() {
   pass "quarantine manifest temporaries preserve publisher identity"
 }
 
+test_orphan_gate_rejects_noncanonical_quarantine_manifest_children() {
+  local home manifests child output code
+  home=$(make_home orphan-noncanonical-quarantine-manifest-child)
+  manifests="$home/state/buzz-replay/_legacy-quarantine/manifests"
+  child="$manifests/unclassified-retained-evidence"
+  mkdir -p "$manifests"
+  printf '%s\n' 'retained evidence with no canonical manifest name' > "$child"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with a noncanonical quarantine manifest child"
+  assert_contains "$output" "legacy quarantine manifest $(basename "$child") has a noncanonical name" \
+    "the orphan gate skipped a noncanonical quarantine manifest child"
+  assert_absent "$(key_file "$home" "$home/xdg")" \
+    "default ensure minted over an unclassified quarantine manifest child"
+  assert_absent "$home/data/buzz-keypair.public" \
+    "a noncanonical quarantine manifest child allowed a replacement identity"
+  pass "orphan identity inspection rejects noncanonical quarantine manifest children"
+}
+
+test_orphan_gate_bounds_replay_payload_reads() {
+  local home replay endpoint channel entry output code
+  home=$(make_home orphan-oversized-replay-payload)
+  replay="$home/state/buzz-replay"
+  endpoint=$(printf '%064d' 7)
+  channel="abababab-cdcd-5efe-8123-456789abcdef"
+  entry="$replay/$endpoint/$channel/1700000000-$(printf '%064d' 8).json"
+  mkdir -p "$(dirname "$entry")"
+  python3 -c 'import sys; open(sys.argv[1], "wb").truncate(3 * 1024 * 1024)' "$entry" \
+    || fail "could not create the oversized replay fixture"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with an oversized replay payload"
+  assert_contains "$output" "cache entry exceeds 2101248-byte read limit" \
+    "the orphan gate buffered an oversized replay payload"
+  assert_present "$entry" "oversized replay evidence was deleted during identity inspection"
+  assert_absent "$(key_file "$home" "$home/xdg")" \
+    "default ensure minted over an oversized replay payload"
+  pass "replay and quarantine payload reads are bounded near the signed-event ceiling"
+}
+
 test_orphan_gate_preserves_corrupt_partition_publisher_evidence() {
   local home relay private publisher channel seeded replay corrupt_name corrupt_path manifest payload output code
   home=$(make_home orphan-corrupt-partition-publisher)
@@ -2883,6 +2925,8 @@ test_orphan_gate_sees_legacy_replay_publisher_evidence
 test_orphan_gate_sees_nested_legacy_replay_publisher_evidence
 test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine
 test_orphan_gate_includes_quarantine_manifest_temporaries
+test_orphan_gate_rejects_noncanonical_quarantine_manifest_children
+test_orphan_gate_bounds_replay_payload_reads
 test_orphan_gate_preserves_corrupt_partition_publisher_evidence
 test_orphan_gate_includes_interrupted_corrupt_quarantine_transactions
 test_orphan_gate_inventories_signed_frames_inside_quarantined_directories

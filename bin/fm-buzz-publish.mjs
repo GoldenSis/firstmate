@@ -101,6 +101,8 @@ import { publicKeyFromPrivate } from "./fm-buzz-crypto.mjs";
 const CACHE_PARTITION = /^[0-9a-f]{64}$/;
 const CHANNEL_PARTITION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const LEGACY_QUARANTINE = "_legacy-quarantine";
+const MAX_SIGNED_BEARINGS_FRAME_BYTES = (2 * 1024 * 1024) + 4096;
+const MAX_CACHE_READ_BUFFER_BYTES = MAX_SIGNED_BEARINGS_FRAME_BYTES + (64 * 1024);
 
 function log(message) {
   process.stderr.write(`fm-buzz-publish: ${message}\n`);
@@ -272,12 +274,21 @@ try:
             value = os.fstat(descriptor)
             if not stat.S_ISREG(value.st_mode):
                 raise RuntimeError("cache entry is not a regular file")
-            sys.stderr.write(json.dumps({"ok": True, "result": metadata(value)}) + "\n")
+            maximum = request["maximum_bytes"]
+            if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum <= 0:
+                raise RuntimeError("cache read limit is invalid")
+            if value.st_size > maximum:
+                raise RuntimeError(f"cache entry exceeds {maximum}-byte read limit")
+            total = 0
             while True:
-                chunk = os.read(descriptor, 1024 * 1024)
+                chunk = os.read(descriptor, min(1024 * 1024, maximum + 1 - total))
                 if not chunk:
                     break
+                total += len(chunk)
+                if total > maximum:
+                    raise RuntimeError(f"cache entry exceeds {maximum}-byte read limit")
                 sys.stdout.buffer.write(chunk)
+            sys.stderr.write(json.dumps({"ok": True, "result": metadata(value)}) + "\n")
         finally:
             os.close(descriptor)
         sys.exit(0)
@@ -318,7 +329,7 @@ function runPinnedCacheOperation(directory, operation, request = {}, input = und
       {
         encoding: readOperation ? undefined : "utf8",
         input,
-        maxBuffer: 1024 * 1024 * 1024,
+        maxBuffer: readOperation ? MAX_CACHE_READ_BUFFER_BYTES : 1024 * 1024,
         stdio: ["pipe", "pipe", "pipe", pin.descriptor],
       },
     );
@@ -672,6 +683,7 @@ function readRegularFile(file) {
   const resolved = path.resolve(file);
   return runPinnedCacheOperation(path.dirname(resolved), "read_regular", {
     name: path.basename(resolved),
+    maximum_bytes: MAX_SIGNED_BEARINGS_FRAME_BYTES,
   });
 }
 
@@ -2326,8 +2338,7 @@ function quarantinedReplayPublisherEntries(cacheRoot) {
     ...corruptQuarantinePublisherEntries(layout, manifestsPresent),
   ];
   if (!manifestsPresent) return evidence;
-  for (const name of cacheReaddirSync(layout.manifestsDir)
-    .filter((candidate) => candidate.endsWith(".json") || candidate.endsWith(".tmp"))) {
+  for (const name of cacheReaddirSync(layout.manifestsDir)) {
     const match = /^([0-9a-f]{64})\.json(?:(?:\.\d+)?\.tmp)?$/.exec(name);
     if (!match) throw new Error(`legacy quarantine manifest ${name} has a noncanonical name`);
     const manifestFile = path.join(layout.manifestsDir, name);

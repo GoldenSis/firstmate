@@ -15,9 +15,6 @@ TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-buzz.XXXXXX")
 TMP_ROOT=$(cd "$TMP_ROOT" && pwd -P)
 FM_TEST_CLEANUP_DIRS+=("$TMP_ROOT")
 
-command -v node >/dev/null 2>&1 || { echo "skip: node not found"; exit 0; }
-command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
-
 STUB_PID=""
 ROTATION_GUARD_PID=""
 ROTATION_GUARD_RELAY=""
@@ -32,6 +29,9 @@ cleanup() {
   fm_test_cleanup
 }
 trap cleanup EXIT
+
+command -v node >/dev/null 2>&1 || { echo "skip: node not found"; exit 0; }
+command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
 
 # An isolated home whose keypair lands in a temp XDG dir and never in the
 # developer's real login keychain.

@@ -45,6 +45,29 @@ test_missing_python3_is_a_loud_prerequisite_failure() {
   pass "missing python3 fails loudly before publication"
 }
 
+test_dependency_skips_remove_the_shared_temporary_root() {
+  local scratch missing tools tool output code
+  scratch="$TMP_ROOT/dependency-skip-cleanup"
+  mkdir -p "$scratch"
+  for missing in node jq; do
+    tools="$scratch/$missing-tools"
+    mkdir -p "$tools" "$scratch/$missing-tmp"
+    for tool in dirname jq mktemp node rm; do
+      [ "$tool" = "$missing" ] && continue
+      ln -s "$(command -v "$tool")" "$tools/$tool"
+    done
+    output=$(PATH="$tools" TMPDIR="$scratch/$missing-tmp" /bin/bash -c '. "$1"' \
+      fm-buzz-dependency-skip "$ROOT/tests/fm-buzz-test-lib.sh" 2>&1)
+    code=$?
+    expect_code 0 "$code" "Buzz tests with missing $missing"
+    assert_contains "$output" "skip: $missing not found" \
+      "missing $missing did not take the dependency-skip path"
+    [ -z "$(find "$scratch/$missing-tmp" -mindepth 1 -print -quit)" ] \
+      || fail "missing $missing leaked the shared Buzz temporary root"
+  done
+  pass "dependency skips remove the shared Buzz temporary root"
+}
+
 test_missing_global_websocket_is_rejected_before_publication() {
   local home tools tool real_node output code
   home=$(make_home missing-websocket)
@@ -1363,6 +1386,7 @@ EOF
 
 test_publish_with_relay_down_exits_zero_and_enqueues
 test_missing_python3_is_a_loud_prerequisite_failure
+test_dependency_skips_remove_the_shared_temporary_root
 test_missing_global_websocket_is_rejected_before_publication
 test_same_second_identical_publishes_have_distinct_signed_identities
 test_replayed_events_are_tracked_before_delivery
