@@ -678,6 +678,69 @@ read -r ROTATION_GUARD_PID ROTATION_GUARD_RELAY <<EOF
 $(start_stub)
 EOF
 
+
+test_inspect_content_truncation_is_marked() {
+  # Silent truncation of signed projection content (especially omitted[] near the
+  # end) is the anti-overclaim failure mode this tool must not hide. Default
+  # display caps at 600 characters with an explicit marker; --full is the only
+  # path that prints the complete projection.
+  local home relay short long full_out marker pad
+  home=$(make_home inspect-truncation)
+  run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
+  marker='... (truncated at 600 bytes; run with --full to see the complete projection)'
+
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+
+  # (a) short content: complete print, no marker
+  test_projection "short-note" \
+    | run_publish "$home" "$relay" >/dev/null 2>&1
+  short=$(run_inspect "$home" "$relay" 2>&1)
+  assert_contains "$short" "short-note" "short projection content did not print"
+  assert_not_contains "$short" "$marker" \
+    "short content must not emit the truncation marker"
+  assert_contains "$short" "signature verified" "short read was not verified"
+
+  # Build a projection whose JSON is well over 600 characters, with omitted[]
+  # carrying a unique token near the end so --full can prove the tail survived.
+  pad=$(python3 -c 'print("X" * 700)')
+  long_note="pad-${pad}"
+  # Use a custom projection via node/jq-free printf through test_projection style:
+  # test_projection only takes a short note; publish a large note via raw JSON.
+  printf '%s' "$(python3 -c '
+import json
+print(json.dumps({
+  "schema": "fm-bearings.v1",
+  "home": "test/home",
+  "generated": "2026-08-10T00:00:00Z",
+  "prs": "not_requested (run: /bearings include PRs)",
+  "in_flight": [],
+  "note": "pad-" + ("X" * 700),
+  "omitted": [{"surface": "tail-token-OMITTED-NEAR-END", "reveal": "--include-tail"}],
+}))
+')" | run_publish "$home" "$relay" >/dev/null 2>&1
+
+  long=$(run_inspect "$home" "$relay" --limit 1 2>&1)
+  assert_contains "$long" "$marker" \
+    "content over 600 chars must print the exact truncation marker"
+  assert_not_contains "$long" "tail-token-OMITTED-NEAR-END" \
+    "default inspect must not silently show the tail after truncation"
+  assert_contains "$long" "pad-" "truncated body should still show the start of the content"
+
+  full_out=$(run_inspect "$home" "$relay" --limit 1 --full 2>&1)
+  assert_not_contains "$full_out" "$marker" \
+    "--full must not emit the truncation marker"
+  assert_contains "$full_out" "tail-token-OMITTED-NEAR-END" \
+    "--full must print complete content including omitted[] near the end"
+  assert_contains "$full_out" "--include-tail" \
+    "--full must include the omitted reveal near the end"
+
+  stop_stub "$STUB_PID"
+  pass "inspect truncation is explicit and --full prints the complete projection"
+}
+
+test_inspect_content_truncation_is_marked
 test_the_inspector_rejects_a_tampered_event
 test_an_anonymous_read_only_claims_privacy_when_the_relay_refuses
 test_an_anonymous_read_that_returns_events_reports_the_breach

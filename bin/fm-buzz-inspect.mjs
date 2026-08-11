@@ -272,7 +272,16 @@ try {
         `    author    ${entry.authorDisplay} (${authorVerdict})\n` +
         `    signature ${verdict}\n    channel   ${channelVerdict}\n\n`,
     );
-    process.stdout.write(full ? `${entry.contentDisplay}\n` : `${entry.contentDisplay.slice(0, 600)}\n`);
+    {
+      const content = entry.contentDisplay;
+      if (full || content.length <= 600) {
+        process.stdout.write(`${content}\n`);
+      } else {
+        process.stdout.write(
+          `${content.slice(0, 600)}... (truncated at 600 bytes; run with --full to see the complete projection)\n`,
+        );
+      }
+    }
   }
 } catch (error) {
   process.stderr.write(`fm-buzz-inspect: ${error.message}\n`);
