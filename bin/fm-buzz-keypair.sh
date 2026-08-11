@@ -33,10 +33,11 @@
 # than a loud one.
 #
 # Rotation: Buzz documents no key-rotation procedure, so `--rotate` is this
-# adapter's. It clears BOTH stores - the keychain entry and the 0600 fallback
-# file - plus data/buzz-keypair.public, then mints a fresh keypair and prints the
-# new public key. Before mutation it checks every used relay/channel pair
-# recorded by bin/fm-buzz-targets.mjs, refusing when the
+# adapter's. It clears BOTH private stores - the keychain entry and the 0600
+# fallback file - while preserving data/buzz-keypair.public as recovery evidence
+# until the fresh private key is stored and that public record is atomically
+# replaced. Before mutation it checks every used relay/channel pair recorded by
+# bin/fm-buzz-targets.mjs, refusing when the
 # outgoing publisher appears in the relay's current membership state because M1
 # has no membership-transfer operation. The first valid membership snapshot pins
 # its signer in data/buzz-relay-authorities.jsonl, and later checks require that
@@ -328,6 +329,8 @@ check_rotation_target_membership() {  # <keychain|file> <public-key> <target-hex
   if [ "$check_status" -ne 0 ]; then
     rotation_membership_errors="${rotation_membership_errors:+$rotation_membership_errors
 }fm-buzz-keypair.sh: could not verify current membership for target $target_hex, relay $relay, channel $channel: $check; nothing was rotated"
+    rotation_membership_error_targets="${rotation_membership_error_targets:+$rotation_membership_error_targets
+}$target_hex"$'\t'"$relay"$'\t'"$channel"
     return 0
   fi
   [ "$check" = "member" ] || return 0
@@ -336,12 +339,9 @@ check_rotation_target_membership() {  # <keychain|file> <public-key> <target-hex
 }
 
 report_rotation_membership_results() {
-  local target_hex relay channel
+  local target_hex relay channel target_public target_relay target_channel affected_results affected_relays retirement_targets
   [ -n "$rotation_membership_errors" ] && printf '%s\n' "$rotation_membership_errors" >&2
-  if [ -z "$rotation_membership_blockers" ]; then
-    [ -z "$rotation_membership_errors" ]
-    return
-  fi
+  if [ -z "$rotation_membership_blockers" ] && [ -z "$rotation_membership_error_targets" ]; then return 0; fi
   while IFS=$'\t' read -r target_hex relay channel; do
     [ -n "$target_hex" ] || continue
     printf 'fm-buzz-keypair.sh: outgoing publisher target %s has current membership on relay %s, channel %s; nothing was rotated\n' \
@@ -349,18 +349,30 @@ report_rotation_membership_results() {
   done <<EOF
 $rotation_membership_blockers
 EOF
+  affected_results="${rotation_membership_blockers}${rotation_membership_blockers:+
+}${rotation_membership_error_targets}"
+  affected_relays=$(printf '%s\n' "$affected_results" | cut -f2 | awk 'NF && !seen[$0]++')
+  retirement_targets=""
+  while IFS=$'\t' read -r target_hex target_public target_relay target_channel; do
+    [ -n "$target_hex" ] || continue
+    printf '%s\n' "$affected_relays" | grep -Fqx -- "$target_relay" || continue
+    retirement_targets="${retirement_targets:+$retirement_targets
+}$target_hex"
+  done <<EOF
+$rotation_targets
+EOF
   printf '%s\n' 'Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity.' >&2
   printf '%s\n' 'If these relays or channels are truly retired, run this full recovery sequence:' >&2
   printf '%s\n' '  docker compose -f docker-compose.buzz-loopback.yml down -v' >&2
   while IFS= read -r target_hex; do
     [ -n "$target_hex" ] && printf '  fm-buzz-keypair.sh --forget-target %s\n' "$target_hex" >&2
   done <<EOF
-$(printf '%s\n' "$rotation_membership_blockers" | cut -f1 | awk '!seen[$0]++')
+$(printf '%s\n' "$retirement_targets" | awk 'NF && !seen[$0]++')
 EOF
   while IFS= read -r relay; do
     [ -n "$relay" ] && printf '  fm-buzz-keypair.sh --forget-relay-identity %s\n' "$relay" >&2
   done <<EOF
-$(printf '%s\n' "$rotation_membership_blockers" | cut -f2 | awk '!seen[$0]++')
+$affected_relays
 EOF
   printf '%s\n' '  fm-buzz-keypair.sh --rotate' >&2
   printf '%s\n' 'Reference: https://github.com/block/buzz/blob/main/ARCHITECTURE.md' >&2
@@ -586,8 +598,6 @@ add_recovery_reason() {  # <reason>
   fi
 }
 
-# Retire the old key before the lookup below, so rotation falls through into the
-# minting path instead of finding the key it was asked to replace.
 if [ "$ROTATE" -eq 1 ]; then
   fm_buzz_file_target_replaceable "$PUBLIC_FILE" || {
     printf 'fm-buzz-keypair.sh: public key record target %s is not a regular file; nothing was rotated\n' "$PUBLIC_FILE" >&2
@@ -693,6 +703,7 @@ if [ "$ROTATE" -eq 1 ]; then
   rotation_timeout=${FM_BUZZ_TIMEOUT_MS:-15000}
   checked_rotation_targets=""
   rotation_membership_errors=""
+  rotation_membership_error_targets=""
   rotation_membership_blockers=""
   if [ -n "$keychain_public" ]; then
     check_rotation_targets_for_store keychain "$keychain_public"
@@ -804,10 +815,6 @@ EOF
   else
     printf 'fm-buzz-keypair.sh: no previous key was stored for this home; minting one\n' >&2
   fi
-  rm -f -- "$PUBLIC_FILE" || {
-    printf 'fm-buzz-keypair.sh: could not remove stale public key record %s; no replacement was minted\n' "$PUBLIC_FILE" >&2
-    exit 1
-  }
 fi
 
 fm_buzz_key_load "$FM_HOME" >/dev/null 2>&1
@@ -841,7 +848,7 @@ if [ "$load_status" -eq 3 ]; then
   exit 1
 fi
 
-if [ -e "$PUBLIC_FILE" ] || [ -L "$PUBLIC_FILE" ]; then
+if [ "$ROTATE" -eq 0 ] && { [ -e "$PUBLIC_FILE" ] || [ -L "$PUBLIC_FILE" ]; }; then
   printf 'fm-buzz-keypair.sh: the recorded public key in %s has no stored private key; recover with --rotate --compromised\n' "$PUBLIC_FILE" >&2
   exit 1
 fi

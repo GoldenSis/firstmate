@@ -205,9 +205,25 @@ relay_cache_dir() {  # <home> <relay>
   printf '%s/state/buzz-replay/%s\n' "$home" "$digest"
 }
 
+channel_id_for_label() {  # <label>
+  node -e '
+    import(process.argv[1]).then(({ channelIdForLabel }) => {
+      process.stdout.write(channelIdForLabel(process.argv[2]));
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$1"
+}
+
+default_channel_id() {  # <home>
+  channel_id_for_label "$(cd "$1" && pwd -P)"
+}
+
+channel_cache_dir() {  # <home> <relay> <channel>
+  printf '%s/%s\n' "$(relay_cache_dir "$1" "$2")" "$3"
+}
+
 seed_replay_event() {  # <home> <relay> <private-key> <created-at> <channel> <note>
   local home=$1 relay=$2 private=$3 created_at=$4 channel=$5 note=$6 directory
-  directory=$(relay_cache_dir "$home" "$relay") || return 1
+  directory=$(channel_cache_dir "$home" "$relay" "$channel") || return 1
   mkdir -p "$directory"
   # shellcheck disable=SC2016
   printf '%s' "$private" | node -e '
@@ -768,6 +784,48 @@ EOF
   [ "$(cat "$keyfile")" = "$private_before" ] \
     || fail "aggregate membership refusal changed the stored private key"
   pass "rotation reports every membership blocker and complete retirement sequence"
+}
+
+test_rotation_query_errors_report_every_target_on_the_endpoint() {
+  local home other old other_public relay targets channel_a channel_b target_a target_b output code
+  home=$(make_home aggregate-membership-query-errors)
+  other=$(make_home aggregate-membership-query-errors-other)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "query-error keypair setup failed"
+  other_public=$(run_keypair "$other" 2>/dev/null) || fail "query-error alternate key setup failed"
+  relay="ws://127.0.0.1:1/aggregate-query-error"
+  channel_a="33333333-4444-5555-8666-777777777777"
+  channel_b="34343434-4545-5656-8767-787878787878"
+  targets="$home/data/buzz-publisher-targets.jsonl"
+  node -e '
+    import(process.argv[2]).then(({ recordPublisherTarget }) => {
+      recordPublisherTarget(process.argv[3], {
+        relay: process.argv[4], channel_id: process.argv[5], publisher_pubkey: process.argv[6],
+      });
+      recordPublisherTarget(process.argv[3], {
+        relay: process.argv[4], channel_id: process.argv[7], publisher_pubkey: process.argv[8],
+      });
+    });
+  ' target-fixture "$ROOT/bin/fm-buzz-targets.mjs" "$targets" "$relay" "$channel_a" "$old" "$channel_b" "$other_public" \
+    || fail "could not seed query-error retirement targets"
+  target_a=$(node "$ROOT/bin/fm-buzz-targets.mjs" list-with-ids "$targets" \
+    | awk -F '\t' -v channel="$channel_a" '$4 == channel { print $1 }')
+  target_b=$(node "$ROOT/bin/fm-buzz-targets.mjs" list-with-ids "$targets" \
+    | awk -F '\t' -v channel="$channel_b" '$4 == channel { print $1 }')
+
+  output=$(run_keypair "$home" --rotate 2>&1)
+  code=$?
+  expect_code 1 "$code" "rotation with an unverifiable target endpoint"
+  assert_contains "$output" "could not verify current membership for target $target_a" \
+    "rotation did not report the membership query error"
+  assert_contains "$output" "--forget-target $target_a" \
+    "query-error recovery omitted the queried target"
+  assert_contains "$output" "--forget-target $target_b" \
+    "query-error recovery omitted another durable target on the affected endpoint"
+  assert_contains "$output" "--forget-relay-identity $relay" \
+    "query-error recovery omitted the affected relay identity"
+  [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "query-error retirement reporting changed the publishing identity"
+  pass "membership query errors report every target needed to retire the endpoint"
 }
 
 test_publisher_target_overrides_are_recorded_and_guard_rotation() {
@@ -1724,6 +1782,8 @@ test_public_record_failures_are_fatal_and_retryable() {
   expect_code 1 "$code" "rotation when the replacement public record cannot be persisted"
   assert_contains "$rotate_output" "private key remains stored for a safe retry" \
     "rotation did not diagnose its retryable public-record failure"
+  [ "$(cat "$rotate_home/data/buzz-keypair.public")" = "$old" ] \
+    || fail "failed rotation removed the last recoverable public identity record"
   rotated_private=$(sed -n 's/.*"private_key"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$rotate_file")
   replacement=$(PATH="$tools:$PATH" run_keypair "$rotate_home" 2>/dev/null) \
     || fail "rotation retry did not repair the public record"
@@ -1989,6 +2049,62 @@ test_cache_cap_is_enforced_before_target_registry_failure() {
   pass "cache pruning precedes fallible publisher-target recording"
 }
 
+test_replayed_events_are_tracked_before_delivery() {
+  local home other relay channel other_private other_public old_file preload output targets readback
+  home=$(make_home replay-target-tracking)
+  other=$(make_home replay-target-tracking-other)
+  run_keypair "$home" >/dev/null 2>&1 || fail "replay target-tracking keypair setup failed"
+  other_public=$(run_keypair "$other" 2>/dev/null) || fail "replay target-tracking alternate key setup failed"
+  other_private=$(jq -r '.private_key' "$(key_file "$other" "$other/xdg")")
+  channel=$(default_channel_id "$home")
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  old_file=$(seed_replay_event "$home" "$relay" "$other_private" 1700000130 "$channel" replay-untracked) \
+    || fail "could not seed untracked replay event"
+  preload="$home/fail-second-target-replace.cjs"
+  cat > "$preload" <<'EOF'
+const fs = require("node:fs");
+const path = require("node:path");
+const { syncBuiltinESMExports } = require("node:module");
+const originalRenameSync = fs.renameSync;
+let replacements = 0;
+fs.renameSync = function guardedRenameSync(source, destination, ...args) {
+  if (path.resolve(String(destination)) === path.resolve(process.env.FM_TEST_TARGETS_FILE)) {
+    replacements += 1;
+    if (replacements === 2) {
+      const error = new Error("simulated replay target tracking failure");
+      error.code = "EACCES";
+      throw error;
+    }
+  }
+  return originalRenameSync.call(fs, source, destination, ...args);
+};
+syncBuiltinESMExports();
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"replay-current"}' \
+    | NODE_OPTIONS="--require=$preload" FM_TEST_TARGETS_FILE="$home/data/buzz-publisher-targets.jsonl" \
+      run_publish "$home" "$relay" 2>&1)
+  assert_contains "$output" "could not record publisher target for cached event" \
+    "an untracked replay event reached delivery after target persistence failed"
+  assert_present "$old_file" "target tracking failure evicted the untracked replay event"
+  targets=$(cat "$home/data/buzz-publisher-targets.jsonl")
+  assert_not_contains "$targets" "$other_public" \
+    "the failure fixture unexpectedly persisted the replayed publisher target"
+  readback=$(node -e '
+    import(process.argv[1]).then(async ({ withRelay, KIND_STREAM_MESSAGE }) => {
+      const { generateKeypair } = await import(process.argv[3]);
+      const { events } = await withRelay(process.argv[2], generateKeypair().privateKey, 8000,
+        async (api) => api.query({ kinds: [KIND_STREAM_MESSAGE] }));
+      process.stdout.write(events.map((event) => event.content).join("\n"));
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay" "$ROOT/bin/fm-buzz-crypto.mjs")
+  stop_stub "$STUB_PID"
+  assert_contains "$readback" "replay-current" "the tracked current event did not publish"
+  assert_not_contains "$readback" "replay-untracked" "an untracked replay event was sent to the relay"
+  pass "every replayed event persists its exact target before delivery"
+}
+
 test_rotation_uses_the_authoritative_replay_cache_path() {
   local home relay channel old keyfile private cache_file cache_name output code
   home=$(make_home authoritative-replay-path)
@@ -2226,6 +2342,106 @@ EOF
   kill "$STUB_PID" 2>/dev/null
   STUB_PID=""
   pass "switching relay endpoints produces a cache miss for the prior relay"
+}
+
+test_endpoint_only_cache_entries_migrate_to_their_exact_channel() {
+  local home old_private keyfile relay port channel_a channel_b endpoint seeded legacy migrated before after output readback
+  home=$(make_home endpoint-channel-migration)
+  run_keypair "$home" >/dev/null 2>&1 || fail "endpoint migration keypair setup failed"
+  keyfile=$(key_file "$home" "$home/xdg")
+  old_private=$(jq -r '.private_key' "$keyfile")
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  port=${relay##*:}
+  stop_stub "$STUB_PID"
+  channel_a=$(channel_id_for_label endpoint-migration-a)
+  channel_b=$(channel_id_for_label endpoint-migration-b)
+  endpoint=$(relay_cache_dir "$home" "$relay") || fail "could not derive endpoint cache directory"
+  seeded=$(seed_replay_event "$home" "$relay" "$old_private" 1700000120 "$channel_a" endpoint-migration-a) \
+    || fail "could not seed endpoint migration event"
+  legacy="$endpoint/$(basename "$seeded")"
+  mv "$seeded" "$legacy" || fail "could not create endpoint-only cache fixture"
+  rmdir "$(dirname "$seeded")" || fail "could not remove the channel directory fixture"
+  before=$(shasum -a 256 "$legacy" | awk '{print $1}')
+
+  read -r STUB_PID relay <<EOF
+$(start_stub --port "$port")
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"endpoint-migration-b"}' \
+    | run_publish "$home" "$relay" --channel-label endpoint-migration-b 2>&1)
+
+  migrated="$endpoint/$channel_a/$(basename "$legacy")"
+  assert_absent "$legacy" "an endpoint-only entry remained outside a channel partition"
+  assert_present "$migrated" "an endpoint-only entry was not migrated to its h-tag channel"
+  after=$(shasum -a 256 "$migrated" | awk '{print $1}')
+  [ "$before" = "$after" ] || fail "endpoint channel migration changed the cached frame bytes"
+  assert_contains "$output" "migrated 1 endpoint-only replay event" \
+    "endpoint channel migration was not reported"
+  readback=$(node -e '
+    import(process.argv[1]).then(async ({ withRelay, KIND_STREAM_MESSAGE }) => {
+      const { generateKeypair } = await import(process.argv[3]);
+      const { events } = await withRelay(process.argv[2], generateKeypair().privateKey, 8000,
+        async (api) => api.query({ kinds: [KIND_STREAM_MESSAGE] }));
+      process.stdout.write(events.map((event) => event.content).join("\n"));
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay" "$ROOT/bin/fm-buzz-crypto.mjs")
+  stop_stub "$STUB_PID"
+  assert_contains "$readback" "endpoint-migration-b" "channel B did not publish its own projection"
+  assert_not_contains "$readback" "endpoint-migration-a" "channel B replayed the migrated channel A entry"
+  [ -d "$endpoint/$channel_b" ] || fail "channel B did not receive its own cache partition"
+  pass "endpoint-only replay entries migrate without cross-channel delivery"
+}
+
+test_same_endpoint_channel_queues_are_isolated() {
+  local home relay port channel_a channel_b directory_a before after output readback
+  home=$(make_home same-endpoint-channel-isolation)
+  run_keypair "$home" >/dev/null 2>&1 || fail "channel isolation keypair setup failed"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  port=${relay##*:}
+  stop_stub "$STUB_PID"
+  channel_a=$(channel_id_for_label same-endpoint-a)
+  channel_b=$(channel_id_for_label same-endpoint-b)
+  printf '%s' '{"schema":"fm-bearings.v1","note":"same-endpoint-a-one"}' \
+    | run_publish "$home" "$relay" --channel-label same-endpoint-a >/dev/null 2>&1
+  printf '%s' '{"schema":"fm-bearings.v1","note":"same-endpoint-a-two"}' \
+    | run_publish "$home" "$relay" --channel-label same-endpoint-a >/dev/null 2>&1
+  directory_a=$(channel_cache_dir "$home" "$relay" "$channel_a")
+  [ "$(find "$directory_a" -type f -name '*.json' | wc -l | tr -d ' ')" = "2" ] \
+    || fail "channel A did not retain two isolated replay entries"
+  before=$(find "$directory_a" -type f -name '*.json' -print0 | sort -z | xargs -0 shasum -a 256)
+
+  read -r STUB_PID relay <<EOF
+$(start_stub --port "$port")
+EOF
+  output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"same-endpoint-b"}' \
+    | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" --channel-label same-endpoint-b 2>&1)
+  after=$(find "$directory_a" -type f -name '*.json' -print0 | sort -z | xargs -0 shasum -a 256)
+  [ "$before" = "$after" ] || fail "channel B inspected or mutated channel A replay bytes"
+  [ "$(find "$directory_a" -type f -name '*.json' | wc -l | tr -d ' ')" = "2" ] \
+    || fail "channel B pruned or drained channel A replay entries"
+  assert_contains "$output" "delivered=1" "channel B did not drain its own queue"
+  readback=$(node -e '
+    import(process.argv[1]).then(async ({ withRelay, KIND_NIP29_CREATE_GROUP, KIND_STREAM_MESSAGE }) => {
+      const { generateKeypair } = await import(process.argv[3]);
+      const { events } = await withRelay(process.argv[2], generateKeypair().privateKey, 8000,
+        async (api) => api.query({ kinds: [KIND_NIP29_CREATE_GROUP, KIND_STREAM_MESSAGE] }));
+      process.stdout.write(events.map((event) => JSON.stringify({
+        kind: event.kind,
+        channel: event.tags.find((tag) => tag[0] === "h")?.[1],
+        content: event.content,
+      })).join("\n"));
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay" "$ROOT/bin/fm-buzz-crypto.mjs")
+  stop_stub "$STUB_PID"
+  assert_contains "$readback" "$channel_b" "channel B was not provisioned"
+  assert_not_contains "$readback" "$channel_a" "channel B provisioned channel A"
+  assert_not_contains "$readback" "same-endpoint-a" "channel B delivered a channel A projection"
+  [ -d "$(channel_cache_dir "$home" "$relay" "$channel_b")" ] \
+    || fail "channel B did not use its exact channel partition"
+  pass "same-endpoint channel queues are provisioned and drained independently"
 }
 
 test_relay_cache_partition_uses_the_normalized_complete_endpoint() {
@@ -2559,6 +2775,59 @@ test_invalid_quarantine_temporaries_are_accounted_for() {
   assert_contains "$second" "recovered invalid recovery residue" \
     "residue recovery did not report deterministic completion"
   pass "invalid quarantine temporaries move into accounted corrupt state"
+}
+
+test_invalid_quarantine_residue_retries_use_link_stable_identity() {
+  local home replay quarantine token temporary preload sentinel first second residues manifests
+  home=$(make_home invalid-quarantine-residue-retry)
+  run_keypair "$home" >/dev/null 2>&1 || fail "residue retry keypair setup failed"
+  replay="$home/state/buzz-replay"
+  quarantine="$replay/_legacy-quarantine"
+  token=$(printf '%064d' 15)
+  mkdir -p "$quarantine/manifests" "$quarantine/payloads" "$quarantine/staging" \
+    "$quarantine/corrupt" "$quarantine/recovery-corrupt"
+  temporary="$quarantine/manifests/$token.json.tmp"
+  printf '%s' '{"truncated":' > "$temporary"
+  preload="$home/fail-residue-hard-link.mjs"
+  sentinel="$home/residue-link-interrupted"
+  cat > "$preload" <<'EOF'
+import { createRequire, syncBuiltinESMExports } from "node:module";
+const fs = createRequire(import.meta.url)("node:fs");
+const originalLinkSync = fs.linkSync;
+fs.linkSync = function guardedLinkSync(source, destination, ...args) {
+  if (
+    String(destination).endsWith(".invalid") &&
+    !fs.existsSync(process.env.FM_TEST_RESIDUE_SENTINEL)
+  ) {
+    originalLinkSync.call(fs, source, destination, ...args);
+    fs.writeFileSync(process.env.FM_TEST_RESIDUE_SENTINEL, "interrupted\n");
+    const error = new Error("simulated residue hard-link interruption");
+    error.code = "EACCES";
+    throw error;
+  }
+  return originalLinkSync.call(fs, source, destination, ...args);
+};
+syncBuiltinESMExports();
+EOF
+  first=$(printf '%s' '{"schema":"fm-bearings.v1","note":"residue-retry-first"}' \
+    | NODE_OPTIONS="--import=$preload" FM_TEST_RESIDUE_SENTINEL="$sentinel" \
+      run_publish "$home" "ws://127.0.0.1:1/residue-retry" 2>&1)
+  assert_present "$sentinel" "the residue retry fixture did not interrupt the hard-link claim"
+  assert_present "$temporary" "the interrupted residue claim unexpectedly removed its source"
+  assert_contains "$first" "simulated residue hard-link interruption" \
+    "the interrupted residue claim was not accounted for"
+
+  second=$(printf '%s' '{"schema":"fm-bearings.v1","note":"residue-retry-second"}' \
+    | run_publish "$home" "ws://127.0.0.1:1/residue-retry" 2>&1)
+  residues=$(find "$quarantine/recovery-corrupt" -type f -name '*.invalid' | wc -l | tr -d ' ')
+  manifests=$(grep -l 'invalid-quarantine-recovery-residue' \
+    "$quarantine/manifests"/*.json 2>/dev/null | wc -l | tr -d ' ')
+  [ "$residues" = "1" ] || fail "residue retry duplicated the quarantined payload"
+  [ "$manifests" = "1" ] || fail "residue retry duplicated the quarantine manifest"
+  assert_absent "$temporary" "residue retry left the original temporary active"
+  assert_contains "$second" "quarantined invalid recovery residue" \
+    "residue retry did not finish the interrupted transaction"
+  pass "invalid quarantine residue retries reuse link-stable provenance"
 }
 
 test_quarantine_manifest_inspection_failures_are_accounted_for() {
@@ -2897,7 +3166,8 @@ test_replay_cache_is_capped_at_100() {
   home=$(make_home cap)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
   relay="ws://127.0.0.1:1"
-  cache_dir=$(relay_cache_dir "$home" "$relay") || fail "could not derive cache partition"
+  cache_dir=$(channel_cache_dir "$home" "$relay" "$(default_channel_id "$home")") \
+    || fail "could not derive cache partition"
   mkdir -p "$cache_dir"
 
   # Seed 120 plausible cache entries with increasing timestamps, then publish
@@ -2954,7 +3224,8 @@ test_cache_limit_one_preserves_the_pending_event() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  cache_dir=$(relay_cache_dir "$home" "$relay") || fail "could not derive cache partition"
+  cache_dir=$(channel_cache_dir "$home" "$relay" "$(default_channel_id "$home")") \
+    || fail "could not derive cache partition"
   mkdir -p "$cache_dir"
   old="$cache_dir/1700000000-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.json"
   printf '%s' '["EVENT",{}]' > "$old"
@@ -3492,7 +3763,8 @@ test_replay_cache_never_reads_non_regular_entries() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  cache_dir=$(relay_cache_dir "$home" "$relay") || fail "could not derive cache partition"
+  cache_dir=$(channel_cache_dir "$home" "$relay" "$(default_channel_id "$home")") \
+    || fail "could not derive cache partition"
   mkdir -p "$cache_dir"
   fifo="$cache_dir/1700000000-$(printf '%064d' 8).json"
   mkfifo "$fifo" || fail "could not create cache FIFO fixture"
@@ -3546,7 +3818,8 @@ test_malformed_cache_names_are_discarded_or_accounted_for() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  replay=$(relay_cache_dir "$home" "$relay") || fail "could not derive cache partition"
+  replay=$(channel_cache_dir "$home" "$relay" "$(default_channel_id "$home")") \
+    || fail "could not derive cache partition"
   mkdir -p "$replay"
   removable="$replay/not-an-event.json"
   retained="$replay/still-not-an-event.json"
@@ -3608,7 +3881,8 @@ test_an_interrupted_cache_write_is_swept_not_leaked() {
   home=$(make_home orphan-tmp)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
   relay="ws://127.0.0.1:1"
-  cache_dir=$(relay_cache_dir "$home" "$relay") || fail "could not derive cache partition"
+  cache_dir=$(channel_cache_dir "$home" "$relay" "$(default_channel_id "$home")") \
+    || fail "could not derive cache partition"
   mkdir -p "$cache_dir"
 
   stale="$cache_dir/1700000001-$(printf '%064d' 1).json.tmp"
@@ -3639,7 +3913,8 @@ $(start_stub)
 EOF
   printf '%s' '{"schema":"fm-bearings.v1","note":"prime-cache"}' \
     | run_publish "$home" "$relay" >/dev/null 2>&1
-  cache_dir=$(relay_cache_dir "$home" "$relay") || fail "could not derive cache partition"
+  cache_dir=$(channel_cache_dir "$home" "$relay" "$(default_channel_id "$home")") \
+    || fail "could not derive cache partition"
   [ -d "$cache_dir" ] || fail "relay-specific cache directory was not created"
   unreadable="$cache_dir/1700000000-$(printf '%064d' 7).json"
   mkdir "$unreadable"
@@ -3702,7 +3977,8 @@ test_cache_prune_failures_are_reported_and_accounted_for() {
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
-  replay=$(relay_cache_dir "$home" "$relay") || fail "could not derive cache partition"
+  replay=$(channel_cache_dir "$home" "$relay" "$(default_channel_id "$home")") \
+    || fail "could not derive cache partition"
   mkdir -p "$replay"
   first="$replay/1700000001-$(printf '%064d' 1).json"
   second="$replay/1700000002-$(printf '%064d' 2).json"
@@ -4663,13 +4939,16 @@ test_quarantine_lifecycle_has_one_pinned_cache_owner() {
     "the quarantine owner does not document manifest identity"
   assert_grep "Startup first accounts for invalid recovery residue" "$ROOT/bin/fm-buzz-publish.mjs" \
     "the quarantine owner does not document recovery order"
-  assert_grep "Active entries live at <replay-root>/<endpoint-digest>/<created_at>-<event-id>.json" \
+  assert_grep "<replay-root>/<endpoint-digest>/<channel-id>/<created_at>-<event-id>.json" \
     "$ROOT/bin/fm-buzz-publish.mjs" \
     "the active-cache owner does not document its partition and entry layout"
   assert_grep "query authoritative membership state for safe key" "$ROOT/bin/fm-buzz-lib.mjs" \
     "the relay-client scope omits rotation membership queries"
   assert_grep 'FM_BUZZ_DOCKER_INTEGRATION=1` enables the opt-in Compose' "$ROOT/docs/buzz-loopback-adapter.md" \
     "the adapter guide does not distinguish the opt-in Docker lane"
+  assert_grep "header of .*fm-buzz-publish.sh.* owns input, option, default, and termination mechanics" \
+    "$ROOT/docs/buzz-loopback-adapter.md" \
+    "the adapter guide does not point runtime mechanics to their owner"
   assert_no_grep "runLegacyQuarantineLifecycle" "$ROOT/bin/fm-buzz-publish.mjs" \
     "the publisher still delegates through the callback facade"
   pass "quarantine lifecycle and pinned mutations have one owner"
@@ -4700,6 +4979,7 @@ test_a_compromised_rotation_does_not_keep_the_retired_key
 test_rotation_refuses_or_quarantines_outgoing_pending_events
 test_rotation_refuses_an_existing_private_channel_before_mutation
 test_rotation_reports_every_membership_blocker
+test_rotation_query_errors_report_every_target_on_the_endpoint
 test_publisher_target_overrides_are_recorded_and_guard_rotation
 test_publisher_target_updates_are_concurrent_and_fail_closed
 test_forget_target_attests_exact_retirement
@@ -4726,6 +5006,7 @@ test_two_homes_sharing_one_xdg_get_separate_keys
 test_publish_with_relay_down_exits_zero_and_enqueues
 test_publisher_target_is_recorded_only_after_cache
 test_cache_cap_is_enforced_before_target_registry_failure
+test_replayed_events_are_tracked_before_delivery
 test_rotation_uses_the_authoritative_replay_cache_path
 test_malformed_projection_is_rejected_before_signing
 test_refresh_preserves_the_snapshot_bytes_including_its_trailing_newline
@@ -4735,6 +5016,8 @@ test_credential_bearing_relays_are_rejected_before_signing_or_caching
 test_rotation_rejects_credential_relays_without_logging_credentials
 test_publish_with_relay_up_delivers_and_lands
 test_relay_switch_does_not_replay_another_relays_cache
+test_endpoint_only_cache_entries_migrate_to_their_exact_channel
+test_same_endpoint_channel_queues_are_isolated
 test_relay_cache_partition_uses_the_normalized_complete_endpoint
 test_legacy_replay_entries_are_quarantined_with_a_manifest
 test_legacy_quarantine_claims_the_source_before_reading
@@ -4743,6 +5026,7 @@ test_quarantine_retry_reuses_link_stable_transaction_identity
 test_quarantine_recovers_atomic_manifest_temporaries
 test_quarantine_recovery_rejects_noncanonical_tokens
 test_invalid_quarantine_temporaries_are_accounted_for
+test_invalid_quarantine_residue_retries_use_link_stable_identity
 test_quarantine_manifest_inspection_failures_are_accounted_for
 test_reconnect_replays_the_identical_event_id
 test_replaying_a_known_event_is_deduped_and_evicted

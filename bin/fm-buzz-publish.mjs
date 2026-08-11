@@ -13,11 +13,13 @@
 // semantics. This engine owns active-cache and quarantine layout, mutation
 // order, validation, recovery, pruning, and relay outcomes because every
 // mutation must share the pinned cache-directory interface below.
-// Active entries live at <replay-root>/<endpoint-digest>/<created_at>-<event-id>.json,
-// where endpoint-digest is SHA-256 of the complete normalized relay endpoint.
-// A complete EVENT frame is cached atomically before target tracking or network
-// access, pruning is oldest-first across active partitions while protecting the
-// current event, and only a classified relay outcome removes a replay entry.
+// Active entries live at
+// <replay-root>/<endpoint-digest>/<channel-id>/<created_at>-<event-id>.json,
+// where endpoint-digest is SHA-256 of the complete normalized relay endpoint and
+// channel-id is the exact canonical h tag. A complete EVENT frame is cached
+// atomically before target tracking or network access, pruning is oldest-first
+// within only the invoked channel partition while protecting the current event,
+// and only a classified relay outcome removes a replay entry.
 //
 // Reads one JSON envelope on stdin so that neither the private key nor the
 // projection - which carries task ids, project names, blockers and PR URLs -
@@ -80,6 +82,7 @@ import {
 import { recordPublisherTarget } from "./fm-buzz-targets.mjs";
 
 const CACHE_PARTITION = /^[0-9a-f]{64}$/;
+const CHANNEL_PARTITION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const LEGACY_QUARANTINE = "_legacy-quarantine";
 
 function log(message) {
@@ -333,6 +336,14 @@ function cachedEventFromFrame(raw, entry) {
   return event;
 }
 
+function cachedEventChannelId(event) {
+  const channels = event.tags.filter((tag) => Array.isArray(tag) && tag.length === 2 && tag[0] === "h");
+  if (channels.length !== 1 || typeof channels[0][1] !== "string" || !CHANNEL_PARTITION.test(channels[0][1])) {
+    throw new Error("event does not have exactly one canonical channel tag");
+  }
+  return channels[0][1];
+}
+
 function containedCachePath(replayDir, candidate) {
   const relative = path.relative(replayDir, path.resolve(candidate));
   return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
@@ -374,6 +385,11 @@ function removeCacheFile(replayDir, file, description) {
 
 function relayCacheDirectory(replayDir, relay) {
   return path.join(replayDir, relayCacheKey(relay));
+}
+
+function relayChannelCacheDirectory(replayDir, relay, channelId) {
+  if (!CHANNEL_PARTITION.test(channelId)) throw new Error("channel id must be a canonical UUID");
+  return path.join(relayCacheDirectory(replayDir, relay), channelId);
 }
 
 function prepareCacheRoot(replayDir) {
@@ -423,23 +439,34 @@ function prepareCacheDirectory(replayDir, name) {
   return pinCacheDirectory(directory);
 }
 
-function prepareRelayCacheDirectory(replayDir, relay) {
-  const directory = relayCacheDirectory(replayDir, relay);
-  if (!containedCachePath(replayDir, directory)) throw new Error("relay cache path escapes replay cache");
+function prepareRelayCacheDirectory(replayDir, relay, channelId) {
+  const endpointDirectory = relayCacheDirectory(replayDir, relay);
+  if (!containedCachePath(replayDir, endpointDirectory)) throw new Error("relay cache path escapes replay cache");
   try {
-    const metadata = cacheLstatSync(directory);
+    const metadata = cacheLstatSync(endpointDirectory);
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-      throw new Error(`relay cache path ${directory} is not a regular directory`);
+      throw new Error(`relay cache path ${endpointDirectory} is not a regular directory`);
     }
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
-    cacheMkdirSync(directory, { mode: 0o700 });
+    cacheMkdirSync(endpointDirectory, { mode: 0o700 });
   }
-  const metadata = cacheLstatSync(directory);
+  const metadata = cacheLstatSync(endpointDirectory);
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-    throw new Error(`relay cache path ${directory} is not a regular directory`);
+    throw new Error(`relay cache path ${endpointDirectory} is not a regular directory`);
   }
-  return pinCacheDirectory(directory);
+  pinCacheDirectory(endpointDirectory);
+  const channelDirectory = relayChannelCacheDirectory(replayDir, relay, channelId);
+  try {
+    const channelMetadata = cacheLstatSync(channelDirectory);
+    if (channelMetadata.isSymbolicLink() || !channelMetadata.isDirectory()) {
+      throw new Error(`channel cache path ${channelDirectory} is not a regular directory`);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    cacheMkdirSync(channelDirectory, { mode: 0o700 });
+  }
+  return pinCacheDirectory(channelDirectory);
 }
 
 const QUARANTINE_TOKEN = /^[0-9a-f]{64}$/;
@@ -584,7 +611,6 @@ function quarantineInvalidRecoveryResidue(
     original_path: originalPath,
     device: metadata.dev,
     inode: metadata.ino,
-    ctime_ms: metadata.ctimeMs,
     birthtime_ms: metadata.birthtimeMs,
   })));
   const destination = path.join(recoveryCorruptDir, `${token}.invalid`);
@@ -641,6 +667,10 @@ function recoverInvalidRecoveryResidues(quarantineDir, manifestsDir, recoveryCor
         continue;
       }
       const metadata = cacheLstatSync(residue);
+      if (metadata.nlink > 1) {
+        log(`deferred invalid recovery residue ${residue} until its source transaction resumes`);
+        continue;
+      }
       finalizeQuarantineRecord(final, {
         original_path: expectedReference,
         legacy_host: null,
@@ -1150,8 +1180,85 @@ function quarantineLegacyEntries(replayDir) {
   return { failures, count };
 }
 
+function migrateEndpointReplayEntries(replayDir) {
+  const failures = [];
+  let migrated = 0;
+  let quarantined = 0;
+  const topology = cacheEndpointDirectories(replayDir);
+  failures.push(...topology.failures);
+  const quarantineDir = prepareCacheDirectory(replayDir, LEGACY_QUARANTINE);
+  const manifestsDir = prepareCacheDirectory(quarantineDir, "manifests");
+  const payloadsDir = prepareCacheDirectory(quarantineDir, "payloads");
+  const stagingDir = prepareCacheDirectory(quarantineDir, "staging");
+  const corruptDir = prepareCacheDirectory(quarantineDir, "corrupt");
+  for (const endpointDirectory of topology.directories) {
+    const inventory = cacheEntries(endpointDirectory);
+    failures.push(...inventory.failures);
+    for (const entry of inventory.entries) {
+      try {
+        const metadata = cacheLstatSync(entry.file);
+        if (!metadata.isFile()) {
+          if (metadata.isSymbolicLink()) log(`cache entry is a symbolic link: ${entry.file}`);
+          quarantineCorruptPartitionNode(
+            replayDir,
+            quarantineDir,
+            corruptDir,
+            manifestsDir,
+            entry.file,
+            metadata,
+          );
+          quarantined += 1;
+          continue;
+        }
+        let event;
+        let channelId;
+        try {
+          const raw = readRegularFile(entry.file).bytes.toString("utf8");
+          event = cachedEventFromFrame(raw, entry);
+          channelId = cachedEventChannelId(event);
+        } catch (error) {
+          quarantineLegacyEntry(
+            replayDir,
+            quarantineDir,
+            manifestsDir,
+            payloadsDir,
+            stagingDir,
+            entry.file,
+            null,
+            { reason: `endpoint-channel-migration: ${error.message}` },
+          );
+          quarantined += 1;
+          continue;
+        }
+        const channelDirectory = prepareCacheDirectory(endpointDirectory, channelId);
+        const destination = path.join(channelDirectory, entry.name);
+        try {
+          const destinationBytes = readRegularFile(destination).bytes;
+          const sourceBytes = readRegularFile(entry.file).bytes;
+          if (!destinationBytes.equals(sourceBytes)) {
+            throw new Error(`channel cache migration collision at ${destination}`);
+          }
+          cacheUnlinkSync(entry.file);
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+          cacheRenameSync(entry.file, destination);
+        }
+        migrated += 1;
+      } catch (error) {
+        log(`could not migrate endpoint-only cache entry ${entry.file}: ${error.message}`);
+        failures.push(entry.file);
+      }
+    }
+    const sweep = sweepOrphanTemporaries(endpointDirectory, Date.now());
+    if (sweep.failed > 0) failures.push(endpointDirectory);
+  }
+  if (migrated > 0) log(`migrated ${migrated} endpoint-only replay event(s) into channel partitions`);
+  if (quarantined > 0) log(`quarantined ${quarantined} ambiguous endpoint-only replay entr${quarantined === 1 ? "y" : "ies"}`);
+  return { failures, migrated, quarantined };
+}
+
 function activeReplayPublisherEntries(cacheRoot) {
-  const topology = cacheDirectories(cacheRoot);
+  const topology = activeCacheDirectories(cacheRoot);
   if (topology.failures.length > 0) {
     throw new Error(`could not inspect active replay partitions:\n${topology.failures.map((file) => `  ${file}`).join("\n")}`);
   }
@@ -1192,7 +1299,12 @@ export function inspectActiveReplayPublisherCache(replayDir) {
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
     throw new Error(`replay cache path ${replayDir} is not a regular directory`);
   }
-  return activeReplayPublisherEntries(prepareCacheRoot(replayDir));
+  const cacheRoot = prepareCacheRoot(replayDir);
+  const migration = migrateEndpointReplayEntries(cacheRoot);
+  if (migration.failures.length > 0) {
+    throw new Error(`could not migrate endpoint-only replay entries:\n${migration.failures.map((file) => `  ${file}`).join("\n")}`);
+  }
+  return activeReplayPublisherEntries(cacheRoot);
 }
 
 export function protectOutgoingPublisherCache(replayDir, publisherPubkeys, options = {}) {
@@ -1209,6 +1321,12 @@ export function protectOutgoingPublisherCache(replayDir, publisherPubkeys, optio
   if (legacyMigration.failures.length > 0) {
     throw new Error(
       `could not settle replay quarantine:\n${legacyMigration.failures.map((file) => `  ${file}`).join("\n")}`,
+    );
+  }
+  const endpointMigration = migrateEndpointReplayEntries(cacheRoot);
+  if (endpointMigration.failures.length > 0) {
+    throw new Error(
+      `could not migrate endpoint-only replay entries:\n${endpointMigration.failures.map((file) => `  ${file}`).join("\n")}`,
     );
   }
   const blocking = activeReplayPublisherEntries(cacheRoot)
@@ -1294,10 +1412,7 @@ function cacheEntries(replayDir) {
   return { entries, failures };
 }
 
-// The cap remains global across normalized relay endpoints. A separate 100-entry
-// allowance per endpoint would let repeated local relay switches grow the private
-// queue without bound. Legacy entries are quarantined outside this active set.
-function cacheDirectories(replayDir) {
+function cacheEndpointDirectories(replayDir) {
   let names;
   try {
     names = cacheReaddirSync(replayDir);
@@ -1324,6 +1439,49 @@ function cacheDirectories(replayDir) {
       log(`could not inspect cache path ${directory}: ${error.message}`);
       failures.push(directory);
     }
+  }
+  return { directories, failures };
+}
+
+function cacheChannelDirectories(endpointDirectory) {
+  let names;
+  try {
+    names = cacheReaddirSync(endpointDirectory);
+  } catch (error) {
+    if (error.code === "ENOENT") return { directories: [], failures: [] };
+    log(`could not inspect endpoint cache directory ${endpointDirectory}: ${error.message}`);
+    return { directories: [], failures: [endpointDirectory] };
+  }
+  const directories = [];
+  const failures = [];
+  for (const name of names) {
+    if (!CHANNEL_PARTITION.test(name)) continue;
+    const directory = path.join(endpointDirectory, name);
+    try {
+      const metadata = cacheLstatSync(directory);
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+        log(`rejected channel cache path ${directory}`);
+        failures.push(directory);
+      } else {
+        directories.push(pinCacheDirectory(directory));
+      }
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      log(`could not inspect channel cache path ${directory}: ${error.message}`);
+      failures.push(directory);
+    }
+  }
+  return { directories, failures };
+}
+
+function activeCacheDirectories(replayDir) {
+  const endpoints = cacheEndpointDirectories(replayDir);
+  const directories = [];
+  const failures = [...endpoints.failures];
+  for (const endpointDirectory of endpoints.directories) {
+    const channels = cacheChannelDirectories(endpointDirectory);
+    directories.push(...channels.directories);
+    failures.push(...channels.failures);
   }
   return { directories, failures };
 }
@@ -1374,18 +1532,13 @@ function sweepOrphanTemporaries(replayDir, now) {
 // without limit and replay ancient fleet state; oldest-first is the right thing to
 // drop because a newer bearings projection supersedes an older one anyway.
 function pruneCache(replayDir, maxCache, protectedFile) {
-  const topology = cacheDirectories(replayDir);
-  const directories = topology.directories;
   const now = Date.now();
-  let failed = topology.failures.length;
-  const outcomes = new Map(topology.failures.map((file) => [`uninspected:${file}`, RETRYABLE]));
-  for (const directory of directories) failed += sweepOrphanTemporaries(directory, now).failed;
-  const inventories = directories.map((directory) => cacheEntries(directory));
-  for (const inventory of inventories) {
-    failed += inventory.failures.length;
-    for (const file of inventory.failures) outcomes.set(`unreadable:${file}`, RETRYABLE);
-  }
-  const entries = inventories.flatMap((inventory) => inventory.entries);
+  let failed = sweepOrphanTemporaries(replayDir, now).failed;
+  const outcomes = new Map();
+  const inventory = cacheEntries(replayDir);
+  failed += inventory.failures.length;
+  for (const file of inventory.failures) outcomes.set(`unreadable:${file}`, RETRYABLE);
+  const entries = inventory.entries;
   const validEntries = [];
   let malformedRetained = 0;
   for (const entry of entries) {
@@ -1477,33 +1630,36 @@ async function main() {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) {
     throw new Error(`invalid relay timeout ${JSON.stringify(timeoutMs)}: expected an integer from 1 to 2147483647`);
   }
+  if (!CHANNEL_PARTITION.test(channelId)) throw new Error("channel id must be a canonical UUID");
   resolveLoopbackRelayHost(relay);
   const event = buildBearingsEvent(channelId, content, privateKey, [
     ["fm-schema", "fm-bearings.v1"],
   ]);
   const cacheRoot = prepareCacheRoot(replayDir);
   const legacyMigration = quarantineLegacyEntries(cacheRoot);
-  const relayCacheDir = prepareRelayCacheDirectory(cacheRoot, relay);
+  const endpointMigration = migrateEndpointReplayEntries(cacheRoot);
+  const relayCacheDir = prepareRelayCacheDirectory(cacheRoot, relay, channelId);
 
   // Cache the signed event before network access: from here on it survives a
   // crash, a kill, or a relay that is not running at all.
   const currentFile = cacheEvent(relayCacheDir, event);
-  const cacheMaintenance = pruneCache(cacheRoot, maxCache, currentFile);
+  const cacheMaintenance = pruneCache(relayCacheDir, maxCache, currentFile);
   recordPublisherTarget(targetsFile, {
     relay,
     channel_id: channelId,
     publisher_pubkey: event.pubkey,
   });
-  let cleanupFailures = cacheMaintenance.failed + legacyMigration.failures.length;
+  let cleanupFailures = cacheMaintenance.failed + legacyMigration.failures.length + endpointMigration.failures.length;
   log(`signed event ${event.id} (${Buffer.byteLength(content, "utf8")} bytes) for channel ${channelId}`);
 
-  const pending = cacheMaintenance.entries.filter((entry) => path.dirname(entry.file) === relayCacheDir);
+  const pending = cacheMaintenance.entries;
   // Final verdict per cache entry rather than running counters, because an entry
   // can be attempted twice: a pass that ran before a late NIP-42 handshake
   // completed is superseded by the one that ran after it, and incrementing
   // counters would report the same event as both retained and delivered.
   const outcome = new Map(cacheMaintenance.outcomes);
   for (const file of legacyMigration.failures) outcome.set(`legacy:${file}`, RETRYABLE);
+  for (const file of endpointMigration.failures) outcome.set(`endpoint-migration:${file}`, RETRYABLE);
   const authRefused = new Set();
 
   await withRelay(relay, privateKey, timeoutMs, async (api) => {
@@ -1556,8 +1712,13 @@ async function main() {
           continue;
         }
         let parsed;
+        let parsedChannelId;
         try {
           parsed = cachedEventFromFrame(raw, entry);
+          parsedChannelId = cachedEventChannelId(parsed);
+          if (parsedChannelId !== channelId) {
+            throw new Error(`event channel ${parsedChannelId} does not match queue channel ${channelId}`);
+          }
         } catch (error) {
           log(`dropping invalid cache entry ${entry.name}: ${error.message}`);
           const removal = removeCacheFile(cacheRoot, entry.file, `drop invalid cache entry ${entry.name}`);
@@ -1567,6 +1728,17 @@ async function main() {
           } else {
             outcome.set(entry.file, PERMANENT);
           }
+          continue;
+        }
+        try {
+          recordPublisherTarget(targetsFile, {
+            relay,
+            channel_id: parsedChannelId,
+            publisher_pubkey: parsed.pubkey,
+          });
+        } catch (error) {
+          log(`could not record publisher target for cached event ${entry.id}: ${error.message}`);
+          outcome.set(entry.file, RETRYABLE);
           continue;
         }
         // The relay verdict and the cache eviction are settled separately on
