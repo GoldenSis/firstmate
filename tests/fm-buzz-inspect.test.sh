@@ -634,7 +634,8 @@ test_quarantine_lifecycle_has_one_pinned_cache_owner() {
     "the quarantine owner does not document its staging and payload layout"
   assert_grep "Every manifests/<token>.json variant requires" "$ROOT/bin/fm-buzz-publish.mjs" \
     "the quarantine owner does not document manifest identity"
-  assert_grep "Startup first accounts for invalid recovery residue" "$ROOT/bin/fm-buzz-publish.mjs" \
+  assert_grep "Startup completes manifest temporaries before accounting for invalid recovery" \
+    "$ROOT/bin/fm-buzz-publish.mjs" \
     "the quarantine owner does not document recovery order"
   assert_grep "<replay-root>/<endpoint-digest>/<channel-id>/<created_at>-<event-id>.json" \
     "$ROOT/bin/fm-buzz-publish.mjs" \

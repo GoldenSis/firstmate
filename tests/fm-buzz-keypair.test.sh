@@ -1527,6 +1527,25 @@ test_forget_key_refuses_when_history_cannot_be_read() {
   pass "--forget-key refuses when public-key history cannot be read"
 }
 
+test_malformed_public_history_is_never_rewritten() {
+  local home retired history before output code
+  home=$(make_home malformed-public-history)
+  run_keypair "$home" >/dev/null 2>&1 || fail "malformed history setup failed"
+  retired=$(printf '%064d' 7)
+  history="$home/data/buzz-keypair.public-history"
+  printf '%s\n%s\n' "$retired" 'not-a-public-key' > "$history"
+  before=$(cat "$history")
+
+  output=$(run_keypair "$home" --forget-key "$retired" 2>&1)
+  code=$?
+  expect_code 1 "$code" "--forget-key with malformed public-key history"
+  assert_contains "$output" "could not read $history" \
+    "a malformed history record was silently dropped"
+  [ "$(cat "$history")" = "$before" ] \
+    || fail "failed malformed-history validation rewrote recoverable evidence"
+  pass "malformed public-key history remains intact"
+}
+
 test_keychain_errors_refuse_rotation_without_minting_a_fallback_key() {
   local tools private public home lookup_home forced_home forced_public output code fallback
   tools=$(make_fake_keychain_tools)
@@ -1796,7 +1815,7 @@ test_public_key_history_is_normalized_consistently() {
   history="$home/data/buzz-keypair.public-history"
   first=$(run_keypair "$home" 2>/dev/null) || fail "normalized history fixture setup failed"
   first_upper=$(printf '%s' "$first" | tr 'a-f' 'A-F')
-  printf '  %s  \r\n%s\nnot-a-key\n' "$first_upper" "$first" > "$history"
+  printf '  %s  \r\n%s\n' "$first_upper" "$first" > "$history"
 
   second=$(run_keypair "$home" --rotate 2>/dev/null) || fail "normalized history rotation failed"
   [ "$(cat "$history")" = "$first" ] \
@@ -1945,6 +1964,46 @@ test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine() {
   assert_absent "$(key_file "$home" "$home/xdg")" \
     "default ensure minted over quarantined legacy identity evidence"
   pass "legacy quarantine preserves publisher identity for orphan recovery"
+}
+
+test_orphan_gate_includes_quarantine_manifest_temporaries() {
+  local home relay private publisher channel seeded replay flat manifest temporary output code
+  home=$(make_home orphan-quarantine-manifest-temporary)
+  run_keypair "$home" >/dev/null 2>&1 || fail "quarantine manifest temporary setup failed"
+  relay="ws://127.0.0.1:1/quarantine-manifest-temporary"
+  private=$(new_private_key) || fail "could not mint a quarantine temporary publisher"
+  publisher=$(public_from_private "$private") || fail "could not derive the quarantine temporary publisher"
+  channel=$(default_channel_id "$home")
+  seeded=$(seed_replay_event "$home" "$relay" "$private" 1700000000 "$channel" quarantine-temporary) \
+    || fail "could not seed quarantine temporary evidence"
+  replay="$home/state/buzz-replay"
+  flat="$replay/$(basename "$seeded")"
+  mv "$seeded" "$flat"
+  node -e '
+    import(process.argv[1]).then(({ migrateReplayCache }) => {
+      const result = migrateReplayCache(process.argv[2]);
+      if (result.legacy.length || result.endpoint.length) process.exitCode = 1;
+    });
+  ' "$ROOT/bin/fm-buzz-publish.mjs" "$replay" \
+    || fail "could not create quarantine temporary evidence"
+  manifest=$(grep -l "$publisher" "$replay/_legacy-quarantine/manifests"/*.json 2>/dev/null | head -1)
+  [ -n "$manifest" ] || fail "quarantine temporary fixture has no publisher manifest"
+  temporary="$manifest.tmp"
+  mv "$manifest" "$temporary"
+  rm -f -- "$(key_file "$home" "$home/xdg")" "$home/data/buzz-keypair.public"
+
+  output=$(run_keypair "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "default ensure with quarantine manifest temporary evidence"
+  assert_contains "$output" "orphan identity evidence exists" \
+    "the orphan gate ignored a quarantine manifest temporary"
+  assert_contains "$output" "$publisher" \
+    "the orphan gate lost the temporary manifest publisher"
+  assert_contains "$output" "$temporary" \
+    "the orphan gate did not name the temporary manifest evidence"
+  assert_absent "$(key_file "$home" "$home/xdg")" \
+    "default ensure minted over temporary quarantine evidence"
+  pass "quarantine manifest temporaries preserve publisher identity"
 }
 
 test_orphan_gate_preserves_corrupt_partition_publisher_evidence() {
@@ -2104,7 +2163,7 @@ EOF
 }
 
 test_orphan_gate_validates_quarantine_manifest_variants() {
-  local home replay quarantine token payload manifest output code recovery_token recovery_payload recovery_manifest
+  local home replay quarantine token payload manifest output code
   home=$(make_home orphan-malformed-quarantine-manifest)
   replay="$home/state/buzz-replay"
   quarantine="$replay/_legacy-quarantine"
@@ -2132,19 +2191,26 @@ test_orphan_gate_validates_quarantine_manifest_variants() {
   home=$(make_home orphan-valid-recovery-residue)
   replay="$home/state/buzz-replay"
   quarantine="$replay/_legacy-quarantine"
-  recovery_token=$(printf '%064d' 82)
-  recovery_payload="$quarantine/recovery-corrupt/$recovery_token.invalid"
-  recovery_manifest="$quarantine/manifests/$recovery_token.json"
   mkdir -p "$quarantine/recovery-corrupt" "$quarantine/manifests"
-  printf 'invalid recovery bytes\n' > "$recovery_payload"
+  # shellcheck disable=SC2016
   node -e '
     const fs = require("node:fs");
-    const payload = process.argv[1];
-    const manifest = process.argv[2];
-    const token = process.argv[3];
-    const metadata = fs.statSync(payload);
+    const { createHash } = require("node:crypto");
+    const quarantine = process.argv[1];
+    const source = `${quarantine}/recovery-corrupt/fixture.invalid`;
+    const originalPath = "manifests/interrupted.json.tmp";
+    fs.writeFileSync(source, "invalid recovery bytes\n");
+    const metadata = fs.statSync(source);
+    const token = createHash("sha256").update(JSON.stringify({
+      original_path: originalPath,
+      device: metadata.dev,
+      inode: metadata.ino,
+    })).digest("hex");
+    const payload = `${quarantine}/recovery-corrupt/${token}.invalid`;
+    const manifest = `${quarantine}/manifests/${token}.json`;
+    fs.renameSync(source, payload);
     fs.writeFileSync(manifest, JSON.stringify({
-      original_path: "recovery-corrupt/" + token + ".invalid",
+      original_path: originalPath,
       legacy_host: null,
       original_timestamps: {
         atime_ms: metadata.atimeMs,
@@ -2159,7 +2225,7 @@ test_orphan_gate_validates_quarantine_manifest_variants() {
       corrupt_type: "invalid-quarantine-recovery-residue",
       recovery_error: "fixture",
     }, null, 2) + "\n");
-  ' "$recovery_payload" "$recovery_manifest" "$recovery_token"
+  ' "$quarantine" || fail "could not create the recovery-residue fixture"
   run_keypair "$home" >/dev/null 2>&1 \
     || fail "a valid recovery-residue manifest blocked first key creation"
   assert_present "$home/data/buzz-keypair.public" \
@@ -2168,7 +2234,7 @@ test_orphan_gate_validates_quarantine_manifest_variants() {
 }
 
 test_orphan_gate_includes_recoverable_quarantine_staging() {
-  local home relay private publisher channel seeded replay token transaction origin output code
+  local home relay private publisher channel seeded replay token transaction output code
   home=$(make_home orphan-quarantine-staging)
   run_keypair "$home" >/dev/null 2>&1 || fail "quarantine staging setup failed"
   relay="ws://127.0.0.1:1/quarantine-staging"
@@ -2178,26 +2244,37 @@ test_orphan_gate_includes_recoverable_quarantine_staging() {
   seeded=$(seed_replay_event "$home" "$relay" "$private" 1700000000 "$channel" quarantine-staging) \
     || fail "could not seed quarantine staging evidence"
   replay="$home/state/buzz-replay"
-  token=$(printf '%s' quarantine-staging | shasum -a 256 | awk '{print $1}')
-  transaction="$replay/_legacy-quarantine/staging/$token"
-  origin="$transaction/origin.json"
+  transaction="$replay/_legacy-quarantine/staging/fixture"
   mkdir -p "$transaction" "$replay/_legacy-quarantine/payloads"
   mv "$seeded" "$transaction/source"
   # shellcheck disable=SC2016
-  node -e '
+  token=$(node -e '
     const fs = require("fs");
-    const source = process.argv[1];
-    const origin = process.argv[2];
-    const token = process.argv[3];
+    const path = require("node:path");
+    const { createHash } = require("node:crypto");
+    const fixture = process.argv[1];
+    const quarantine = process.argv[2];
+    const source = path.join(fixture, "source");
+    const originalPath = "legacy/staged.json";
     const metadata = fs.statSync(source);
-    fs.writeFileSync(origin, `${JSON.stringify({
+    const token = createHash("sha256").update(JSON.stringify({
+      original_path: originalPath,
+      device: metadata.dev,
+      inode: metadata.ino,
+    })).digest("hex");
+    const transaction = path.join(quarantine, "staging", token);
+    fs.renameSync(fixture, transaction);
+    fs.writeFileSync(path.join(transaction, "origin.json"), `${JSON.stringify({
+      original_path: originalPath,
       transaction_token: token,
       payload_reference: `payloads/${token}.json`,
       source_device: metadata.dev,
       source_inode: metadata.ino,
       publisher_pubkey: null,
     }, null, 2)}\n`);
-  ' "$transaction/source" "$origin" "$token"
+    process.stdout.write(token);
+  ' "$transaction" "$replay/_legacy-quarantine")
+  transaction="$replay/_legacy-quarantine/staging/$token"
   rm -f -- "$(key_file "$home" "$home/xdg")" "$home/data/buzz-keypair.public"
 
   output=$(run_keypair "$home" 2>&1)
@@ -2465,6 +2542,7 @@ test_rotation_compares_the_recorded_key_with_stored_private_material
 test_rotation_detects_and_cleans_up_divergent_stores
 test_orphaned_public_record_requires_compromised_recovery
 test_forget_key_refuses_when_history_cannot_be_read
+test_malformed_public_history_is_never_rewritten
 test_keychain_errors_refuse_rotation_without_minting_a_fallback_key
 test_public_record_failures_are_fatal_and_retryable
 test_key_record_targets_reject_non_files
@@ -2477,6 +2555,7 @@ test_public_flag_fails_before_a_keypair_exists
 test_rotation_stages_the_replacement_before_clearing_the_outgoing_key
 test_orphan_gate_sees_legacy_replay_publisher_evidence
 test_orphan_gate_preserves_publisher_evidence_after_legacy_quarantine
+test_orphan_gate_includes_quarantine_manifest_temporaries
 test_orphan_gate_preserves_corrupt_partition_publisher_evidence
 test_orphan_gate_validates_quarantine_payloads_without_filename_trust
 test_orphan_gate_fails_closed_on_unreadable_quarantine_payloads

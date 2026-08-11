@@ -286,18 +286,24 @@ command -v node >/dev/null 2>&1 || {
 }
 
 read_history() {
-  local raw line normalized
+  local raw line normalized history=""
   if [ ! -e "$HISTORY_FILE" ] && [ ! -L "$HISTORY_FILE" ]; then
     return 0
   fi
   [ -f "$HISTORY_FILE" ] || return 1
   raw=$(cat -- "$HISTORY_FILE") || return 1
-  printf '%s\n' "$raw" |
-    while IFS= read -r line || [ -n "$line" ]; do
-      normalized=$(fm_buzz_normalize_public_key "$line") || continue
-      printf '%s\n' "$normalized"
-    done |
-    awk '!seen[$0]++'
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    normalized=$(fm_buzz_normalize_public_key "$line") || return 1
+    case $'\n'"$history"$'\n' in
+      *$'\n'"$normalized"$'\n'*) ;;
+      *) history="${history:+$history
+}$normalized" ;;
+    esac
+  done <<EOF
+$raw
+EOF
+  [ -z "$history" ] || printf '%s\n' "$history"
 }
 
 # Derive the public key from the stored private key without the private key ever

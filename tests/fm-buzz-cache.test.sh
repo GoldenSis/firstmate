@@ -283,6 +283,9 @@ test_missing_manifest_backed_quarantine_payloads_fail_closed() {
     quarantine_timestamp:"1970-01-01T00:00:00.000Z",
     payload_reference:("corrupt/" + $token + "/entry"),
     publisher_pubkey:null,
+    source_device:1,
+    source_inode:1,
+    source_mode:33188,
     corrupt_type:"regular-file",
     content_sha256:null
   }' > "$manifest"
@@ -509,43 +512,44 @@ test_quarantine_retry_reuses_link_stable_transaction_identity() {
 
 test_quarantine_recovers_atomic_manifest_temporaries() {
   local home replay quarantine regular_token corrupt_token recovery_token mismatch_token digest_token
-  local regular_payload corrupt_payload recovery_payload digest_payload token
+  local token
   home=$(make_home quarantine-temporary-recovery)
   run_keypair "$home" >/dev/null 2>&1 || fail "quarantine temporary keypair setup failed"
   replay="$home/state/buzz-replay"
   quarantine="$replay/_legacy-quarantine"
-  regular_token=$(printf '%064d' 61)
-  corrupt_token=$(printf '%064d' 62)
-  recovery_token=$(printf '%064d' 63)
-  mismatch_token=$(printf '%064d' 64)
-  digest_token=$(printf '%064d' 65)
-  regular_payload="$quarantine/payloads/$regular_token.json"
-  corrupt_payload="$quarantine/corrupt/$corrupt_token/entry"
-  recovery_payload="$quarantine/recovery-corrupt/$recovery_token.invalid"
-  digest_payload="$quarantine/payloads/$digest_token.json"
   mkdir -p "$quarantine/manifests" "$quarantine/payloads" "$quarantine/staging" \
-    "$quarantine/corrupt/$corrupt_token" "$quarantine/recovery-corrupt"
-  printf '%s' 'regular-manifest-payload' > "$regular_payload"
-  printf '%s' 'corrupt-manifest-payload' > "$corrupt_payload"
-  printf '%s' 'recovery-manifest-payload' > "$recovery_payload"
-  printf '%s' 'digest-mismatch-payload' > "$digest_payload"
+    "$quarantine/corrupt/fixture" "$quarantine/recovery-corrupt"
   # shellcheck disable=SC2016
-  node -e '
+  read -r regular_token corrupt_token recovery_token mismatch_token digest_token <<EOF
+$(node -e '
     const fs = require("node:fs");
+    const path = require("node:path");
     const { createHash } = require("node:crypto");
-    const [quarantine, manifests, ...tokens] = process.argv.slice(1);
+    const [quarantine, manifests] = process.argv.slice(1);
     const timestamps = (metadata) => ({
       atime_ms: metadata.atimeMs,
       mtime_ms: metadata.mtimeMs,
       ctime_ms: metadata.ctimeMs,
       birthtime_ms: metadata.birthtimeMs,
     });
+    const tokenFor = (originalPath, metadata, includeMode = false) => {
+      const provenance = {
+        original_path: originalPath,
+        device: metadata.dev,
+        inode: metadata.ino,
+      };
+      if (includeMode) provenance.mode = metadata.mode;
+      return createHash("sha256").update(JSON.stringify(provenance)).digest("hex");
+    };
     const write = (token, suffix, manifest) => {
       fs.writeFileSync(`${manifests}/${token}.json${suffix}.tmp`, `${JSON.stringify(manifest)}\n`);
     };
-    const [regular, corrupt, recovery, mismatch, digestMismatch] = tokens;
+    const regularSeed = `${quarantine}/payloads/regular.fixture`;
+    fs.writeFileSync(regularSeed, "regular-manifest-payload");
+    const regularMetadata = fs.statSync(regularSeed);
+    const regular = tokenFor("legacy/regular.json", regularMetadata);
     const regularPayload = `${quarantine}/payloads/${regular}.json`;
-    const regularMetadata = fs.statSync(regularPayload);
+    fs.renameSync(regularSeed, regularPayload);
     const regularBytes = fs.readFileSync(regularPayload);
     const regularManifest = {
       original_path: "legacy/regular.json",
@@ -561,8 +565,12 @@ test_quarantine_recovers_atomic_manifest_temporaries() {
       publisher_pubkey: null,
     };
     write(regular, ".4242", regularManifest);
+    const corruptSeed = `${quarantine}/corrupt/fixture/entry`;
+    fs.writeFileSync(corruptSeed, "corrupt-manifest-payload");
+    const corruptMetadata = fs.statSync(corruptSeed);
+    const corrupt = tokenFor("legacy/corrupt-node", corruptMetadata, true);
+    fs.renameSync(`${quarantine}/corrupt/fixture`, `${quarantine}/corrupt/${corrupt}`);
     const corruptPayload = `${quarantine}/corrupt/${corrupt}/entry`;
-    const corruptMetadata = fs.statSync(corruptPayload);
     const corruptBytes = fs.readFileSync(corruptPayload);
     write(corrupt, "", {
       original_path: "legacy/corrupt-node",
@@ -570,12 +578,19 @@ test_quarantine_recovers_atomic_manifest_temporaries() {
       original_timestamps: timestamps(corruptMetadata),
       quarantine_timestamp: new Date(0).toISOString(),
       payload_reference: `corrupt/${corrupt}/entry`,
+      source_device: corruptMetadata.dev,
+      source_inode: corruptMetadata.ino,
+      source_mode: corruptMetadata.mode,
       corrupt_type: "regular-file",
       content_sha256: createHash("sha256").update(corruptBytes).digest("hex"),
       publisher_pubkey: null,
     });
+    const recoverySeed = `${quarantine}/recovery-corrupt/recovery.fixture`;
+    fs.writeFileSync(recoverySeed, "recovery-manifest-payload");
+    const recoveryMetadata = fs.statSync(recoverySeed);
+    const recovery = tokenFor("manifests/interrupted.json.tmp", recoveryMetadata);
     const recoveryPayload = `${quarantine}/recovery-corrupt/${recovery}.invalid`;
-    const recoveryMetadata = fs.statSync(recoveryPayload);
+    fs.renameSync(recoverySeed, recoveryPayload);
     write(recovery, ".4243", {
       original_path: "manifests/interrupted.json.tmp",
       original_timestamps: timestamps(recoveryMetadata),
@@ -586,19 +601,48 @@ test_quarantine_recovers_atomic_manifest_temporaries() {
       corrupt_type: "invalid-quarantine-recovery-residue",
       recovery_error: "temporary-recovery-fixture",
     });
-    write(mismatch, "", { ...regularManifest });
+    const mismatchSeed = `${quarantine}/payloads/mismatch.fixture`;
+    fs.writeFileSync(mismatchSeed, "provenance-mismatch-payload");
+    const mismatchMetadata = fs.statSync(mismatchSeed);
+    const expectedMismatch = tokenFor("legacy/mismatch.json", mismatchMetadata);
+    const mismatch = `${expectedMismatch[0] === "0" ? "1" : "0"}${expectedMismatch.slice(1)}`;
+    fs.renameSync(mismatchSeed, `${quarantine}/payloads/${mismatch}.json`);
+    const mismatchBytes = fs.readFileSync(`${quarantine}/payloads/${mismatch}.json`);
+    write(mismatch, "", {
+      original_path: "legacy/mismatch.json",
+      legacy_host: null,
+      original_timestamps: timestamps(mismatchMetadata),
+      quarantine_timestamp: new Date(0).toISOString(),
+      payload_reference: `payloads/${mismatch}.json`,
+      source_device: mismatchMetadata.dev,
+      source_inode: mismatchMetadata.ino,
+      content_sha256_observed: createHash("sha256").update(mismatchBytes).digest("hex"),
+      content_size_observed: mismatchBytes.length,
+      quarantine_reason: "temporary-recovery-fixture",
+      publisher_pubkey: null,
+    });
+    const digestSeed = `${quarantine}/payloads/digest.fixture`;
+    fs.writeFileSync(digestSeed, "digest-mismatch-payload");
+    const digestMetadata = fs.statSync(digestSeed);
+    const digestMismatch = tokenFor("legacy/digest.json", digestMetadata);
     const digestPayload = `${quarantine}/payloads/${digestMismatch}.json`;
-    const digestMetadata = fs.statSync(digestPayload);
+    fs.renameSync(digestSeed, digestPayload);
     write(digestMismatch, "", {
-      ...regularManifest,
+      original_path: "legacy/digest.json",
+      legacy_host: null,
+      original_timestamps: timestamps(digestMetadata),
+      quarantine_timestamp: new Date(0).toISOString(),
       payload_reference: `payloads/${digestMismatch}.json`,
       source_device: digestMetadata.dev,
       source_inode: digestMetadata.ino,
       content_sha256_observed: "0".repeat(64),
       content_size_observed: fs.statSync(digestPayload).size,
+      quarantine_reason: "temporary-recovery-fixture",
+      publisher_pubkey: null,
     });
-  ' "$quarantine" "$quarantine/manifests" "$regular_token" "$corrupt_token" \
-    "$recovery_token" "$mismatch_token" "$digest_token"
+    process.stdout.write(`${regular} ${corrupt} ${recovery} ${mismatch} ${digestMismatch}\n`);
+  ' "$quarantine" "$quarantine/manifests")
+EOF
 
   printf '%s' '{"schema":"fm-bearings.v1","note":"recover-manifest-temp"}' \
     | run_publish "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
@@ -693,10 +737,10 @@ test_invalid_quarantine_temporaries_are_accounted_for() {
     | run_publish "$home" "ws://127.0.0.1:1" 2>&1)
   manifest=$(grep -l 'invalid-quarantine-recovery-residue' \
     "$quarantine/manifests"/*.json 2>/dev/null | head -1)
-  [ -n "$manifest" ] || fail "an interrupted residue transaction was not recovered"
+  [ -z "$manifest" ] || fail "a residue without source provenance was assigned a replacement manifest"
   assert_present "$residue" "residue recovery discarded the retained invalid bytes"
-  assert_contains "$second" "recovered invalid recovery residue" \
-    "residue recovery did not report deterministic completion"
+  assert_contains "$second" "recovery-residue provenance manifest is missing" \
+    "residue recovery did not fail closed without its source provenance"
   pass "invalid quarantine temporaries move into accounted corrupt state"
 }
 
@@ -803,23 +847,45 @@ EOF
 # --- (d) reconnect replays the identical event id --------------------------
 
 test_replay_cache_is_capped_at_100() {
-  local home relay cache_dir count i
+  local home relay cache_dir private channel oldest newest count
   home=$(make_home cap)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
   relay="ws://127.0.0.1:1"
   cache_dir=$(channel_cache_dir "$home" "$relay" "$(default_channel_id "$home")") \
     || fail "could not derive cache partition"
   mkdir -p "$cache_dir"
+  private=$(jq -r '.private_key' "$(key_file "$home" "$home/xdg")")
+  channel=$(default_channel_id "$home")
 
-  # Seed 120 plausible cache entries with increasing timestamps, then publish
+  # Seed 120 valid cache entries with increasing timestamps, then publish
   # once against a dead relay: the prune must bring the cache to the cap,
   # keeping the newest and dropping the oldest.
-  i=1
-  while [ "$i" -le 120 ]; do
-    printf '["EVENT",{"id":"%060d","created_at":%d}]' "$i" "$((1700000000 + i))" \
-      > "$cache_dir/$((1700000000 + i))-$(printf '%064d' "$i").json"
-    i=$((i + 1))
-  done
+  # shellcheck disable=SC2016
+  printf '%s' "$private" | node -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    let privateKey = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { privateKey += chunk; });
+    process.stdin.on("end", async () => {
+      const { KIND_STREAM_MESSAGE, signEvent } = await import(process.argv[1]);
+      for (let i = 1; i <= 120; i += 1) {
+        const event = signEvent({
+          created_at: 1700000000 + i,
+          kind: KIND_STREAM_MESSAGE,
+          tags: [["h", process.argv[3]]],
+          content: JSON.stringify({ schema: "fm-bearings.v1", note: `cap-${i}` }),
+        }, privateKey.trim());
+        fs.writeFileSync(
+          path.join(process.argv[2], `${event.created_at}-${event.id}.json`),
+          JSON.stringify(["EVENT", event]),
+        );
+      }
+    });
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$cache_dir" "$channel" \
+    || fail "could not seed valid cap fixtures"
+  oldest=$(find "$cache_dir" -type f -name '1700000001-*.json' -print -quit)
+  newest=$(find "$cache_dir" -type f -name '1700000120-*.json' -print -quit)
   [ "$(replay_count "$home")" = "120" ] || fail "cache seeding failed"
 
   printf '%s' '{"schema":"fm-bearings.v1"}' \
@@ -829,9 +895,9 @@ test_replay_cache_is_capped_at_100() {
   [ "$count" = "100" ] || fail "the replay cache is not capped at 100 (found $count)"
 
   # The newest must survive and the oldest must be gone.
-  assert_present "$cache_dir/$((1700000000 + 120))-$(printf '%064d' 120).json" \
+  assert_present "$newest" \
     "the cap dropped a newer event instead of an older one"
-  assert_absent "$cache_dir/$((1700000000 + 1))-$(printf '%064d' 1).json" \
+  assert_absent "$oldest" \
     "the cap did not drop the oldest event"
   pass "the replay cache is capped at 100, dropping oldest first"
 }
@@ -857,7 +923,7 @@ test_cache_limit_must_be_a_positive_integer() {
 }
 
 test_cache_limit_one_preserves_the_pending_event() {
-  local home relay output clock cache_dir old
+  local home relay output clock cache_dir private channel old
   home=$(make_home cache-limit-one)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
   clock="$TMP_ROOT/fixed-buzz-clock.mjs"
@@ -868,8 +934,10 @@ EOF
   cache_dir=$(channel_cache_dir "$home" "$relay" "$(default_channel_id "$home")") \
     || fail "could not derive cache partition"
   mkdir -p "$cache_dir"
-  old="$cache_dir/1700000000-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.json"
-  printf '%s' '["EVENT",{}]' > "$old"
+  private=$(jq -r '.private_key' "$(key_file "$home" "$home/xdg")")
+  channel=$(default_channel_id "$home")
+  old=$(seed_replay_event "$home" "$relay" "$private" 1700000000 "$channel" limit-one-old) \
+    || fail "could not seed the same-second cache entry"
 
   output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"limit-one"}' \
     | NODE_OPTIONS="--import=$clock" FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
@@ -1368,7 +1436,8 @@ test_relay_timeout_must_fit_the_node_timer_range() {
 }
 
 test_malformed_cache_names_are_discarded_or_accounted_for() {
-  local home relay replay removable retained output
+  local home relay replay removable retained private channel signed malformed_signed
+  local wrong_channel wrong_seeded wrong_signed quarantine_manifest output
   home=$(make_home malformed-cache-names)
   run_keypair "$home" >/dev/null 2>&1 || fail "keypair setup failed"
   read -r STUB_PID relay <<EOF
@@ -1377,21 +1446,39 @@ EOF
   replay=$(channel_cache_dir "$home" "$relay" "$(default_channel_id "$home")") \
     || fail "could not derive cache partition"
   mkdir -p "$replay"
+  private=$(jq -r '.private_key' "$(key_file "$home" "$home/xdg")")
+  channel=$(default_channel_id "$home")
+  signed=$(seed_replay_event "$home" "$relay" "$private" 1700000000 "$channel" malformed-signed) \
+    || fail "could not seed the malformed-name signed cache entry"
+  malformed_signed="$replay/signed-but-malformed.json"
+  mv "$signed" "$malformed_signed"
+  wrong_channel=$(channel_id_for_label malformed-wrong-channel)
+  wrong_seeded=$(seed_replay_event \
+    "$home" "$relay" "$private" 1700000001 "$wrong_channel" malformed-wrong-channel) \
+    || fail "could not seed the wrong-channel signed cache entry"
+  wrong_signed="$replay/signed-wrong-channel"
+  mv "$wrong_seeded" "$wrong_signed"
   removable="$replay/not-an-event.json"
   retained="$replay/still-not-an-event.json"
   printf '%s' '{"malformed":true}' > "$removable"
   mkdir "$retained"
 
   output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"malformed-cache-name"}' \
-    | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
+    | FM_BUZZ_MAX_CACHE=3 run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
   assert_contains "$output" "dropping invalid cache entry not-an-event.json" \
     "a malformed cache filename was silently ignored"
   assert_contains "$output" "could not drop invalid cache entry still-not-an-event.json" \
     "a failed malformed-entry cleanup was silently ignored"
-  assert_contains "$output" "retained=1 discarded=1 cleanup_failed=1" \
+  assert_contains "$output" "delivered=2 retained=1 discarded=1 cleanup_failed=1" \
     "malformed cache filenames were not truthfully accounted for"
+  assert_absent "$malformed_signed" "a signed malformed-name cache entry was not recovered"
+  assert_absent "$wrong_signed" "a wrong-channel signed cache entry remained active"
+  quarantine_manifest=$(grep -l 'noncanonical-cache-entry-channel-mismatch' \
+    "$home/state/buzz-replay/_legacy-quarantine/manifests"/*.json 2>/dev/null | head -1)
+  [ -n "$quarantine_manifest" ] \
+    || fail "a wrong-channel signed cache entry was discarded without quarantine"
   assert_absent "$removable" "a removable malformed cache entry survived cleanup"
   assert_present "$retained" "the failed-cleanup fixture disappeared unexpectedly"
   [ "$(replay_count "$home")" = "1" ] \
@@ -1521,9 +1608,9 @@ EOF
 
   assert_contains "$output" "dropping invalid cache entry" \
     "parseable corrupt cache entries were not diagnosed"
-  assert_contains "$output" "delivered=1 retained=0 discarded=3 cleanup_failed=0" \
-    "parseable corrupt cache entries were not truthfully discarded"
-  assert_absent "$wrong_frame" "a cache frame whose filename disagreed with its event was replayed"
+  assert_contains "$output" "delivered=2 retained=0 discarded=2 cleanup_failed=0" \
+    "parseable cache entries were not truthfully recovered or discarded"
+  assert_absent "$wrong_frame" "a cache frame whose filename disagreed with its event was left noncanonical"
   assert_absent "$empty_frame" "an object-only cache entry was retained"
   assert_absent "$notice_frame" "a non-EVENT cache frame was retained"
   [ "$(replay_count "$home")" = "0" ] || fail "corrupt cache entries remained after cleanup"

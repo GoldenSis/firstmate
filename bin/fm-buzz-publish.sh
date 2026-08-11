@@ -494,16 +494,16 @@ publish() {
 }
 
 check_publish_prerequisites() {
+  command -v python3 >/dev/null 2>&1 || {
+    log "python3 is required for safe replay-cache operations; see docs/buzz-loopback-adapter.md#prerequisites"
+    return 2
+  }
   command -v node >/dev/null 2>&1 || { log "node is unavailable; skipping publish"; return 1; }
   node -e 'if (typeof globalThis.WebSocket !== "function") process.exit(1)' >/dev/null 2>&1 || {
     log "Node.js does not provide the global WebSocket API; skipping publish"
     return 1
   }
   command -v jq >/dev/null 2>&1 || { log "jq is unavailable; skipping publish"; return 1; }
-  command -v python3 >/dev/null 2>&1 || {
-    log "python3 is required for safe replay-cache operations; see docs/buzz-loopback-adapter.md#prerequisites"
-    return 2
-  }
 }
 
 ARGUMENT_ERROR=0

@@ -52,8 +52,9 @@
 // Regular-entry manifests additionally require legacy_host, source_device,
 // source_inode, observed content hash and size, quarantine_reason, and the
 // validated publisher_pubkey when the payload contains a signed event.
-// Corrupt-node manifests additionally require corrupt_type and may carry a
-// content hash when their retained node is readable.
+// Corrupt-node manifests additionally require source_device, source_inode,
+// source_mode, and corrupt_type, and may carry a content hash when their retained
+// node is readable.
 // Recovery-residue manifests additionally require source_device, source_inode,
 // corrupt_type, and recovery_error, while legacy_host, quarantine_reason, and
 // publisher_pubkey are not part of that variant.
@@ -784,13 +785,13 @@ function prepareCacheRoot(replayDir) {
   return requested;
 }
 
-function prepareCacheDirectory(replayDir, name) {
+function prepareCacheDirectory(replayDir, name, description = "cache") {
   const directory = path.join(replayDir, name);
-  if (!containedCachePath(replayDir, directory)) throw new Error("cache directory escapes replay cache");
+  if (!containedCachePath(replayDir, directory)) throw new Error(`${description} directory escapes replay cache`);
   try {
     const metadata = cacheLstatSync(directory);
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-      throw new Error(`cache path ${directory} is not a regular directory`);
+      throw new Error(`${description} path ${directory} is not a regular directory`);
     }
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
@@ -802,31 +803,8 @@ function prepareCacheDirectory(replayDir, name) {
 function prepareRelayCacheDirectory(replayDir, relay, channelId) {
   const endpointDirectory = relayCacheDirectory(replayDir, relay);
   if (!containedCachePath(replayDir, endpointDirectory)) throw new Error("relay cache path escapes replay cache");
-  try {
-    const metadata = cacheLstatSync(endpointDirectory);
-    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-      throw new Error(`relay cache path ${endpointDirectory} is not a regular directory`);
-    }
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    cacheMkdirSync(endpointDirectory, { mode: 0o700 });
-  }
-  const metadata = cacheLstatSync(endpointDirectory);
-  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-    throw new Error(`relay cache path ${endpointDirectory} is not a regular directory`);
-  }
-  pinCacheDirectory(endpointDirectory);
-  const channelDirectory = relayChannelCacheDirectory(replayDir, relay, channelId);
-  try {
-    const channelMetadata = cacheLstatSync(channelDirectory);
-    if (channelMetadata.isSymbolicLink() || !channelMetadata.isDirectory()) {
-      throw new Error(`channel cache path ${channelDirectory} is not a regular directory`);
-    }
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    cacheMkdirSync(channelDirectory, { mode: 0o700 });
-  }
-  return pinCacheDirectory(channelDirectory);
+  const endpoint = prepareCacheDirectory(replayDir, path.basename(endpointDirectory), "relay cache");
+  return prepareCacheDirectory(endpoint, channelId, "channel cache");
 }
 
 const QUARANTINE_TOKEN = /^[0-9a-f]{64}$/;
@@ -836,6 +814,20 @@ function requireQuarantineToken(value) {
     throw new Error("invalid quarantine transaction token");
   }
   return value;
+}
+
+function quarantineProvenanceToken(originalPath, device, inode, mode = null) {
+  if (
+    typeof originalPath !== "string" || originalPath === "" ||
+    !Number.isSafeInteger(device) || device < 0 ||
+    !Number.isSafeInteger(inode) || inode < 0 ||
+    !(mode === null || (Number.isSafeInteger(mode) && mode >= 0))
+  ) {
+    throw new Error("quarantine source provenance is malformed");
+  }
+  const provenance = { original_path: originalPath, device, inode };
+  if (mode !== null) provenance.mode = mode;
+  return requireQuarantineToken(sha256(JSON.stringify(provenance)));
 }
 
 function quarantineManifestPath(manifestsDir, token) {
@@ -864,6 +856,14 @@ function stagedLegacyOrigin(origin, quarantineDir, payloadsDir, transactionDir) 
   ) {
     throw new Error("quarantine source identity is malformed");
   }
+  const expectedToken = quarantineProvenanceToken(
+    origin.original_path,
+    origin.source_device,
+    origin.source_inode,
+  );
+  if (originToken !== expectedToken) {
+    throw new Error("quarantine transaction token does not match its source provenance");
+  }
   assertCacheDirectory(transactionDir);
   return { token: originToken, payload };
 }
@@ -881,6 +881,15 @@ function corruptPartitionRecord(record, quarantineDir, transactionDir) {
   if (record.manifest.payload_reference !== expectedReference || referenced !== expected) {
     throw new Error("corrupt quarantine payload reference does not match its transaction token");
   }
+  const expectedToken = quarantineProvenanceToken(
+    record.manifest.original_path,
+    record.manifest.source_device,
+    record.manifest.source_inode,
+    record.manifest.source_mode,
+  );
+  if (recordToken !== expectedToken) {
+    throw new Error("quarantine transaction token does not match its source provenance");
+  }
   assertCacheDirectory(transactionDir);
   return { token: recordToken, manifest: record.manifest };
 }
@@ -892,6 +901,7 @@ function quarantineManifestIdentity(manifest) {
     payload_reference: manifest.payload_reference,
     source_device: manifest.source_device ?? null,
     source_inode: manifest.source_inode ?? null,
+    source_mode: manifest.source_mode ?? null,
     corrupt_type: manifest.corrupt_type ?? null,
     quarantine_reason: manifest.quarantine_reason ?? "legacy-cache-migration",
     publisher_pubkey: manifest.publisher_pubkey ?? null,
@@ -961,6 +971,9 @@ function quarantineManifestVariant(manifest, token) {
   }
   if (manifest.payload_reference === corruptReference) {
     if (
+      !Number.isSafeInteger(manifest.source_device) || manifest.source_device < 0 ||
+      !Number.isSafeInteger(manifest.source_inode) || manifest.source_inode < 0 ||
+      !Number.isSafeInteger(manifest.source_mode) || manifest.source_mode < 0 ||
       typeof manifest.corrupt_type !== "string" || manifest.corrupt_type === "" ||
       !(manifest.content_sha256 === null ||
         (typeof manifest.content_sha256 === "string" && CACHE_PARTITION.test(manifest.content_sha256)))
@@ -1067,6 +1080,21 @@ function quarantineManifestPayload(quarantineDir, manifest, token) {
       throw new Error(`legacy quarantine payload ${payload} does not match its publisher identity`);
     }
   }
+  const expectedToken = variant === "corrupt"
+    ? quarantineProvenanceToken(
+      manifest.original_path,
+      manifest.source_device,
+      manifest.source_inode,
+      manifest.source_mode,
+    )
+    : quarantineProvenanceToken(
+      manifest.original_path,
+      manifest.source_device,
+      manifest.source_inode,
+    );
+  if (token !== expectedToken) {
+    throw new Error("quarantine transaction token does not match its source provenance");
+  }
   return { variant, payload, metadata };
 }
 
@@ -1141,10 +1169,9 @@ function quarantineInvalidRecoveryResidue(
     if (existing.dev !== metadata.dev || existing.ino !== metadata.ino) {
       throw new Error(`recovery-residue quarantine collision at ${destination}`);
     }
-    cacheUnlinkSync(source);
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
-    cacheRenameSync(source, destination);
+    cacheLinkAcrossPinnedDirectories(source, destination);
   }
   const manifest = {
     original_path: originalPath,
@@ -1158,6 +1185,11 @@ function quarantineInvalidRecoveryResidue(
     recovery_error: String(reason),
   };
   finalizeQuarantineRecord(quarantineManifestPath(manifestsDir, token), manifest);
+  const currentSource = cacheLstatSync(source);
+  if (currentSource.dev !== metadata.dev || currentSource.ino !== metadata.ino) {
+    throw new Error("invalid recovery residue source identity changed before removal");
+  }
+  cacheUnlinkSync(source);
   log(`quarantined invalid recovery residue ${source} at ${destination}`);
 }
 
@@ -1191,18 +1223,7 @@ function recoverInvalidRecoveryResidues(quarantineDir, manifestsDir, recoveryCor
         log(`deferred invalid recovery residue ${residue} until its source transaction resumes`);
         continue;
       }
-      finalizeQuarantineRecord(final, {
-        original_path: expectedReference,
-        legacy_host: null,
-        original_timestamps: metadataTimestamps(metadata),
-        quarantine_timestamp: new Date().toISOString(),
-        payload_reference: expectedReference,
-        source_device: metadata.dev,
-        source_inode: metadata.ino,
-        corrupt_type: "invalid-quarantine-recovery-residue",
-        recovery_error: "recovered incomplete residue transaction",
-      });
-      log(`recovered invalid recovery residue ${residue}`);
+      throw new Error("recovery-residue provenance manifest is missing");
     } catch (error) {
       log(`could not account for invalid recovery residue ${residue}: ${error.message}`);
       failures.push(residue);
@@ -1528,6 +1549,9 @@ function quarantineCorruptPartitionNode(replayDir, quarantineDir, corruptDir, ma
     original_path: originalPath,
     legacy_host: null,
     original_timestamps: metadataTimestamps(metadata),
+    source_device: metadata.dev,
+    source_inode: metadata.ino,
+    source_mode: metadata.mode,
     content_sha256: null,
     quarantine_timestamp: new Date().toISOString(),
     payload_reference: payloadReference,
@@ -1883,6 +1907,11 @@ function migrateEndpointReplayEntries(replayDir) {
       );
       if (channelSweep.failed > 0) failures.push(channelDirectory);
       quarantined += channelSweep.quarantined;
+      quarantined += settleNoncanonicalChannelEntries(
+        channelDirectory,
+        interruptedWriteQuarantine,
+        failures,
+      );
     }
   }
   if (migrated > 0) log(`migrated ${migrated} endpoint-only replay event(s) into channel partitions`);
@@ -1890,19 +1919,28 @@ function migrateEndpointReplayEntries(replayDir) {
   return { failures, migrated, quarantined };
 }
 
-function replayPublisherEntries(cacheRoot, topologyProvider, description) {
+function replayPublisherEntries(cacheRoot, topologyProvider, description, inspectAll = false) {
   const topology = topologyProvider(cacheRoot);
   if (topology.failures.length > 0) {
     throw new Error(`could not inspect ${description} partitions:\n${topology.failures.map((file) => `  ${file}`).join("\n")}`);
   }
   const evidence = [];
   for (const directory of topology.directories) {
-    const inventory = cacheEntries(directory);
+    const inventory = cacheEntries(directory, { inspectAll });
     if (inventory.failures.length > 0) {
       throw new Error(`could not inspect ${description} entries:\n${inventory.failures.map((file) => `  ${file}`).join("\n")}`);
     }
     for (const entry of inventory.entries) {
-      if (entry.malformed) throw new Error(`${description} entry ${entry.file} is invalid: ${entry.reason}`);
+      if (entry.malformed) {
+        if (entry.regular) {
+          const publisherPubkey = validatedSignedPublisher(entry.file);
+          if (publisherPubkey !== null) {
+            evidence.push({ path: entry.file, publisherPubkey });
+            continue;
+          }
+        }
+        throw new Error(`${description} entry ${entry.file} is invalid: ${entry.reason}`);
+      }
       let event;
       try {
         event = cachedEventFromFrame(readRegularFile(entry.file).bytes.toString("utf8"), entry);
@@ -1917,7 +1955,7 @@ function replayPublisherEntries(cacheRoot, topologyProvider, description) {
 }
 
 function activeReplayPublisherEntries(cacheRoot) {
-  return replayPublisherEntries(cacheRoot, activeCacheDirectories, "active replay");
+  return replayPublisherEntries(cacheRoot, activeCacheDirectories, "active replay", true);
 }
 
 // Flat and host-keyed entries predate the endpoint-digest layout and are never
@@ -2095,10 +2133,15 @@ function quarantinedReplayPublisherEntries(cacheRoot) {
     throw new Error(`legacy quarantine manifest path ${manifestsDir} is not a regular directory`);
   }
   pinCacheDirectory(manifestsDir);
-  for (const name of cacheReaddirSync(manifestsDir).filter((candidate) => candidate.endsWith(".json"))) {
-    const match = /^([0-9a-f]{64})\.json$/.exec(name);
+  for (const name of cacheReaddirSync(manifestsDir)
+    .filter((candidate) => candidate.endsWith(".json") || candidate.endsWith(".tmp"))) {
+    const match = /^([0-9a-f]{64})\.json(?:(?:\.\d+)?\.tmp)?$/.exec(name);
     if (!match) throw new Error(`legacy quarantine manifest ${name} has a noncanonical name`);
-    const manifestFile = quarantineManifestPath(manifestsDir, match[1]);
+    const manifestFile = path.join(manifestsDir, name);
+    const manifestMetadata = cacheLstatSync(manifestFile);
+    if (manifestMetadata.isSymbolicLink() || !manifestMetadata.isFile()) {
+      throw new Error(`legacy quarantine manifest ${manifestFile} is not a regular file`);
+    }
     let manifest;
     try {
       manifest = readQuarantineManifest(manifestFile);
@@ -2206,7 +2249,7 @@ export function protectOutgoingPublisherCache(replayDir, publisherPubkeys, optio
   return { count: blocking.length, paths, quarantined };
 }
 
-function cacheEntries(replayDir) {
+function cacheEntries(replayDir, options = {}) {
   let names;
   try {
     names = cacheReaddirSync(replayDir);
@@ -2217,7 +2260,10 @@ function cacheEntries(replayDir) {
   }
   const entries = [];
   const failures = [];
-  for (const name of names.filter((candidate) => candidate.endsWith(".json"))) {
+  const candidates = options.inspectAll
+    ? names.filter((candidate) => !candidate.endsWith(".json.tmp"))
+    : names.filter((candidate) => candidate.endsWith(".json"));
+  for (const name of candidates) {
     const file = path.join(replayDir, name);
     if (!containedCachePath(replayDir, file)) {
       failures.push(file);
@@ -2238,6 +2284,7 @@ function cacheEntries(replayDir) {
       entries.push({
         name,
         file,
+        regular: metadata.isFile(),
         malformed: true,
         reason: metadata.isSymbolicLink()
           ? "cache entry is a symbolic link"
@@ -2247,7 +2294,7 @@ function cacheEntries(replayDir) {
       });
       continue;
     }
-    entries.push({ name, createdAt, id: match[2], file, malformed: false });
+    entries.push({ name, createdAt, id: match[2], file, regular: true, malformed: false });
   }
   entries.sort((a, b) => {
       if (a.malformed !== b.malformed) return a.malformed ? -1 : 1;
@@ -2255,6 +2302,84 @@ function cacheEntries(replayDir) {
       return (a.createdAt - b.createdAt) || a.id.localeCompare(b.id);
     });
   return { entries, failures };
+}
+
+function recoverNoncanonicalSignedCacheEntry(replayDir, entry, expectedChannelId, quarantine = null) {
+  let raw;
+  try {
+    raw = readRegularFile(entry.file).bytes.toString("utf8");
+  } catch (error) {
+    throw new Error(`could not read noncanonical cache entry ${entry.file}: ${error.message}`);
+  }
+  let event;
+  try {
+    event = signedEventFromFrame(raw);
+  } catch {
+    return { kind: "invalid" };
+  }
+  const retainOrQuarantine = (reason) => {
+    if (quarantine === null) return { kind: "retained", reason, event };
+    quarantineLegacyEntry(
+      quarantine.replayDir,
+      quarantine.quarantineDir,
+      quarantine.manifestsDir,
+      quarantine.payloadsDir,
+      quarantine.stagingDir,
+      entry.file,
+      null,
+      { reason, publisherPubkey: event.pubkey },
+    );
+    return { kind: "quarantined", event };
+  };
+  let channelId;
+  try {
+    channelId = cachedEventChannelId(event);
+  } catch (error) {
+    return retainOrQuarantine(`noncanonical-cache-entry-channel: ${error.message}`);
+  }
+  if (channelId !== expectedChannelId) {
+    return retainOrQuarantine("noncanonical-cache-entry-channel-mismatch");
+  }
+  const target = path.join(replayDir, `${event.created_at}-${event.id}.json`);
+  if (target === entry.file) return { kind: "canonical", entry, event };
+  let existing;
+  try {
+    existing = readRegularFile(target).bytes.toString("utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      return retainOrQuarantine(`noncanonical-cache-entry-destination: ${error.message}`);
+    }
+  }
+  if (existing !== undefined) {
+    if (existing !== raw) return retainOrQuarantine("noncanonical-cache-entry-collision");
+    cacheUnlinkSync(entry.file);
+    return { kind: "duplicate", event };
+  }
+  cacheRenameSync(entry.file, target);
+  return { kind: "recovered", entry: cacheEntryDescriptor(target), event };
+}
+
+function settleNoncanonicalChannelEntries(channelDirectory, quarantine, failures) {
+  const inventory = cacheEntries(channelDirectory, { inspectAll: true });
+  failures.push(...inventory.failures);
+  let quarantined = 0;
+  for (const entry of inventory.entries) {
+    if (!entry.regular) continue;
+    try {
+      const result = recoverNoncanonicalSignedCacheEntry(
+        channelDirectory,
+        entry,
+        path.basename(channelDirectory),
+        quarantine,
+      );
+      if (result.kind === "quarantined") quarantined += 1;
+      if (result.kind === "retained") failures.push(entry.file);
+    } catch (error) {
+      log(`could not settle noncanonical cache entry ${entry.file}: ${error.message}`);
+      failures.push(entry.file);
+    }
+  }
+  return quarantined;
 }
 
 function temporaryReplayPublisherEntries(replayDir, description) {
@@ -2485,38 +2610,66 @@ function sweepOrphanTemporaries(replayDir, now, quarantine = null) {
 // Keep the cache bounded. An unbounded queue after a long relay outage would grow
 // without limit and replay ancient fleet state; oldest-first is the right thing to
 // drop because a newer bearings projection supersedes an older one anyway.
-function pruneCache(replayDir, maxCache, protectedFile) {
+function pruneCache(replayDir, maxCache, protectedFile, currentPublisher) {
   const now = Date.now();
   let failed = sweepOrphanTemporaries(replayDir, now).failed;
   const outcomes = new Map();
-  const inventory = cacheEntries(replayDir);
+  const inventory = cacheEntries(replayDir, { inspectAll: true });
   failed += inventory.failures.length;
   for (const file of inventory.failures) outcomes.set(`unreadable:${file}`, RETRYABLE);
   const entries = inventory.entries;
   const validEntries = [];
-  let malformedRetained = 0;
+  const publishers = new Map();
+  let invalidRetained = 0;
   for (const entry of entries) {
-    if (!entry.malformed) {
-      validEntries.push(entry);
-      continue;
+    if (entry.regular) {
+      let recovery;
+      try {
+        recovery = recoverNoncanonicalSignedCacheEntry(
+          replayDir,
+          entry,
+          path.basename(replayDir),
+        );
+      } catch (error) {
+        log(error.message);
+        failed += 1;
+        invalidRetained += 1;
+        outcomes.set(`invalid:${entry.file}`, RETRYABLE);
+        continue;
+      }
+      if (recovery.kind === "canonical" || recovery.kind === "recovered") {
+        validEntries.push(recovery.entry);
+        publishers.set(recovery.entry.file, recovery.event.pubkey);
+        continue;
+      }
+      if (recovery.kind === "duplicate") continue;
+      if (recovery.kind === "retained") {
+        log(`retaining signed cache entry ${entry.name}: ${recovery.reason}`);
+        failed += 1;
+        invalidRetained += 1;
+        outcomes.set(`invalid:${entry.file}`, RETRYABLE);
+        continue;
+      }
     }
-    log(`dropping invalid cache entry ${entry.name}: ${entry.reason}`);
+    const reason = entry.reason ?? "invalid signed EVENT frame";
+    log(`dropping invalid cache entry ${entry.name}: ${reason}`);
     const removal = removeCacheFile(replayDir, entry.file, `drop invalid cache entry ${entry.name}`);
     if (removal.removed) outcomes.set(`invalid:${entry.file}`, PERMANENT);
     if (removal.failed) {
       failed += 1;
-      malformedRetained += 1;
+      invalidRetained += 1;
       outcomes.set(`invalid:${entry.file}`, RETRYABLE);
     }
   }
   validEntries.sort((a, b) => (a.createdAt - b.createdAt) || a.id.localeCompare(b.id));
-  const excess = validEntries.length + malformedRetained - maxCache;
+  const excess = validEntries.length + invalidRetained - maxCache;
   if (excess <= 0) return { entries: validEntries, dropped: 0, failed, outcomes };
   let dropped = 0;
   const pruned = new Set();
   for (const entry of validEntries) {
     if (dropped >= excess) break;
     if (entry.file === protectedFile) continue;
+    if (publishers.get(entry.file) !== currentPublisher) continue;
     const removal = removeCacheFile(replayDir, entry.file, `prune cache entry ${entry.name}`);
     if (removal.removed) {
       dropped += 1;
@@ -2664,7 +2817,7 @@ async function main() {
       ["nonce", randomBytes(16).toString("hex")],
     ]);
     const currentFile = cacheEvent(relayCacheDir, event);
-    const cacheMaintenance = pruneCache(relayCacheDir, maxCache, currentFile);
+    const cacheMaintenance = pruneCache(relayCacheDir, maxCache, currentFile, currentPublisher);
     recordPublisherTarget(targetsFile, {
       relay,
       channel_id: channelId,

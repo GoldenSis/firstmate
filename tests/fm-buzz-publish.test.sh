@@ -30,7 +30,7 @@ test_missing_python3_is_a_loud_prerequisite_failure() {
   home=$(make_home missing-python3)
   tools="$home/prerequisite-tools"
   mkdir -p "$tools"
-  for tool in bash dirname node jq; do
+  for tool in bash dirname jq; do
     ln -s "$(command -v "$tool")" "$tools/$tool"
   done
   output=$(PATH="$tools" \
@@ -702,7 +702,7 @@ EOF
     || fail "could not seed a foreign-author cache entry"
 
   output=$(printf '%s' '{"schema":"fm-bearings.v1","note":"current-publisher"}' \
-    | run_publish "$home" "$relay" 2>&1)
+    | FM_BUZZ_MAX_CACHE=1 run_publish "$home" "$relay" 2>&1)
   stop_stub "$STUB_PID"
 
   assert_present "$foreign_file" "the current publisher evicted another author\'s cached event"
