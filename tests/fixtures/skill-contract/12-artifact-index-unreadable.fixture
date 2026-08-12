@@ -1,0 +1,4 @@
+check: SC006
+mutation: reference-diagnostic
+diagnostic-line: .agents/skills/alpha/SKILL.md:1: .agents/skills/alpha/SKILL.md: cannot read the tracked-file index
+expected-receipt: SC006 artifact-reachability: the reference resolver could not read the tracked-file index

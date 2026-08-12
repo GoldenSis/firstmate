@@ -1,0 +1,14 @@
+id: investigate-and-ship
+contexts: 4
+durable-lines: 72
+trigger-clear: true
+intents: 2
+target-owner: diagnostic-reasoning,delivery-lifecycle
+harnesses: claude,codex,opencode,pi,grok
+backends: tmux,herdr,zellij,orca,cmux
+name-kind: job
+readable: true
+route: split-and-reapply
+files-created: 0
+expected: refused-and-split
+expected-reason: one-coherent-capability

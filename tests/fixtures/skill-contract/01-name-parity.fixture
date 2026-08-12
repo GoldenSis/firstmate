@@ -1,0 +1,3 @@
+check: SC001
+mutation: mismatched-name
+expected-receipt: SC001 name-parity: .agents/skills/alpha/SKILL.md directory name 'alpha' does not match frontmatter name 'beta'

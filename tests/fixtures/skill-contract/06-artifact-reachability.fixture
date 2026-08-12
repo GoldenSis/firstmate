@@ -1,0 +1,3 @@
+check: SC006
+mutation: stale-artifact
+expected-receipt: SC006 artifact-reachability: .agents/skills/alpha/SKILL.md references missing local target 'docs/missing.md'

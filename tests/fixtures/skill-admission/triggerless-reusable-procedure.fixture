@@ -1,0 +1,14 @@
+id: reconcile-status-history
+contexts: 3
+durable-lines: 38
+trigger-clear: false
+intents: 1
+target-owner: docs/architecture.md
+harnesses: claude,codex,opencode,pi,grok
+backends: tmux,herdr,zellij,orca,cmux
+name-kind: job
+readable: true
+route: docs-procedure
+files-created: 0
+expected: non-skill
+expected-reason: clear-trigger

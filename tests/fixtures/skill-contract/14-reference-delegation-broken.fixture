@@ -1,0 +1,3 @@
+check: SC006
+mutation: broken-reference-delegation
+expected-receipt: SC006 artifact-reachability: the reference resolver could not run (exit 127):

@@ -1,0 +1,14 @@
+id: print-pr-url
+contexts: 3
+durable-lines: 11
+trigger-clear: true
+intents: 1
+target-owner: bin/fm-pr-check.sh
+harnesses: claude,codex,opencode,pi,grok
+backends: tmux,herdr,zellij,orca,cmux
+name-kind: job
+readable: true
+route: existing-script-or-brief
+files-created: 0
+expected: non-skill
+expected-reason: non-triviality

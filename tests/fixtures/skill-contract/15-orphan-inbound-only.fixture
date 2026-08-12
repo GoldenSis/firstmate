@@ -1,0 +1,3 @@
+check: SC004
+mutation: inbound-reference-only
+expected-receipt: SC004 orphan: agent-only skill 'alpha' is reachable only from another skill file and must declare standalone: true

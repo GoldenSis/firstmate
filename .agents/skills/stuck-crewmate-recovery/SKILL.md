@@ -11,6 +11,8 @@ metadata:
 
 # stuck-crewmate-recovery
 
+On a stale wake, the `AGENTS.md` section 13 entries for `wedge-autonudge` and this playbook own the escalation order between them.
+
 Use this playbook when the session-start digest reports an ordinary direct report's endpoint dead or its metadata has no window, or when a direct report is stale, looping, repeatedly confused, asking a question its brief already answers, unresponsive, or when a steer failed to land.
 
 Load `harness-adapters` before sending an interrupt, exit command, resume command, or harness-specific skill invocation.

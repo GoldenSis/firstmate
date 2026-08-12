@@ -2,6 +2,8 @@
 name: wedge-autonudge
 description: Cheap first rung below stuck-crewmate-recovery. On a stale wake, try a bounded deterministic auto-nudge (bin/fm-autonudge.sh) BEFORE spending a firstmate turn on the LLM recovery ladder. Use when a crewmate pane went stale and you want to poke it without burning a turn.
 user-invocable: false
+metadata:
+  internal: true
 ---
 
 # wedge-autonudge

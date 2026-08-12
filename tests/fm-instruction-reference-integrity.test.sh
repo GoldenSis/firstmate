@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Deterministic integrity gate for literal repo-owned routing references in the
 # always-loaded Firstmate instruction surface.
+#
+# This file owns literal-reference resolution for the whole repo. `--check <repo>`
+# audits the instruction surface; `--check-files <repo> <file>...` lends the same
+# resolver, exclusions, and diagnostics to other suites (tests/fm-skill-contract.test.sh
+# uses it for skill files) so a second, weaker resolver never gets written.
 # shellcheck disable=SC2016
 set -u
 
@@ -40,9 +45,18 @@ tracked_resolves_ignoring_case() {
 extract_literal_references() {
   local agents=$1
   awk '
-    function emit(line_number, literal) {
-      sub(/^[[:space:]]+/, "", literal)
-      sub(/[[:space:]]+$/, "", literal)
+    function emit(line_number, span,   literal) {
+      sub(/^[[:space:]]+/, "", span)
+      sub(/[[:space:]]+$/, "", span)
+      # A backticked span may be an invocation ("bin/tool.sh --flag") or a path
+      # followed by prose ("AGENTS.md section 1"). The reference is its first
+      # token; the rest are arguments or words, not targets to resolve.
+      literal = span
+      sub(/[[:space:]].*$/, "", literal)
+      # Truncating to the first token can leave prose punctuation glued to it
+      # ("`docs/one.md, docs/two.md`"), which resolves nothing and would name a
+      # path that appears in no file.
+      sub(/[,;.)]+$/, "", literal)
       if (literal == "" || literal ~ /[<>{}*?\[\]]/) {
         return
       }
@@ -56,7 +70,7 @@ extract_literal_references() {
       if (literal ~ /^docs\/adr\/?$/) {
         return
       }
-      if (literal ~ /^(bin|docs|tests)\// ||
+      if (literal ~ /^(bin|docs|tests|skills)\// ||
           literal ~ /^\.agents\/skills\// ||
           literal ~ /^\.github\/workflows\// ||
           literal == "AGENTS.md" ||
@@ -109,9 +123,26 @@ extract_internal_skill_triggers() {
   ' "$agents"
 }
 
+resolve_literals() {
+  local tracked=$1 label=$2 path=$3 line literal failed=0
+  while IFS=$'\t' read -r line literal; do
+    [ -n "$literal" ] || continue
+    if tracked_resolves_exactly "$tracked" "$literal"; then
+      continue
+    fi
+    if tracked_resolves_ignoring_case "$tracked" "$literal"; then
+      diagnostic "$label" "$line" "$literal" "case does not match the tracked target"
+    else
+      diagnostic "$label" "$line" "$literal" "no exact tracked target"
+    fi
+    failed=1
+  done < <(extract_literal_references "$path")
+  return "$failed"
+}
+
 check_instruction_references() {
   local repo=$1 agents="$1/AGENTS.md" claude="$1/CLAUDE.md"
-  local tracked line literal skill target failed=0
+  local tracked line skill target failed=0
 
   tracked=$(git -C "$repo" ls-files 2>/dev/null) || {
     diagnostic "AGENTS.md" 1 "AGENTS.md" "cannot read the tracked-file index"
@@ -142,18 +173,7 @@ check_instruction_references() {
   fi
 
   if [ -f "$agents" ]; then
-    while IFS=$'\t' read -r line literal; do
-      [ -n "$literal" ] || continue
-      if tracked_resolves_exactly "$tracked" "$literal"; then
-        continue
-      fi
-      if tracked_resolves_ignoring_case "$tracked" "$literal"; then
-        diagnostic "AGENTS.md" "$line" "$literal" "case does not match the tracked target"
-      else
-        diagnostic "AGENTS.md" "$line" "$literal" "no exact tracked target"
-      fi
-      failed=1
-    done < <(extract_literal_references "$agents")
+    resolve_literals "$tracked" "AGENTS.md" "$agents" || failed=1
 
     while IFS=$'\t' read -r line skill; do
       [ -n "$skill" ] || continue
@@ -173,12 +193,45 @@ check_instruction_references() {
   return "$failed"
 }
 
+check_file_references() {
+  local repo=$1
+  shift
+  local tracked relative failed=0
+
+  tracked=$(git -C "$repo" ls-files 2>/dev/null) || {
+    diagnostic "$1" 1 "$1" "cannot read the tracked-file index"
+    return 1
+  }
+
+  for relative in "$@"; do
+    if [ ! -f "$repo/$relative" ]; then
+      diagnostic "$relative" 1 "$relative" "missing file"
+      failed=1
+      continue
+    fi
+    resolve_literals "$tracked" "$relative" "$repo/$relative" || failed=1
+  done
+
+  return "$failed"
+}
+
 if [ "${1:-}" = "--check" ]; then
   [ "$#" -eq 2 ] || {
     printf 'usage: %s --check <repo>\n' "$0" >&2
     exit 2
   }
   check_instruction_references "$2"
+  exit $?
+fi
+
+if [ "${1:-}" = "--check-files" ]; then
+  [ "$#" -ge 3 ] || {
+    printf 'usage: %s --check-files <repo> <repo-relative-file>...\n' "$0" >&2
+    exit 2
+  }
+  CHECK_REPO=$2
+  shift 2
+  check_file_references "$CHECK_REPO" "$@"
   exit $?
 fi
 
@@ -235,6 +288,10 @@ test_reference_fixture_matrix() {
     'example|pass|none||Example: use `bin/missing.sh`.'
     'directory|pass|none||Inspect `docs/` and `.github/workflows/`.'
     'missing-directory|fail|none|AGENTS.md:1: docs/absent/: no exact tracked target|Inspect `docs/absent/`.'
+    'invocation-span|fail|none|AGENTS.md:1: bin/missing.sh: no exact tracked target|Use `bin/missing.sh --flag`.'
+    'path-plus-prose|pass|none||Read `AGENTS.md section 1` and `bin/tool.sh --flag`.'
+    'path-list|pass|none||Read `docs/guide.md, bin/tool.sh` together.'
+    'punctuated-span|fail|none|AGENTS.md:1: bin/missing.sh: no exact tracked target|Use `bin/missing.sh; then stop`.'
   )
 
   for row in "${cases[@]}"; do

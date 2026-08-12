@@ -1,0 +1,14 @@
+id: reconcile-merge-authority
+contexts: 3
+durable-lines: 41
+trigger-clear: true
+intents: 1
+target-owner: project-management
+harnesses: claude,codex,opencode,pi,grok
+backends: tmux,herdr,zellij,orca,cmux
+name-kind: job
+readable: false
+route: revise-and-reapply
+files-created: 0
+expected: needs-revision
+expected-reason: smart-intern-readability
