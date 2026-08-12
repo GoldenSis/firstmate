@@ -130,7 +130,7 @@ Keep instructions as the authority and discovery layer, but make repeated execut
 
 - Put one full sentence per line in tracked Markdown.
 - Exception: the compact `AGENTS.md` intentionally packs multiple sentences per physical line to stay within its size budget; this exception applies to `AGENTS.md` itself and no other tracked Markdown.
-- Never wrap multiple sentences onto one physical line.
+- Outside that compact `AGENTS.md` exception, never wrap multiple sentences onto one physical line.
 - Plain dash `-`, never an em dash.
 - Never add an agent name as a commit co-author.
 - `bin/*.sh` and `bin/backends/*.sh` must pass `shellcheck`.
