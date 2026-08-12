@@ -12,6 +12,8 @@
 # its absence is a loud startup error rather than an optional publish failure.
 # An invalid fm-bearings.v1 input is also loud because signing data outside the
 # projection contract would make the publisher attest to content it did not check.
+# Relay-supplied rejection diagnostics render C0 and C1 terminal controls as
+# visible `\uXXXX` escapes before they reach stderr.
 #
 # Why the contract is this absolute: Buzz is an additive reporting surface and
 # nothing in Firstmate's operation may depend on it. If this script could fail, a

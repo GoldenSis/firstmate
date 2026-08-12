@@ -20,6 +20,9 @@
 // influence it. If a future change makes any Firstmate code path consume this
 // output, that is not an increment - it re-opens the question of who owns
 // canonical state.
+// Relay-supplied event content and refusal text are terminal output, not trusted
+// formatting. C0 and C1 controls are rendered as visible \uXXXX escapes in both
+// bounded and --full output; --full removes only the content byte limit.
 
 import {
   channelIdForLabel,

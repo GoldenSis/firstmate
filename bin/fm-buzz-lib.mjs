@@ -36,6 +36,9 @@ import {
 
 const LOOPBACK_RELAY_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
 
+// Render untrusted relay text at a terminal boundary without letting C0 or C1
+// controls alter the terminal. Protocol classification must still use the raw
+// value first: these visible escapes are presentation, not wire normalization.
 export function escapeTerminalControls(value) {
   return String(value).replace(/[\u0000-\u001f\u007f-\u009f]/gu, (character) =>
     `\\u${character.codePointAt(0).toString(16).padStart(4, "0")}`,

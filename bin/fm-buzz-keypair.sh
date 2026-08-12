@@ -40,6 +40,8 @@
 # memberships would be stranded because M1 has no membership-transfer operation.
 # bin/fm-buzz-lib.mjs owns authoritative membership queries, and
 # bin/fm-buzz-targets.mjs owns tracked targets and relay-authority trust records.
+# Relay-supplied membership diagnostics render C0 and C1 terminal controls as
+# visible `\uXXXX` escapes before they reach stderr.
 # This command never prints the private key, old or new.
 # Rotation also refuses while any active replay partition contains a valid event
 # authored by an identity being retired, because replay authenticates only as the

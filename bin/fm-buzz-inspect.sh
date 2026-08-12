@@ -19,7 +19,9 @@
 # per event. Content longer than that ends with an explicit truncation marker
 # (`... (truncated at 600 bytes; run with --full to see the complete projection)`);
 # --full prints complete event content with no marker, and --limit changes the
-# relay query limit.
+# relay query limit. Both modes render C0 and C1 terminal controls in event content
+# and relay refusal text as visible `\uXXXX` escapes; --full disables truncation,
+# not that terminal-safety boundary.
 #
 # --anonymous reads with a throwaway non-member identity without loading the
 # publishing private key. It reports a definite negative privacy result only for
