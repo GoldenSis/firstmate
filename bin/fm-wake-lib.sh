@@ -50,6 +50,14 @@ fm_path_age() {
   echo $(( $(date +%s) - m ))
 }
 
+fm_path_identity() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%d:%i' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i' "$1" 2>/dev/null
+  fi
+}
+
 fm_watcher_lock_matches_pid() {
   local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity current_identity
   lockdir="$state/.watch.lock"
@@ -248,27 +256,79 @@ fm_lock_recheck_stale_owner() {
   return 0
 }
 
-fm_lock_try_acquire() {
-  local lockdir=$1 pid steal cur rc steal_owner primary_owner
+fm_lock_reclaim_stale_owner() {
+  local lockdir=$1 expected_owner=$2 expected_pid=$3 expected_identity claimed_identity claim
+  fm_lock_recheck_stale_owner "$lockdir" "$expected_owner" "$expected_pid" || return 1
+  if [ -n "$expected_owner" ]; then
+    expected_identity=$(fm_path_identity "$lockdir") || return 1
+    fm_lock_clean_known_files "$expected_owner"
+    rmdir "$expected_owner" 2>/dev/null || return 1
+    claim="${expected_owner}.reclaimed-link"
+    [ ! -e "$claim" ] && [ ! -L "$claim" ] || return 1
+    mv "$lockdir" "$claim" 2>/dev/null || return 1
+    claimed_identity=$(fm_path_identity "$claim" 2>/dev/null || true)
+    if [ "$claimed_identity" != "$expected_identity" ] \
+      || ! fm_lock_points_to_owner "$claim" "$expected_owner"; then
+      if [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ]; then
+        mv "$claim" "$lockdir" 2>/dev/null || true
+      fi
+      return 1
+    fi
+    rm -f "$claim" 2>/dev/null
+    return $?
+  fi
+  fm_lock_clean_known_files "$lockdir"
+  rmdir "$lockdir" 2>/dev/null
+}
+
+fm_lock_acquire_preflight() {
+  local lockdir=$1 pid
   FM_LOCK_HELD_PID=
   FM_LOCK_OWNER_DIR=
-
   if fm_lock_try_create "$lockdir"; then
     return 0
   fi
-
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
-  if fm_pid_alive "$pid"; then
-    FM_LOCK_HELD_PID=$pid
+  FM_LOCK_HELD_PID=$pid
+  if fm_pid_alive "$pid" || fm_lock_mid_acquire_is_fresh "$lockdir" "$pid"; then
     return 1
   fi
-  if fm_lock_mid_acquire_is_fresh "$lockdir" "$pid"; then
-    FM_LOCK_HELD_PID=$pid
+  return 2
+}
+
+fm_lock_try_acquire_guard() {
+  local lockdir=$1 pid owner preflight_status
+  if fm_lock_acquire_preflight "$lockdir"; then
+    return 0
+  else
+    preflight_status=$?
+  fi
+  if [ "$preflight_status" -eq 1 ]; then
     return 1
   fi
+  pid=${FM_LOCK_HELD_PID:-}
+  owner=
+  if [ -L "$lockdir" ]; then
+    owner=$(fm_lock_link_owner "$lockdir" 2>/dev/null || true)
+  fi
+  fm_lock_reclaim_stale_owner "$lockdir" "$owner" "$pid" || return 1
+  fm_lock_try_create "$lockdir"
+}
+
+fm_lock_try_acquire() {
+  local lockdir=$1 pid steal cur rc steal_owner primary_owner preflight_status
+  if fm_lock_acquire_preflight "$lockdir"; then
+    return 0
+  else
+    preflight_status=$?
+  fi
+  if [ "$preflight_status" -eq 1 ]; then
+    return 1
+  fi
+  pid=${FM_LOCK_HELD_PID:-}
 
   steal="$lockdir.steal"
-  if ! fm_lock_try_acquire "$steal"; then
+  if ! fm_lock_try_acquire_guard "$steal"; then
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=
     return 1

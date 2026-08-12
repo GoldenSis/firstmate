@@ -19,3 +19,15 @@ config/wedge-alarm
 
 # runtime logs
 run/**/*.log
+
+# Buzz loopback adapter. state/ and data/ are already ignored wholesale above, so
+# these are belt-and-braces: they keep keypair material and signed-event bytes
+# uncommittable even if those broad rules are ever narrowed. No keypair material,
+# public or private, is ever committed.
+state/buzz-replay/
+state/buzz-relay-key/
+data/buzz-keypair.*
+data/.buzz-keypair.rotation-stage
+data/buzz-publisher-targets.jsonl
+data/buzz-relay-authorities.jsonl
+data/buzz-compromised-unverifiable-pairs.jsonl
