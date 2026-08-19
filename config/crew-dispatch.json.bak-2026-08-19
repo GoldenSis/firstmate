@@ -1,0 +1,84 @@
+{
+  "_gemini_privacy_constraint": "HARD RULE, overrides every gemini rule below. SETTLED 2026-08-10 — KEEP PERMANENTLY. The key is on the PAID tier now (project 'Gemini Project', account achretien22@gmail.com), and Google's paid-tier terms state prompts and responses are NOT used to improve Google products — so the ORIGINAL justification (free-tier training) is gone. The ban is kept anyway, deliberately: not-training is not the same as not-leaving-the-house. This data would still cross to a US cloud provider, and Golden Rule 10 says PII/bank/org-internals stay local. Keeping it costs almost nothing, because such tasks simply route to grok/codex/claude or run local. RULE: NEVER dispatch to gemini any task touching PII, bank or financial data, contacts, private correspondence, credentials, or local-AI-org internals. When a task that would otherwise match a gemini rule below carries private data, fall through to the next matching rule (grok/codex/claude) or route it local. Do not relax this without Arnaud saying so explicitly — the paid tier is NOT sufficient reason on its own.",
+  "rules": [
+    {
+      "when": "The task's input is an image, screenshot, photo, diagram, PDF, or video — anything that must be LOOKED AT rather than read as plain text. NOT personal photos, ID documents, bank statements or anything with PII: see _gemini_privacy_constraint.",
+      "use": {
+        "harness": "gemini",
+        "model": "gemini-3.1-flash-lite"
+      },
+      "why": "Capability first (org-routing §2): never hand a visual task to a text-only worker. Gemini is natively multimodal and runs on a FREE-tier API key, so eyes-on work costs nothing instead of burning frontier tokens. (NB: this is NOT the Google One AI Pro subscription — that grants no CLI/API entitlement; see the runbook §6b tier finding, 2026-08-07.)"
+    },
+    {
+      "when": "The task needs a very large amount of context held at once — read this whole repo/subsystem end to end, digest a long document, transcript, or log dump, or answer 'how does all of this fit together' across many files. Only for public/code/non-sensitive material: see _gemini_privacy_constraint.",
+      "use": {
+        "harness": "gemini",
+        "model": "gemini-3.1-flash-lite"
+      },
+      "why": "Gemini's million-token context is its real differentiator: it swallows the whole corpus in one pass instead of the chunk-and-stitch dance the other harnesses need. Long-doc/whole-repo comprehension was already routed to Gemini in the wiki ([[ai-operating-system]]); this puts the fleet's dispatch in line with it."
+    },
+    {
+      "when": "The task is a scout: a read-only investigation, survey, audit, code-reading or 'find out how X works' report with no push and no code changes.",
+      "use": [
+        {
+          "harness": "grok"
+        },
+        {
+          "harness": "gemini",
+          "model": "gemini-3.1-flash-lite"
+        }
+      ],
+      "why": "Scouts are read-only and cannot break anything, so they are the safest large slice of work to move off the Codex budget onto the near-idle Grok subscription and the paid-tier Gemini key (prepaid credits, pinned to flash-lite for cost). Two seats now share this lane so neither saturates. NOTE: this is an ordered preference, not a balancer — quota-balanced only understands the codex and claude windows (bin/fm-dispatch-select.sh general_ids), so it would silently no-op here; grok is tried first, and gemini is the standing alternate — deliberately second, because as of 2026-08-10 it is metered against a prepaid CHF balance while grok is an already-paid subscription, so grok is the cheaper first call."
+    },
+    {
+      "when": "The task depends on fresh news, current events, live public facts, or recent market and product changes.",
+      "use": {
+        "harness": "grok"
+      },
+      "why": "Grok is the preferred dispatch when current web-connected context is central to the work. Gemini also has live search and is the fallback here if Grok is unavailable."
+    },
+    {
+      "when": "The task is a trivial mechanical edit such as a rote rename, formatting sweep, targeted typo fix, dependency bump or simple file gathering.",
+      "use": [
+        {
+          "harness": "grok"
+        },
+        {
+          "harness": "gemini",
+          "model": "gemini-3.1-flash-lite"
+        }
+      ],
+      "why": "Narrow low-ambiguity work does not need the strongest coder, and neither of these costs anything extra (grok = already-paid subscription, gemini = paid tier, prepaid credits, pinned to flash-lite for cost). Spread it across both rather than piling it all on one."
+    },
+    {
+      "when": "The Codex session window is heavily consumed (roughly below a quarter remaining) and the task is NOT a risky or ambiguous multi-file implementation.",
+      "use": [
+        {
+          "harness": "grok"
+        },
+        {
+          "harness": "gemini",
+          "model": "gemini-3.1-flash-lite"
+        }
+      ],
+      "why": "Deliberate pressure valve: spend the idle Grok subscription and the free Gemini tier before the Codex window that the whole fleet shares. Two valves instead of one means the fleet keeps moving even when Grok is stretched. Risky work still goes to the strongest available coder."
+    },
+    {
+      "when": "The task is a big or ambiguous multi-file feature, a risky refactor, a security-sensitive change, or work that requires holding many moving parts in mind.",
+      "use": [
+        {
+          "harness": "codex"
+        },
+        {
+          "harness": "claude"
+        }
+      ],
+      "select": "quota-balanced",
+      "why": "Hard work goes to the strongest coders. quota-balanced only understands codex and claude general windows (bin/fm-dispatch-select.sh general_ids), so it resolves to codex today and starts genuinely alternating the moment Claude is signed in. Gemini is deliberately NOT in this lane yet — it has not been measured against codex/claude on risky multi-file implementation here, and Golden Rule 2 says don't assert what we haven't verified."
+    }
+  ],
+  "default": {
+    "harness": "codex"
+  },
+  "_gemini_model_note": "Every gemini rule is pinned to gemini-3.1-flash-lite. SETTLED 2026-08-10 — KEEP THE PIN, and here is the reasoning so it is not re-litigated. OBSOLETE REASON: 'Pro returns 429 on the free tier' — true until billing, false since (free tier caps every Pro model at literally 'limit: 0'; the paid tier returns 200). REASON NOT TO RAISE IT: there is NO MEASURED EVIDENCE that flash-lite is failing on gemini's lanes. Raising an unattended crew's model on the theory that a bigger model would be better is speculation, and Golden Rule 2 says do not assert what has not been verified. Cost is bounded either way now (monthly spend cap CHF 20 set 2026-08-10, prepaid balance CHF 199.70, auto-reload OFF), so this is a quality question, not a safety one. REVISIT WHEN THERE IS A MEASURED FAILURE: a visual or very-large-context task where flash-lite demonstrably produces a worse result than a stronger model — then raise THAT LANE ONLY, to gemini-3.5-flash first (verified working), not to Pro. Also note: the endpoint burst-throttles — several rapid POSTs each return HTTP 404 with an EMPTY BODY while the same call alone returns 200. Retry once before concluding a key or model is dead."
+}
