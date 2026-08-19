@@ -118,6 +118,109 @@ write_origin_meta() {  # <home> <id> [kind]
     "mode=$kind"
 }
 
+test_declined_hold_requires_and_accepts_durable_no_route_resolution() {
+  local home origin declined_hold routed_hold show declined_body routed_body
+  home=$(make_home declined-resolution)
+  origin=sample-declined-review
+  mkdir -p "$home/data/$origin"
+  tasks_in "$home" add "$origin" "Review a declined sample proposal" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create declined-decision origin"
+  write_origin_meta "$home" "$origin"
+  printf 'done: report complete\n' > "$home/state/$origin.status"
+  printf '# Declined sample proposal\n\nThe captain declined the proposal.\n' \
+    > "$home/data/$origin/report.md"
+
+  declined_hold=$(run_decisions "$home" hold "$origin" proposal \
+    --title "Decide the sample proposal" --reason "captain proposal decision pending" --repo sample) \
+    || fail "could not register declined-decision hold"
+  routed_hold=$(run_decisions "$home" hold "$origin" followup \
+    --title "Decide the sample follow-up" --reason "captain followup decision pending" --repo sample) \
+    || fail "could not register routed-decision control hold"
+  run_decisions "$home" complete "$origin" proposal followup >/dev/null \
+    || fail "could not complete declined-decision inventory"
+
+  tasks_in "$home" "done" "$declined_hold" >/dev/null \
+    || fail "could not reproduce the hand-closed declined hold"
+  if run_decisions "$home" verify "$origin" \
+    > "$home/closed-without-markers.out" 2> "$home/closed-without-markers.err"; then
+    fail "hand-closed declined hold passed verification without durable resolution markers"
+  fi
+  assert_grep "is neither actively held nor durably resolved" "$home/closed-without-markers.err" \
+    "declined-hold regression did not reproduce the teardown verification refusal"
+
+  printf 'Declined on 2026-08-07 because the proposal is not worth pursuing.\n' \
+    > "$home/declined-decision.txt"
+  run_decisions "$home" resolve "$origin" proposal \
+    --decision-file "$home/declined-decision.txt" --routed-none >/dev/null \
+    || fail "could not durably resolve the declined hold without routed work"
+  run_decisions "$home" resolve "$origin" proposal \
+    --decision-file "$home/declined-decision.txt" --routed-none >/dev/null \
+    || fail "identical no-route resolution retry was not idempotent"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "declined hold did not pass verification after durable no-route resolution"
+  show=$(tasks_in "$home" show "$declined_hold" --full)
+  assert_contains "$show" "Resolution recorded by fm-decision-hold." \
+    "no-route resolution omitted the resolution marker"
+  assert_contains "$show" "Routed work:" "no-route resolution omitted the routed-work marker"
+  assert_contains "$show" "- None (no dependent work)." \
+    "no-route resolution did not record an explicit human-readable none entry"
+  declined_body=$(printf '%s\n' "$show" | sed -n 's/^  body: //p' | head -1)
+
+  if run_decisions "$home" resolve "$origin" proposal --routed-none \
+    > "$home/missing-decision-file.out" 2> "$home/missing-decision-file.err"; then
+    fail "no-route resolution accepted a missing decision file"
+  fi
+  assert_grep "--decision-file is required" "$home/missing-decision-file.err" \
+    "no-route resolution did not retain the mandatory decision record"
+
+  tasks_in "$home" add sample-followup-implementation "Apply the sample follow-up" \
+    --kind ship --repo sample >/dev/null \
+    || fail "could not create routed-decision control task"
+  tasks_in "$home" block sample-followup-implementation --by "$routed_hold" >/dev/null \
+    || fail "could not block routed-decision control task"
+  printf 'Proceed with the sample follow-up.\n' > "$home/followup-decision.txt"
+  if run_decisions "$home" resolve "$origin" followup \
+    --decision-file "$home/followup-decision.txt" --routed-none \
+    --routed-to sample-followup-implementation \
+    > "$home/mixed-routing.out" 2> "$home/mixed-routing.err"; then
+    fail "resolution accepted both --routed-none and --routed-to"
+  fi
+  assert_grep "--routed-none cannot be combined with --routed-to" "$home/mixed-routing.err" \
+    "mixed no-route and routed resolution did not fail explicitly"
+
+  if run_decisions "$home" resolve "$origin" followup \
+    --decision-file "$home/followup-decision.txt" --routed-to missing-followup-task \
+    > "$home/missing-route.out" 2> "$home/missing-route.err"; then
+    fail "routed resolution accepted a missing dependent task"
+  fi
+  assert_grep "does not exist in the active home" "$home/missing-route.err" \
+    "routed resolution did not require every dependent task to exist"
+  tasks_in "$home" unblock sample-followup-implementation --by "$routed_hold" >/dev/null \
+    || fail "could not prepare unblocked routed-decision control task"
+  if run_decisions "$home" resolve "$origin" followup \
+    --decision-file "$home/followup-decision.txt" --routed-to sample-followup-implementation \
+    > "$home/unblocked-route.out" 2> "$home/unblocked-route.err"; then
+    fail "routed resolution accepted a dependent task not blocked by the hold"
+  fi
+  assert_grep "is not durably blocked by" "$home/unblocked-route.err" \
+    "routed resolution did not require every dependent task to be blocked by the hold"
+  tasks_in "$home" block sample-followup-implementation --by "$routed_hold" >/dev/null \
+    || fail "could not restore routed-decision control edge"
+  run_decisions "$home" resolve "$origin" followup \
+    --decision-file "$home/followup-decision.txt" --routed-to sample-followup-implementation >/dev/null \
+    || fail "existing routed resolution path no longer succeeded"
+  show=$(tasks_in "$home" show "$routed_hold" --full)
+  routed_body=$(printf '%s\n' "$show" | sed -n 's/^  body: //p' | head -1)
+  [ "$declined_body" != "$routed_body" ] \
+    || fail "no-route and routed resolution bodies were not distinguishable"
+  assert_not_contains "$show" "- None (no dependent work)." \
+    "routed resolution body looked like a no-route attestation"
+  assert_contains "$show" "- sample-followup-implementation" \
+    "routed resolution body lost its dependent task"
+  pass "declined holds can be durably resolved with an explicit no-route attestation"
+}
+
 test_structured_holds_survive_teardown_and_route_resolution() {
   local home id route_hold access_hold before after json open show
   home=$(make_home durable-lifecycle)
@@ -551,6 +654,8 @@ test_resolve_matches_quoted_blocked_by_edges() {
 }
 
 test_uninventoried_report_decision_refuses_completion
+
+test_declined_hold_requires_and_accepts_durable_no_route_resolution
 
 test_scout_teardown_always_requires_inventory_verification
 test_structured_holds_survive_teardown_and_route_resolution
