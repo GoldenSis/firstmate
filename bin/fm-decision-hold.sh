@@ -121,6 +121,49 @@ show_field() {  # <show-output> <field>
   printf '%s\n' "$output" | sed -n "s/^  $field: //p" | head -1
 }
 
+backlog_task_ids() {
+  awk '
+    /^- \[[ xX]\] [A-Za-z0-9][A-Za-z0-9._-]* - / {
+      line = $0
+      sub(/^- \[[ xX]\] /, "", line)
+      sub(/ - .*/, "", line)
+      print line
+      next
+    }
+    /^- \*\*[A-Za-z0-9][A-Za-z0-9._-]*\*\* - / {
+      line = $0
+      sub(/^- \*\*/, "", line)
+      sub(/\*\* - .*/, "", line)
+      print line
+    }
+  ' "$DATA/backlog.md"
+}
+
+backlog_dependents() {  # <blocker-id>
+  local blocker=$1 ids task show deps
+  ids=$(backlog_task_ids) || return 1
+  while IFS= read -r task; do
+    [ -n "$task" ] || continue
+    show=$(task_show "$task") || return 1
+    deps=$(show_field "$show" deps | tr -d '[:space:]')
+    deps=${deps#\"}
+    deps=${deps%\"}
+    case ",$deps," in
+      *",blocked-by:$blocker,"*) printf '%s\n' "$task" ;;
+    esac
+  done <<EOF
+$ids
+EOF
+}
+
+require_no_backlog_dependents() {  # <hold-id>
+  local id=$1 dependents
+  dependents=$(backlog_dependents "$id") \
+    || fail "could not inspect backlog dependencies for $id"
+  [ -z "$dependents" ] \
+    || fail "--routed-none cannot resolve $id while backlog tasks remain blocked by it: $(printf '%s\n' "$dependents" | paste -sd, -)"
+}
+
 origin_exists_here() {  # <origin-id>
   [ -f "$STATE/$1.meta" ] && return 0
   [ -f "$DATA/$1/report.md" ] && return 0
@@ -406,6 +449,9 @@ command_resolve() {
   require_tasks_axi
   id=$(hold_id "$origin" "$key")
   if verify_hold_resolved "$id"; then
+    if [ "$routed_none" = 1 ]; then
+      require_no_backlog_dependents "$id"
+    fi
     hold_show=$(task_show "$id")
     hold_body=$(show_field "$hold_show" body)
     verify_resolution_identity "$id" "$hold_body" "$decision_digest" "$routed_csv"
@@ -455,6 +501,10 @@ command_resolve() {
         ;;
     esac
   done
+
+  if [ "$routed_none" = 1 ]; then
+    require_no_backlog_dependents "$id"
+  fi
 
   body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: %s\n\nCaptain decision:\n%s\n\nRouted work:\n' "$decision_digest" "$routed_csv" "$decision")
   if [ "$routed_none" = 1 ]; then

@@ -25,7 +25,7 @@ The `--force` path remains the explicit captain-approved discard escape hatch.
 
 The `resolve` subcommand requires a decision file and exactly one routing form: `--routed-none` or one or more `--routed-to` tasks.
 The routed form requires each dependent task to exist with a structured `blocked-by` edge pointing to the hold, records the decision digest and routed task identities in the hold body, clears each dependency edge through tasks-axi, and then marks the hold Done.
-The no-route form records the same resolution and routed-work markers with an explicit none identity and human-readable none entry before marking an active hold Done.
+The no-route form rejects any backlog task whose raw `blocked-by` field still names the hold, then records the same resolution and routed-work markers with an explicit none identity and human-readable none entry before marking an active hold Done.
 It can also add those missing markers to an already-Done hold only when the record retains its kind `captain` and `hold-kind: captain` identity.
 An exact retry can finish a partial operation, while a changed decision or routed-task set is rejected.
 A failed routed or active no-route operation before the final close leaves the hold open.
@@ -50,7 +50,7 @@ The focused end-to-end regression uses only synthetic `sample` identities and de
 It begins with a completed investigation and visual review whose genuine unresolved choice exists only in the report.
 The initial Bearings snapshot correctly has no open decision, and the new teardown gate refuses to erase the source.
 A later regression covers tasks-axi's quoted multi-entry `blocked_by` output so `resolve` matches the first, middle, and last ids and rejects a genuinely absent id.
-The no-route regressions cover normal active-hold closure, body recording, exact retry, verification, repair of the known hand-closed shape, and refusal to repair a completed captain task without retained captain-hold identity.
+The no-route regressions cover dependency-edge refusal for active and hand-closed holds, normal active-hold closure, body recording, exact retry, verification, repair of the known hand-closed shape, and refusal to repair a completed captain task without retained captain-hold identity.
 
 The focused lifecycle command and output are from 2026-08-19.
 The remaining command outputs preserve the 2026-07-14 and 2026-07-17 regression record.
@@ -59,7 +59,7 @@ The remaining command outputs preserve the 2026-07-14 and 2026-07-17 regression 
 $ bash tests/fm-decision-hold-lifecycle.test.sh
 ok - report-only unresolved decision is reproduced and completion refuses before loss
 ok - active captain holds close, retry, and verify with no routed work
-ok - declined holds repair only retained captain-held identities
+ok - no-route repair requires retained hold identity and no dependency edges
 ok - non-forced scout teardown always requires durable inventory verification
 ok - captain holds are idempotent, distinct, teardown-safe, Bearings-visible, and durably routed before close
 ok - completion and verification validate origins before constructing paths

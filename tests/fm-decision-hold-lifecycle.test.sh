@@ -119,7 +119,7 @@ write_origin_meta() {  # <home> <id> [kind]
 }
 
 test_active_hold_accepts_durable_no_route_resolution() {
-  local home origin hold before after
+  local home origin hold before after show
   home=$(make_home active-no-route)
   origin=sample-deferred-review
   mkdir -p "$home/data/$origin"
@@ -138,6 +138,41 @@ test_active_hold_accepts_durable_no_route_resolution() {
     || fail "could not complete deferred-decision inventory"
   printf 'Deferred until the sample constraints change.\n' > "$home/deferred-decision.txt"
 
+  tasks_in "$home" add sample-other-blocker "Unrelated sample blocker" \
+    --kind ship --repo sample >/dev/null \
+    || fail "could not create an unrelated active blocker"
+  tasks_in "$home" add sample-deferred-dependent "Dependent on the deferred proposal" \
+    --kind ship --repo sample >/dev/null \
+    || fail "could not create active-hold dependent"
+  tasks_in "$home" block sample-deferred-dependent --by sample-other-blocker >/dev/null \
+    || fail "could not add the unrelated dependency edge"
+  tasks_in "$home" block sample-deferred-dependent --by "$hold" >/dev/null \
+    || fail "could not block the active-hold dependent"
+  if run_decisions "$home" resolve "$origin" proposal \
+    --decision-file "$home/deferred-decision.txt" --routed-none \
+    > "$home/active-dependent.out" 2> "$home/active-dependent.err"; then
+    fail "active no-route resolution accepted a raw dependency edge"
+  fi
+  assert_grep "backlog tasks remain blocked by it: sample-deferred-dependent" \
+    "$home/active-dependent.err" \
+    "active no-route resolution did not reject its dependent task"
+  show=$(tasks_in "$home" show "$hold" --full)
+  assert_contains "$show" "state: queued" \
+    "failed active no-route resolution closed the captain hold"
+  assert_not_contains "$show" "Resolution recorded by fm-decision-hold." \
+    "failed active no-route resolution recorded a false attestation"
+  show=$(tasks_in "$home" show sample-deferred-dependent --full)
+  assert_contains "$show" "deps: \"blocked-by:sample-other-blocker,blocked-by:$hold\"" \
+    "failed active no-route resolution cleared the dependency edge"
+  tasks_in "$home" unblock sample-deferred-dependent --by "$hold" >/dev/null \
+    || fail "could not clear the active-hold dependency fixture"
+  tasks_in "$home" unblock sample-deferred-dependent --by sample-other-blocker >/dev/null \
+    || fail "could not clear the unrelated dependency fixture"
+  tasks_in "$home" rm sample-deferred-dependent >/dev/null \
+    || fail "could not remove the active-hold dependency fixture"
+  tasks_in "$home" rm sample-other-blocker >/dev/null \
+    || fail "could not remove the unrelated active blocker"
+
   run_decisions "$home" resolve "$origin" proposal \
     --decision-file "$home/deferred-decision.txt" --routed-none >/dev/null \
     || fail "could not close an active hold with no routed work"
@@ -149,6 +184,26 @@ test_active_hold_accepts_durable_no_route_resolution() {
     "active no-route resolution omitted the captain decision"
   assert_contains "$before" "- None (no dependent work)." \
     "active no-route resolution omitted the explicit none entry"
+
+  tasks_in "$home" add sample-late-dependent "Late dependency on the resolved proposal" \
+    --kind ship --repo sample >/dev/null \
+    || fail "could not create resolved-hold dependent"
+  tasks_in "$home" block sample-late-dependent --by "$hold" >/dev/null \
+    || fail "could not block the resolved-hold dependent"
+  if run_decisions "$home" resolve "$origin" proposal \
+    --decision-file "$home/deferred-decision.txt" --routed-none \
+    > "$home/resolved-dependent.out" 2> "$home/resolved-dependent.err"; then
+    fail "resolved no-route retry accepted a raw dependency edge"
+  fi
+  assert_grep "backlog tasks remain blocked by it: sample-late-dependent" \
+    "$home/resolved-dependent.err" \
+    "resolved no-route retry did not reject its dependent task"
+  after=$(tasks_in "$home" show "$hold" --full)
+  [ "$before" = "$after" ] || fail "failed resolved no-route retry changed the hold"
+  tasks_in "$home" unblock sample-late-dependent --by "$hold" >/dev/null \
+    || fail "could not clear the resolved-hold dependency fixture"
+  tasks_in "$home" rm sample-late-dependent >/dev/null \
+    || fail "could not remove the resolved-hold dependency fixture"
 
   run_decisions "$home" resolve "$origin" proposal \
     --decision-file "$home/deferred-decision.txt" --routed-none >/dev/null \
@@ -182,6 +237,11 @@ test_declined_hold_requires_and_accepts_durable_no_route_resolution() {
   run_decisions "$home" complete "$origin" proposal followup >/dev/null \
     || fail "could not complete declined-decision inventory"
 
+  tasks_in "$home" add sample-declined-dependent "Dependent on the declined proposal" \
+    --kind ship --repo sample >/dev/null \
+    || fail "could not create hand-closed-hold dependent"
+  tasks_in "$home" block sample-declined-dependent --by "$declined_hold" >/dev/null \
+    || fail "could not block the hand-closed-hold dependent"
   tasks_in "$home" "done" "$declined_hold" >/dev/null \
     || fail "could not reproduce the hand-closed declined hold"
   if run_decisions "$home" verify "$origin" \
@@ -193,6 +253,27 @@ test_declined_hold_requires_and_accepts_durable_no_route_resolution() {
 
   printf 'Declined on 2026-08-07 because the proposal is not worth pursuing.\n' \
     > "$home/declined-decision.txt"
+  if run_decisions "$home" resolve "$origin" proposal \
+    --decision-file "$home/declined-decision.txt" --routed-none \
+    > "$home/done-dependent.out" 2> "$home/done-dependent.err"; then
+    fail "hand-closed no-route repair accepted a raw dependency edge"
+  fi
+  assert_grep "backlog tasks remain blocked by it: sample-declined-dependent" \
+    "$home/done-dependent.err" \
+    "hand-closed no-route repair did not reject its dependent task"
+  show=$(tasks_in "$home" show "$declined_hold" --full)
+  assert_contains "$show" "state: done" \
+    "failed hand-closed repair reopened the captain hold"
+  assert_not_contains "$show" "Resolution recorded by fm-decision-hold." \
+    "failed hand-closed repair recorded a false attestation"
+  show=$(tasks_in "$home" show sample-declined-dependent --full)
+  assert_contains "$show" "deps: \"blocked-by:$declined_hold\"" \
+    "failed hand-closed repair cleared the dependency edge"
+  tasks_in "$home" unblock sample-declined-dependent --by "$declined_hold" >/dev/null \
+    || fail "could not clear the hand-closed dependency fixture"
+  tasks_in "$home" rm sample-declined-dependent >/dev/null \
+    || fail "could not remove the hand-closed dependency fixture"
+
   run_decisions "$home" resolve "$origin" proposal \
     --decision-file "$home/declined-decision.txt" --routed-none >/dev/null \
     || fail "could not durably resolve the declined hold without routed work"
@@ -277,7 +358,7 @@ test_declined_hold_requires_and_accepts_durable_no_route_resolution() {
   show=$(tasks_in "$home" show "$collision_hold" --full)
   assert_not_contains "$show" "Resolution recorded by fm-decision-hold." \
     "failed collision repair changed the unrelated captain task"
-  pass "declined holds repair only retained captain-held identities"
+  pass "no-route repair requires retained hold identity and no dependency edges"
 }
 
 test_structured_holds_survive_teardown_and_route_resolution() {
