@@ -192,6 +192,30 @@ export function channelIdForLabel(label) {
   ].join("-");
 }
 
+// A per-crew lane is a NEW LABEL through channelIdForLabel above, never a new
+// derivation. That is the whole mechanism: the fleet label is untouched, so the
+// fleet channel keeps the exact id it has always had, and a task's lane is one
+// more deterministic name hashed by the same function into the same v5 shape.
+//
+// The label is `firstmate-crew:<sha256(fleet label)>:<task id>` rather than the
+// fleet label with the id appended, because appending is not injective: a home
+// whose path happened to end in the separator plus another id would derive the
+// same string as a different home publishing that task. Hashing the fleet label
+// to a fixed 64 hex characters, then appending a task id drawn from a character
+// set that excludes the separator, makes the encoding unambiguous by
+// construction. It also cannot collide with a fleet label, which is an absolute
+// path, and it leaks no more than the fleet label already does: the channel id
+// was never a secret (see docs/buzz-loopback-adapter.md, invariant 2).
+const CREW_TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+
+export function crewChannelLabel(fleetLabel, taskId) {
+  if (typeof taskId !== "string" || !CREW_TASK_ID.test(taskId)) {
+    throw new Error(`rejected crew task id: ${taskId}`);
+  }
+  const digest = bytesToHex(sha256(Buffer.from(String(fleetLabel), "utf8")));
+  return `firstmate-crew:${digest}:${taskId}`;
+}
+
 export function nowSeconds() {
   return Math.floor(Date.now() / 1000);
 }

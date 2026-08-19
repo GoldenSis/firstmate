@@ -421,6 +421,10 @@ FM_BUZZ_MAX_CACHE=100               # positive-integer best-effort total per rel
 FM_BUZZ_STDIN_TIMEOUT_S=30          # positive integer through 2147483647; deadline for reading the projection on stdin; an expired read is discarded rather than published
 FM_BUZZ_MAX_PROJECTION_BYTES=1048576 # positive projection byte limit up to the fixed 1048576-byte ceiling; oversized input is rejected before signing or caching
 FM_BUZZ_LOCK_TIMEOUT_S=30           # positive integer through 2147483647; deadline for each publisher lock acquisition; timeout and interruption remain logged exit-0 non-events
+FM_BUZZ_CREW_STATUS_LINES=40        # positive integer; status events carried per crew lane; a bounded lane discloses what it dropped in its own omitted[]
+FM_BUZZ_CREW_STATUS_BYTES=16384     # positive integer; bytes read from the end of one task's status log per crew lane; disclosed when it bites
+FM_BUZZ_CREW_STATUS_LINE_CHARS=200  # positive integer; characters kept per status event in a crew lane; disclosed when it bites
+FM_BUZZ_CREW_INPUT_BYTES=1048576    # positive integer; projection input cap for `fm-buzz-crew-lanes.sh`; oversized input is refused rather than truncated
 FM_BUZZ_FORCE_FILE_STORE=           # set to 1 to select the 0600 fallback for normal loads and stores; rotation still inspects and clears every store per `fm-buzz-keypair.sh --help`
 FM_BUZZ_REQUIRE_PINNED_RELAY_AUTHORITY=0 # set to 1 to refuse rotation membership checks until the relay/channel signer is already pinned
 # sub-supervisor (bin/fm-supervise-daemon.sh); presence-gated via /afk
