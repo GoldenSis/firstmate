@@ -149,12 +149,12 @@ EXEC_MISSING_REVISION_JSON='{
 
 FLOW_FAILURE_REVISION_JSON='{
   "revision": 2,
-  "source": "id: m1_controlled_failure\nnamespace: firstmate.m1\n\nlabels:\n  system.readOnly: true\n\ntasks:\n  - id: before_failure\n    type: io.kestra.plugin.core.log.Log\n    message: controlled failure begins\n  - id: always_fails\n    type: io.kestra.plugin.core.execution.Fail\n    errorMessage: synthetic controlled failure\n  - id: after_failure\n    type: io.kestra.plugin.core.log.Log\n    message: this task must not run"
+  "source": "id: m1_controlled_failure\nnamespace: firstmate.m1\n\nlabels:\n  system.readOnly: true\n\ntasks:\n  - id: before_failure\n    type: io.kestra.plugin.core.log.Log\n    message: controlled failure begins\n  - id: always_fails\n    type: io.kestra.plugin.core.execution.Fail\n    errorMessage: synthetic controlled failure\n    retry:\n      type: constant\n      interval: PT0.5S\n      maxAttempts: 3\n      maxDuration: PT10S\n      warningOnRetry: true\n  - id: after_failure\n    type: io.kestra.plugin.core.log.Log\n    message: this task must not run"
 }'
 
 FLOW_FAILURE_OLD_REVISION_JSON='{
   "revision": 1,
-  "source": "id: m1_controlled_failure\nnamespace: firstmate.m1\n\nlabels:\n  system.readOnly: true\n\ntasks:\n  - id: before_failure\n    type: io.kestra.plugin.core.log.Log\n    message: controlled failure begins\n  - id: always_fails\n    type: io.kestra.plugin.core.execution.Fail\n    errorMessage: synthetic controlled failure"
+  "source": "id: m1_controlled_failure\nnamespace: firstmate.m1\n\nlabels:\n  system.readOnly: true\n\ntasks:\n  - id: before_failure\n    type: io.kestra.plugin.core.log.Log\n    message: controlled failure begins\n  - id: always_fails\n    type: io.kestra.plugin.core.execution.Fail\n    errorMessage: synthetic controlled failure\n    retry:\n      type: constant\n      interval: PT0.5S\n      maxAttempts: 3\n      maxDuration: PT10S\n      warningOnRetry: true"
 }'
 
 FLOW_SHAPE_REVISION_JSON='{
@@ -186,14 +186,15 @@ make_fake_curl() {
   fakebin=$(fm_fakebin "$dir")
   cat > "$fakebin/curl" <<'SH'
 #!/usr/bin/env bash
-method=GET url="" cfg="" formstrings=""
+method=GET url="" cfg="" formstrings="" output=""
 argv=$*
 while [ $# -gt 0 ]; do
   case "$1" in
     -X|--request) method=$2; shift 2 ;;
     --config) cfg=$2; shift 2 ;;
     --form-string) formstrings="$formstrings $2"; shift 2 ;;
-    --max-time|--noproxy|-H|--data-binary|-F|-o|-w|-m) shift 2 ;;
+    -o|--output) output=$2; shift 2 ;;
+    --max-time|--noproxy|-H|--data-binary|-F|-w|-m) shift 2 ;;
     -q|--fail-with-body|-sS|-s|-S) shift ;;
     http://*|https://*) url=$1; shift ;;
     *) shift ;;
@@ -212,32 +213,53 @@ done
 } >> "$FAKE_CURL_LOG"
 
 path=${url#*/api/v1/main}
+emit() {
+  if [ -n "$output" ]; then
+    printf '%s' "$1" > "$output"
+  else
+    printf '%s' "$1"
+  fi
+}
+emit_artifact() {
+  if [ "${FAKE_ARTIFACT_BINARY:-0}" = 1 ]; then
+    if [ -n "$output" ]; then
+      printf 'binary\000artifact\n\n' > "$output"
+    else
+      printf 'binary\000artifact\n\n'
+    fi
+  else
+    emit 'label=synthetic-alpha
+units=3
+route=safe
+'
+  fi
+}
 if [ -n "${FAKE_CURL_FAIL_MATCH:-}" ]; then
   case "$path" in
     *"$FAKE_CURL_FAIL_MATCH"*)
-      printf '%s' "${FAKE_CURL_FAIL_BODY:-synthetic HTTP failure}"
+      emit "${FAKE_CURL_FAIL_BODY:-synthetic HTTP failure}"
       exit 22
       ;;
   esac
 fi
 case "$method $path" in
-  'POST /flows/validate') printf '%s' "$FAKE_VALIDATE_RESPONSE" ;;
-  'POST /flows/bulk'*) printf '[]' ;;
-  'POST /executions/firstmate.m1/m1_shape'*) printf '{"id":"EXECSUCCESS1"}' ;;
-  'POST /executions/firstmate.m1/m1_controlled_failure'*) printf '{"id":"EXECFAILURE1"}' ;;
-  'GET /executions/EXECSUCCESS1/file'*) printf 'label=synthetic-alpha\nunits=3\nroute=safe\n' ;;
-  'GET /executions/EXECSUCCESS1') printf '%s' "$FAKE_EXEC_SUCCESS" ;;
-  'GET /executions/EXECFAILURE1') printf '%s' "$FAKE_EXEC_FAILURE" ;;
-  'GET /executions/EXECREPLAY1') printf '%s' "$FAKE_EXEC_REPLAY" ;;
-  'GET /executions/EXECFOREIGNNS') printf '%s' "$FAKE_EXEC_FOREIGN_NAMESPACE" ;;
-  'GET /executions/EXECUNTRACKED') printf '%s' "$FAKE_EXEC_UNTRACKED_FLOW" ;;
-  'GET /executions/EXECHISTORICAL1') printf '%s' "$FAKE_EXEC_HISTORICAL" ;;
-  'GET /executions/EXECNOREVISION') printf '%s' "$FAKE_EXEC_MISSING_REVISION" ;;
-  'GET /flows/firstmate.m1/m1_controlled_failure?revision=1&source=true') printf '%s' "$FAKE_FLOW_FAILURE_OLD_REVISION" ;;
-  'GET /flows/firstmate.m1/m1_controlled_failure?revision=2&source=true') printf '%s' "$FAKE_FLOW_FAILURE_REVISION" ;;
-  'GET /flows/firstmate.m1/m1_shape?revision=1&source=true') printf '%s' "$FAKE_FLOW_SHAPE_REVISION" ;;
-  'GET /logs/EXECFAILURE1') printf '%s' "$FAKE_LOGS_FAILURE" ;;
-  *) printf '{}' ;;
+  'POST /flows/validate') emit "$FAKE_VALIDATE_RESPONSE" ;;
+  'POST /flows/bulk'*) emit '[]' ;;
+  'POST /executions/firstmate.m1/m1_shape'*) emit '{"id":"EXECSUCCESS1"}' ;;
+  'POST /executions/firstmate.m1/m1_controlled_failure'*) emit '{"id":"EXECFAILURE1"}' ;;
+  'GET /executions/EXECSUCCESS1/file'*) emit_artifact ;;
+  'GET /executions/EXECSUCCESS1') emit "$FAKE_EXEC_SUCCESS" ;;
+  'GET /executions/EXECFAILURE1') emit "$FAKE_EXEC_FAILURE" ;;
+  'GET /executions/EXECREPLAY1') emit "$FAKE_EXEC_REPLAY" ;;
+  'GET /executions/EXECFOREIGNNS') emit "$FAKE_EXEC_FOREIGN_NAMESPACE" ;;
+  'GET /executions/EXECUNTRACKED') emit "$FAKE_EXEC_UNTRACKED_FLOW" ;;
+  'GET /executions/EXECHISTORICAL1') emit "$FAKE_EXEC_HISTORICAL" ;;
+  'GET /executions/EXECNOREVISION') emit "$FAKE_EXEC_MISSING_REVISION" ;;
+  'GET /flows/firstmate.m1/m1_controlled_failure?revision=1&source=true') emit "$FAKE_FLOW_FAILURE_OLD_REVISION" ;;
+  'GET /flows/firstmate.m1/m1_controlled_failure?revision=2&source=true') emit "$FAKE_FLOW_FAILURE_REVISION" ;;
+  'GET /flows/firstmate.m1/m1_shape?revision=1&source=true') emit "$FAKE_FLOW_SHAPE_REVISION" ;;
+  'GET /logs/EXECFAILURE1') emit "$FAKE_LOGS_FAILURE" ;;
+  *) emit '{}' ;;
 esac
 SH
   chmod +x "$fakebin/curl"
@@ -272,6 +294,7 @@ seam() {
     FAKE_VALIDATE_RESPONSE="${SEAM_VALIDATE_RESPONSE:-$VALIDATION_OK_JSON}" \
     FAKE_CURL_FAIL_MATCH="${SEAM_FAIL_MATCH:-}" \
     FAKE_CURL_FAIL_BODY="${SEAM_FAIL_BODY:-}" \
+    FAKE_ARTIFACT_BINARY="${SEAM_ARTIFACT_BINARY:-0}" \
     FM_KESTRA_CONFIG="$workdir/absent-kestra.env" \
     FM_KESTRA_BASE_URL="${SEAM_BASE_URL:-http://127.0.0.1:18080}" \
     FM_KESTRA_TENANT=main \
@@ -287,6 +310,7 @@ SEAM_NAMESPACE=""
 SEAM_VALIDATE_RESPONSE=""
 SEAM_FAIL_MATCH=""
 SEAM_FAIL_BODY=""
+SEAM_ARTIFACT_BINARY=""
 SEAM_PROXY=""
 
 workdir() {
@@ -384,6 +408,77 @@ test_malformed_and_multiline_input_values_are_refused() {
   pass "integer syntax, arbitrary-length ranges, and single-line serialization are validated before any request"
 }
 
+test_input_validation_matches_the_supported_kestra_semantics() {
+  local d file out rc
+  d="$TMP_ROOT/input-semantics"
+  mkdir -p "$d"
+  file="$d/flow.yaml"
+  printf '%s\n' 'id: semantics
+namespace: firstmate.m1
+labels:
+  system.readOnly: true
+inputs:
+  - id: count
+    type: INT
+  - id: code
+    type: STRING
+    validator: code|[0-9]+
+  - id: route
+    type: SELECT
+    required: false
+    values:
+      - safe mode
+      - fast
+tasks:
+  - id: only
+    type: io.kestra.plugin.core.log.Log
+    message: synthetic' > "$file"
+
+  rc=0
+  out=$(bash -c '. "$1"; fm_kestra_check_flow "$2"; fm_kestra_validate_inputs "$2"' \
+    _ "$ROOT/bin/fm-kestra-lib.sh" "$file" 2>&1) || rc=$?
+  expect_code 2 "$rc" "an omitted required field must default to required"
+  assert_contains "$out" "missing required input: count" \
+    "the adapter must apply Kestra's required-by-default input semantics"
+
+  rc=0
+  out=$(bash -c '. "$1"; fm_kestra_check_flow "$2"; fm_kestra_validate_inputs "$2" count=2147483648 code=123' \
+    _ "$ROOT/bin/fm-kestra-lib.sh" "$file" 2>&1) || rc=$?
+  expect_code 2 "$rc" "an INT beyond Java Integer range must be refused"
+  assert_contains "$out" "signed 32-bit INT range" "the refusal must name Kestra's INT range"
+
+  rc=0
+  out=$(bash -c '. "$1"; fm_kestra_check_flow "$2"; fm_kestra_validate_inputs "$2" count=1 code=x1' \
+    _ "$ROOT/bin/fm-kestra-lib.sh" "$file" 2>&1) || rc=$?
+  expect_code 2 "$rc" "a STRING validator must match the entire value"
+  assert_contains "$out" "must match code|[0-9]+" "substring matches must not satisfy the validator"
+
+  out=$(bash -c '. "$1"; fm_kestra_check_flow "$2"; fm_kestra_validate_inputs "$2" count=1 code=123 "route=safe mode"' \
+    _ "$ROOT/bin/fm-kestra-lib.sh" "$file") \
+    || fail "an exact block-list SELECT value containing a space must validate"
+  assert_contains "$out" "route=safe mode" "SELECT values must preserve internal whitespace exactly"
+
+  printf '%s\n' 'id: bounds
+namespace: firstmate.m1
+labels:
+  system.readOnly: true
+inputs:
+  - id: count
+    type: INT
+    min: -2147483649
+tasks:
+  - id: only
+    type: io.kestra.plugin.core.log.Log
+    message: synthetic' > "$file"
+  rc=0
+  out=$(bash -c '. "$1"; fm_kestra_check_flow "$2"' \
+    _ "$ROOT/bin/fm-kestra-lib.sh" "$file" 2>&1) || rc=$?
+  expect_code 1 "$rc" "an INT schema bound beyond Java Integer range must be refused"
+  assert_contains "$out" "min/max outside the signed 32-bit range" \
+    "schema bounds must fit the same type as submitted INT values"
+  pass "required defaults, INT range, full regex matches, and exact SELECT values mirror the supported semantics"
+}
+
 # ===========================================================================
 # 2. An allowed execution returns an opaque execution ID
 # ===========================================================================
@@ -421,6 +516,47 @@ test_credential_never_reaches_argv_and_the_auth_file_is_private() {
   assert_grep 'ARGV -q --noproxy * --config ' "$d/curl.log" \
     "curl must ignore user config and bypass every proxy before loading the credential"
   pass "the Basic Auth credential is isolated from argv, the child environment, curl config, and proxies"
+}
+
+test_credential_config_and_request_cleanup_are_private_per_process() {
+  local child_record config d out rc stray
+  d=$(workdir credential-files)
+  config="$d/kestra.env"
+  printf '%s\n' 'FM_KESTRA_BASE_URL=http://127.0.0.1:18080
+FM_KESTRA_TENANT=main
+FM_KESTRA_NAMESPACE=firstmate.m1
+FM_KESTRA_USER=synthetic-operator
+FM_KESTRA_PASSWORD=Synthetic-M1-Only' > "$config"
+  chmod 0644 "$config"
+  rc=0
+  out=$(env -i PATH="$BASE_PATH" FM_KESTRA_CONFIG="$config" \
+    bash -c '. "$1"; fm_kestra_load_config' _ "$ROOT/bin/fm-kestra-lib.sh" 2>&1) || rc=$?
+  expect_code 2 "$rc" "a group/world-readable credential config must be refused"
+  assert_contains "$out" "must have mode 0600" "the config refusal must name the required mode"
+
+  chmod 0600 "$config"
+  ln -s "$config" "$d/kestra-link.env"
+  rc=0
+  out=$(env -i PATH="$BASE_PATH" FM_KESTRA_CONFIG="$d/kestra-link.env" \
+    bash -c '. "$1"; fm_kestra_load_config' _ "$ROOT/bin/fm-kestra-lib.sh" 2>&1) || rc=$?
+  expect_code 2 "$rc" "a symlinked credential config must be refused"
+  assert_contains "$out" "regular, non-symlink" "the config refusal must name the file-type boundary"
+
+  child_record="$d/child-path"
+  TMPDIR="$d" bash -c '
+    . "$1"
+    fm_kestra_tempfile parent parent_file
+    (
+      fm_kestra_tempfile auth child_file
+      printf "%s\n" "$child_file" > "$2"
+      sh -c "kill -TERM \"\$PPID\""
+    ) || :
+    [ -f "$parent_file" ] || exit 1
+  ' _ "$ROOT/bin/fm-kestra-lib.sh" "$child_record" \
+    || fail "an interrupted subshell must clean only its own request files"
+  stray=$(find "$d" -maxdepth 1 -name '.fm-kestra-*' -print)
+  [ -z "$stray" ] || fail "interrupted request credentials survived cleanup: $stray"
+  pass "credential config and interrupted request files stay private and are cleaned per process"
 }
 
 # ===========================================================================
@@ -640,6 +776,7 @@ test_the_http_gate_allows_only_exact_role_paths() {
   local out rc
   out=$(FM_KESTRA_NAMESPACE="$NS" bash -c '
     . "$1/bin/fm-kestra-lib.sh"
+    fm_kestra_snapshot_flow_files
     for role in deploy run read; do
       for probe in \
         "POST /executions/firstmate.m1/m1_shape/replay" \
@@ -654,6 +791,7 @@ test_the_http_gate_allows_only_exact_role_paths() {
         "POST /flows/bulk?delete=false&namespace=firstmate.m1&extra=1" \
         "POST /flows/bulk?delete=false&namespace=someone.else" \
         "POST /executions/firstmate.m1/m1_shape/eval" \
+        "POST /executions/firstmate.m1/not_reviewed" \
         "GET /executions/webhook/firstmate.m1/m1_shape/key" \
         "GET /executions/EXECSUCCESS1/unknown" \
         "GET /logs/EXECFAILURE1/extra"
@@ -695,6 +833,7 @@ test_the_http_gate_accepts_no_raw_curl_options() {
         fm_kestra_load_config
         role=$2
         body=$3
+        [ "$role" != run ] || fm_kestra_snapshot_flow_files
         case "$4" in
           request) set -- -X DELETE ;;
           url) set -- --url http://example.invalid/ ;;
@@ -726,6 +865,29 @@ test_a_run_may_not_target_another_namespace() {
   ' _ "$ROOT" 2>&1)
   [ -z "$out" ] || fail "the run role must not reach a namespace outside the allow-list"
   pass "the run role can only launch executions inside the one allow-listed namespace"
+}
+
+test_forbidden_api_words_are_matched_as_segments() {
+  local out
+  out=$(bash -c '
+    . "$1/bin/fm-kestra-lib.sh"
+    for path in \
+      /executions/firstmate.m1/state-audit \
+      /executions/firstmate.m1/restart-check \
+      /executions/firstmate.m1/replay-analysis
+    do
+      fm_kestra_path_has_forbidden_segment "$path" && printf "FALSE POSITIVE %s\n" "$path"
+    done
+    for path in \
+      /executions/EXECSUCCESS1/state \
+      /executions/EXECSUCCESS1/replay \
+      /namespaces/firstmate.m1
+    do
+      fm_kestra_path_has_forbidden_segment "$path" || printf "MISSED %s\n" "$path"
+    done
+  ' _ "$ROOT")
+  [ -z "$out" ] || fail "forbidden API path-segment matching is wrong:"$'\n'"$out"
+  pass "the HTTP deny-list matches exact path segments without rejecting safe identifiers"
 }
 
 # ===========================================================================
@@ -822,11 +984,14 @@ tasks:
     fm_kestra_snapshot_flow_files
     [ "${#FM_KESTRA_SNAPSHOT_FILES[@]}" -eq 1 ] || exit 1
     printf "message: changed\n" > "$1/kestra/flows/tracked.yaml"
-    cat "${FM_KESTRA_SNAPSHOT_FILES[0]}"
+    resolved=""
+    fm_kestra_resolve_flow reviewed resolved
+    [ "$resolved" = "${FM_KESTRA_SNAPSHOT_FILES[0]}" ] || exit 1
+    cat "$resolved"
   ' _ "$d") || fail "the HEAD flow snapshot must remain readable after the worktree source changes"
   assert_contains "$out" "message: reviewed" "the snapshot must contain the reviewed HEAD bytes"
   assert_not_contains "$out" "message: changed" "the snapshot must not re-read the mutable worktree source"
-  pass "deployment flow snapshots remain bound to immutable HEAD blobs"
+  pass "flow resolution and validation remain bound to one immutable HEAD snapshot"
 }
 
 test_deploy_refuses_a_flow_without_the_read_only_label() {
@@ -1018,6 +1183,126 @@ listeners:
   pass "all Kestra 1.3.34 flow, flowable, switch, DAG, and listener task containers are validated"
 }
 
+test_deploy_accepts_only_the_exact_supported_yaml_shape() {
+  local body case_name d out rc needle
+  for case_name in inline-tasks inline-inputs anchor quoted-id block-scalar unknown-top; do
+    case "$case_name" in
+      inline-tasks)
+        body='id: inline_tasks
+namespace: firstmate.m1
+labels:
+  system.readOnly: true
+tasks: [{id: only, type: io.kestra.plugin.core.log.Log, message: synthetic}]'
+        needle='flow-style mappings and sequences'
+        ;;
+      inline-inputs)
+        body='id: inline_inputs
+namespace: firstmate.m1
+labels:
+  system.readOnly: true
+inputs: [{id: value, type: STRING}]
+tasks:
+  - id: only
+    type: io.kestra.plugin.core.log.Log
+    message: synthetic'
+        needle='flow-style mappings and sequences'
+        ;;
+      anchor)
+        body='id: anchor
+namespace: firstmate.m1
+labels:
+  system.readOnly: true
+tasks:
+  - id: only
+    type: &task_type io.kestra.plugin.core.log.Log
+    message: synthetic'
+        needle='anchors, aliases, and merge keys'
+        ;;
+      quoted-id)
+        body='id: "quoted"
+namespace: firstmate.m1
+labels:
+  system.readOnly: true
+tasks:
+  - id: only
+    type: io.kestra.plugin.core.log.Log
+    message: synthetic'
+        needle='top-level id must be an unquoted'
+        ;;
+      block-scalar)
+        body='id: block
+namespace: firstmate.m1
+labels:
+  system.readOnly: true
+tasks:
+  - id: only
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      synthetic'
+        needle='must be a single-line scalar'
+        ;;
+      unknown-top)
+        body='id: unknown
+namespace: firstmate.m1
+description: unsupported
+labels:
+  system.readOnly: true
+tasks:
+  - id: only
+    type: io.kestra.plugin.core.log.Log
+    message: synthetic'
+        needle='unsupported top-level key: description'
+        ;;
+    esac
+    d="$TMP_ROOT/yaml-$case_name"
+    fixture_flow "$d" "$case_name" "$body"
+    rc=0
+    out=$(check_fixture "$d") || rc=$?
+    expect_code 2 "$rc" "$case_name must be refused instead of approximately parsed"
+    assert_contains "$out" "$needle" "$case_name must name the unsupported YAML boundary"
+  done
+  pass "deployment refuses every YAML form outside the exact supported M1 shape"
+}
+
+test_deploy_refuses_triggers_and_side_effecting_core_tasks() {
+  local d out rc type
+  d="$TMP_ROOT/trigger"
+  fixture_flow "$d" trigger 'id: trigger
+namespace: firstmate.m1
+labels:
+  system.readOnly: true
+triggers:
+  - id: schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"
+tasks:
+  - id: only
+    type: io.kestra.plugin.core.log.Log
+    message: synthetic'
+  rc=0
+  out=$(check_fixture "$d") || rc=$?
+  expect_code 2 "$rc" "a flow trigger must be refused"
+  assert_contains "$out" "triggers are refused because executions must start through the run adapter" \
+    "the trigger refusal must name the authority boundary"
+
+  for type in io.kestra.plugin.core.http.Request io.kestra.plugin.core.execution.PurgeExecutions; do
+    d="$TMP_ROOT/task-${type##*.}"
+    fixture_flow "$d" side_effect "id: side_effect
+namespace: firstmate.m1
+labels:
+  system.readOnly: true
+tasks:
+  - id: unsafe
+    type: $type"
+    rc=0
+    out=$(check_fixture "$d") || rc=$?
+    expect_code 2 "$rc" "$type must be refused despite using the core-plugin prefix"
+    assert_contains "$out" "outside the core-plugin allow-list for M1-safe tasks: $type" \
+      "the exact task allow-list must reject $type"
+  done
+  pass "deployment refuses autonomous triggers and side-effecting core task types"
+}
+
 test_deploy_refuses_an_input_it_cannot_pre_check() {
   local d out rc
   d="$TMP_ROOT/unknown-input"
@@ -1182,6 +1467,30 @@ test_artifact_output_is_replaced_only_after_a_successful_download() {
   pass "artifact downloads preserve an existing destination until the request succeeds"
 }
 
+test_artifact_streaming_preserves_binary_bytes_and_trailing_newlines() {
+  local d expected rc target uri
+  d=$(workdir artifact-binary)
+  uri='kestra:///firstmate/m1/m1-shape/executions/EXECSUCCESS1/tasks/artifact/AAA/1.txt'
+  expected="$d/expected.bin"
+  target="$d/actual.bin"
+  printf 'binary\000artifact\n\n' > "$expected"
+  rc=0
+  SEAM_ARTIFACT_BINARY=1 seam "$d" "$STATUS" artifact EXECSUCCESS1 "$uri" --out "$target" \
+    >/dev/null 2>&1 || rc=$?
+  expect_code 0 "$rc" "a binary artifact download must succeed"
+  cmp -s "$expected" "$target" \
+    || fail "artifact staging changed NUL bytes or trailing newlines"
+
+  target="$d/stdout.bin"
+  rc=0
+  SEAM_ARTIFACT_BINARY=1 seam "$d" "$STATUS" artifact EXECSUCCESS1 "$uri" \
+    > "$target" 2>/dev/null || rc=$?
+  expect_code 0 "$rc" "a binary artifact written to stdout must succeed"
+  cmp -s "$expected" "$target" \
+    || fail "artifact stdout changed NUL bytes or trailing newlines"
+  pass "artifact reads stream through files without command-substitution corruption"
+}
+
 test_declared_outputs_are_reported() {
   local d out rc
   d=$(workdir outputs)
@@ -1215,18 +1524,20 @@ test_log_transport_failure_cannot_be_masked_by_jq() {
 # 9. Tracked material invariants
 # ===========================================================================
 
-test_every_tracked_flow_is_read_only_and_core_only() {
+test_every_tracked_flow_is_read_only_and_uses_only_m1_safe_tasks() {
   local file stray
   for file in "$FLOWS"/*.yaml; do
     assert_grep 'system.readOnly: "true"' "$file" "$file must carry the read-only label"
     assert_grep "namespace: $NS" "$file" "$file must declare the allow-listed namespace"
-    # Ask the library's own parser rather than re-rolling a weaker grep here: a
-    # task's retry block has its own `type:` and a naive grep would flag it.
-    stray=$(bash -c '. "$1/bin/fm-kestra-lib.sh"; fm_kestra_task_types "$2"' _ "$ROOT" "$file" \
-      | grep -v '^io\.kestra\.plugin\.core\.' || true)
-    [ -z "$stray" ] || fail "$file uses task types outside the core plugins: $stray"
+    stray=$(bash -c '
+      . "$1/bin/fm-kestra-lib.sh"
+      while IFS= read -r type; do
+        fm_kestra_task_type_allowed "$type" || printf "%s\n" "$type"
+      done <<< "$(fm_kestra_task_types "$2")"
+    ' _ "$ROOT" "$file")
+    [ -z "$stray" ] || fail "$file uses task types outside the exact M1-safe allow-list: $stray"
   done
-  pass "every tracked flow is read-only-labelled, core-plugin-only, and in the allow-listed namespace"
+  pass "every tracked flow is read-only-labelled, M1-safe, and in the allow-listed namespace"
 }
 
 test_no_credential_or_endpoint_value_is_committed() {
@@ -1249,6 +1560,20 @@ test_the_pinned_version_and_checksum_are_stated_once() {
     "the pinned asset checksum must be stated in code"
   assert_no_grep "latest" "$ROOT/bin/fm-kestra-deploy.sh" "no floating version tag may appear"
   pass "the Kestra version and asset checksum are pinned in code, with no floating tag"
+}
+
+test_kestra_contracts_have_one_documentation_owner() {
+  assert_grep "never inherited or propagated to a secondmate home" "$ROOT/docs/configuration.md" \
+    "configuration docs must keep Kestra credentials home-local"
+  assert_grep "replay lineage" "$ROOT/docs/scripts.md" \
+    "the script inventory must list every status evidence mode"
+  assert_no_grep "de846ac42e2b35a2e55301d01335de6ea30eab77fd69570f238e06ea28149a4b" \
+    "$ROOT/docs/kestra-seam.md" "the rationale page must not duplicate the pinned checksum"
+  assert_no_grep "1.3.34" "$ROOT/docs/kestra-seam.md" \
+    "the rationale page must not duplicate the pinned version literal"
+  assert_no_grep "GET /executions/" "$ROOT/docs/kestra-seam.md" \
+    "the rationale page must not duplicate the request matrix"
+  pass "Kestra mechanics stay with script and configuration owners while rationale stays in the seam guide"
 }
 
 test_no_prototype_artifact_is_present() {
@@ -1305,8 +1630,10 @@ test_typed_input_rejection_happens_before_any_request
 test_undeclared_input_is_refused
 test_missing_required_input_is_refused
 test_malformed_and_multiline_input_values_are_refused
+test_input_validation_matches_the_supported_kestra_semantics
 test_allowed_execution_returns_one_opaque_id
 test_credential_never_reaches_argv_and_the_auth_file_is_private
+test_credential_config_and_request_cleanup_are_private_per_process
 test_tracked_flow_configures_exactly_three_attempts
 test_status_adapter_reports_three_attempts_and_the_retry_transitions
 test_status_adapter_reports_every_attempt_log_line
@@ -1322,6 +1649,7 @@ test_every_mutating_operation_is_refused_by_the_status_adapter
 test_the_http_gate_allows_only_exact_role_paths
 test_the_http_gate_accepts_no_raw_curl_options
 test_a_run_may_not_target_another_namespace
+test_forbidden_api_words_are_matched_as_segments
 test_check_mode_accepts_the_tracked_flows_without_config_or_network
 test_flow_discovery_uses_only_canonical_unchanged_git_sources
 test_deploy_flow_snapshot_is_immutable_after_capture
@@ -1330,6 +1658,8 @@ test_deploy_requires_an_exact_true_read_only_label
 test_deploy_refuses_a_task_type_outside_the_core_plugin_allow_list
 test_deploy_checks_each_task_map_independently
 test_deploy_checks_every_supported_task_container
+test_deploy_accepts_only_the_exact_supported_yaml_shape
+test_deploy_refuses_triggers_and_side_effecting_core_tasks
 test_deploy_refuses_an_input_it_cannot_pre_check
 test_deploy_refuses_a_validator_the_adapter_cannot_faithfully_pre_check
 test_deploy_refuses_a_namespace_outside_the_allow_list
@@ -1339,10 +1669,12 @@ test_http_failures_are_failures_and_keep_the_response_diagnostic
 test_a_non_loopback_endpoint_is_refused
 test_only_a_declared_artifact_can_be_read
 test_artifact_output_is_replaced_only_after_a_successful_download
+test_artifact_streaming_preserves_binary_bytes_and_trailing_newlines
 test_declared_outputs_are_reported
 test_log_transport_failure_cannot_be_masked_by_jq
-test_every_tracked_flow_is_read_only_and_core_only
+test_every_tracked_flow_is_read_only_and_uses_only_m1_safe_tasks
 test_no_credential_or_endpoint_value_is_committed
 test_the_pinned_version_and_checksum_are_stated_once
+test_kestra_contracts_have_one_documentation_owner
 test_no_prototype_artifact_is_present
 test_live_engine_behaviour

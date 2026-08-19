@@ -4,9 +4,9 @@
 # It does exactly one thing: launch one execution of one allow-listed flow with
 # typed, locally pre-checked inputs, and print the opaque execution ID.
 #
-# The allow-list is the tracked, unchanged kestra/flows/ directory itself. A flow
-# identity with no source in HEAD is not addressable here, and a local flow edit
-# stops execution, so runnable source only changes through Git review and deploy.
+# The allow-list is one immutable snapshot of the tracked, unchanged HEAD blobs in
+# kestra/flows/. A flow identity absent from that snapshot is not addressable here,
+# and the same bytes are used for resolution, schema validation, and request gating.
 #
 # Denied, structurally rather than by omission:
 #   - replay, restart, resume, kill, and state override;
@@ -73,7 +73,8 @@ done
 
 [ -n "$FLOW" ] || fm_kestra_die "--flow is required"
 
-FLOW_FILE=$(fm_kestra_resolve_flow "$FLOW")
+FLOW_FILE=""
+fm_kestra_resolve_flow "$FLOW" FLOW_FILE
 fm_kestra_check_flow "$FLOW_FILE" || fm_kestra_die "flow source failed validation: $FLOW_FILE"
 
 fm_kestra_load_config

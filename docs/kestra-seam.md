@@ -28,66 +28,29 @@ Four pieces implement it.
 Each script's header comment is the authoritative description of its behavior, flags, and refusals; `bin/fm-kestra-lib.sh` owns the shared configuration, parsing, and HTTP gate contracts.
 Read the header before first use rather than relying on this page.
 
-## What the seam refuses
+## Boundary rationale and ownership
 
-The allow-list is the unchanged files tracked in Git HEAD directly under `kestra/flows/`.
-A flow identity with no reviewed source in Git is not addressable, and any staged, modified, or untracked YAML in that directory stops the seam.
-There is no production flow-directory override, so the runnable source set changes only through Git review.
-Deployment snapshots the HEAD blobs once, then statically validates and sends those same immutable bytes.
+Git review is the authority for which flow identities and source bytes are addressable.
+The deploy and run script headers own the exact source-resolution and validation rules, while `bin/fm-kestra-lib.sh` owns the supported YAML shape, task and input allow-lists, and request matrix.
+Unsupported source constructs fail closed because approximating Kestra's semantics locally would make the adapter a weaker validator.
 
-`bin/fm-kestra-deploy.sh` refuses a flow whose namespace is not the one namespace named in local config, a flow missing the `system.readOnly: "true"` label, a task type outside `io.kestra.plugin.core.`, and any input schema or validator regex the run adapter could not faithfully pre-check.
-It always updates the namespace with `delete=false`.
 Kestra is never given permission to pull and reconcile Git itself, because upstream documents that Git-driven synchronization can delete objects depending on the source-of-truth setting.
-The seam pushes; Kestra never pulls.
+The seam pushes reviewed source while keeping reconciliation authority outside Kestra.
 
-`bin/fm-kestra-run.sh` accepts only `--flow` and `--input` and refuses every other argument by name.
-Inputs are validated against the reviewed flow's declared schema before the first byte leaves the machine, so a rejected input never creates an execution.
+The status script header owns the evidence modes and the checks that bind every read to reviewed flow identity.
+Replay lineage remains evidence, while performing replay remains authority and therefore stays outside this milestone.
 
-`bin/fm-kestra-status.sh` returns execution state, task logs, declared outputs, replay lineage, and artifacts the execution itself declared as outputs.
-Every status subcommand first fetches the execution record, then refuses it unless its namespace is the configured namespace and its flow has an unchanged tracked source.
-That refusal happens before any evidence is printed and before a log, artifact, or flow-revision request is made.
-Suppression evidence is calculated from the execution's recorded `flowRevision`, never the current flow source, and is explicitly marked unavailable when that revision cannot be resolved safely.
-An artifact URI the execution did not publish is refused, which keeps the adapter an evidence reader rather than a storage browser.
+## Runtime boundary
 
-Underneath all three, `fm_kestra_path_allowed` in `bin/fm-kestra-lib.sh` gates every request by role.
-Replay, restart, resume, kill, state override, flow deletion, secret access, and namespace administration are unreachable from every role, so an argument-parsing bug still cannot reach a mutating endpoint.
-The gate accepts only a YAML body file for deploy, validated form fields for run, and no payload for read, so callers cannot append raw `curl` options.
-Replay *lineage* stays readable, because knowing an execution was derived from another one is evidence.
-
-## Version pin
-
-| Item | Value |
-| --- | --- |
-| Product | Kestra Open Source Edition |
-| Version | 1.3.34 |
-| Asset | <https://github.com/kestra-io/kestra/releases/download/v1.3.34/kestra-1.3.34> |
-| SHA-256 | `de846ac42e2b35a2e55301d01335de6ea30eab77fd69570f238e06ea28149a4b` |
-
-`fm_kestra_pinned_version` and `fm_kestra_pinned_sha256` in `bin/fm-kestra-lib.sh` are the single source of those two values.
-Verify a downloaded asset before running it:
-
-```sh
-shasum -a 256 kestra-1.3.34
-# must print the SHA-256 above
-```
-
-No `latest` tag and no unversioned image is supported.
-The standalone asset needs Java 21 or newer and ships core plugins only, which is exactly what M1 wants: no plugin installation, so no added supply-chain or runtime surface.
-
-Bind the main and management servers to loopback.
-Do not mount the Docker socket and do not mount host `/tmp`; the official quickstart's shape is rejected here.
+The version, edition, asset, checksum, endpoint, and transport contract has one owner in the header and functions of `bin/fm-kestra-lib.sh`.
+The pin avoids a floating runtime target, and the local-only posture avoids turning this narrow seam into a general Kestra deployment surface.
+M1 installs no plugins and does not adopt the official quickstart's privileged host integrations.
 
 ## Local configuration
 
-Endpoint and credential live in `config/kestra.env`, which is gitignored.
-Nothing under `kestra/` or `bin/` carries a value.
-`docs/examples/kestra-env` is the copyable shape.
-
-Kestra OSS authenticates one broad Basic Auth identity that can create, execute, replay, change state, and delete through the same API and UI.
-Treat that credential as a disclosure risk.
-The adapters hand it to `curl` through a mode-0600 config file that is removed after the request, and never place it in argv or in credential-named variables inherited by the curl process.
-Curl ignores user configuration and bypasses every proxy before loading that credential, so a loopback request cannot be redirected by `.curlrc` or proxy settings.
-HTTP error responses fail the adapter while retaining the response body as diagnostic evidence.
+`docs/configuration.md` owns where `config/kestra.env` lives and whether it is inherited, and `docs/examples/kestra-env` is the copyable shape.
+`bin/fm-kestra-lib.sh` owns the exact file validation and credential-handling mechanics.
+The broad Kestra OSS identity remains a disclosure risk even though the adapters expose only narrow operations.
 
 ## Synthetic data only
 
@@ -108,11 +71,10 @@ The retry obligation is therefore split into three claims:
 2. the status adapter reports the attempts, the `FAILED -> RETRYING -> RUNNING` transitions, the per-attempt error logs, and revision-accurate suppressed tasks without losing or inventing any of them, asserted against recorded execution and flow-revision shapes;
 3. Kestra's engine actually performing three attempts, which the hermetic suite does not assert.
 
-Claim 3 is covered by the opt-in live section at the end of that file, which runs only when `FM_KESTRA_LIVE=1` is set and a real loopback Kestra 1.3.34 has the tracked flows deployed.
+Claim 3 is covered by the opt-in live section at the end of that file, which runs only when `FM_KESTRA_LIVE=1` is set and the pinned loopback runtime has the tracked flows deployed.
 Every test name says which claim it belongs to, so no assertion reads as stronger than it is.
 
-Three endpoint shapes are used by the read adapter but were not exercised against a live server during this milestone: `GET /logs/{executionId}` for task logs, `GET /executions/{executionId}/file?path=...` for artifact bytes, and `GET /flows/{namespace}/{flowId}?revision=...&source=true` for revision-accurate task topology.
-The live section is what confirms them.
+The live section confirms the server-dependent request shapes that the library's request matrix owns.
 
 ## Deferred decisions and where they attach
 

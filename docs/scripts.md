@@ -99,4 +99,4 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-kestra-lib.sh`       | Own the Kestra seam's config, loopback rule, flow parsing, input validation, and role-gated HTTP |
 | `fm-kestra-deploy.sh`    | Validate tracked `kestra/flows/` and update the one allow-listed namespace with deletion disabled |
 | `fm-kestra-run.sh`       | Launch one execution of one allow-listed flow with typed inputs; print the opaque execution id |
-| `fm-kestra-status.sh`    | Read-only Kestra evidence: execution state, task logs, declared outputs, declared artifacts |
+| `fm-kestra-status.sh`    | Read-only Kestra evidence: execution state, task logs, declared outputs, replay lineage, declared artifacts |

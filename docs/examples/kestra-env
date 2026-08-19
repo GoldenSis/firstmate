@@ -2,6 +2,7 @@
 #
 # Copy to config/kestra.env in your firstmate home and fill in real values. That
 # path is gitignored: no endpoint and no credential belongs in kestra/ or bin/.
+# Run `chmod 0600 config/kestra.env` after copying; the seam refuses any other mode.
 #
 # Kestra OSS authenticates one broad Basic Auth identity that can create, execute,
 # replay, change state, and delete through the same API. Treat this file as a

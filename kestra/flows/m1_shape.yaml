@@ -23,7 +23,9 @@ inputs:
   - id: route
     type: SELECT
     required: true
-    values: [safe, fast]
+    values:
+      - safe
+      - fast
   - id: label
     type: STRING
     required: true

@@ -5,13 +5,12 @@
 # (fm-kestra-deploy.sh, fm-kestra-run.sh, fm-kestra-status.sh) all depend on:
 #
 #   1. Local configuration and the loopback-only endpoint rule.
-#   2. Flow-identity resolution against the tracked, unchanged flows under
-#      kestra/flows/. A flow that is not in HEAD is not addressable, a local flow
-#      edit stops the seam, and deployment validates and sends one immutable
-#      snapshot of the HEAD blobs.
-#   3. Static flow-source validation: `system.readOnly` label, single allow-listed
-#      namespace, core-plugin-only task types, and an input schema this library can
-#      faithfully pre-check.
+#   2. Flow-identity resolution against one immutable snapshot of the tracked,
+#      unchanged HEAD blobs under kestra/flows/. A flow that is not in that snapshot
+#      is not addressable, and a local flow edit stops the seam.
+#   3. Static flow-source validation against the exact YAML shape, task types, and
+#      input schema M1 supports. Unsupported syntax, triggers, and side-effecting
+#      task types are refused rather than approximated.
 #   4. The HTTP gate. Every request goes through fm_kestra_request, which takes a
 #      ROLE and refuses any method/path the role does not positively allow. Replay,
 #      restart, resume, kill, state override, flow deletion, secrets, and namespace
@@ -101,6 +100,7 @@ fm_kestra_flow_files() {
 
 FM_KESTRA_SNAPSHOT_FILES=()
 FM_KESTRA_SNAPSHOT_SOURCES=()
+FM_KESTRA_SNAPSHOT_HEAD=""
 
 # fm_kestra_snapshot_flow_files: populate parallel arrays with immutable copies of
 # the current HEAD flow blobs and their canonical source paths.
@@ -108,6 +108,7 @@ fm_kestra_snapshot_flow_files() {
   local head relative metadata mode type object snapshot untracked current_head
   FM_KESTRA_SNAPSHOT_FILES=()
   FM_KESTRA_SNAPSHOT_SOURCES=()
+  FM_KESTRA_SNAPSHOT_HEAD=""
   head=$(git -C "$FM_KESTRA_ROOT" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) \
     || fm_kestra_die "flow allow-list is unavailable from Git HEAD"
   git -C "$FM_KESTRA_ROOT" diff --quiet "$head" -- kestra/flows \
@@ -145,6 +146,13 @@ fm_kestra_snapshot_flow_files() {
     || fm_kestra_die "flow allow-list is unavailable from Git HEAD"
   [ "$current_head" = "$head" ] \
     || fm_kestra_die "Git HEAD changed while flow sources were being prepared"
+  FM_KESTRA_SNAPSHOT_HEAD=$head
+}
+
+fm_kestra_ensure_flow_snapshot() {
+  if [ -z "$FM_KESTRA_SNAPSHOT_HEAD" ]; then
+    fm_kestra_snapshot_flow_files
+  fi
 }
 
 # --- flow source parsing ----------------------------------------------------
@@ -165,6 +173,323 @@ fm_kestra_scalar() {
       gsub(/^["'\'']|["'\'']$/, "", value)
       print value
       exit
+    }
+  ' "$file"
+}
+
+fm_kestra_supported_yaml() {
+  local file=$1 source=${2:-$1}
+  awk -v source="$source" '
+    BEGIN { section = ""; block_indent = -1; problems = 0 }
+    function fail(message) {
+      print source ": " message > "/dev/stderr"
+      problems = 1
+    }
+    function indent(line) { match(line, /^ */); return RLENGTH }
+    function trim(value) {
+      sub(/^[ \t]+/, "", value)
+      sub(/[ \t]+$/, "", value)
+      return value
+    }
+    function mapping_key(line, value) {
+      value = line
+      sub(/^[ ]*-?[ ]*/, "", value)
+      sub(/:.*/, "", value)
+      return value
+    }
+    function mapping_value(line, value) {
+      value = line
+      sub(/^[^:]*:[ \t]*/, "", value)
+      return trim(value)
+    }
+    function clear_from(level, i) {
+      for (i in tasks) if ((i + 0) >= level) delete tasks[i]
+      for (i in containers) if ((i + 0) >= level) delete containers[i]
+      for (i in retries) if ((i + 0) >= level) delete retries[i]
+    }
+    function plain_identity(value) {
+      return value ~ /^[A-Za-z0-9_-]+$/
+    }
+    function plain_namespace(value) {
+      return value ~ /^[A-Za-z0-9._-]+$/
+    }
+    function plain_select(value) {
+      return value ~ /^[A-Za-z0-9._ -]+$/ && value !~ /  / && value !~ /^ | $/
+    }
+    function task_field_allowed(type, key) {
+      if (key == "id" || key == "type") return 1
+      if (type == "io.kestra.plugin.core.log.Log") return key == "message"
+      if (type == "io.kestra.plugin.core.debug.Return") return key == "format"
+      if (type == "io.kestra.plugin.core.flow.Sequential" ||
+          type == "io.kestra.plugin.core.flow.Parallel") return key == "tasks"
+      if (type == "io.kestra.plugin.core.flow.If") {
+        return key == "condition" || key == "then" || key == "else"
+      }
+      if (type == "io.kestra.plugin.core.storage.Write") {
+        return key == "extension" || key == "content"
+      }
+      if (type == "io.kestra.plugin.core.execution.Fail") {
+        return key == "errorMessage" || key == "retry"
+      }
+      return 0
+    }
+    /^[ \t]*$/ || /^[ \t]*#/ { next }
+    {
+      raw = $0
+      if (raw ~ /\t/) {
+        fail("tabs are not supported in flow YAML")
+        next
+      }
+      level = indent(raw)
+      if (block_indent >= 0) {
+        if (level > block_indent) next
+        block_indent = -1
+      }
+      if (level % 2 != 0) fail("indentation must use two-space levels")
+      if (raw ~ /(^|[ :])<<:/ || raw ~ /(^|[ :\-])[&*][A-Za-z0-9_-]+/) {
+        fail("YAML anchors, aliases, and merge keys are not supported")
+      }
+      if (raw ~ /:[ ]*[\[{]/) fail("flow-style mappings and sequences are not supported")
+      if (raw ~ /^[ ]*(---|\.\.\.)[ ]*$/ || raw ~ /^[ ]*%/) {
+        fail("YAML directives and document markers are not supported inside a flow")
+      }
+    }
+    level == 0 {
+      clear_from(0)
+      if (raw !~ /^[A-Za-z_][A-Za-z0-9_.-]*:/) {
+        fail("unsupported top-level YAML form")
+        section = ""
+        next
+      }
+      key = mapping_key(raw)
+      value = mapping_value(raw)
+      if (seen_top[key]++) fail("duplicate top-level key: " key)
+      if (key == "triggers") {
+        fail("top-level triggers are refused because executions must start through the run adapter")
+        section = ""
+      } else if (key == "id") {
+        section = ""
+        if (!plain_identity(value)) fail("top-level id must be an unquoted [A-Za-z0-9_-]+ scalar")
+      } else if (key == "namespace") {
+        section = ""
+        if (!plain_namespace(value)) fail("top-level namespace must be an unquoted [A-Za-z0-9._-]+ scalar")
+      } else if (key == "labels" || key == "inputs" || key == "tasks" || key == "outputs") {
+        section = key
+        if (value != "") fail("top-level " key " must use the supported block form")
+        if (key == "tasks") containers[0] = "tasks"
+      } else {
+        fail("unsupported top-level key: " key)
+        section = ""
+      }
+      next
+    }
+    section == "labels" {
+      if (level != 2 || raw !~ /^  system\.readOnly:[ ]*("true"|true)[ ]*$/) {
+        fail("labels must contain only system.readOnly: \"true\"")
+      }
+      next
+    }
+    section == "inputs" {
+      if (level == 2 && raw ~ /^  - id:/) {
+        input_count++
+        input_id = mapping_value(raw)
+        values_input = 0
+        if (!plain_identity(input_id)) fail("input id must be an unquoted [A-Za-z0-9_-]+ scalar")
+        if (seen_input_id[input_id]++) fail("duplicate input id: " input_id)
+        input_ids[input_count] = input_id
+        next
+      }
+      if (level == 4 && input_count > 0 && raw ~ /^    [A-Za-z_][A-Za-z0-9_]*:/) {
+        key = mapping_key(raw)
+        value = mapping_value(raw)
+        values_input = 0
+        if (input_fields[input_count, key]++) fail("duplicate input key: " key)
+        if (key == "type") {
+          if (value !~ /^(INT|SELECT|STRING)$/) fail("unsupported input type: " value)
+          input_types[input_count] = value
+        } else if (key == "required") {
+          if (value !~ /^(true|false)$/) fail("input required must be true or false")
+        } else if (key == "min" || key == "max") {
+          if (value !~ /^-?[0-9]+$/) fail("input " key " must be an unquoted integer")
+        } else if (key == "validator") {
+          if (value == "" || substr(value, 1, 1) == "\"" ||
+              substr(value, 1, 1) == sprintf("%c", 39)) {
+            fail("input validator must be a non-empty unquoted scalar")
+          }
+        } else if (key == "defaults") {
+          if (value == "" || substr(value, 1, 1) == "\"" ||
+              substr(value, 1, 1) == sprintf("%c", 39)) {
+            fail("input defaults must be a non-empty unquoted scalar")
+          }
+        } else if (key == "description") {
+          if (value == "" || value ~ /^[|>]/) fail("input description must be a single-line scalar")
+        } else if (key == "values") {
+          if (value != "") fail("SELECT values must use the supported block-list form")
+          values_input = input_count
+        } else {
+          fail("unsupported input key: " key)
+        }
+        next
+      }
+      if (level == 6 && values_input == input_count && raw ~ /^      - /) {
+        value = raw
+        sub(/^      - /, "", value)
+        value = trim(value)
+        if (!plain_select(value) || value ~ /[,#]/) fail("SELECT values must be exact unquoted scalars")
+        if (seen_select[input_count, value]++) fail("duplicate SELECT value: " value)
+        select_count[input_count]++
+        next
+      }
+      fail("unsupported inputs YAML form")
+      next
+    }
+    section == "tasks" {
+      clear_from(level)
+      if (raw ~ /^[ ]*- id:/) {
+        if (!(level - 2 in containers)) {
+          fail("task list item is outside a supported tasks, then, or else container")
+          next
+        }
+        task_count++
+        task_id = mapping_value(raw)
+        if (!plain_identity(task_id)) fail("task id must be an unquoted [A-Za-z0-9_-]+ scalar")
+        if (seen_task_id[task_id]++) fail("duplicate task id: " task_id)
+        tasks[level] = task_count
+        task_ids[task_count] = task_id
+        task_fields[task_count, "id"] = 1
+        next
+      }
+      if (level - 2 in retries) {
+        key = mapping_key(raw)
+        value = mapping_value(raw)
+        task = retries[level - 2]
+        if (retry_fields[task, key]++) fail("duplicate retry key: " key)
+        if (key == "type") {
+          if (value != "constant") fail("retry type must be constant")
+        } else if (key == "interval" || key == "maxDuration") {
+          if (value !~ /^PT[0-9]+([.][0-9]+)?S$/) fail("retry " key " must be a plain second duration")
+        } else if (key == "maxAttempts") {
+          if (value !~ /^[1-9][0-9]*$/) fail("retry maxAttempts must be a positive integer")
+        } else if (key == "warningOnRetry") {
+          if (value !~ /^(true|false)$/) fail("retry warningOnRetry must be true or false")
+        } else {
+          fail("unsupported retry key: " key)
+        }
+        next
+      }
+      if (!(level - 2 in tasks) || raw !~ /^[ ]*[A-Za-z_][A-Za-z0-9_]*:/) {
+        fail("unsupported task YAML form")
+        next
+      }
+      task = tasks[level - 2]
+      key = mapping_key(raw)
+      value = mapping_value(raw)
+      if (task_fields[task, key]++) fail("duplicate task key: " key)
+      if (key == "type") {
+        if (value !~ /^io[.]kestra[.]plugin[.]core[.][A-Za-z0-9_.]+$/) {
+          fail("task type must be an unquoted core-plugin identity")
+        }
+        task_types[task] = value
+      } else if (key == "tasks" || key == "then" || key == "else") {
+        if (value != "") fail("task container " key " must use the supported block-list form")
+        containers[level] = key
+      } else if (key == "retry") {
+        if (value != "") fail("retry must use the supported block-mapping form")
+        retries[level] = task
+      } else if (key == "content") {
+        if (value != "|") fail("content is the only supported block scalar and must use |")
+        block_indent = level
+      } else if (key == "message" || key == "format" || key == "condition" ||
+                 key == "extension" || key == "errorMessage") {
+        if (value == "" || value ~ /^[|>]/) fail("task key " key " must be a single-line scalar")
+      } else {
+        fail("unsupported task key: " key)
+      }
+      next
+    }
+    section == "outputs" {
+      if (level == 2 && raw ~ /^  - id:/) {
+        output_count++
+        output_id = mapping_value(raw)
+        if (!plain_identity(output_id)) fail("output id must be an unquoted [A-Za-z0-9_-]+ scalar")
+        if (seen_output_id[output_id]++) fail("duplicate output id: " output_id)
+        next
+      }
+      if (level == 4 && output_count > 0 && raw ~ /^    [A-Za-z_][A-Za-z0-9_]*:/) {
+        key = mapping_key(raw)
+        value = mapping_value(raw)
+        if (output_fields[output_count, key]++) fail("duplicate output key: " key)
+        if (key == "type") {
+          if (value !~ /^(FILE|STRING)$/) fail("unsupported output type: " value)
+          output_types[output_count] = value
+        } else if (key == "value") {
+          if (value == "" || value ~ /^[|>]/) fail("output value must be a single-line scalar")
+          output_values[output_count] = value
+        } else {
+          fail("unsupported output key: " key)
+        }
+        next
+      }
+      fail("unsupported outputs YAML form")
+      next
+    }
+    {
+      fail("content outside a supported top-level section")
+    }
+    END {
+      if (!("id" in seen_top)) fail("missing top-level id")
+      if (!("namespace" in seen_top)) fail("missing top-level namespace")
+      if (!("labels" in seen_top)) fail("missing top-level labels")
+      if (!("tasks" in seen_top)) fail("missing top-level tasks")
+      if (task_count == 0) fail("tasks must declare at least one task")
+      for (i = 1; i <= input_count; i++) {
+        if (input_types[i] == "") fail("input " input_ids[i] " is missing type")
+        if (input_types[i] == "SELECT" && select_count[i] == 0) {
+          fail("SELECT input " input_ids[i] " declares no values")
+        }
+      }
+      for (i = 1; i <= task_count; i++) {
+        if (task_types[i] == "") fail("task " task_ids[i] " is missing type")
+        type = task_types[i]
+        if (type == "io.kestra.plugin.core.log.Log" && !task_fields[i, "message"]) {
+          fail("Log task " task_ids[i] " is missing message")
+        } else if (type == "io.kestra.plugin.core.debug.Return" && !task_fields[i, "format"]) {
+          fail("Return task " task_ids[i] " is missing format")
+        } else if ((type == "io.kestra.plugin.core.flow.Sequential" ||
+                    type == "io.kestra.plugin.core.flow.Parallel") && !task_fields[i, "tasks"]) {
+          fail("flow wrapper " task_ids[i] " is missing tasks")
+        } else if (type == "io.kestra.plugin.core.flow.If" &&
+                   (!task_fields[i, "condition"] || !task_fields[i, "then"] || !task_fields[i, "else"])) {
+          fail("If task " task_ids[i] " requires condition, then, and else")
+        } else if (type == "io.kestra.plugin.core.storage.Write" &&
+                   (!task_fields[i, "extension"] || !task_fields[i, "content"])) {
+          fail("Write task " task_ids[i] " requires extension and content")
+        } else if (type == "io.kestra.plugin.core.execution.Fail" &&
+                   (!task_fields[i, "errorMessage"] || !task_fields[i, "retry"])) {
+          fail("Fail task " task_ids[i] " requires errorMessage and retry")
+        }
+      }
+      for (pair in task_fields) {
+        split(pair, parts, SUBSEP)
+        task = parts[1]
+        key = parts[2]
+        if (!task_field_allowed(task_types[task], key)) {
+          fail("task " task_ids[task] " uses unsupported key for its type: " key)
+        }
+      }
+      for (i = 1; i <= task_count; i++) {
+        if (task_types[i] == "io.kestra.plugin.core.execution.Fail" &&
+            (!retry_fields[i, "type"] || !retry_fields[i, "interval"] ||
+             !retry_fields[i, "maxAttempts"] || !retry_fields[i, "maxDuration"] ||
+             !retry_fields[i, "warningOnRetry"])) {
+          fail("Fail task " task_ids[i] " requires the complete supported retry shape")
+        }
+      }
+      for (i = 1; i <= output_count; i++) {
+        if (output_types[i] == "") fail("output is missing type")
+        if (output_values[i] == "") fail("output is missing value")
+      }
+      exit problems
     }
   ' "$file"
 }
@@ -325,6 +650,7 @@ fm_kestra_inputs() {
         cur_values US cur_validator US cur_default
       cur_id = ""; cur_type = ""; cur_required = ""; cur_min = ""
       cur_max = ""; cur_values = ""; cur_validator = ""; cur_default = ""
+      in_values = 0
     }
     function scalar(line,   value) {
       value = line
@@ -349,10 +675,19 @@ fm_kestra_inputs() {
       gsub(/^["'\'']|["'\'']$/, "", cur_id)
       next
     }
+    in_values && /^[ \t]*-[ \t]+/ {
+      value = $0
+      sub(/^[ \t]*-[ \t]+/, "", value)
+      sub(/[ \t]+$/, "", value)
+      if (cur_values != "") cur_values = cur_values ","
+      cur_values = cur_values value
+      next
+    }
     {
       key = $0
       sub(/^[ \t]+/, "", key)
       sub(/:.*/, "", key)
+      in_values = 0
       if (key == "type") { cur_type = scalar($0) }
       else if (key == "required") { cur_required = scalar($0) }
       else if (key == "min") { cur_min = scalar($0) }
@@ -361,10 +696,8 @@ fm_kestra_inputs() {
       else if (key == "description") { }
       else if (key == "defaults") { cur_default = scalar($0) }
       else if (key == "values") {
-        cur_values = scalar($0)
-        sub(/^\[/, "", cur_values)
-        sub(/\]$/, "", cur_values)
-        gsub(/[ \t]/, "", cur_values)
+        cur_values = ""
+        in_values = 1
       }
       else { cur_id = "!unknown:" key }
     }
@@ -374,25 +707,43 @@ fm_kestra_inputs() {
 
 # --- static flow validation -------------------------------------------------
 
-# Only Kestra core plugins are allowed. M1 installs no plugins, so a task type
-# outside this prefix would deploy a flow that cannot run and would quietly expand
-# the supply-chain surface the moment someone "fixed" it by installing one.
-FM_KESTRA_ALLOWED_TYPE_PREFIX='io.kestra.plugin.core.'
+fm_kestra_task_type_allowed() {
+  case "$1" in
+    io.kestra.plugin.core.debug.Return|\
+    io.kestra.plugin.core.execution.Fail|\
+    io.kestra.plugin.core.flow.If|\
+    io.kestra.plugin.core.flow.Parallel|\
+    io.kestra.plugin.core.flow.Sequential|\
+    io.kestra.plugin.core.log.Log|\
+    io.kestra.plugin.core.storage.Write)
+      return 0
+      ;;
+  esac
+  return 1
+}
 
 # An input validator is pre-checked locally with POSIX ERE before any execution is
 # created. Kestra evaluates the same pattern as a Java regex, so a pattern using a
 # Java-only construct would be checked by two different engines and the local check
 # would be the weaker one. Refuse those patterns at deploy time instead.
 fm_kestra_validator_is_ere_safe() {
+  local rc=0
   case "$1" in
     *'\d'*|*'\w'*|*'\s'*|*'\D'*|*'\W'*|*'\S'*|*'\b'*|*'\B'*|*'\A'*|*'\z'*|*'\Z'*|*'\p'*|*'(?'*)
       return 1 ;;
   esac
-  return 0
+  printf '' | grep -Eq -- "^($1)$" || rc=$?
+  [ "$rc" -ne 2 ]
 }
 
 fm_kestra_is_integer() {
   [[ $1 =~ ^-?[0-9]+$ ]]
+}
+
+fm_kestra_is_int32() {
+  fm_kestra_is_integer "$1" || return 1
+  [ "$(fm_kestra_compare_integers "$1" -2147483648)" != lt ] \
+    && [ "$(fm_kestra_compare_integers "$1" 2147483647)" != gt ]
 }
 
 # fm_kestra_compare_integers <left> <right>: print lt, eq, or gt without converting
@@ -423,6 +774,7 @@ fm_kestra_compare_integers() {
 # network, no config.
 fm_kestra_check_flow() {
   local file=$1 source=${2:-$1} problems=0 id ns label_value record
+  fm_kestra_supported_yaml "$file" "$source" || problems=1
   id=$(fm_kestra_scalar "$file" id)
   ns=$(fm_kestra_scalar "$file" namespace)
 
@@ -458,19 +810,17 @@ fm_kestra_check_flow() {
       || { printf '%s: task map is missing id\n' "$source" >&2; problems=1; }
     [ -n "$type" ] \
       || { printf '%s: task %s is missing type\n' "$source" "${task_id:-<unknown>}" >&2; problems=1; continue; }
-    case "$type" in
-      "$FM_KESTRA_ALLOWED_TYPE_PREFIX"*) : ;;
-      *)
-        printf '%s: task type outside the core-plugin allow-list: %s\n' "$source" "$type" >&2
-        problems=1
-        ;;
-    esac
+    if ! fm_kestra_task_type_allowed "$type"; then
+      printf '%s: task type outside the core-plugin allow-list for M1-safe tasks: %s\n' \
+        "$source" "$type" >&2
+      problems=1
+    fi
   done <<< "$(fm_kestra_task_records "$file")"
 
   while IFS= read -r record; do
     [ -n "$record" ] || continue
-    local in_id in_type in_min in_max in_values in_validator
-    IFS=$FM_KESTRA_US read -r in_id in_type _ in_min in_max in_values in_validator _ <<< "$record"
+    local in_id in_type in_required in_min in_max in_values in_validator
+    IFS=$FM_KESTRA_US read -r in_id in_type in_required in_min in_max in_values in_validator _ <<< "$record"
     case "$in_id" in
       '!unknown:'*)
         printf '%s: input key this adapter cannot pre-check: %s\n' "$source" "${in_id#!unknown:}" >&2
@@ -478,11 +828,26 @@ fm_kestra_check_flow() {
         continue
         ;;
     esac
+    case "$in_required" in
+      ''|true|false) : ;;
+      *)
+        printf '%s: input %s has invalid required value: %s\n' "$source" "$in_id" "$in_required" >&2
+        problems=1
+        ;;
+    esac
     case "$in_type" in
       INT)
         if { [ -n "$in_min" ] && ! fm_kestra_is_integer "$in_min"; } \
           || { [ -n "$in_max" ] && ! fm_kestra_is_integer "$in_max"; }; then
           printf '%s: input %s has a non-integer min/max\n' "$source" "$in_id" >&2
+          problems=1
+        elif { [ -n "$in_min" ] && ! fm_kestra_is_int32 "$in_min"; } \
+          || { [ -n "$in_max" ] && ! fm_kestra_is_int32 "$in_max"; }; then
+          printf '%s: input %s has min/max outside the signed 32-bit range\n' "$source" "$in_id" >&2
+          problems=1
+        elif [ -n "$in_min" ] && [ -n "$in_max" ] \
+          && [ "$(fm_kestra_compare_integers "$in_min" "$in_max")" = gt ]; then
+          printf '%s: input %s has min greater than max\n' "$source" "$in_id" >&2
           problems=1
         fi
         ;;
@@ -509,23 +874,33 @@ fm_kestra_check_flow() {
 
 # --- flow identity resolution -----------------------------------------------
 
-# fm_kestra_resolve_flow <flow-id>: print the tracked file whose top-level id
-# matches, or fail. This IS the allow-list: an identity with no tracked source is
-# not addressable by any entrypoint.
+# fm_kestra_resolve_flow <flow-id> <out-var>: resolve the identity against this
+# process's immutable HEAD snapshot and store its snapshot path in <out-var>.
 fm_kestra_resolve_flow() {
-  local want=$1 file match=""
+  local want=$1 out_var=$2 file match=""
   case "$want" in
     ''|*[!a-zA-Z0-9_-]*) fm_kestra_die "flow identity is not allow-listed: ${want:-<empty>}" ;;
   esac
-  while IFS= read -r file; do
-    [ -n "$file" ] || continue
+  fm_kestra_ensure_flow_snapshot
+  for file in "${FM_KESTRA_SNAPSHOT_FILES[@]}"; do
     if [ "$(fm_kestra_scalar "$file" id)" = "$want" ]; then
       match=$file
       break
     fi
-  done <<< "$(fm_kestra_flow_files)"
+  done
   [ -n "$match" ] || fm_kestra_die "flow identity is not allow-listed: $want"
-  printf '%s\n' "$match"
+  printf -v "$out_var" '%s' "$match"
+}
+
+fm_kestra_flow_is_in_snapshot() {
+  local want=$1 file
+  fm_kestra_ensure_flow_snapshot
+  for file in "${FM_KESTRA_SNAPSHOT_FILES[@]}"; do
+    if [ "$(fm_kestra_scalar "$file" id)" = "$want" ]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # --- typed input validation -------------------------------------------------
@@ -571,7 +946,7 @@ fm_kestra_validate_inputs() {
     done
 
     if [ "$found" -eq 0 ]; then
-      if [ "$in_required" = "true" ] && [ -z "$in_default" ]; then
+      if [ "${in_required:-true}" = "true" ] && [ -z "$in_default" ]; then
         fm_kestra_die "missing required input: $in_id"
       fi
       continue
@@ -591,6 +966,8 @@ fm_kestra_validate_inputs() {
         if [ -n "$in_max" ] && [ "$(fm_kestra_compare_integers "$value" "$in_max")" = gt ]; then
           fm_kestra_die "input $in_id must be <= $in_max, got: $value"
         fi
+        fm_kestra_is_int32 "$value" \
+          || fm_kestra_die "input $in_id must fit Kestra's signed 32-bit INT range, got: $value"
         ;;
       SELECT)
         local allowed candidate ok=0
@@ -604,7 +981,7 @@ fm_kestra_validate_inputs() {
         if [ -n "$in_validator" ]; then
           fm_kestra_validator_is_ere_safe "$in_validator" \
             || fm_kestra_die "input $in_id has a validator this adapter cannot pre-check"
-          printf '%s' "$value" | grep -Eq -- "$in_validator" \
+          printf '%s' "$value" | grep -Eq -- "^($in_validator)$" \
             || fm_kestra_die "input $in_id must match $in_validator, got: $value"
         fi
         ;;
@@ -635,14 +1012,26 @@ fm_kestra_config_file() {
   printf '%s\n' "${FM_KESTRA_CONFIG:-${FM_CONFIG_OVERRIDE:-$FM_KESTRA_HOME/config}/kestra.env}"
 }
 
+fm_kestra_file_mode() {
+  local mode
+  mode=$(stat -c '%a' "$1" 2>/dev/null) || mode=$(stat -f '%Lp' "$1" 2>/dev/null) || return 1
+  printf '%s\n' "$mode"
+}
+
 # fm_kestra_load_config: populate FM_KESTRA_BASE_URL, FM_KESTRA_TENANT,
 # FM_KESTRA_NAMESPACE, and the credential, then enforce the loopback rule.
 # Environment values win over the file so a caller can drive a test endpoint
 # without writing config; both paths land in the same validation.
 fm_kestra_load_config() {
-  local file line key value
+  local file line key value mode
   file=$(fm_kestra_config_file)
-  if [ -f "$file" ]; then
+  if [ -e "$file" ] || [ -L "$file" ]; then
+    [ -f "$file" ] && [ ! -L "$file" ] \
+      || fm_kestra_die "Kestra config must be a regular, non-symlink file: $file"
+    mode=$(fm_kestra_file_mode "$file") \
+      || fm_kestra_die "could not verify Kestra config permissions: $file"
+    [ "$mode" = 600 ] \
+      || fm_kestra_die "Kestra config must have mode 0600: $file"
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in
         ''|'#'*) continue ;;
@@ -722,17 +1111,29 @@ fm_kestra_assert_loopback() {
 
 # --- private temporary files ------------------------------------------------
 #
-# One owner, so the credential file and the deploy body share a single EXIT trap.
-# A library that installed its own trap alongside a caller's would silently replace
-# it, and the file the caller was cleaning up would survive instead.
+# One owner per shell process, so parent staging files and subshell request
+# credentials cannot replace or inherit each other's cleanup registration.
 
 FM_KESTRA_TEMPFILES=()
+FM_KESTRA_TEMPFILE_PID=""
 
 fm_kestra_tempfile_cleanup() {
   local file
   for file in "${FM_KESTRA_TEMPFILES[@]}"; do
     [ -n "$file" ] && rm -f -- "$file"
   done
+}
+
+fm_kestra_tempfile_register_cleanup() {
+  local pid="$$:${BASH_SUBSHELL:-0}"
+  if [ "$FM_KESTRA_TEMPFILE_PID" != "$pid" ]; then
+    FM_KESTRA_TEMPFILES=()
+    FM_KESTRA_TEMPFILE_PID=$pid
+    trap fm_kestra_tempfile_cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+  fi
 }
 
 # fm_kestra_tempfile <label> <out-var> [directory]: create a fresh mode-0600 temp
@@ -744,15 +1145,13 @@ fm_kestra_tempfile_cleanup() {
 # the moment that subshell ended, deleting the file before the caller could use it.
 fm_kestra_tempfile() {
   local file old_umask dir
+  fm_kestra_tempfile_register_cleanup
   dir=${3:-${TMPDIR:-/tmp}}
   old_umask=$(umask)
   umask 077
   file=$(mktemp "$dir/.fm-kestra-$1.XXXXXX") || { umask "$old_umask"; return 1; }
   umask "$old_umask"
   chmod 0600 "$file" 2>/dev/null || true
-  if [ "${#FM_KESTRA_TEMPFILES[@]}" -eq 0 ]; then
-    trap fm_kestra_tempfile_cleanup EXIT HUP INT TERM
-  fi
   FM_KESTRA_TEMPFILES+=("$file")
   printf -v "$2" '%s' "$file"
 }
@@ -765,15 +1164,26 @@ fm_kestra_tempfile() {
 # namespace administration are denied structurally rather than left undocumented.
 
 # fm_kestra_path_allowed <role> <method> <path>: 0 when the role allows it.
+fm_kestra_path_has_forbidden_segment() {
+  local path=${1%%\?*} segment
+  local segments=()
+  IFS='/' read -r -a segments <<< "$path"
+  for segment in "${segments[@]}"; do
+    case "$segment" in
+      replay|restart|resume|kill|state|set-labels|change-status|secrets|namespaces|users|bindings|apitokens)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
 fm_kestra_path_allowed() {
   local role=$1 method=$2 path=$3
 
   # Belt and braces: no role may ever reach a state-changing or secret surface,
   # whatever its own pattern list says.
-  case "$path" in
-    */replay*|*/restart*|*/resume*|*/kill*|*/state*|*/set-labels*|*/change-status*|*secrets*|*/namespaces*|*/users*|*/bindings*|*/apitokens*)
-      return 1 ;;
-  esac
+  fm_kestra_path_has_forbidden_segment "$path" && return 1
   case "$method" in
     DELETE|PUT|PATCH) return 1 ;;
   esac
@@ -798,7 +1208,7 @@ fm_kestra_path_allowed() {
           tail=${path#"/executions/$ns/"}
           case "$tail" in
             ''|*/*|*'?'*) return 1 ;;
-            *) return 0 ;;
+            *) fm_kestra_flow_is_in_snapshot "$tail" && return 0 ;;
           esac
           ;;
       esac
@@ -843,6 +1253,38 @@ fm_kestra_path_allowed() {
   return 1
 }
 
+fm_kestra_curl_request() {
+  local method=$1 path=$2 output=$3 netrc="" rc
+  shift 3
+  local curl_args=()
+  fm_kestra_tempfile auth netrc || return 1
+  printf 'user = "%s:%s"\n' "$FM_KESTRA_USER" "$FM_KESTRA_PASSWORD" > "$netrc" || {
+    rm -f -- "$netrc"
+    return 1
+  }
+  curl_args=(-q --noproxy '*' --config "$netrc" --fail-with-body -sS \
+    --max-time "${FM_KESTRA_TIMEOUT_S:-30}")
+  curl_args+=("$@")
+  if [ -n "$output" ]; then
+    curl_args+=(--output "$output")
+  fi
+  curl_args+=(--request "$method" "$FM_KESTRA_BASE_URL/api/v1/$FM_KESTRA_TENANT$path")
+  curl "${curl_args[@]}"
+  rc=$?
+  rm -f -- "$netrc"
+  return "$rc"
+}
+
+fm_kestra_request_to_file() {
+  local path=$1 output=$2
+  command -v curl >/dev/null 2>&1 || fm_kestra_die "curl is required for the Kestra seam" 1
+  fm_kestra_path_allowed read GET "$path" \
+    || fm_kestra_die "refused: read may not GET $path"
+  [ -f "$output" ] && [ ! -L "$output" ] \
+    || fm_kestra_die "refused: read output is not a regular staging file"
+  fm_kestra_curl_request GET "$path" "$output"
+}
+
 # fm_kestra_request <role> <method> <path> [structured payload...]
 #
 # Writes the response body to stdout and returns curl's status. The credential is
@@ -857,7 +1299,7 @@ fm_kestra_request() {
   fm_kestra_path_allowed "$role" "$method" "$path" \
     || fm_kestra_die "refused: $role may not $method $path"
 
-  local netrc="" rc body field name
+  local body field name
   local request_args=()
   case "$role" in
     deploy)
@@ -890,20 +1332,5 @@ fm_kestra_request() {
     *) fm_kestra_die "refused: unknown Kestra request role: $role" ;;
   esac
 
-  fm_kestra_tempfile auth netrc || return 1
-  printf 'user = "%s:%s"\n' "$FM_KESTRA_USER" "$FM_KESTRA_PASSWORD" > "$netrc" || {
-    rm -f -- "$netrc"
-    return 1
-  }
-
-  curl -q --noproxy '*' --config "$netrc" --fail-with-body -sS \
-    --max-time "${FM_KESTRA_TIMEOUT_S:-30}" \
-    ${request_args+"${request_args[@]}"} \
-    --request "$method" \
-    "$FM_KESTRA_BASE_URL/api/v1/$FM_KESTRA_TENANT$path"
-  rc=$?
-  # Removed as soon as curl returns, so the credential's window on disk is one
-  # request long. fm_kestra_tempfile's EXIT trap covers an interrupted run.
-  rm -f -- "$netrc"
-  return "$rc"
+  fm_kestra_curl_request "$method" "$path" "" ${request_args+"${request_args[@]}"}
 }

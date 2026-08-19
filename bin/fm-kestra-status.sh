@@ -95,6 +95,17 @@ kestra_get() {
   printf '%s' "$body"
 }
 
+kestra_get_file() {
+  local path=$1 destination=$2 rc=0
+  fm_kestra_request_to_file "$path" "$destination" || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    exit 2
+  elif [ "$rc" -ne 0 ]; then
+    [ ! -s "$destination" ] || cat -- "$destination" >&2
+    fm_kestra_die "read request failed: $path" 1
+  fi
+}
+
 EXEC_JSON=$(kestra_get "/executions/$EXECUTION")
 EXEC_ID=$(printf '%s' "$EXEC_JSON" | jq -er '.id | select(type == "string")') \
   || fm_kestra_die "execution response has no valid id" 1
@@ -106,7 +117,8 @@ FLOW=$(printf '%s' "$EXEC_JSON" | jq -er '.flowId | select(type == "string")') \
   || fm_kestra_die "execution response id does not match the requested execution" 1
 [ "$NS" = "$FM_KESTRA_NAMESPACE" ] \
   || fm_kestra_die "refused: execution $EXECUTION belongs to namespace $NS, not allow-listed namespace $FM_KESTRA_NAMESPACE"
-FLOW_FILE=$(fm_kestra_resolve_flow "$FLOW")
+FLOW_FILE=""
+fm_kestra_resolve_flow "$FLOW" FLOW_FILE
 FLOW_NS=$(fm_kestra_scalar "$FLOW_FILE" namespace)
 [ "$FLOW_NS" = "$FM_KESTRA_NAMESPACE" ] \
   || fm_kestra_die "refused: tracked flow $FLOW does not belong to allow-listed namespace $FM_KESTRA_NAMESPACE"
@@ -201,11 +213,14 @@ case "$SUBCOMMAND" in
       OUT_DIR=$(dirname -- "$OUT")
       fm_kestra_tempfile artifact ARTIFACT_TMP "$OUT_DIR" \
         || fm_kestra_die "could not create an artifact staging file beside $OUT" 1
-      kestra_get "/executions/$EXECUTION/file?path=$ENCODED" > "$ARTIFACT_TMP"
+      kestra_get_file "/executions/$EXECUTION/file?path=$ENCODED" "$ARTIFACT_TMP"
       mv -- "$ARTIFACT_TMP" "$OUT" || fm_kestra_die "could not replace artifact output: $OUT" 1
       printf 'artifact: %s\n' "$OUT"
     else
-      kestra_get "/executions/$EXECUTION/file?path=$ENCODED"
+      fm_kestra_tempfile artifact ARTIFACT_TMP \
+        || fm_kestra_die "could not create an artifact staging file" 1
+      kestra_get_file "/executions/$EXECUTION/file?path=$ENCODED" "$ARTIFACT_TMP"
+      cat -- "$ARTIFACT_TMP"
     fi
     ;;
 esac

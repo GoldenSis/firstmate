@@ -11,8 +11,10 @@
 #   - a flow whose namespace is not the one allow-listed namespace in local config;
 #   - a flow missing the `system.readOnly: "true"` label (without it, the Kestra UI
 #     editor can change a deployed flow and Git review becomes advisory);
-#   - a task type outside `io.kestra.plugin.core.` (M1 installs no plugins);
-#   - an input schema, or a validator regex, this seam cannot faithfully pre-check.
+#   - a task type outside the exact M1-safe allow-list in fm-kestra-lib.sh;
+#   - a YAML shape, input schema, or validator regex this seam cannot represent
+#     and pre-check exactly;
+#   - any trigger, because executions may start only through fm-kestra-run.sh.
 #
 # Usage:
 #   fm-kestra-deploy.sh --check    validate tracked flows only; no config, no network

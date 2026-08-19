@@ -107,7 +107,8 @@ See [`wedge-alarm.md`](wedge-alarm.md) for the channel reference and macOS verif
 ## Kestra execution seam (config/kestra.env)
 
 `config/kestra.env` (local, gitignored) carries the loopback endpoint, tenant, the one allow-listed namespace, and the Basic Auth identity for the Kestra seam.
-No value is committed anywhere; [`examples/kestra-env`](examples/kestra-env) is the copyable shape and [`kestra-seam.md`](kestra-seam.md) owns the seam's boundaries, version pin, and deferred decisions.
+It is home-local and is never inherited or propagated to a secondmate home.
+No value is committed anywhere; [`examples/kestra-env`](examples/kestra-env) is the copyable shape and [`kestra-seam.md`](kestra-seam.md) owns the seam's rationale, boundaries, and deferred decisions.
 The seam is inert without that file: `bin/fm-kestra-deploy.sh --check` still validates the tracked flows offline, and every other entrypoint refuses until an endpoint and namespace are configured.
 
 ## Gate defaults (.no-mistakes.yaml)
@@ -501,6 +502,7 @@ config/backlog-backend  backlog backend override; LOCAL, gitignored; absent or "
 config/backend  runtime session-provider backend override for new tasks; LOCAL, gitignored; absent = falls through to runtime auto-detection (the runtime firstmate itself is executing inside), then tmux; tmux is the verified reference backend (docs/tmux-backend.md), while herdr, zellij, orca, and cmux are experimental spawn backends (docs/herdr-backend.md, docs/zellij-backend.md, docs/orca-backend.md, docs/cmux-backend.md) - herdr and cmux can also be selected by runtime auto-detection, zellij and orca never are (always explicit), and codex-app is not accepted; see docs/codex-app-backend.md; not inherited into secondmate homes
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
+config/kestra.env   loopback Kestra endpoint, namespace, and Basic Auth identity; LOCAL, gitignored, mode 0600; never inherited or propagated to secondmate homes
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
 data/                personal fleet records; LOCAL, gitignored as a whole
   backlog.md         task queue, dependencies, history
