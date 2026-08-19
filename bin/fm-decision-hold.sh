@@ -121,39 +121,73 @@ show_field() {  # <show-output> <field>
   printf '%s\n' "$output" | sed -n "s/^  $field: //p" | head -1
 }
 
-backlog_task_ids() {
-  awk '
-    /^- \[[ xX]\] [A-Za-z0-9][A-Za-z0-9._-]* - / {
-      line = $0
-      sub(/^- \[[ xX]\] /, "", line)
-      sub(/ - .*/, "", line)
-      print line
+backlog_dependents() {  # <blocker-id>
+  local blocker=$1 snapshot
+  snapshot=$(tasks_axi list --fields deps) || return 1
+  printf '%s\n' "$snapshot" | awk -v blocker="$blocker" '
+    function split_row(line, values,    ch, escaped, i, n, quoted) {
+      n = 1
+      values[n] = ""
+      for (i = 1; i <= length(line); i++) {
+        ch = substr(line, i, 1)
+        if (escaped) {
+          values[n] = values[n] ch
+          escaped = 0
+        } else if (quoted && ch == "\\") {
+          escaped = 1
+        } else if (ch == "\"") {
+          quoted = !quoted
+        } else if (!quoted && ch == ",") {
+          n++
+          values[n] = ""
+        } else {
+          values[n] = values[n] ch
+        }
+      }
+      if (quoted || escaped) return 0
+      return n
+    }
+    /^count: [0-9]+$/ {
+      count = $0
+      sub(/^count: /, "", count)
+      count_seen = 1
       next
     }
-    /^- \*\*[A-Za-z0-9][A-Za-z0-9._-]*\*\* - / {
-      line = $0
-      sub(/^- \*\*/, "", line)
-      sub(/\*\* - .*/, "", line)
-      print line
+    /^tasks\[[0-9]+\]\{id,state,kind,repo,title,deps\}:$/ {
+      header_count = $0
+      sub(/^tasks\[/, "", header_count)
+      sub(/\].*$/, "", header_count)
+      header_seen = 1
+      table = 1
+      next
     }
-  ' "$DATA/backlog.md"
-}
-
-backlog_dependents() {  # <blocker-id>
-  local blocker=$1 ids task show deps
-  ids=$(backlog_task_ids) || return 1
-  while IFS= read -r task; do
-    [ -n "$task" ] || continue
-    show=$(task_show "$task") || return 1
-    deps=$(show_field "$show" deps | tr -d '[:space:]')
-    deps=${deps#\"}
-    deps=${deps%\"}
-    case ",$deps," in
-      *",blocked-by:$blocker,"*) printf '%s\n' "$task" ;;
-    esac
-  done <<EOF
-$ids
-EOF
+    table && /^  / {
+      rows++
+      fields = split_row(substr($0, 3), values)
+      if (fields != 6) {
+        invalid = 1
+        next
+      }
+      dependencies = values[6]
+      dependency_count = split(dependencies, dependency, ",")
+      for (i = 1; i <= dependency_count; i++) {
+        if (dependency[i] == "blocked-by:" blocker) {
+          print values[1]
+          break
+        }
+      }
+      next
+    }
+    table { table = 0 }
+    END {
+      if (!count_seen) exit 1
+      if (count == 0) {
+        if (header_seen || rows != 0) exit 1
+        exit 0
+      }
+      if (!header_seen || header_count != count || rows != count || invalid) exit 1
+    }
+  '
 }
 
 require_no_backlog_dependents() {  # <hold-id>

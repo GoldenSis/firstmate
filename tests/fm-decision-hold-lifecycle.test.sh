@@ -119,7 +119,7 @@ write_origin_meta() {  # <home> <id> [kind]
 }
 
 test_active_hold_accepts_durable_no_route_resolution() {
-  local home origin hold before after show
+  local home origin hold before after show dependency_scan_calls
   home=$(make_home active-no-route)
   origin=sample-deferred-review
   mkdir -p "$home/data/$origin"
@@ -137,11 +137,17 @@ test_active_hold_accepts_durable_no_route_resolution() {
   run_decisions "$home" complete "$origin" proposal >/dev/null \
     || fail "could not complete deferred-decision inventory"
   printf 'Deferred until the sample constraints change.\n' > "$home/deferred-decision.txt"
+  cat > "$home/fakebin/tasks-axi" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_HOME/tasks-axi.calls"
+exec "$REAL_TASKS_AXI" "$@"
+EOF
+  chmod +x "$home/fakebin/tasks-axi"
 
   tasks_in "$home" add sample-other-blocker "Unrelated sample blocker" \
     --kind ship --repo sample >/dev/null \
     || fail "could not create an unrelated active blocker"
-  tasks_in "$home" add sample-deferred-dependent "Dependent on the deferred proposal" \
+  tasks_in "$home" add sample-deferred-dependent 'Dependent, "quoted", on the deferred proposal' \
     --kind ship --repo sample >/dev/null \
     || fail "could not create active-hold dependent"
   tasks_in "$home" block sample-deferred-dependent --by sample-other-blocker >/dev/null \
@@ -156,6 +162,13 @@ test_active_hold_accepts_durable_no_route_resolution() {
   assert_grep "backlog tasks remain blocked by it: sample-deferred-dependent" \
     "$home/active-dependent.err" \
     "active no-route resolution did not reject its dependent task"
+  dependency_scan_calls=$(grep -c '^list --fields deps$' "$home/tasks-axi.calls" || true)
+  [ "$dependency_scan_calls" -eq 1 ] \
+    || fail "active no-route resolution did not use one canonical dependency snapshot"
+  assert_no_grep "show sample-other-blocker --full" "$home/tasks-axi.calls" \
+    "dependency scan reparsed an unrelated task"
+  assert_no_grep "show sample-deferred-dependent --full" "$home/tasks-axi.calls" \
+    "dependency scan reparsed the dependent task"
   show=$(tasks_in "$home" show "$hold" --full)
   assert_contains "$show" "state: queued" \
     "failed active no-route resolution closed the captain hold"
