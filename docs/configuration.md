@@ -104,6 +104,12 @@ An absent file means `auto`, i.e. default-on on macOS: the alarm exists precisel
 A missing or failing channel logs and falls through to the next, never crashing the daemon.
 See [`wedge-alarm.md`](wedge-alarm.md) for the channel reference and macOS verification evidence, and [`examples/wedge-alarm`](examples/wedge-alarm) for a copyable config.
 
+## Kestra execution seam (config/kestra.env)
+
+`config/kestra.env` (local, gitignored) carries the loopback endpoint, tenant, the one allow-listed namespace, and the Basic Auth identity for the Kestra seam.
+No value is committed anywhere; [`examples/kestra-env`](examples/kestra-env) is the copyable shape and [`kestra-seam.md`](kestra-seam.md) owns the seam's boundaries, version pin, and deferred decisions.
+The seam is inert without that file: `bin/fm-kestra-deploy.sh --check` still validates the tracked flows offline, and every other entrypoint refuses until an endpoint and namespace are configured.
+
 ## Gate defaults (.no-mistakes.yaml)
 
 The tracked `.no-mistakes.yaml` keeps test evidence outside the repo and defines `commands.test` so no-mistakes runs firstmate's bash behavior suite directly.

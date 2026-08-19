@@ -1,0 +1,31 @@
+# Firstmate Kestra seam, M1 controlled-failure flow. Synthetic data only.
+#
+# This flow exists to keep two behaviours observable and regression-tested: a task
+# that exhausts its configured attempts and reaches a terminal failure, and the
+# task after it never running as a result. `maxAttempts: 3` is three total
+# attempts, not one attempt plus three retries.
+#
+# Git review is the only way this file changes; bin/fm-kestra-deploy.sh is the only
+# authorized path into a Kestra namespace.
+id: m1_controlled_failure
+namespace: firstmate.m1
+
+labels:
+  system.readOnly: "true"
+
+tasks:
+  - id: before_failure
+    type: io.kestra.plugin.core.log.Log
+    message: "controlled failure begins"
+  - id: always_fails
+    type: io.kestra.plugin.core.execution.Fail
+    errorMessage: "synthetic controlled failure, attempt={{ taskrun.attemptsCount }}"
+    retry:
+      type: constant
+      interval: PT0.5S
+      maxAttempts: 3
+      maxDuration: PT10S
+      warningOnRetry: true
+  - id: after_failure
+    type: io.kestra.plugin.core.log.Log
+    message: "this task must not run"
