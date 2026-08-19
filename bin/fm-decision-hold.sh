@@ -37,12 +37,13 @@
 #
 # `resolve --routed-none` explicitly attests that the decision creates no
 # dependent work, such as a decline, a not-now decision, or a duplicate answered
-# by another hold. It is invalid when dependent work exists. `resolve --routed-to`
-# requires every named task to exist and to be blocked by the hold. Both forms
-# write the captain decision and routed-work marker into the hold body. The routed
-# form clears dependency edges before marking the hold Done. A failure before the
-# final close leaves an active captain hold open. A failed repair of an
-# already-Done captain hold leaves it Done and safe to retry.
+# by another hold. It checks one canonical tasks-axi dependency snapshot and is
+# invalid when dependent work exists. `resolve --routed-to` requires every named
+# task to exist and to be blocked by the hold. Both forms write the captain
+# decision and routed-work marker into the hold body. The routed form clears
+# dependency edges before marking the hold Done. A failure before the final close
+# leaves an active captain hold open. A failed repair of an already-Done captain
+# hold leaves it Done and safe to retry.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
