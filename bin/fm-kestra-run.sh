@@ -4,9 +4,9 @@
 # It does exactly one thing: launch one execution of one allow-listed flow with
 # typed, locally pre-checked inputs, and print the opaque execution ID.
 #
-# The allow-list is the tracked kestra/flows/ directory itself. A flow identity with
-# no reviewed source in Git is not addressable here, so the set of runnable flows
-# only changes through Git review and bin/fm-kestra-deploy.sh.
+# The allow-list is the tracked, unchanged kestra/flows/ directory itself. A flow
+# identity with no source in HEAD is not addressable here, and a local flow edit
+# stops execution, so runnable source only changes through Git review and deploy.
 #
 # Denied, structurally rather than by omission:
 #   - replay, restart, resume, kill, and state override;
@@ -101,6 +101,7 @@ RESPONSE=$(fm_kestra_request run POST "/executions/$FM_KESTRA_NAMESPACE/$FLOW" \
 if [ "$RC" -eq 2 ]; then
   exit 2
 elif [ "$RC" -ne 0 ]; then
+  [ -z "$RESPONSE" ] || printf '%s\n' "$RESPONSE" >&2
   fm_kestra_die "execution request failed" 1
 fi
 

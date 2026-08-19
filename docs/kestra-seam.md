@@ -11,9 +11,9 @@ A `SUCCESS` state is evidence that a task ran; it is not approval, not authoriza
 ## Data flow
 
 ```text
-reviewed Git YAML   -> authorized deployer -> immutable Kestra flow
+unchanged Git YAML -> authorized deployer -> immutable Kestra flow
 firstmate request   -> allow-list/input adapter -> Kestra execution ID
-Kestra state/logs/declared outputs -> read-only adapter -> firstmate report
+allow-listed execution/revision/logs/outputs -> read-only adapter -> firstmate report
 ```
 
 Four pieces implement it.
@@ -30,8 +30,9 @@ Read the header before first use rather than relying on this page.
 
 ## What the seam refuses
 
-The allow-list is the tracked `kestra/flows/` directory itself.
-A flow identity with no reviewed source in Git is not addressable, so the set of runnable flows changes only through Git review.
+The allow-list is the unchanged files tracked in Git HEAD directly under `kestra/flows/`.
+A flow identity with no reviewed source in Git is not addressable, and any staged, modified, or untracked YAML in that directory stops the seam.
+There is no production flow-directory override, so the runnable source set changes only through Git review.
 
 `bin/fm-kestra-deploy.sh` refuses a flow whose namespace is not the one namespace named in local config, a flow missing the `system.readOnly: "true"` label, a task type outside `io.kestra.plugin.core.`, and any input schema or validator regex the run adapter could not faithfully pre-check.
 It always updates the namespace with `delete=false`.
@@ -42,6 +43,9 @@ The seam pushes; Kestra never pulls.
 Inputs are validated against the reviewed flow's declared schema before the first byte leaves the machine, so a rejected input never creates an execution.
 
 `bin/fm-kestra-status.sh` returns execution state, task logs, declared outputs, and artifacts the execution itself declared as outputs.
+Every status subcommand first fetches the execution record, then refuses it unless its namespace is the configured namespace and its flow has an unchanged tracked source.
+That refusal happens before any evidence is printed and before a log, artifact, or flow-revision request is made.
+Suppression evidence is calculated from the execution's recorded `flowRevision`, never the current flow source, and is explicitly marked unavailable when that revision cannot be resolved safely.
 An artifact URI the execution did not publish is refused, which keeps the adapter an evidence reader rather than a storage browser.
 
 Underneath all three, `fm_kestra_path_allowed` in `bin/fm-kestra-lib.sh` gates every request by role.
@@ -79,7 +83,9 @@ Nothing under `kestra/` or `bin/` carries a value.
 
 Kestra OSS authenticates one broad Basic Auth identity that can create, execute, replay, change state, and delete through the same API and UI.
 Treat that credential as a disclosure risk.
-The adapters hand it to `curl` through a mode-0600 config file that is removed on exit, and never place it in argv, so it does not appear in a process listing or a shell history.
+The adapters hand it to `curl` through a mode-0600 config file that is removed after the request, and never place it in argv or in credential-named variables inherited by the curl process.
+Curl ignores user configuration and bypasses every proxy before loading that credential, so a loopback request cannot be redirected by `.curlrc` or proxy settings.
+HTTP error responses fail the adapter while retaining the response body as diagnostic evidence.
 
 ## Synthetic data only
 
@@ -97,13 +103,13 @@ The hermetic suite asserts what the seam does; it cannot assert what Kestra's en
 The retry obligation is therefore split into three claims:
 
 1. the reviewed flow configures three total attempts, asserted statically against the tracked YAML;
-2. the status adapter reports the attempts, the `FAILED -> RETRYING -> RUNNING` transitions, the per-attempt error logs, and the suppressed following task without losing or inventing any of them, asserted against a recorded execution shape;
+2. the status adapter reports the attempts, the `FAILED -> RETRYING -> RUNNING` transitions, the per-attempt error logs, and revision-accurate suppressed tasks without losing or inventing any of them, asserted against recorded execution and flow-revision shapes;
 3. Kestra's engine actually performing three attempts, which the hermetic suite does not assert.
 
 Claim 3 is covered by the opt-in live section at the end of that file, which runs only when `FM_KESTRA_LIVE=1` is set and a real loopback Kestra 1.3.34 has the tracked flows deployed.
 Every test name says which claim it belongs to, so no assertion reads as stronger than it is.
 
-Two endpoint shapes are used by the read adapter but were not exercised against a live server during this milestone: `GET /logs/{executionId}` for task logs and `GET /executions/{executionId}/file?path=...` for artifact bytes.
+Three endpoint shapes are used by the read adapter but were not exercised against a live server during this milestone: `GET /logs/{executionId}` for task logs, `GET /executions/{executionId}/file?path=...` for artifact bytes, and `GET /flows/{namespace}/{flowId}?revision=...&source=true` for revision-accurate task topology.
 The live section is what confirms them.
 
 ## Deferred decisions and where they attach

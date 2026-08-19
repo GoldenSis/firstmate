@@ -5,9 +5,10 @@
 # (fm-kestra-deploy.sh, fm-kestra-run.sh, fm-kestra-status.sh) all depend on:
 #
 #   1. Local configuration and the loopback-only endpoint rule.
-#   2. Flow-identity resolution against the TRACKED flows under kestra/flows/.
-#      A flow that is not in Git is not addressable, so Git review is the only
-#      way the set of runnable flows changes.
+#   2. Flow-identity resolution against the tracked, unchanged flows under
+#      kestra/flows/. A flow that is not in HEAD is not addressable, and a local
+#      flow edit stops the seam, so Git review is the only way runnable source
+#      changes.
 #   3. Static flow-source validation: `system.readOnly` label, single allow-listed
 #      namespace, core-plugin-only task types, and an input schema this library can
 #      faithfully pre-check.
@@ -34,7 +35,9 @@
 # credential is treated as a disclosure risk throughout: it is read from gitignored
 # local config, handed to curl through a mode-0600 temp config file that is removed
 # on exit, and never placed in argv, in an exported environment variable curl
-# inherits by name, or in any diagnostic this library prints.
+# inherits by name, or in any diagnostic this library prints. Curl ignores user
+# config, bypasses every proxy, and treats HTTP errors as failures with their
+# response body retained as a diagnostic.
 #
 # Sourced, not executed. Callers source it and then call fm_kestra_load_config.
 # shellcheck shell=bash
@@ -46,7 +49,7 @@ fi
 FM_KESTRA_LIB_SOURCED=1
 
 FM_KESTRA_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FM_KESTRA_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$FM_KESTRA_LIB_DIR/.." && pwd)}"
+FM_KESTRA_ROOT="$(cd "$FM_KESTRA_LIB_DIR/.." && pwd)"
 FM_KESTRA_HOME="${FM_HOME:-$FM_KESTRA_ROOT}"
 
 # The pinned target. Callers print these rather than re-spelling literals.
@@ -66,15 +69,34 @@ fm_kestra_die() {
 # FM_HOME: flows are shared tracked material that Git reviews, not per-home local
 # state that an operator can vary.
 fm_kestra_flows_dir() {
-  printf '%s\n' "${FM_KESTRA_FLOWS_DIR:-$FM_KESTRA_ROOT/kestra/flows}"
+  printf '%s\n' "$FM_KESTRA_ROOT/kestra/flows"
 }
 
 # fm_kestra_flow_files: print every tracked flow file, sorted, one per line.
 fm_kestra_flow_files() {
-  local dir
+  local dir relative untracked
   dir=$(fm_kestra_flows_dir)
   [ -d "$dir" ] || fm_kestra_die "flow directory is unavailable: $dir"
-  find "$dir" -maxdepth 1 -type f -name '*.yaml' | LC_ALL=C sort
+  git -C "$FM_KESTRA_ROOT" rev-parse --verify HEAD >/dev/null 2>&1 \
+    || fm_kestra_die "flow allow-list is unavailable from Git HEAD"
+  git -C "$FM_KESTRA_ROOT" diff --quiet HEAD -- kestra/flows \
+    || fm_kestra_die "tracked flow sources have local changes; commit them before using the seam"
+  untracked=$(git -C "$FM_KESTRA_ROOT" ls-files --others --exclude-standard -- 'kestra/flows/*.yaml')
+  [ -z "$untracked" ] \
+    || fm_kestra_die "untracked flow sources are present; commit or remove them before using the seam"
+  while IFS= read -r relative; do
+    [ -n "$relative" ] || continue
+    case "$relative" in
+      kestra/flows/*.yaml) : ;;
+      *) fm_kestra_die "tracked flow path is outside kestra/flows: $relative" ;;
+    esac
+    case "${relative#kestra/flows/}" in
+      */*) fm_kestra_die "tracked flow source must be directly under kestra/flows: $relative" ;;
+    esac
+    [ ! -L "$FM_KESTRA_ROOT/$relative" ] && [ -f "$FM_KESTRA_ROOT/$relative" ] \
+      || fm_kestra_die "tracked flow source is not a regular file: $relative"
+    printf '%s\n' "$FM_KESTRA_ROOT/$relative"
+  done < <(git -C "$FM_KESTRA_ROOT" ls-files -- 'kestra/flows/*.yaml' | LC_ALL=C sort)
 }
 
 # --- flow source parsing ----------------------------------------------------
@@ -99,47 +121,86 @@ fm_kestra_scalar() {
   ' "$file"
 }
 
-# fm_kestra_task_ids <file>: print every task id declared anywhere in the flow's
-# `tasks:` section, including tasks nested in Sequential/Parallel groups and in
-# both arms of a branch. Ids from `inputs:` and `outputs:` are excluded by tracking
-# which top-level section each line belongs to.
-fm_kestra_task_ids() {
+# fm_kestra_task_records <file>: print the id and plugin type of every task map,
+# separated by US. Task lists are the top-level `tasks:` list and nested `tasks:`,
+# `then:`, and `else:` lists. Other YAML lists cannot change task-map ownership.
+fm_kestra_task_records() {
   awk '
-    /^[a-zA-Z_][a-zA-Z0-9_]*:/ { section = $0; sub(/:.*/, "", section); next }
-    section != "tasks" { next }
-    /^[ \t]*- id:[ \t]*/ {
-      value = $0
-      sub(/^[ \t]*- id:[ \t]*/, "", value)
+    BEGIN { US = sprintf("%c", 31); count = 0 }
+    function indent(line) { match(line, /^[ \t]*/); return RLENGTH }
+    function scalar(line, prefix,   value) {
+      value = line
+      sub(prefix, "", value)
       sub(/[ \t]+$/, "", value)
       gsub(/^["'\'']|["'\'']$/, "", value)
-      if (value != "") print value
+      return value
+    }
+    function clear_from(level,   i) {
+      for (i in owners) if (i >= level) delete owners[i]
+      for (i in current) if (i >= level) delete current[i]
+    }
+    /^[a-zA-Z_][a-zA-Z0-9_]*:/ {
+      clear_from(0)
+      section = $0
+      sub(/:.*/, "", section)
+      if (section == "tasks") owners[0] = "tasks"
+      next
+    }
+    section != "tasks" { next }
+    /^[ \t]*$/ || /^[ \t]*#/ { next }
+    {
+      level = indent($0)
+      clear_from(level)
+    }
+    /^[ \t]*[a-zA-Z_][a-zA-Z0-9_]*:[ \t]*$/ {
+      key = $0
+      sub(/^[ \t]*/, "", key)
+      sub(/:.*/, "", key)
+      owners[level] = key
+      next
+    }
+    /^[ \t]*-[ \t]*/ {
+      parent = -1
+      for (i in owners) {
+        if (i < level && i > parent) parent = i
+      }
+      if (parent < 0 || (owners[parent] != "tasks" && owners[parent] != "then" && owners[parent] != "else")) next
+      count++
+      current[level] = count
+      ids[count] = ""
+      types[count] = ""
+      if ($0 ~ /^[ \t]*-[ \t]+id:[ \t]*/) {
+        ids[count] = scalar($0, "^[ \\t]*-[ \\t]+id:[ \\t]*")
+      } else if ($0 ~ /^[ \t]*-[ \t]+type:[ \t]*/) {
+        types[count] = scalar($0, "^[ \\t]*-[ \\t]+type:[ \\t]*")
+      }
+      next
+    }
+    /^[ \t]*type:[ \t]*/ {
+      task_level = level - 2
+      if (!(task_level in current)) next
+      types[current[task_level]] = scalar($0, "^[ \\t]*type:[ \\t]*")
+    }
+    END {
+      for (i = 1; i <= count; i++) print ids[i] US types[i]
     }
   ' "$1"
 }
 
-# fm_kestra_task_types <file>: print the plugin type of every task in the tasks
-# section. Only a `type:` at a task's own field indentation counts: a task's
-# `retry:` block has its own nested `type: constant`, which is a retry strategy and
-# not a plugin, so counting it would make the core-plugin allow-list reject every
-# flow that configures a retry.
+fm_kestra_task_ids() {
+  local record id
+  while IFS= read -r record; do
+    IFS=$FM_KESTRA_US read -r id _ <<< "$record"
+    [ -n "$id" ] && printf '%s\n' "$id"
+  done <<< "$(fm_kestra_task_records "$1")"
+}
+
 fm_kestra_task_types() {
-  awk '
-    /^[a-zA-Z_][a-zA-Z0-9_]*:/ { section = $0; sub(/:.*/, "", section); next }
-    section != "tasks" { next }
-    /^[ \t]*- / {
-      match($0, /^[ \t]*/)
-      field_indent = RLENGTH + 2
-    }
-    /^[ \t]*type:[ \t]*/ {
-      match($0, /^[ \t]*/)
-      if (RLENGTH != field_indent) next
-      value = $0
-      sub(/^[ \t]*type:[ \t]*/, "", value)
-      sub(/[ \t]+$/, "", value)
-      gsub(/^["'\'']|["'\'']$/, "", value)
-      if (value != "") print value
-    }
-  ' "$1"
+  local record type
+  while IFS= read -r record; do
+    IFS=$FM_KESTRA_US read -r _ type <<< "$record"
+    [ -n "$type" ] && printf '%s\n' "$type"
+  done <<< "$(fm_kestra_task_records "$1")"
 }
 
 # fm_kestra_inputs <file>: print one record per declared input, fields separated by
@@ -228,10 +289,14 @@ fm_kestra_validator_is_ere_safe() {
   return 0
 }
 
+fm_kestra_is_integer() {
+  [[ $1 =~ ^-?[0-9]+$ ]]
+}
+
 # fm_kestra_check_flow <file>: print one `<file>: <problem>` line per problem and
 # return non-zero if any were found. Pure static analysis, no network, no config.
 fm_kestra_check_flow() {
-  local file=$1 problems=0 id ns label_line record
+  local file=$1 problems=0 id ns label_value record
   id=$(fm_kestra_scalar "$file" id)
   ns=$(fm_kestra_scalar "$file" namespace)
 
@@ -246,17 +311,27 @@ fm_kestra_check_flow() {
 
   # The readOnly label is what keeps a deployed flow immutable in the Kestra UI.
   # Without it, Git review is advisory rather than binding.
-  label_line=$(awk '
+  label_value=$(awk '
     /^[a-zA-Z_][a-zA-Z0-9_]*:/ { section = $0; sub(/:.*/, "", section); next }
-    section == "labels" && /^[ \t]*system\.readOnly:[ \t]*/ { print; exit }
+    section == "labels" && /^[ \t]*system\.readOnly:[ \t]*/ {
+      value = $0
+      sub(/^[ \t]*system\.readOnly:[ \t]*/, "", value)
+      sub(/[ \t]+$/, "", value)
+      gsub(/^["'\'']|["'\'']$/, "", value)
+      print value
+    }
   ' "$file")
-  case "$label_line" in
-    *true*) : ;;
-    *) printf '%s: missing label system.readOnly: "true"\n' "$file" >&2; problems=1 ;;
-  esac
+  [ "$label_value" = true ] \
+    || { printf '%s: missing label system.readOnly: "true"\n' "$file" >&2; problems=1; }
 
-  while IFS= read -r type; do
-    [ -n "$type" ] || continue
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    local task_id type
+    IFS=$FM_KESTRA_US read -r task_id type <<< "$record"
+    [ -n "$task_id" ] \
+      || { printf '%s: task map is missing id\n' "$file" >&2; problems=1; }
+    [ -n "$type" ] \
+      || { printf '%s: task %s is missing type\n' "$file" "${task_id:-<unknown>}" >&2; problems=1; continue; }
     case "$type" in
       "$FM_KESTRA_ALLOWED_TYPE_PREFIX"*) : ;;
       *)
@@ -264,7 +339,7 @@ fm_kestra_check_flow() {
         problems=1
         ;;
     esac
-  done <<< "$(fm_kestra_task_types "$file")"
+  done <<< "$(fm_kestra_task_records "$file")"
 
   while IFS= read -r record; do
     [ -n "$record" ] || continue
@@ -279,9 +354,11 @@ fm_kestra_check_flow() {
     esac
     case "$in_type" in
       INT)
-        case "$in_min$in_max" in
-          *[!0-9-]*) printf '%s: input %s has a non-integer min/max\n' "$file" "$in_id" >&2; problems=1 ;;
-        esac
+        if { [ -n "$in_min" ] && ! fm_kestra_is_integer "$in_min"; } \
+          || { [ -n "$in_max" ] && ! fm_kestra_is_integer "$in_max"; }; then
+          printf '%s: input %s has a non-integer min/max\n' "$file" "$in_id" >&2
+          problems=1
+        fi
         ;;
       SELECT)
         [ -n "$in_values" ] || { printf '%s: SELECT input %s declares no values\n' "$file" "$in_id" >&2; problems=1; }
@@ -374,11 +451,14 @@ fm_kestra_validate_inputs() {
       continue
     fi
 
+    case "$value" in
+      *$'\r'*|*$'\n'*) fm_kestra_die "input $in_id must be a single-line value" ;;
+    esac
+
     case "$in_type" in
       INT)
-        case "$value" in
-          ''|*[!0-9-]*|-*-*) fm_kestra_die "input $in_id must be an integer, got: $value" ;;
-        esac
+        fm_kestra_is_integer "$value" \
+          || fm_kestra_die "input $in_id must be an integer, got: $value"
         if [ -n "$in_min" ] && [ "$value" -lt "$in_min" ]; then
           fm_kestra_die "input $in_id must be >= $in_min, got: $value"
         fi
@@ -463,6 +543,7 @@ fm_kestra_load_config() {
   FM_KESTRA_TENANT=${FM_KESTRA_TENANT:-main}
   : "${FM_KESTRA_BASE_URL:=}" "${FM_KESTRA_NAMESPACE:=}"
   : "${FM_KESTRA_USER:=}" "${FM_KESTRA_PASSWORD:=}"
+  export -n FM_KESTRA_USER FM_KESTRA_PASSWORD
 
   [ -n "$FM_KESTRA_BASE_URL" ] \
     || fm_kestra_die "FM_KESTRA_BASE_URL is not configured (see $file)"
@@ -519,33 +600,34 @@ fm_kestra_assert_loopback() {
 # A library that installed its own trap alongside a caller's would silently replace
 # it, and the file the caller was cleaning up would survive instead.
 
-FM_KESTRA_TEMPFILES=""
+FM_KESTRA_TEMPFILES=()
 
 fm_kestra_tempfile_cleanup() {
   local file
-  for file in $FM_KESTRA_TEMPFILES; do
+  for file in "${FM_KESTRA_TEMPFILES[@]}"; do
     [ -n "$file" ] && rm -f -- "$file"
   done
 }
 
-# fm_kestra_tempfile <label> <out-var>: create a fresh mode-0600 temp file and
-# store its path in <out-var>, registered for removal when the calling script exits
-# or is interrupted.
+# fm_kestra_tempfile <label> <out-var> [directory]: create a fresh mode-0600 temp
+# file and store its path in <out-var>, registered for removal when the calling
+# script exits or is interrupted.
 #
 # The path is returned through a variable rather than stdout on purpose. A
 # `$(...)` capture runs in a subshell, and the EXIT trap this registers would fire
 # the moment that subshell ended, deleting the file before the caller could use it.
 fm_kestra_tempfile() {
-  local file old_umask
+  local file old_umask dir
+  dir=${3:-${TMPDIR:-/tmp}}
   old_umask=$(umask)
   umask 077
-  file=$(mktemp "${TMPDIR:-/tmp}/.fm-kestra-$1.XXXXXX") || { umask "$old_umask"; return 1; }
+  file=$(mktemp "$dir/.fm-kestra-$1.XXXXXX") || { umask "$old_umask"; return 1; }
   umask "$old_umask"
   chmod 0600 "$file" 2>/dev/null || true
-  if [ -z "$FM_KESTRA_TEMPFILES" ]; then
+  if [ "${#FM_KESTRA_TEMPFILES[@]}" -eq 0 ]; then
     trap fm_kestra_tempfile_cleanup EXIT HUP INT TERM
   fi
-  FM_KESTRA_TEMPFILES="$FM_KESTRA_TEMPFILES $file"
+  FM_KESTRA_TEMPFILES+=("$file")
   printf -v "$2" '%s' "$file"
 }
 
@@ -597,7 +679,38 @@ fm_kestra_path_allowed() {
       ;;
     read)
       case "$method $path" in
-        'GET /executions/'*|'GET /logs/'*) return 0 ;;
+        'GET /executions/'*)
+          tail=${path#/executions/}
+          case "$tail" in
+            ''|*'?'*|*/*|*[!a-zA-Z0-9_-]*) : ;;
+            *) return 0 ;;
+          esac
+          case "$tail" in
+            */file\?path=*)
+              local execution=${tail%%/*} encoded=${tail#*/file?path=}
+              case "$execution" in ''|*[!a-zA-Z0-9_-]*) return 1 ;; esac
+              case "$encoded" in ''|*[!a-zA-Z0-9%._~-]*) return 1 ;; esac
+              return 0
+              ;;
+          esac
+          ;;
+        'GET /logs/'*)
+          tail=${path#/logs/}
+          case "$tail" in ''|*'?'*|*/*|*[!a-zA-Z0-9_-]*) : ;; *) return 0 ;; esac
+          ;;
+        "GET /flows/$ns/"*)
+          [ -n "$ns" ] || return 1
+          tail=${path#"/flows/$ns/"}
+          case "$tail" in
+            *'?revision='*'&source=true')
+              local flow=${tail%%\?*} revision=${tail#*'?revision='}
+              revision=${revision%&source=true}
+              case "$flow" in ''|*/*|*[!a-zA-Z0-9_-]*) return 1 ;; esac
+              case "$revision" in ''|*[!0-9]*) return 1 ;; esac
+              return 0
+              ;;
+          esac
+          ;;
       esac
       ;;
   esac
@@ -623,7 +736,7 @@ fm_kestra_request() {
     return 1
   }
 
-  curl --config "$netrc" -sS -X "$method" \
+  curl -q --noproxy '*' --config "$netrc" --fail-with-body -sS -X "$method" \
     --max-time "${FM_KESTRA_TIMEOUT_S:-30}" \
     "$@" \
     "$FM_KESTRA_BASE_URL/api/v1/$FM_KESTRA_TENANT$path"

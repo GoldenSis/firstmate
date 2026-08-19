@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # fm-kestra-deploy.sh - the authorized deploy-after-merge step for the Kestra seam.
 #
-# This is the ONLY path from firstmate's tracked kestra/flows/ into a Kestra
-# namespace. Kestra is deliberately never given permission to pull and reconcile
-# Git itself: upstream documents that Git-driven synchronization can DELETE objects
-# depending on the source-of-truth setting, so this script pushes instead, and
-# always with `delete=false`.
+# This is the ONLY path from firstmate's tracked, unchanged kestra/flows/ into a
+# Kestra namespace. A staged, modified, or untracked flow stops deployment. Kestra
+# is deliberately never given permission to pull and reconcile Git itself: upstream
+# documents that Git-driven synchronization can DELETE objects depending on the
+# source-of-truth setting, so this script pushes instead, always with `delete=false`.
 #
 # What it refuses, before any request leaves the machine:
 #   - a flow whose namespace is not the one allow-listed namespace in local config;
@@ -48,8 +48,10 @@ FILES=$(fm_kestra_flow_files)
 
 problems=0
 declared_ns=""
+flow_count=0
 while IFS= read -r file; do
   [ -n "$file" ] || continue
+  flow_count=$((flow_count + 1))
   fm_kestra_check_flow "$file" || problems=1
   ns=$(fm_kestra_scalar "$file" namespace)
   if [ -z "$declared_ns" ]; then
@@ -73,6 +75,7 @@ fi
 # --- authorization ----------------------------------------------------------
 
 fm_kestra_load_config
+command -v jq >/dev/null 2>&1 || fm_kestra_die "jq is required for the Kestra seam" 1
 [ "$declared_ns" = "$FM_KESTRA_NAMESPACE" ] || fm_kestra_die \
   "tracked flows declare namespace $declared_ns but only $FM_KESTRA_NAMESPACE is allow-listed"
 
@@ -95,24 +98,27 @@ validation=$(fm_kestra_request deploy POST /flows/validate \
 if [ "$rc" -eq 2 ]; then
   exit 2
 elif [ "$rc" -ne 0 ]; then
+  [ -z "$validation" ] || printf '%s\n' "$validation" >&2
   fm_kestra_die "flow validation request failed" 1
 fi
-case "$validation" in
-  *'"constraints":null'*|*'"constraints": null'*|'[]'|'') : ;;
-  *'"constraints"'*)
-    printf '%s\n' "$validation" >&2
-    fm_kestra_die "server rejected a tracked flow" 1
-    ;;
-esac
+if ! printf '%s' "$validation" | jq -e --argjson expected "$flow_count" '
+  type == "array" and
+  length == $expected and
+  all(.[]; type == "object" and has("constraints") and .constraints == null)
+' >/dev/null 2>&1; then
+  [ -z "$validation" ] || printf '%s\n' "$validation" >&2
+  fm_kestra_die "server rejected a tracked flow or returned an incomplete validation result" 1
+fi
 
 # `delete=false` is not a default worth trusting to a caller: deletion stays off.
 rc=0
-fm_kestra_request deploy POST \
+update_response=$(fm_kestra_request deploy POST \
   "/flows/bulk?delete=false&namespace=$FM_KESTRA_NAMESPACE" \
-  -H 'Content-Type: application/x-yaml' --data-binary "@$BODY" >/dev/null || rc=$?
+  -H 'Content-Type: application/x-yaml' --data-binary "@$BODY") || rc=$?
 if [ "$rc" -eq 2 ]; then
   exit 2
 elif [ "$rc" -ne 0 ]; then
+  [ -z "$update_response" ] || printf '%s\n' "$update_response" >&2
   fm_kestra_die "namespace update failed" 1
 fi
 
