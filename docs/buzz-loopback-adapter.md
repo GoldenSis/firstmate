@@ -1,6 +1,6 @@
-# Buzz loopback adapter (Milestone 1 proof of concept)
+# Buzz loopback adapter
 
-A one-way publisher that renders Firstmate's bearings projection into a private channel on a locally self-hosted Buzz relay.
+A one-way publisher that renders Firstmate's bearings projection into a private channel on a locally self-hosted Buzz relay, and each live crewmate's own status stream into a channel of its own.
 It is additive: nothing in Firstmate reads it, depends on it, or waits for it.
 
 This document is the reference for the adapter and the record of what was verified against a running relay.
@@ -12,6 +12,7 @@ Buzz is Block's open-source Nostr-based workspace (Apache-2.0).
 Its relevant property is that every message is an individually signed, individually verified event in an append-only log, and a private channel is enforced server-side - when membership is required - rather than trusted from the client.
 The M1 stack deliberately does not require it, so nothing here relies on that enforcement; see invariant 2.
 The adapter uses exactly that and nothing else: it signs one event per invocation carrying `bin/fm-bearings-snapshot.sh --json` verbatim, and publishes it to a private channel on a relay bound to loopback.
+`bin/fm-buzz-refresh.sh` is the single call that publishes the fleet channel and then one lane per live crewmate, each lane an ordinary invocation of the same publisher against its own channel.
 
 The projection is already report-shaped, so the adapter is a renderer rather than a data model.
 In particular the projection's `omitted[]` disclosure array is passed through untouched, because a bounded projection whose truncation disclosure was stripped in transit is worse than no projection at all: an absence stops being unambiguous.
@@ -56,6 +57,52 @@ Each one is the reason a specific failure mode cannot occur, and breaching any o
    Buzz's own `request_approval` is unimplemented upstream and fails runs that reach it, and it must not be built on regardless.
    An approval that arrives via Buzz is evidence, never authority.
 
+## Per-crew lanes
+
+The fleet channel answers "what is the fleet doing".
+It does not answer "what is this one crewmate doing", because every crewmate's status is flattened into one document with nothing distinguishing them.
+A lane fixes that: one channel per live task, carrying that task's own status stream and its identity, so the captain can open one place per crewmate and watch it work.
+
+### The mechanism, and why it is (a)
+
+Two mechanisms were on the table: a derived channel per task, or Buzz's native threads inside the existing channel.
+This ships the derived channel, and did not half-build the other.
+`channelIdForLabel` was made derivable on purpose - it hashes `firstmate-buzz-channel:<label>`, takes 16 bytes, and sets the v5 and variant bits - so a per-crew channel is a new NAME through a function that is already tested, and the replay cache is already partitioned by `<endpoint-digest>/<channel-id>/`, so multi-channel publication needs no new storage, no new lock, and no new wire protocol.
+Threads would be tidier for a reader, but this adapter speaks only the NIP-01 and NIP-29 subset it needs; nothing in `bin/fm-buzz-lib.mjs` addresses a thread, so taking that route means new protocol surface on a pre-1.0 relay that can move under the adapter at any time.
+Channel sprawl is the price paid, and it is the cheaper one: a channel per live task is bounded by the fleet, and every lane id is recomputable from the home and the task id with nothing to persist.
+
+### The label
+
+`crewChannelLabel(<fleet label>, <task id>)` returns `firstmate-crew:<sha256(fleet label)>:<task id>`, which is then hashed by the unchanged `channelIdForLabel`.
+The fleet label is hashed rather than concatenated because appending is not injective: a home path that happened to end in the separator plus another id would derive the same string as a different home publishing that task.
+A task id is restricted to `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, which excludes the separator, so the encoding is unambiguous by construction; an id outside that set is refused rather than published to some other channel.
+The fleet label itself is untouched, so the fleet channel keeps the exact id it has always had and a captain reading it does not silently lose their history.
+`tests/fm-buzz-crew-lanes.test.sh` pins the derived id of a fixed label against its literal value, so a change to that derivation fails rather than quietly re-homing the channel.
+
+### What a lane carries
+
+Each lane is itself a valid `fm-bearings.v1` projection with `view: "crew-lane"`: the same `home`, `generated` and `prs` identity, an `in_flight[]` narrowed to exactly one row, plus `crew{id,kind,harness,mode}` and the bounded `status_events[]` for that task.
+Being a valid projection is what lets the publisher validate and sign it through the path it already had, with no second contract to keep in sync.
+The fleet projection's `omitted[]` is carried through untouched and each lane's own bounds - events dropped by the line cap, a status log read only from its last bytes, per-event text truncation, an absent status log, an in-flight entry with no current task record - are appended after it.
+
+Invariant 4 was the load-bearing question here, so the reasoning is recorded rather than assumed.
+A lane may carry only what the fleet projection already publishes about a task, at more depth, and never a surface that projection deliberately dropped.
+The deliberate drops are the ones it enumerates in its own `omitted[]`: backlog item bodies, task paths, watch/steer actions, and healthy endpoint detail.
+None of them appear in a lane, and `bin/fm-buzz-crew-lanes.sh` withholds worktree paths, home paths, status-log paths, endpoint targets and backends even though it has them in hand.
+Status-line text is not on that list: the fleet projection already publishes it as `in_flight[].doing`, so a lane publishes more of the same stream, bounded and disclosed, rather than a new surface.
+The lane set is exactly the `in_flight[]` set the fleet projection already published, so a task the fleet projection bounded away does not gain a lane by the back door.
+
+`bin/fm-fleet-snapshot.sh --json` was checked before any new reader was written, as the rule requires.
+It exposes per-task `kind`, `harness`, `mode` and `paths.status_log.last_event`, but only that last event - never the stream - so the stream is read from the path the canonical snapshot names, bounded and disclosed.
+The snapshot is consulted once per refresh, and it is reconciled with the bearings projection by task id rather than assumed to be simultaneous.
+
+### The trigger
+
+Nothing auto-invokes any of this.
+`bin/fm-buzz-refresh.sh` is one explicit call firstmate can make after a wake drain, and it is deliberately not a daemon, a watcher hook, a timer, or anything in a crewmate's own execution path.
+That is what keeps invariant 3 real: Buzz stays off the critical path of both firstmate and every crewmate, so a relay that is down, slow, or absent cannot break a merge, a teardown, a wake drain, or a turn end.
+The refresh forwards the fleet publication's exit status unchanged - the contract `bin/fm-buzz-publish.sh` already owned - and treats every crew-lane failure as a logged non-event, because an additive surface may never make anything louder than it was.
+
 ## Using it
 
 Bring the relay up, publish, read back, tear down.
@@ -70,8 +117,10 @@ For native Docker:
 ```
 docker compose -f docker-compose.buzz-loopback.yml up -d
 bin/fm-buzz-keypair.sh                                             # once; prints the public key
-bin/fm-buzz-publish.sh --refresh                                   # publish current bearings
+bin/fm-buzz-refresh.sh                                             # publish the fleet channel and every crew lane
+bin/fm-buzz-publish.sh --refresh                                   # or: the fleet channel alone
 bin/fm-buzz-inspect.sh --full                                      # read it back (human diagnostic)
+bin/fm-buzz-inspect.sh --crew <task id> --full                     # read one crewmate's lane back
 docker compose -f docker-compose.buzz-loopback.yml down -v         # clean slate, volumes included
 ```
 
@@ -88,7 +137,7 @@ ssh -F "$buzz_colima_config" -M -S "$buzz_colima_control" -fN \
   -L 127.0.0.1:3000:127.0.0.1:3000 \
   -L '[::1]:3000:127.0.0.1:3000' colima
 bin/fm-buzz-keypair.sh                                             # once; prints the public key
-bin/fm-buzz-publish.sh --refresh                                   # publish current bearings
+bin/fm-buzz-refresh.sh                                             # publish the fleet channel and every crew lane
 bin/fm-buzz-inspect.sh --full                                      # read it back (human diagnostic)
 docker compose -f docker-compose.buzz-loopback.yml down -v         # clean slate, volumes included
 ssh -F "$buzz_colima_config" -S "$buzz_colima_control" -O exit colima
@@ -200,7 +249,8 @@ The relay stack is disposable by design, while durable adapter target records su
 
 ## Out of scope
 
-Per-task rooms, artifact delivery, and channel membership management are Milestone 2.
+Per-task lanes shipped; see [Per-crew lanes](#per-crew-lanes) above.
+Artifact delivery and channel membership management are still Milestone 2.
 NIP-OA signed approval provenance is Milestone 3.
 Reading state back from Buzz, canvases, Buzz workflows, and any hosted account are out of scope permanently, or until the study that ruled them out is re-opened.
 

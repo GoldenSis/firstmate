@@ -33,9 +33,20 @@
 # greps this file to assert `set -e` has not crept back in.
 # ===========================================================================
 #
+# ONE INVOCATION, ONE CHANNEL. This script publishes one projection into one
+# channel, and that is still true now that the adapter has per-crew lanes: a lane
+# is just another invocation with --channel-label set to that crewmate's derived
+# label. bin/fm-buzz-refresh.sh is the single entry point that walks the fleet
+# channel and every lane; bin/fm-buzz-crew-lanes.sh owns what a lane contains and
+# bin/fm-buzz-lib.mjs's crewChannelLabel owns how a lane label is derived. Nothing
+# here changed for the fleet channel, whose label derivation is byte-identical to
+# what it always was, so it keeps the channel id a captain has been reading.
+#
 # The published event is one append-only NIP-29 channel message whose content is
 # the `fm-bearings-snapshot.sh --json` projection VERBATIM, including its
-# omitted[] disclosure array. The disclosure is what makes a bounded projection
+# omitted[] disclosure array. A per-crew lane is itself a valid fm-bearings.v1
+# projection narrowed to one task, so it is validated and signed by this same
+# path with no second contract. The disclosure is what makes a bounded projection
 # honest - it states what was dropped and how to reveal it - so it is passed
 # through untouched rather than summarised or stripped.
 #

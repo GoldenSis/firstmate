@@ -498,3 +498,21 @@ fm_buzz_channel_id() {  # <script dir> <label>
     });
   ' "$script_dir/fm-buzz-lib.mjs" "$label"
 }
+
+# Print the per-crew lane label for one task under a fleet label. Same reason as
+# above: the publisher derives it to address a lane and the inspector derives it
+# to read one back, so there is exactly one caller-visible spelling.
+# bin/fm-buzz-lib.mjs owns the encoding and the task-id character set; a rejected
+# id exits non-zero here rather than falling back to some other channel.
+fm_buzz_crew_channel_label() {  # <script dir> <fleet label> <task id>
+  local script_dir=${1:?script dir required} fleet_label=${2-} task_id=${3-}
+  # shellcheck disable=SC2016 # Node source, not a shell expansion.
+  node -e '
+    import(process.argv[1]).then(({ crewChannelLabel }) => {
+      process.stdout.write(crewChannelLabel(process.argv[2], process.argv[3]));
+    }).catch((error) => {
+      process.stderr.write(`${error.message}\n`);
+      process.exitCode = 1;
+    });
+  ' "$script_dir/fm-buzz-lib.mjs" "$fleet_label" "$task_id"
+}
