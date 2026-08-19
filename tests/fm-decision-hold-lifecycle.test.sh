@@ -118,8 +118,50 @@ write_origin_meta() {  # <home> <id> [kind]
     "mode=$kind"
 }
 
+test_active_hold_accepts_durable_no_route_resolution() {
+  local home origin hold before after
+  home=$(make_home active-no-route)
+  origin=sample-deferred-review
+  mkdir -p "$home/data/$origin"
+  tasks_in "$home" add "$origin" "Review a deferred sample proposal" \
+    --kind scout --repo sample --start >/dev/null \
+    || fail "could not create deferred-decision origin"
+  write_origin_meta "$home" "$origin"
+  printf 'done: report complete\n' > "$home/state/$origin.status"
+  printf '# Deferred sample proposal\n\nThe captain deferred the proposal.\n' \
+    > "$home/data/$origin/report.md"
+
+  hold=$(run_decisions "$home" hold "$origin" proposal \
+    --title "Decide the deferred proposal" --reason "captain proposal decision pending" --repo sample) \
+    || fail "could not register deferred-decision hold"
+  run_decisions "$home" complete "$origin" proposal >/dev/null \
+    || fail "could not complete deferred-decision inventory"
+  printf 'Deferred until the sample constraints change.\n' > "$home/deferred-decision.txt"
+
+  run_decisions "$home" resolve "$origin" proposal \
+    --decision-file "$home/deferred-decision.txt" --routed-none >/dev/null \
+    || fail "could not close an active hold with no routed work"
+  before=$(tasks_in "$home" show "$hold" --full)
+  assert_contains "$before" "state: done" "no-route resolution did not close the active hold"
+  assert_contains "$before" "Resolution recorded by fm-decision-hold." \
+    "active no-route resolution omitted the resolution marker"
+  assert_contains "$before" "Deferred until the sample constraints change." \
+    "active no-route resolution omitted the captain decision"
+  assert_contains "$before" "- None (no dependent work)." \
+    "active no-route resolution omitted the explicit none entry"
+
+  run_decisions "$home" resolve "$origin" proposal \
+    --decision-file "$home/deferred-decision.txt" --routed-none >/dev/null \
+    || fail "active no-route resolution retry was not idempotent"
+  after=$(tasks_in "$home" show "$hold" --full)
+  [ "$before" = "$after" ] || fail "active no-route resolution retry changed the hold"
+  run_decisions "$home" verify "$origin" >/dev/null \
+    || fail "active no-route resolution did not pass inventory verification"
+  pass "active captain holds close, retry, and verify with no routed work"
+}
+
 test_declined_hold_requires_and_accepts_durable_no_route_resolution() {
-  local home origin declined_hold routed_hold show declined_body routed_body
+  local home origin declined_hold routed_hold collision_hold show declined_body routed_body
   home=$(make_home declined-resolution)
   origin=sample-declined-review
   mkdir -p "$home/data/$origin"
@@ -218,7 +260,24 @@ test_declined_hold_requires_and_accepts_durable_no_route_resolution() {
     "routed resolution body looked like a no-route attestation"
   assert_contains "$show" "- sample-followup-implementation" \
     "routed resolution body lost its dependent task"
-  pass "declined holds can be durably resolved with an explicit no-route attestation"
+
+  collision_hold=$(run_decisions "$home" id "$origin" collision)
+  tasks_in "$home" add "$collision_hold" "Unrelated completed captain task" \
+    --kind captain --repo sample >/dev/null \
+    || fail "could not create completed captain-task collision"
+  tasks_in "$home" "done" "$collision_hold" >/dev/null \
+    || fail "could not close completed captain-task collision"
+  if run_decisions "$home" resolve "$origin" collision \
+    --decision-file "$home/declined-decision.txt" --routed-none \
+    > "$home/collision.out" 2> "$home/collision.err"; then
+    fail "no-route repair overwrote a completed captain task that was never held"
+  fi
+  assert_grep "is not held for the captain" "$home/collision.err" \
+    "no-route repair did not require retained captain-hold identity"
+  show=$(tasks_in "$home" show "$collision_hold" --full)
+  assert_not_contains "$show" "Resolution recorded by fm-decision-hold." \
+    "failed collision repair changed the unrelated captain task"
+  pass "declined holds repair only retained captain-held identities"
 }
 
 test_structured_holds_survive_teardown_and_route_resolution() {
@@ -655,6 +714,7 @@ test_resolve_matches_quoted_blocked_by_edges() {
 
 test_uninventoried_report_decision_refuses_completion
 
+test_active_hold_accepts_durable_no_route_resolution
 test_declined_hold_requires_and_accepts_durable_no_route_resolution
 
 test_scout_teardown_always_requires_inventory_verification

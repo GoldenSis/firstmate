@@ -41,7 +41,8 @@
 # requires every named task to exist and to be blocked by the hold. Both forms
 # write the captain decision and routed-work marker into the hold body. The routed
 # form clears dependency edges before marking the hold Done. A failure before the
-# final step leaves an active captain hold open.
+# final close leaves an active captain hold open. A failed repair of an
+# already-Done captain hold leaves it Done and safe to retry.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -373,7 +374,7 @@ EOF
 }
 
 command_resolve() {
-  local origin=${1:-} key=${2:-} decision_file='' id='' decision='' decision_digest='' body='' routed='' routed_csv='' dep show blocked state kind hold_show hold_body resolution_recorded=0 routed_none=0 hold_was_done=0
+  local origin=${1:-} key=${2:-} decision_file='' id='' decision='' decision_digest='' body='' routed='' routed_csv='' dep show blocked state kind hold_kind hold_show hold_body resolution_recorded=0 routed_none=0 hold_was_done=0
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
   shift 2
   while [ "$#" -gt 0 ]; do
@@ -415,7 +416,10 @@ command_resolve() {
     hold_show=$(task_show "$id") || fail "captain hold $id is absent from $FM_HOME/data/backlog.md"
     state=$(show_field "$hold_show" state)
     kind=$(show_field "$hold_show" kind)
-    if [ "$state" = "done" ] && [ "$kind" = captain ]; then
+    hold_kind=$(show_field "$hold_show" hold_kind)
+    if [ "$state" = "done" ]; then
+      [ "$kind" = captain ] || fail "backlog item $id is not kind captain"
+      [ "$hold_kind" = captain ] || fail "backlog item $id is not held for the captain"
       hold_was_done=1
     else
       verify_hold_active "$id"
