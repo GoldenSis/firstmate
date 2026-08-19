@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # fm-kestra-status.sh - the read-only half of firstmate's Kestra seam.
 #
-# It returns four kinds of evidence and nothing else: execution state, task logs,
-# declared flow outputs, and artifacts a flow actually declared as an output. Before
-# any evidence is printed or any follow-up request is made, the execution must resolve
-# to the configured namespace and a tracked, unchanged flow. Every request goes
-# through the `read` role of fm-kestra-lib.sh's HTTP gate, which allows only the exact
-# execution, log, artifact, and recorded-flow-revision GET shapes used here.
-#
-# Replay LINEAGE is readable through `lineage`, because knowing an execution was
-# derived from another one is evidence. Performing a replay is not offered by any
-# subcommand and is refused by the gate.
+# It returns five kinds of evidence and nothing else: execution state, task logs,
+# declared flow outputs, replay lineage, and artifacts a flow actually declared as
+# an output. Before any evidence is printed or any follow-up request is made, the
+# execution must resolve to the configured namespace and a tracked, unchanged flow.
+# Every request goes through the `read` role of fm-kestra-lib.sh's HTTP gate, which
+# allows only the exact execution, log, artifact, and recorded-flow-revision GET
+# shapes used here. Performing a replay is not offered by any subcommand and is
+# refused by the gate.
 #
 # A state this prints is evidence that a task ran. It is never approval, never
 # authorization, and never a business decision; nothing downstream may treat a

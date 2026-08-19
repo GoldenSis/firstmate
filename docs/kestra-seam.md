@@ -33,6 +33,7 @@ Read the header before first use rather than relying on this page.
 The allow-list is the unchanged files tracked in Git HEAD directly under `kestra/flows/`.
 A flow identity with no reviewed source in Git is not addressable, and any staged, modified, or untracked YAML in that directory stops the seam.
 There is no production flow-directory override, so the runnable source set changes only through Git review.
+Deployment snapshots the HEAD blobs once, then statically validates and sends those same immutable bytes.
 
 `bin/fm-kestra-deploy.sh` refuses a flow whose namespace is not the one namespace named in local config, a flow missing the `system.readOnly: "true"` label, a task type outside `io.kestra.plugin.core.`, and any input schema or validator regex the run adapter could not faithfully pre-check.
 It always updates the namespace with `delete=false`.
@@ -42,7 +43,7 @@ The seam pushes; Kestra never pulls.
 `bin/fm-kestra-run.sh` accepts only `--flow` and `--input` and refuses every other argument by name.
 Inputs are validated against the reviewed flow's declared schema before the first byte leaves the machine, so a rejected input never creates an execution.
 
-`bin/fm-kestra-status.sh` returns execution state, task logs, declared outputs, and artifacts the execution itself declared as outputs.
+`bin/fm-kestra-status.sh` returns execution state, task logs, declared outputs, replay lineage, and artifacts the execution itself declared as outputs.
 Every status subcommand first fetches the execution record, then refuses it unless its namespace is the configured namespace and its flow has an unchanged tracked source.
 That refusal happens before any evidence is printed and before a log, artifact, or flow-revision request is made.
 Suppression evidence is calculated from the execution's recorded `flowRevision`, never the current flow source, and is explicitly marked unavailable when that revision cannot be resolved safely.
@@ -50,6 +51,7 @@ An artifact URI the execution did not publish is refused, which keeps the adapte
 
 Underneath all three, `fm_kestra_path_allowed` in `bin/fm-kestra-lib.sh` gates every request by role.
 Replay, restart, resume, kill, state override, flow deletion, secret access, and namespace administration are unreachable from every role, so an argument-parsing bug still cannot reach a mutating endpoint.
+The gate accepts only a YAML body file for deploy, validated form fields for run, and no payload for read, so callers cannot append raw `curl` options.
 Replay *lineage* stays readable, because knowing an execution was derived from another one is evidence.
 
 ## Version pin

@@ -88,7 +88,7 @@ ACCEPTED=$(fm_kestra_validate_inputs "$FLOW_FILE" ${INPUTS+"${INPUTS[@]}"})
 FORM=()
 while IFS= read -r pair; do
   [ -n "$pair" ] || continue
-  FORM+=(--form-string "$pair")
+  FORM+=("$pair")
 done <<< "$ACCEPTED"
 
 command -v jq >/dev/null 2>&1 || fm_kestra_die "jq is required for the Kestra seam" 1

@@ -190,7 +190,7 @@ method=GET url="" cfg="" formstrings=""
 argv=$*
 while [ $# -gt 0 ]; do
   case "$1" in
-    -X) method=$2; shift 2 ;;
+    -X|--request) method=$2; shift 2 ;;
     --config) cfg=$2; shift 2 ;;
     --form-string) formstrings="$formstrings $2"; shift 2 ;;
     --max-time|--noproxy|-H|--data-binary|-F|-o|-w|-m) shift 2 ;;
@@ -346,7 +346,7 @@ test_missing_required_input_is_refused() {
 }
 
 test_malformed_and_multiline_input_values_are_refused() {
-  local d out rc bad
+  local d out rc bad case_name expected
   for bad in 'units=1-2' 'units=-'; do
     d=$(workdir "reject-${bad#*=}")
     rc=0
@@ -357,6 +357,23 @@ test_malformed_and_multiline_input_values_are_refused() {
     [ ! -s "$d/curl.log" ] || fail "malformed integer $bad must be refused before any request"
   done
 
+  for case_name in \
+    '18446744073709551619:must be <= 5' \
+    '-18446744073709551613:must be >= 1'
+  do
+    bad=${case_name%%:*}
+    expected=${case_name#*:}
+    d=$(workdir "reject-wide-${bad#-}")
+    rc=0
+    out=$(seam "$d" "$RUN" --flow m1_shape \
+      --input route=safe --input label=synthetic-alpha --input "units=$bad" 2>&1) || rc=$?
+    expect_code 2 "$rc" "out-of-range arbitrary-length integer $bad must be refused"
+    assert_contains "$out" "$expected" \
+      "arbitrary-length integer comparison must preserve the mathematical sign and magnitude"
+    [ ! -s "$d/curl.log" ] \
+      || fail "out-of-range arbitrary-length integer $bad reached the request layer"
+  done
+
   d=$(workdir reject-multiline)
   rc=0
   out=$(seam "$d" "$RUN" --flow m1_shape \
@@ -364,7 +381,7 @@ test_malformed_and_multiline_input_values_are_refused() {
   expect_code 2 "$rc" "a multiline string input must be refused"
   assert_contains "$out" "single-line value" "the multiline refusal must name the line boundary"
   [ ! -s "$d/curl.log" ] || fail "a multiline input must be refused before any request"
-  pass "integer syntax and single-line serialization are validated before any request"
+  pass "integer syntax, arbitrary-length ranges, and single-line serialization are validated before any request"
 }
 
 # ===========================================================================
@@ -664,6 +681,41 @@ test_the_http_gate_allows_only_exact_role_paths() {
   pass "the HTTP gate admits only the exact deploy, run, execution, log, artifact, and revision paths"
 }
 
+test_the_http_gate_accepts_no_raw_curl_options() {
+  local attack body d out rc role
+  for role in deploy run read; do
+    for attack in request url proxy config; do
+      d=$(workdir "structured-$role-$attack")
+      body="$d/body.yaml"
+      printf 'id: harmless\n' > "$body"
+      rc=0
+      # shellcheck disable=SC2016 # The child shell owns its positional parameters.
+      out=$(seam "$d" bash -c '
+        . "$1/bin/fm-kestra-lib.sh"
+        fm_kestra_load_config
+        role=$2
+        body=$3
+        case "$4" in
+          request) set -- -X DELETE ;;
+          url) set -- --url http://example.invalid/ ;;
+          proxy) set -- --proxy http://127.0.0.1:65535 ;;
+          config) set -- -K "$body" ;;
+        esac
+        case "$role" in
+          deploy) fm_kestra_request deploy POST /flows/validate "$body" "$@" ;;
+          run) fm_kestra_request run POST /executions/firstmate.m1/m1_shape safe=value "$@" ;;
+          read) fm_kestra_request read GET /executions/EXECSUCCESS1 "$@" ;;
+        esac
+      ' _ "$ROOT" "$role" "$body" "$attack" 2>&1) || rc=$?
+      expect_code 2 "$rc" "$role must refuse raw curl option injection through $attack"
+      assert_contains "$out" "refused:" "$role must identify the structured request refusal"
+      [ ! -s "$d/curl.log" ] \
+        || fail "$role launched curl after a raw option injection attempt through $attack"
+    done
+  done
+  pass "deploy, run, and read construct requests only from role-specific structured values"
+}
+
 test_a_run_may_not_target_another_namespace() {
   local out
   out=$(FM_KESTRA_NAMESPACE=firstmate.m1 bash -c '
@@ -746,6 +798,35 @@ tasks:
   expect_code 2 "$rc" "a locally modified tracked flow must stop discovery"
   assert_contains "$out" "local changes" "the refusal must name the unreviewed edit"
   pass "flow discovery is fixed to canonical tracked sources and refuses local or untracked YAML"
+}
+
+test_deploy_flow_snapshot_is_immutable_after_capture() {
+  local d out
+  d="$TMP_ROOT/immutable-flow-snapshot"
+  mkdir -p "$d/bin" "$d/kestra/flows"
+  cp "$ROOT/bin/fm-kestra-lib.sh" "$d/bin/fm-kestra-lib.sh"
+  fixture_flow "$d/kestra/flows" tracked 'id: reviewed
+namespace: firstmate.m1
+labels:
+  system.readOnly: true
+tasks:
+  - id: only
+    type: io.kestra.plugin.core.log.Log
+    message: reviewed'
+  git -C "$d" init -q
+  git -C "$d" add bin/fm-kestra-lib.sh kestra/flows/tracked.yaml
+  git -C "$d" -c user.name=Test -c user.email=test@example.invalid commit -qm initial
+
+  out=$(TMPDIR="$d" bash -c '
+    . "$1/bin/fm-kestra-lib.sh"
+    fm_kestra_snapshot_flow_files
+    [ "${#FM_KESTRA_SNAPSHOT_FILES[@]}" -eq 1 ] || exit 1
+    printf "message: changed\n" > "$1/kestra/flows/tracked.yaml"
+    cat "${FM_KESTRA_SNAPSHOT_FILES[0]}"
+  ' _ "$d") || fail "the HEAD flow snapshot must remain readable after the worktree source changes"
+  assert_contains "$out" "message: reviewed" "the snapshot must contain the reviewed HEAD bytes"
+  assert_not_contains "$out" "message: changed" "the snapshot must not re-read the mutable worktree source"
+  pass "deployment flow snapshots remain bound to immutable HEAD blobs"
 }
 
 test_deploy_refuses_a_flow_without_the_read_only_label() {
@@ -862,6 +943,81 @@ tasks:
   pass "every task map is independently parsed or rejected without order-dependent gaps"
 }
 
+test_deploy_checks_every_supported_task_container() {
+  local d out rc type
+  d="$TMP_ROOT/task-containers"
+  fixture_flow "$d" containers 'id: containers
+namespace: firstmate.m1
+
+labels:
+  system.readOnly: true
+
+tasks:
+  - id: sequential
+    type: io.kestra.plugin.core.flow.Sequential
+    tasks:
+      - id: nested_tasks
+        type: io.kestra.plugin.external.NestedTasks
+    errors:
+      - id: nested_errors
+        type: io.kestra.plugin.external.NestedErrors
+    finally:
+      - id: nested_finally
+        type: io.kestra.plugin.external.NestedFinally
+  - id: conditional
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ true }}"
+    then:
+      - id: then_task
+        type: io.kestra.plugin.external.Then
+    else:
+      - id: else_task
+        type: io.kestra.plugin.external.Else
+  - id: switch
+    type: io.kestra.plugin.core.flow.Switch
+    value: synthetic
+    cases:
+      synthetic:
+        - id: case_task
+          type: io.kestra.plugin.external.Case
+    defaults:
+      - id: default_task
+        type: io.kestra.plugin.external.Default
+  - id: dag
+    type: io.kestra.plugin.core.flow.Dag
+    tasks:
+      - task:
+          id: dag_task
+          type: io.kestra.plugin.external.Dag
+
+errors:
+  - id: flow_error
+    type: io.kestra.plugin.external.FlowErrors
+
+finally:
+  - id: flow_finally
+    type: io.kestra.plugin.external.FlowFinally
+
+afterExecution:
+  - id: after_execution
+    type: io.kestra.plugin.external.AfterExecution
+
+listeners:
+  - tasks:
+      - id: listener_task
+        type: io.kestra.plugin.external.Listener'
+  rc=0
+  out=$(check_fixture "$d") || rc=$?
+  expect_code 2 "$rc" "a non-core task in any supported Kestra task container must be refused"
+  for type in NestedTasks NestedErrors NestedFinally Then Else Case Default Dag \
+    FlowErrors FlowFinally AfterExecution Listener
+  do
+    assert_contains "$out" "io.kestra.plugin.external.$type" \
+      "the parser must validate tasks in the $type container shape"
+  done
+  pass "all Kestra 1.3.34 flow, flowable, switch, DAG, and listener task containers are validated"
+}
+
 test_deploy_refuses_an_input_it_cannot_pre_check() {
   local d out rc
   d="$TMP_ROOT/unknown-input"
@@ -927,7 +1083,7 @@ test_deploy_refuses_a_namespace_outside_the_allow_list() {
 }
 
 test_deploy_never_enables_deletion() {
-  local d rc
+  local body_calls body_files d rc
   d=$(workdir deploy-run)
   rc=0
   seam "$d" "$DEPLOY" >/dev/null 2>&1 || rc=$?
@@ -936,6 +1092,10 @@ test_deploy_never_enables_deletion() {
     "the namespace update must disable deletion"
   assert_grep "POST http://127.0.0.1:18080/api/v1/main/flows/validate" "$d/curl.log" \
     "flows must be validated server-side before the update"
+  body_calls=$(sed -n 's/^ARGV .*--data-binary @\([^ ]*\).*/\1/p' "$d/curl.log" | wc -l | tr -d ' ')
+  body_files=$(sed -n 's/^ARGV .*--data-binary @\([^ ]*\).*/\1/p' "$d/curl.log" | sort -u | wc -l | tr -d ' ')
+  [ "$body_calls" -eq 2 ] && [ "$body_files" -eq 1 ] \
+    || fail "server validation and deployment must send the same staged HEAD body"
   assert_no_grep "delete=true" "$d/curl.log" "deletion must never be enabled"
   # Kestra must never be handed Git reconciliation; the seam pushes instead.
   assert_no_grep "/git" "$d/curl.log" "the deployer must never ask Kestra to reconcile Git"
@@ -1160,13 +1320,16 @@ test_every_status_read_is_bound_to_the_allow_list_before_follow_up
 test_every_mutating_verb_is_refused_by_the_run_adapter
 test_every_mutating_operation_is_refused_by_the_status_adapter
 test_the_http_gate_allows_only_exact_role_paths
+test_the_http_gate_accepts_no_raw_curl_options
 test_a_run_may_not_target_another_namespace
 test_check_mode_accepts_the_tracked_flows_without_config_or_network
 test_flow_discovery_uses_only_canonical_unchanged_git_sources
+test_deploy_flow_snapshot_is_immutable_after_capture
 test_deploy_refuses_a_flow_without_the_read_only_label
 test_deploy_requires_an_exact_true_read_only_label
 test_deploy_refuses_a_task_type_outside_the_core_plugin_allow_list
 test_deploy_checks_each_task_map_independently
+test_deploy_checks_every_supported_task_container
 test_deploy_refuses_an_input_it_cannot_pre_check
 test_deploy_refuses_a_validator_the_adapter_cannot_faithfully_pre_check
 test_deploy_refuses_a_namespace_outside_the_allow_list

@@ -20,9 +20,9 @@
 #                                  the allow-listed namespace with deletion disabled
 #   fm-kestra-deploy.sh --help     this text
 #
-# Endpoint and credential come from gitignored local config; see the shape in
-# docs/kestra-seam.md. Nothing here reads or writes captain-private data, and every
-# tracked flow is synthetic.
+# Endpoint and credential come from gitignored captain-private config; see the
+# shape in docs/kestra-seam.md. No captain-private data enters a flow payload, and
+# every tracked flow is synthetic.
 #
 # Exit status: 0 on success, 2 on a refusal or usage error, 1 on a transport or
 # server failure.
@@ -41,34 +41,41 @@ case "${1:-}" in
 esac
 [ "$#" -le 1 ] || fm_kestra_die "unexpected extra arguments"
 
-FILES=$(fm_kestra_flow_files)
-[ -n "$FILES" ] || fm_kestra_die "no tracked flows under $(fm_kestra_flows_dir)"
+fm_kestra_snapshot_flow_files
+[ "${#FM_KESTRA_SNAPSHOT_FILES[@]}" -gt 0 ] \
+  || fm_kestra_die "no tracked flows under $(fm_kestra_flows_dir)"
 
 # --- static validation ------------------------------------------------------
 
 problems=0
 declared_ns=""
 flow_count=0
-while IFS= read -r file; do
-  [ -n "$file" ] || continue
+index=0
+while [ "$index" -lt "${#FM_KESTRA_SNAPSHOT_FILES[@]}" ]; do
+  file=${FM_KESTRA_SNAPSHOT_FILES[$index]}
+  source=${FM_KESTRA_SNAPSHOT_SOURCES[$index]}
+  index=$((index + 1))
   flow_count=$((flow_count + 1))
-  fm_kestra_check_flow "$file" || problems=1
+  fm_kestra_check_flow "$file" "$source" || problems=1
   ns=$(fm_kestra_scalar "$file" namespace)
   if [ -z "$declared_ns" ]; then
     declared_ns=$ns
   elif [ "$ns" != "$declared_ns" ]; then
     printf '%s: flows must share one namespace; expected %s, found %s\n' \
-      "$file" "$declared_ns" "$ns" >&2
+      "$source" "$declared_ns" "$ns" >&2
     problems=1
   fi
-done <<< "$FILES"
+done
 [ "$problems" -eq 0 ] || fm_kestra_die "tracked flows failed validation"
 
 if [ "$MODE" = check ]; then
-  while IFS= read -r file; do
-    [ -n "$file" ] || continue
-    printf 'ok: %s (%s/%s)\n' "$file" "$declared_ns" "$(fm_kestra_scalar "$file" id)"
-  done <<< "$FILES"
+  index=0
+  while [ "$index" -lt "${#FM_KESTRA_SNAPSHOT_FILES[@]}" ]; do
+    file=${FM_KESTRA_SNAPSHOT_FILES[$index]}
+    source=${FM_KESTRA_SNAPSHOT_SOURCES[$index]}
+    index=$((index + 1))
+    printf 'ok: %s (%s/%s)\n' "$source" "$declared_ns" "$(fm_kestra_scalar "$file" id)"
+  done
   exit 0
 fi
 
@@ -83,18 +90,16 @@ command -v jq >/dev/null 2>&1 || fm_kestra_die "jq is required for the Kestra se
 BODY=""
 fm_kestra_tempfile flows BODY || fm_kestra_die "could not create a staging file" 1
 first=1
-while IFS= read -r file; do
-  [ -n "$file" ] || continue
+for file in "${FM_KESTRA_SNAPSHOT_FILES[@]}"; do
   [ "$first" -eq 1 ] || printf -- '---\n' >> "$BODY"
   first=0
   cat -- "$file" >> "$BODY"
   printf '\n' >> "$BODY"
-done <<< "$FILES"
+done
 
 # Server-side validation first: a rejected flow must never reach the update call.
 rc=0
-validation=$(fm_kestra_request deploy POST /flows/validate \
-  -H 'Content-Type: application/x-yaml' --data-binary "@$BODY") || rc=$?
+validation=$(fm_kestra_request deploy POST /flows/validate "$BODY") || rc=$?
 if [ "$rc" -eq 2 ]; then
   exit 2
 elif [ "$rc" -ne 0 ]; then
@@ -114,7 +119,7 @@ fi
 rc=0
 update_response=$(fm_kestra_request deploy POST \
   "/flows/bulk?delete=false&namespace=$FM_KESTRA_NAMESPACE" \
-  -H 'Content-Type: application/x-yaml' --data-binary "@$BODY") || rc=$?
+  "$BODY") || rc=$?
 if [ "$rc" -eq 2 ]; then
   exit 2
 elif [ "$rc" -ne 0 ]; then
@@ -122,7 +127,6 @@ elif [ "$rc" -ne 0 ]; then
   fm_kestra_die "namespace update failed" 1
 fi
 
-while IFS= read -r file; do
-  [ -n "$file" ] || continue
+for file in "${FM_KESTRA_SNAPSHOT_FILES[@]}"; do
   printf 'deployed: %s/%s\n' "$FM_KESTRA_NAMESPACE" "$(fm_kestra_scalar "$file" id)"
-done <<< "$FILES"
+done
