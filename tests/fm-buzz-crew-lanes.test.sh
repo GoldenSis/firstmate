@@ -196,7 +196,7 @@ test_a_lane_carries_its_own_status_lines_and_identity() {
     || fail "the lane did not carry task-a's status lines verbatim: $events"
 
   # Deliberately dropped surfaces stay dropped: a lane is depth on an already
-  # published surface, never a new one (adapter invariant 4).
+  # published surface, never a new one (the per-crew lane non-widening contract).
   printf '%s' "$content" | grep -q 'projects/wt' \
     && fail "the lane widened the projection with a worktree path"
   printf '%s' "$content" | jq -e 'has("paths") or has("actions") or has("endpoints") or has("bodies")' \
@@ -334,6 +334,75 @@ test_fire_and_forget_contract_is_intact() {
   pass "the refresh entry point's fire-and-forget contract is intact"
 }
 
+test_lane_documents_stay_out_of_process_arguments() {
+  local home guard_bin leak real_jq
+  home=$(make_fleet_home lane-argv)
+  printf '%s\n' "working: fm-buzz-argv-sentinel" "${TASK_A_EVENTS[@]}" \
+    > "$home/state/task-a.status"
+  guard_bin="$home/jq-guard"
+  leak="$home/jq-argv-leak"
+  real_jq=$(command -v jq)
+  mkdir -p "$guard_bin"
+  cat > "$guard_bin/jq" <<'SH'
+#!/usr/bin/env bash
+for argument in "$@"; do
+  case $argument in
+    *fm-buzz-argv-sentinel*) : > "$FM_BUZZ_ARGV_LEAK" ;;
+  esac
+done
+exec "$FM_BUZZ_REAL_JQ" "$@"
+SH
+  chmod +x "$guard_bin/jq"
+
+  (
+    export FM_BUZZ_ARGV_LEAK="$leak" FM_BUZZ_REAL_JQ="$real_jq"
+    PATH="$guard_bin:$PATH" run_lanes "$home" --projection <(bearings_json "$home") >/dev/null
+  ) || fail "the guarded lane projection failed"
+  [ ! -e "$leak" ] || fail "status content crossed a jq process argument"
+  ! grep -Eq -- '--argjson[[:space:]]+task[[:space:]]' "$LANES" \
+    || fail "a lane document is still passed through process arguments"
+  pass "lane documents stay out of process arguments"
+}
+
+test_refresh_setup_failures_are_non_events() {
+  local home broken_bin output code
+  home=$(make_fleet_home refresh-setup-failures)
+  broken_bin="$home/no-mktemp"
+  mkdir -p "$broken_bin"
+  cat > "$broken_bin/mktemp" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$broken_bin/mktemp"
+
+  output=$(PATH="$broken_bin:$PATH" run_refresh "$home" "ws://127.0.0.1:1" 2>&1)
+  code=$?
+  expect_code 0 "$code" "refresh with an unavailable temporary spool"
+  assert_contains "$output" "could not create a temporary file for the projection" \
+    "the temporary-spool failure was not logged"
+
+  output=$(FM_BEARINGS_IN_FLIGHT=0 run_refresh "$home" "ws://127.0.0.1:1" 2>&1)
+  code=$?
+  expect_code 0 "$code" "refresh with a failed bearings snapshot"
+  assert_contains "$output" "bearings snapshot failed; skipping publish" \
+    "the bearings-snapshot failure was not logged"
+  pass "refresh setup failures are logged non-events"
+}
+
+test_channel_labels_preserve_embedded_newlines() {
+  local home relay label channel
+  home=$(make_fleet_home newline-channel-label)
+  relay=ws://127.0.0.1:1
+  label=$'fleet\nlabel'
+  channel=$(channel_id_for_label "$label")
+
+  run_refresh "$home" "$relay" --fleet-only --channel-label "$label" >/dev/null 2>&1
+  expect_code 0 "$?" "refresh with a newline in the channel label"
+  [ "$(cached_event_count "$home" "$relay" "$channel")" = "1" ] \
+    || fail "the channel label was split while constructing publisher arguments"
+  pass "channel labels preserve embedded newlines"
+}
+
 test_the_default_fleet_channel_id_is_unchanged
 test_two_task_ids_derive_two_well_formed_distinct_channels
 test_a_lane_carries_its_own_status_lines_and_identity
@@ -343,3 +412,6 @@ test_each_lane_is_named_for_its_crew
 test_the_fleet_omitted_disclosure_survives_untouched
 test_an_unreachable_or_refusing_relay_is_a_non_event
 test_fire_and_forget_contract_is_intact
+test_lane_documents_stay_out_of_process_arguments
+test_refresh_setup_failures_are_non_events
+test_channel_labels_preserve_embedded_newlines

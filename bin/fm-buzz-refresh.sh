@@ -140,28 +140,13 @@ trap cleanup EXIT
 # temporary directory.
 trap 'cleanup; exit 0' INT TERM HUP
 
-publish_args() {  # <channel label> [channel name]
-  printf '%s\n' --relay
-  printf '%s\n' "$RELAY"
-  printf '%s\n' --channel-label
-  printf '%s\n' "$1"
-  if [ -n "${2:-}" ]; then
-    printf '%s\n' --channel-name
-    printf '%s\n' "$2"
-  fi
-  if [ -n "$TIMEOUT_MS" ]; then
-    printf '%s\n' --timeout
-    printf '%s\n' "$TIMEOUT_MS"
-  fi
-}
-
 # Publish one already-built projection into one channel. Every caller feeds the
 # document on stdin, which is how it stays off a command line.
 publish_document() {  # <channel label> <file> [channel name]
-  local label=$1 file=$2 name=${3:-} args=()
-  while IFS= read -r argument; do
-    args+=("$argument")
-  done < <(publish_args "$label" "$name")
+  local label=$1 file=$2 name=${3:-}
+  local args=(--relay "$RELAY" --channel-label "$label")
+  [ -n "$name" ] && args+=(--channel-name "$name")
+  [ -n "$TIMEOUT_MS" ] && args+=(--timeout "$TIMEOUT_MS")
   "$SCRIPT_DIR/fm-buzz-publish.sh" "${args[@]}" < "$file"
 }
 
@@ -170,11 +155,11 @@ refresh() {
 
   PROJECTION=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-refresh.XXXXXX") || {
     log "could not create a temporary file for the projection"
-    return 1
+    return 0
   }
   if ! "$SCRIPT_DIR/fm-bearings-snapshot.sh" --json > "$PROJECTION" 2>/dev/null; then
     log "bearings snapshot failed; skipping publish"
-    return 1
+    return 0
   fi
 
   fleet_label=$CHANNEL_LABEL

@@ -101,7 +101,7 @@ Each lane is itself a valid `fm-bearings.v1` projection with `view: "crew-lane"`
 Being a valid projection is what lets the publisher validate and sign it through the path it already had, with no second contract to keep in sync.
 The fleet projection's `omitted[]` is carried through untouched and each lane's own bounds - events dropped by the line cap, a status log read only from its last bytes, per-event text truncation, an absent status log, an in-flight entry with no current task record - are appended after it.
 
-Invariant 4 was the load-bearing question here, so the reasoning is recorded rather than assumed.
+The per-crew lane non-widening contract was the load-bearing question here, so the reasoning is recorded rather than assumed.
 A lane may carry only what the fleet projection already publishes about a task, at more depth, and never a surface that projection deliberately dropped.
 The deliberate drops are the ones it enumerates in its own `omitted[]`: backlog item bodies, task paths, watch/steer actions, and healthy endpoint detail.
 None of them appear in a lane, and `bin/fm-buzz-crew-lanes.sh` withholds worktree paths, home paths, status-log paths, endpoint targets and backends even though it has them in hand.

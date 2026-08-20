@@ -27,7 +27,7 @@
 # stream; that check is what AGENTS.md-era guidance means by looking before
 # writing a new reader, and the result is recorded in docs/buzz-loopback-adapter.md.
 #
-# NO WIDENING (adapter invariant 4). A lane may carry only what the fleet
+# NO WIDENING (per-crew lane non-widening contract). A lane may carry only what the fleet
 # projection already publishes about a task, at more depth - never a surface the
 # fleet projection deliberately dropped. The dropped surfaces are the ones the
 # projection enumerates in its own omitted[]: backlog bodies, task paths,
@@ -215,14 +215,16 @@ while IFS= read -r id; do
     MISSING=$((MISSING + 1))
     continue
   }
-  lane=$(jq -c \
+  lane=$(printf '%s\n%s\n' "$task" "$status" | jq -sc \
     --arg id "$id" \
-    --argjson task "$task" \
-    --argjson status "$status" \
     --argjson status_lines "$STATUS_LINES" \
     --argjson status_bytes "$STATUS_BYTES" \
-    --argjson status_chars "$STATUS_LINE_CHARS" '
-      first(.in_flight[] | select(.id == $id)) as $row
+    --argjson status_chars "$STATUS_LINE_CHARS" \
+    --slurpfile projection "$SPOOL" '
+      .[0] as $task
+      | .[1] as $status
+      | $projection[0]
+      | first(.in_flight[] | select(.id == $id)) as $row
       | {
           schema: "fm-bearings.v1",
           view: "crew-lane",
@@ -251,12 +253,13 @@ while IFS= read -r id; do
                then [{surface: "status event text for \($id) truncated at \($status_chars) characters",
                       reveal: "raise FM_BUZZ_CREW_STATUS_LINE_CHARS"}] else [] end))
         }
-    ' "$SPOOL") || {
+    ') || {
     log "could not project a lane for $id"
     MISSING=$((MISSING + 1))
     continue
   }
-  LANES=$(jq -c --argjson lane "$lane" --arg id "$id" '. + [{id: $id, projection: $lane}]' <<<"$LANES") || {
+  LANES=$(printf '%s\n%s\n' "$LANES" "$lane" \
+    | jq -sc --arg id "$id" '. as $documents | $documents[0] + [{id: $id, projection: $documents[1]}]') || {
     log "could not collect the lane for $id"
     exit 1
   }
