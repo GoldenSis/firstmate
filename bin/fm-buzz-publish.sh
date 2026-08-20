@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fm-buzz-publish.sh - publish one bearings projection to the loopback Buzz relay.
+# fm-buzz-publish.sh - publish one bearings projection or replay one cached channel.
 #
 # ============================ FIRE-AND-FORGET ==============================
 # RUNTIME PUBLISH FAILURES EXIT 0. MISSING PYTHON 3 AND INPUT-CONTRACT FAILURES EXIT NON-ZERO.
@@ -44,11 +44,13 @@
 #
 # THE NAME IS NOT THE LABEL. The label derives the channel id and must never move
 # for an existing channel; the display name is what a Buzz client lists a channel
-# under, and it is free to change. They are separate options because every lane
-# needs its own name while the fleet channel keeps the one it has always had. A
-# lane that inherits the default name is addressed correctly and still unreadable:
-# a captain browsing the client sees one row per lane, all called
-# firstmate-bearings, distinguishable only by UUID.
+# under, and it can vary without changing that id. The relay applies the name only
+# when creating the channel, so publishing cannot rename one that already exists.
+# Label and name are separate options because every lane needs its own name while
+# the fleet channel keeps the one it has always had. A lane that inherits the
+# default name is addressed correctly and still unreadable: a captain browsing the
+# client sees one row per lane, all called firstmate-bearings, distinguishable only
+# by UUID.
 #
 # The published event is one append-only NIP-29 channel message whose content is
 # the `fm-bearings-snapshot.sh --json` projection VERBATIM, including its

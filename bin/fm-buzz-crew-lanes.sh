@@ -54,7 +54,7 @@
 #   fm-buzz-crew-lanes.sh --projection <file>  read it from a file instead
 #   fm-buzz-crew-lanes.sh --help               this text
 #
-# Bounds (all overridable, all disclosed when they bite):
+# Bounds (all positive integers without a leading zero; all disclosed when they bite):
 #   FM_BUZZ_CREW_STATUS_LINES       status events per lane           (default 40)
 #   FM_BUZZ_CREW_STATUS_BYTES       bytes read per status log        (default 16384)
 #   FM_BUZZ_CREW_STATUS_LINE_CHARS  characters per status event      (default 200)

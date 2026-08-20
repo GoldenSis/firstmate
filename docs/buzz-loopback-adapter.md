@@ -10,9 +10,10 @@ Mechanics live in each script's own header and `--help`; this file covers the sh
 
 Buzz is Block's open-source Nostr-based workspace (Apache-2.0).
 Its relevant property is that every message is an individually signed, individually verified event in an append-only log, and a private channel is enforced server-side - when membership is required - rather than trusted from the client.
-The M1 stack deliberately does not require it, so nothing here relies on that enforcement; see invariant 2.
+The bundled loopback stack deliberately does not require it, so nothing here relies on that enforcement; see invariant 2.
 The fleet invocation signs an event carrying `bin/fm-bearings-snapshot.sh --json` verbatim and publishes it to a private channel on a relay bound to loopback.
 `bin/fm-buzz-refresh.sh` is the single call that publishes that fleet event and then one validated single-task projection per live crewmate, each lane an ordinary invocation of the same publisher against its own channel.
+It then retries nonempty cached channel queues so a projection captured before a task completed is not stranded after its lane leaves the live set.
 
 The projection is already report-shaped, so the adapter is a renderer rather than a data model.
 In particular the projection's `omitted[]` disclosure array is passed through untouched, because a bounded projection whose truncation disclosure was stripped in transit is worse than no projection at all: an absence stops being unambiguous.
@@ -136,7 +137,7 @@ For native Docker:
 ```
 docker compose -f docker-compose.buzz-loopback.yml up -d
 bin/fm-buzz-keypair.sh                                             # once; prints the public key
-bin/fm-buzz-refresh.sh                                             # publish the fleet channel and every crew lane
+bin/fm-buzz-refresh.sh                                             # publish the fleet, live crew lanes, and cached queues
 bin/fm-buzz-publish.sh --refresh                                   # or: the fleet channel alone
 bin/fm-buzz-inspect.sh --full                                      # read it back (human diagnostic)
 bin/fm-buzz-inspect.sh --crew <task id> --full                     # read one crewmate's lane back
@@ -156,7 +157,7 @@ ssh -F "$buzz_colima_config" -M -S "$buzz_colima_control" -fN \
   -L 127.0.0.1:3000:127.0.0.1:3000 \
   -L '[::1]:3000:127.0.0.1:3000' colima
 bin/fm-buzz-keypair.sh                                             # once; prints the public key
-bin/fm-buzz-refresh.sh                                             # publish the fleet channel and every crew lane
+bin/fm-buzz-refresh.sh                                             # publish the fleet, live crew lanes, and cached queues
 bin/fm-buzz-inspect.sh --full                                      # read it back (human diagnostic)
 docker compose -f docker-compose.buzz-loopback.yml down -v         # clean slate, volumes included
 ssh -F "$buzz_colima_config" -S "$buzz_colima_control" -O exit colima
@@ -249,7 +250,7 @@ The exact query was:
 docker compose -f docker-compose.buzz-loopback.yml exec -T postgres psql -U buzz -d buzz -c "select id, name from channels order by name;"
 ```
 
-After `bin/fm-buzz-refresh.sh` republished all ten lanes with `crew-<task id>` names, the query returned 17 rows in which every one of the ten pre-existing lane channels was still named `firstmate-bearings`, alongside the `Welcome`, `general`, and `welcome-everyone` channels created by the desktop client.
+After `bin/fm-buzz-refresh.sh` republished all ten lanes with `crew-<home qualifier>-<task id>` names, the query returned 17 rows in which every one of the ten pre-existing lane channels was still named `firstmate-bearings`, alongside the `Welcome`, `general`, and `welcome-everyone` channels created by the desktop client.
 
 The independence check is structural as well as behavioral: no operational Firstmate path outside the `bin/fm-buzz-*` family invokes the adapter, so a stopped relay has no path by which to reach supervision.
 `tests/fm-buzz-inspect.test.sh` asserts that as a standing regression test.

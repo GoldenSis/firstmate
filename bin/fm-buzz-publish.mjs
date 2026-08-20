@@ -52,6 +52,10 @@
 // appears in a command line or in the process environment. Fields: privateKey,
 // phase, optional content, relay, channelId, channelName, timeoutMs, replayDir,
 // targetsFile, migration, preparation, maxCache.
+// A newly signed message records its effective display name in one
+// `fm-channel-name` tag so replay-only delivery can provision a missing channel
+// under the original readable name. Replay ignores absent, duplicate, malformed,
+// non-ASCII, or oversized name tags and falls back to the publisher default.
 //
 // Legacy and explicitly discarded rotation entries are retained under
 // _legacy-quarantine with payloads and manifests rather than silently deleted.

@@ -412,20 +412,20 @@ GROK_HOME=              # optional Grok config home for firstmate's global grok 
 FM_SEND_RETRIES=3       # fm-send Enter-retry attempts after typing the line once
 FM_SEND_SLEEP=0.4       # seconds between fm-send submit checks
 FM_SEND_SETTLE=1        # seconds fm-send waits after a successful text submit; 0 disables
-# loopback Buzz bearings publisher (docs/buzz-loopback-adapter.md); additive, and nothing in firstmate reads it
+# loopback Buzz fleet and per-crew bearings publisher (docs/buzz-loopback-adapter.md); additive, and nothing in firstmate reads it
 BUZZ_IMAGE=ghcr.io/block/buzz:main  # Compose-only relay image override; pin an immutable compatible digest when reproducible infrastructure matters
 BUZZ_LOOPBACK_PORT=3000             # Compose-only host loopback port; when changed, set FM_BUZZ_RELAY=ws://localhost:<port> so publishing, inspection, and rotation address the same relay
 FM_BUZZ_RELAY=ws://localhost:3000   # credential-free ws/wss loopback relay URL; only 127.0.0.1, localhost, and [::1] hosts are accepted, and the `localhost` spelling is load-bearing for the bundled relay's HTTP Host routing
-FM_BUZZ_TIMEOUT_MS=15000            # positive integer through 2147483647; relay budget for each publish connection and rotation membership query; `fm-buzz-publish.sh --timeout` overrides it for publishing
-FM_BUZZ_REFRESH_TIMEOUT_S=30        # positive integer without a leading zero; total budget for fleet, live-lane, and cached-queue publication in one `fm-buzz-refresh.sh` run
+FM_BUZZ_TIMEOUT_MS=15000            # positive integer through 2147483647; relay budget for each publish connection and rotation membership query; `fm-buzz-publish.sh --timeout` overrides it for publishing, while refresh lowers it when the total refresh deadline has less time remaining
+FM_BUZZ_REFRESH_TIMEOUT_S=30        # positive integer without a leading zero; total budget for the entire `fm-buzz-refresh.sh` run, including snapshot and projection work, fleet and live-lane publication, and cached-queue replay
 FM_BUZZ_MAX_CACHE=100               # positive-integer best-effort total per relay/channel partition enforced by pruning current-publisher events; retained foreign-author and unreadable evidence may keep it above the limit
 FM_BUZZ_STDIN_TIMEOUT_S=30          # positive integer through 2147483647; deadline for reading the projection on stdin; an expired read is discarded rather than published
 FM_BUZZ_MAX_PROJECTION_BYTES=1048576 # positive projection byte limit up to the fixed 1048576-byte ceiling; oversized input is rejected before signing or caching
-FM_BUZZ_LOCK_TIMEOUT_S=30           # positive integer through 2147483647; deadline for each publisher lock acquisition; timeout and interruption remain logged exit-0 non-events
-FM_BUZZ_CREW_STATUS_LINES=40        # positive integer; status events carried per crew lane; a bounded lane discloses what it dropped in its own omitted[]
-FM_BUZZ_CREW_STATUS_BYTES=16384     # positive integer; bytes read from the end of one task's status log per crew lane; disclosed when it bites
-FM_BUZZ_CREW_STATUS_LINE_CHARS=200  # positive integer; characters kept per status event in a crew lane; disclosed when it bites
-FM_BUZZ_CREW_INPUT_BYTES=1048576    # positive integer; projection input cap for `fm-buzz-crew-lanes.sh`; oversized input is refused rather than truncated
+FM_BUZZ_LOCK_TIMEOUT_S=30           # positive integer through 2147483647; deadline for each publisher lock acquisition, lowered to the remaining total budget during refresh; timeout and interruption remain logged exit-0 non-events
+FM_BUZZ_CREW_STATUS_LINES=40        # positive integer without a leading zero; status events carried per crew lane; a bounded lane discloses what it dropped in its own omitted[]
+FM_BUZZ_CREW_STATUS_BYTES=16384     # positive integer without a leading zero; bytes read from the end of one task's status log per crew lane; disclosed when it bites
+FM_BUZZ_CREW_STATUS_LINE_CHARS=200  # positive integer without a leading zero; characters kept per status event in a crew lane; disclosed when it bites
+FM_BUZZ_CREW_INPUT_BYTES=1048576    # positive integer without a leading zero; projection input cap for `fm-buzz-crew-lanes.sh`; oversized input is refused rather than truncated
 FM_BUZZ_FORCE_FILE_STORE=           # set to 1 to select the 0600 fallback for normal loads and stores; rotation still inspects and clears every store per `fm-buzz-keypair.sh --help`
 FM_BUZZ_REQUIRE_PINNED_RELAY_AUTHORITY=0 # set to 1 to refuse rotation membership checks until the relay/channel signer is already pinned
 # sub-supervisor (bin/fm-supervise-daemon.sh); presence-gated via /afk
@@ -486,7 +486,7 @@ README.md            public overview and development notes
 .claude/skills       symlink to .agents/skills for claude compatibility
 skills/              standalone public installer-facing skills, committed; not loaded by firstmate
 bin/                 helper scripts, committed; read each script's header before first use
-docker-compose.buzz-loopback.yml  loopback-only Buzz relay stack for the additive bearings publisher, committed; the running instance is disposable (docs/buzz-loopback-adapter.md)
+docker-compose.buzz-loopback.yml  loopback-only Buzz relay stack for the additive fleet and per-crew bearings publisher, committed; the running instance is disposable (docs/buzz-loopback-adapter.md)
 .env                 optional X-mode pairing token; LOCAL, gitignored; presence-gates section 14
 config/crew-harness  crewmate harness override; LOCAL, gitignored; absent or "default" = same as firstmate. Inherited as the literal file: a concrete primary adapter value also controls a secondmate home's own crewmates (section 4)
 config/crew-dispatch.json  optional crewmate dispatch profiles; LOCAL, gitignored; firstmate-maintained but human-editable natural-language rules that choose a per-task harness/model/effort profile (section 4). Inherited by secondmate homes

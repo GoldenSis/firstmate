@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# fm-buzz-refresh.sh - the one entry point that publishes the fleet channel and
-# every per-crew lane to the loopback Buzz relay.
+# fm-buzz-refresh.sh - publish the fleet channel, every live per-crew lane, and
+# pending cached queues to the loopback Buzz relay.
 #
 # ============================ FIRE-AND-FORGET ==============================
 # CREW-LANE FAILURES ARE LOGGED NON-EVENTS. THE FLEET PUBLICATION'S EXIT STATUS
-# IS FORWARDED UNCHANGED.
+# IS FORWARDED UNCHANGED, EXCEPT A REFRESH DEADLINE IS A LOGGED EXIT-0 NON-EVENT.
 #
 # The fleet publication is the pre-existing behavior and keeps the contract
 # bin/fm-buzz-publish.sh already owns: runtime publication failures exit 0, while
@@ -61,15 +61,20 @@
 # id, with any in-flight entry it cannot match disclosed rather than guessed at.
 #
 # Usage:
-#   fm-buzz-refresh.sh                    publish the fleet channel and every lane
+#   fm-buzz-refresh.sh                    publish the fleet, live lanes, and cached queues
 #   fm-buzz-refresh.sh --fleet-only       publish only the fleet channel
 #   fm-buzz-refresh.sh --relay <url>      override the relay (default ws://localhost:3000)
 #   fm-buzz-refresh.sh --channel-label <s>
 #                                         override the fleet channel-derivation label
-#   fm-buzz-refresh.sh --timeout <ms>     relay timeout, passed through
+#   fm-buzz-refresh.sh --timeout <ms>     relay timeout cap, integer 1..2147483647;
+#                                         lowered to the remaining refresh budget
 #   fm-buzz-refresh.sh --help             this text
 #
-# The complete run is bounded by FM_BUZZ_REFRESH_TIMEOUT_S (default 30 seconds).
+# The complete run is bounded by FM_BUZZ_REFRESH_TIMEOUT_S, a positive integer
+# without a leading zero (default 30 seconds). Each publisher's relay and lock
+# timeout is lowered when necessary to fit the remaining refresh budget.
+# Argument errors and an invalid refresh timeout are logged exit-0 non-events
+# that publish nothing.
 #
 # This script reads Firstmate state only through the read-only bearings and fleet
 # snapshots and never reads Buzz into Firstmate state. Buzz is a projection
