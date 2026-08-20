@@ -417,6 +417,7 @@ BUZZ_IMAGE=ghcr.io/block/buzz:main  # Compose-only relay image override; pin an 
 BUZZ_LOOPBACK_PORT=3000             # Compose-only host loopback port; when changed, set FM_BUZZ_RELAY=ws://localhost:<port> so publishing, inspection, and rotation address the same relay
 FM_BUZZ_RELAY=ws://localhost:3000   # credential-free ws/wss loopback relay URL; only 127.0.0.1, localhost, and [::1] hosts are accepted, and the `localhost` spelling is load-bearing for the bundled relay's HTTP Host routing
 FM_BUZZ_TIMEOUT_MS=15000            # positive integer through 2147483647; relay budget for each publish connection and rotation membership query; `fm-buzz-publish.sh --timeout` overrides it for publishing
+FM_BUZZ_REFRESH_TIMEOUT_S=30        # positive integer without a leading zero; total budget for fleet, live-lane, and cached-queue publication in one `fm-buzz-refresh.sh` run
 FM_BUZZ_MAX_CACHE=100               # positive-integer best-effort total per relay/channel partition enforced by pruning current-publisher events; retained foreign-author and unreadable evidence may keep it above the limit
 FM_BUZZ_STDIN_TIMEOUT_S=30          # positive integer through 2147483647; deadline for reading the projection on stdin; an expired read is discarded rather than published
 FM_BUZZ_MAX_PROJECTION_BYTES=1048576 # positive projection byte limit up to the fixed 1048576-byte ceiling; oversized input is rejected before signing or caching

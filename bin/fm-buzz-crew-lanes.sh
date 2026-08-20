@@ -118,14 +118,21 @@ done
 command -v jq >/dev/null 2>&1 || { log "jq is unavailable"; exit 1; }
 
 SPOOL=""
+STATUS_SPOOL=""
 cleanup() {
+  [ -n "$STATUS_SPOOL" ] && rm -f -- "$STATUS_SPOOL"
   [ -n "$SPOOL" ] && rm -f -- "$SPOOL"
+  STATUS_SPOOL=""
   SPOOL=""
 }
 trap cleanup EXIT
 
 SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-crew-lanes.XXXXXX") || {
   log "could not create a temporary file for the projection"
+  exit 1
+}
+STATUS_SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-crew-status.XXXXXX") || {
+  log "could not create a temporary file for status events"
   exit 1
 }
 
@@ -182,7 +189,10 @@ status_events_json() {  # <path>
   bytes=$(wc -c < "$path" | tr -d '[:space:]')
   case $bytes in ''|*[!0-9]*) bytes=0 ;; esac
   [ "$bytes" -gt "$STATUS_BYTES" ] && byte_truncated=true
-  tail -c "$STATUS_BYTES" < "$path" | jq -Rn \
+  if ! tail -c "$STATUS_BYTES" < "$path" > "$STATUS_SPOOL"; then
+    return 1
+  fi
+  jq -Rn \
     --argjson max_lines "$STATUS_LINES" \
     --argjson max_chars "$STATUS_LINE_CHARS" \
     --argjson byte_truncated "$byte_truncated" '
@@ -197,7 +207,7 @@ status_events_json() {  # <path>
           line_truncated: ($kept | any(. | length > $max_chars)),
           byte_truncated: $byte_truncated,
           events: ($kept | map(if length > $max_chars then .[:$max_chars] else . end))
-        }'
+        }' < "$STATUS_SPOOL"
 }
 
 LANES='[]'

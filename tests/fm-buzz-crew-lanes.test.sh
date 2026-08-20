@@ -40,6 +40,12 @@ crew_channel_id() {  # <home> <task id>
   channel_id_for_label "$(crew_channel_label "$(cd "$1" && pwd -P)" "$2")"
 }
 
+home_qualifier() {  # <home>
+  local channel
+  channel=$(default_channel_id "$1") || return 1
+  printf '%s\n' "${channel%%-*}"
+}
+
 # A home with two live tasks whose status streams are distinguishable on sight,
 # so a lane carrying the wrong crew's events cannot pass by accident.
 TASK_A_EVENTS=(
@@ -167,6 +173,12 @@ test_two_task_ids_derive_two_well_formed_distinct_channels() {
   # A task id outside the accepted set is refused rather than published somewhere.
   crew_channel_label "$PINNED_FLEET_LABEL" 'task/../fleet' >/dev/null 2>&1 \
     && fail "a task id containing a separator was accepted"
+  crew_channel_label "$PINNED_FLEET_LABEL" '-task' >/dev/null 2>&1 \
+    || fail "a canonical task id beginning with a hyphen was rejected"
+  crew_channel_label "$PINNED_FLEET_LABEL" '_task' >/dev/null 2>&1 \
+    || fail "a canonical task id beginning with an underscore was rejected"
+  crew_channel_label "$PINNED_FLEET_LABEL" '.task' >/dev/null 2>&1 \
+    && fail "a task id beginning with a dot was accepted"
   pass "two task ids derive two well-formed, distinct, non-colliding channels"
 }
 
@@ -259,8 +271,9 @@ EOF
 }
 
 test_each_lane_is_named_for_its_crew() {
-  local home relay names
+  local home relay names qualifier
   home=$(make_fleet_home lane-naming)
+  qualifier=$(home_qualifier "$home")
   read -r STUB_PID relay <<EOF
 $(start_stub)
 EOF
@@ -272,9 +285,63 @@ EOF
   # What a captain browsing a Buzz client actually reads. Addressing the lanes
   # correctly is not enough: three channels sharing one name are three identical
   # rows, which is the state this test exists to keep the adapter out of.
-  [ "$names" = "$(printf 'crew-task-a\ncrew-task-b\nfirstmate-bearings')" ] \
+  [ "$names" = "$(printf 'crew-%s-task-a\ncrew-%s-task-b\nfirstmate-bearings' "$qualifier" "$qualifier")" ] \
     || fail "the published channel names were not one per crew plus the fleet: $names"
   pass "each lane is named for its crew and the fleet channel keeps its name"
+}
+
+test_two_homes_publish_distinguishable_lane_names() {
+  local home_a home_b qualifier_a qualifier_b relay names expected
+  home_a=$(make_fleet_home lane-home-a)
+  home_b=$(make_fleet_home lane-home-b)
+  qualifier_a=$(home_qualifier "$home_a")
+  qualifier_b=$(home_qualifier "$home_b")
+  [ "$qualifier_a" != "$qualifier_b" ] || fail "the two fixture homes share a display qualifier"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  run_refresh "$home_a" "$relay" >/dev/null 2>&1
+  expect_code 0 "$?" "refresh from the first home"
+  run_refresh "$home_b" "$relay" >/dev/null 2>&1
+  expect_code 0 "$?" "refresh from the second home"
+  names=$(query_channel_names "$relay") || fail "the stub served no channel-creation events"
+  stop_stub "$STUB_PID"
+  expected=$(printf 'crew-%s-task-a\ncrew-%s-task-b\ncrew-%s-task-a\ncrew-%s-task-b\nfirstmate-bearings\nfirstmate-bearings\n' \
+    "$qualifier_a" "$qualifier_a" "$qualifier_b" "$qualifier_b" | sort)
+  [ "$names" = "$expected" ] || fail "two homes produced ambiguous channel names: $names"
+  pass "two homes sharing a relay publish distinguishable lane names"
+}
+
+test_completed_lane_replay_is_not_stranded() {
+  local home relay relay_port readback names qualifier
+  home=$(make_fleet_home completed-lane-replay)
+  qualifier=$(home_qualifier "$home")
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  relay_port=${relay##*:}
+  stop_stub "$STUB_PID"
+  run_refresh "$home" "$relay" >/dev/null 2>&1
+  [ "$(replay_count "$home")" = "3" ] || fail "the relay outage did not cache the fleet and lane events"
+  grep -v 'task-a - Ship the thing' "$home/data/backlog.md" > "$home/data/backlog.next"
+  mv "$home/data/backlog.next" "$home/data/backlog.md"
+  rm -f "$home/state/task-a.meta" "$home/state/task-a.status"
+
+  read -r STUB_PID relay <<EOF
+$(start_stub --port "$relay_port")
+EOF
+  run_refresh "$home" "$relay" >/dev/null 2>&1
+  expect_code 0 "$?" "refresh after task-a completed"
+  [ "$(replay_count "$home")" = "0" ] || fail "the completed task's replay partition stayed cached"
+  readback=$(run_inspect "$home" "$relay" --crew task-a --full 2>&1) \
+    || fail "the completed task's cached lane did not reach the relay"
+  assert_contains "$readback" "task-a is writing the fix" \
+    "the completed task's cached status stream was not replayed"
+  names=$(query_channel_names "$relay") || fail "the replayed lane was not provisioned"
+  stop_stub "$STUB_PID"
+  assert_contains "$names" "crew-${qualifier}-task-a" \
+    "the replayed lane lost its cached display name"
+  pass "completed lane replay drains independently of current liveness"
 }
 
 test_the_fleet_omitted_disclosure_survives_untouched() {
@@ -389,6 +456,50 @@ SH
   pass "refresh setup failures are logged non-events"
 }
 
+test_status_read_failures_are_not_reported_as_present() {
+  local home guard_bin real_tail lanes errors
+  home=$(make_fleet_home status-read-race)
+  guard_bin="$home/tail-guard"
+  errors="$home/status-read-errors"
+  real_tail=$(command -v tail)
+  mkdir -p "$guard_bin"
+  cat > "$guard_bin/tail" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-c" ]; then
+  exit 1
+fi
+exec "$FM_BUZZ_REAL_TAIL" "$@"
+SH
+  chmod +x "$guard_bin/tail"
+  lanes=$(PATH="$guard_bin:$PATH" FM_BUZZ_REAL_TAIL="$real_tail" \
+    run_lanes "$home" --projection <(bearings_json "$home") 2>"$errors") \
+    || fail "the lane projector failed after a raced status read"
+  [ "$(printf '%s' "$lanes" | jq 'length')" = "0" ] \
+    || fail "a failed status read still produced a present status stream"
+  assert_contains "$(cat "$errors")" "could not read the status stream" \
+    "the failed status read was not disclosed"
+  pass "status read failures are not reported as present streams"
+}
+
+test_refresh_deadline_bounds_a_silent_relay() {
+  local home relay output started elapsed
+  home=$(make_fleet_home refresh-deadline)
+  read -r STUB_PID relay <<EOF
+$(start_stub --silent-ok)
+EOF
+  started=$(date +%s)
+  output=$(FM_BUZZ_REFRESH_TIMEOUT_S=2 run_refresh "$home" "$relay" 2>&1)
+  expect_code 0 "$?" "refresh against a silent relay"
+  elapsed=$(($(date +%s) - started))
+  stop_stub "$STUB_PID"
+  [ "$elapsed" -le 5 ] || fail "the two-second refresh budget took ${elapsed}s"
+  assert_contains "$output" "refresh deadline reached after the fleet channel" \
+    "the refresh did not report which work its deadline skipped"
+  [ "$(replay_count "$home")" = "1" ] \
+    || fail "the refresh continued publishing crew lanes after its deadline"
+  pass "one refresh-wide deadline bounds a silent relay"
+}
+
 test_channel_labels_preserve_embedded_newlines() {
   local home relay label channel
   home=$(make_fleet_home newline-channel-label)
@@ -409,9 +520,13 @@ test_a_lane_carries_its_own_status_lines_and_identity
 test_lane_events_never_land_in_another_lanes_partition
 test_lanes_reach_the_relay_and_read_back_as_one_crews_stream
 test_each_lane_is_named_for_its_crew
+test_two_homes_publish_distinguishable_lane_names
+test_completed_lane_replay_is_not_stranded
 test_the_fleet_omitted_disclosure_survives_untouched
 test_an_unreachable_or_refusing_relay_is_a_non_event
 test_fire_and_forget_contract_is_intact
 test_lane_documents_stay_out_of_process_arguments
 test_refresh_setup_failures_are_non_events
+test_status_read_failures_are_not_reported_as_present
+test_refresh_deadline_bounds_a_silent_relay
 test_channel_labels_preserve_embedded_newlines

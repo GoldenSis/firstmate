@@ -39,11 +39,11 @@
 #      derivation. bin/fm-buzz-crew-lanes.sh owns what a lane contains.
 #
 # HOW A LANE IS NAMED, AND WHY IT IS NOT THE LABEL. Each lane is published with
-# --channel-name crew-<task id>, so a captain browsing a Buzz client reads a list
-# of crews rather than a column of UUIDs. The name is display metadata and never
-# touches the id derivation. The fleet channel is published with NO name option,
-# which leaves the publisher's own default in place and keeps the name a captain
-# has been reading alongside the id they have been reading.
+# --channel-name crew-<home qualifier>-<task id>, so a captain browsing a Buzz
+# client can distinguish the same task id in two homes. The name is display
+# metadata and never touches the id derivation. The fleet channel is published
+# with NO name option, which leaves the publisher's own default in place and keeps
+# the name a captain has been reading alongside the id they have been reading.
 #
 # The replay cache already partitions by <endpoint-digest>/<channel-id>, and the
 # delivery lock is already scoped per endpoint-and-channel, so publishing into
@@ -51,6 +51,8 @@
 # lane is one ordinary bin/fm-buzz-publish.sh invocation against its own channel.
 # Lanes are published one at a time for that reason - the locks are per queue, and
 # serial invocations keep the whole-tree replay barrier uncontended.
+# Nonempty replay partitions are retried even when their tasks are no longer live,
+# so a projection cached before task completion is not stranded indefinitely.
 #
 # One bearings snapshot is taken and reused for both the fleet publication and the
 # lane projection, so the two agree on what was in flight. bin/fm-buzz-crew-lanes.sh
@@ -67,6 +69,8 @@
 #   fm-buzz-refresh.sh --timeout <ms>     relay timeout, passed through
 #   fm-buzz-refresh.sh --help             this text
 #
+# The complete run is bounded by FM_BUZZ_REFRESH_TIMEOUT_S (default 30 seconds).
+#
 # This script reads Firstmate state only through the read-only bearings and fleet
 # snapshots and never reads Buzz into Firstmate state. Buzz is a projection
 # target, never a state source.
@@ -75,6 +79,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 # shellcheck source=bin/fm-buzz-key-lib.sh
 . "$SCRIPT_DIR/fm-buzz-key-lib.sh"
@@ -82,8 +87,12 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 RELAY=${FM_BUZZ_RELAY:-ws://localhost:3000}
 CHANNEL_LABEL=""
 TIMEOUT_MS=""
+REFRESH_TIMEOUT_S=${FM_BUZZ_REFRESH_TIMEOUT_S:-30}
 FLEET_ONLY=0
 ARGUMENT_ERROR=0
+REFRESH_DEADLINE=0
+PUBLISH_DEADLINE_REACHED=0
+PUBLISH_STARTED=0
 
 log() {
   printf 'fm-buzz-refresh: %s\n' "$1" >&2
@@ -140,18 +149,72 @@ trap cleanup EXIT
 # temporary directory.
 trap 'cleanup; exit 0' INT TERM HUP
 
-# Publish one already-built projection into one channel. Every caller feeds the
-# document on stdin, which is how it stays off a command line.
+publish_bounded() {  # <file or empty> <publisher arguments...>
+  local file=$1 now remaining remaining_ms requested effective lock_timeout status
+  shift
+  local args=("$@")
+  PUBLISH_DEADLINE_REACHED=0
+  PUBLISH_STARTED=0
+  now=$(date +%s)
+  remaining=$((REFRESH_DEADLINE - now))
+  if [ "$remaining" -le 0 ]; then
+    PUBLISH_DEADLINE_REACHED=1
+    return 124
+  fi
+  requested=${TIMEOUT_MS:-${FM_BUZZ_TIMEOUT_MS:-15000}}
+  case $requested in
+    ''|*[!0-9]*|0|0*) ;;
+    *)
+      if [ "$remaining" -gt 2147483 ]; then
+        remaining_ms=2147483000
+      else
+        remaining_ms=$((remaining * 1000))
+      fi
+      effective=$requested
+      [ "$effective" -gt "$remaining_ms" ] && effective=$remaining_ms
+      args+=(--timeout "$effective")
+      ;;
+  esac
+  if [ -n "$TIMEOUT_MS" ]; then
+    case $TIMEOUT_MS in ''|*[!0-9]*|0|0*) args+=(--timeout "$TIMEOUT_MS") ;; esac
+  fi
+  lock_timeout=${FM_BUZZ_LOCK_TIMEOUT_S:-30}
+  case $lock_timeout in
+    ''|*[!0-9]*|0|0*) ;;
+    *) [ "$lock_timeout" -gt "$remaining" ] && lock_timeout=$remaining ;;
+  esac
+  PUBLISH_STARTED=1
+  if [ -n "$file" ]; then
+    FM_BUZZ_LOCK_TIMEOUT_S=$lock_timeout \
+      "$SCRIPT_DIR/fm-buzz-publish.sh" "${args[@]}" < "$file"
+  else
+    FM_BUZZ_LOCK_TIMEOUT_S=$lock_timeout \
+      "$SCRIPT_DIR/fm-buzz-publish.sh" "${args[@]}" < /dev/null
+  fi
+  status=$?
+  now=$(date +%s)
+  [ "$now" -ge "$REFRESH_DEADLINE" ] && PUBLISH_DEADLINE_REACHED=1
+  return "$status"
+}
+
 publish_document() {  # <channel label> <file> [channel name]
   local label=$1 file=$2 name=${3:-}
   local args=(--relay "$RELAY" --channel-label "$label")
   [ -n "$name" ] && args+=(--channel-name "$name")
-  [ -n "$TIMEOUT_MS" ] && args+=(--timeout "$TIMEOUT_MS")
-  "$SCRIPT_DIR/fm-buzz-publish.sh" "${args[@]}" < "$file"
+  publish_bounded "$file" "${args[@]}"
+}
+
+replay_channel() {  # <channel id>
+  publish_bounded "" --relay "$RELAY" --replay-channel "$1"
 }
 
 refresh() {
-  local fleet_label lane_count=0 lane_failures=0
+  local home_label home_channel home_qualifier fleet_label fleet_channel
+  local lane_count=0 lane_failures=0 replay_count=0 replay_failures=0
+  local addressed_channels="" pending_channels="" replay_channels=""
+  local replay_total=0 replay_index=0 lane_total=0 lane_index=0 skipped=0
+
+  REFRESH_DEADLINE=$(($(date +%s) + REFRESH_TIMEOUT_S))
 
   PROJECTION=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-refresh.XXXXXX") || {
     log "could not create a temporary file for the projection"
@@ -162,15 +225,30 @@ refresh() {
     return 0
   fi
 
+  home_label=$(fm_buzz_key_account "$FM_HOME")
+  home_channel=$(fm_buzz_channel_id "$SCRIPT_DIR" "$home_label") || {
+    log "could not derive the home qualifier; skipping publish"
+    return 0
+  }
+  home_qualifier=${home_channel%%-*}
   fleet_label=$CHANNEL_LABEL
   if [ -z "$fleet_label" ]; then
-    fleet_label=$(fm_buzz_key_account "$FM_HOME")
+    fleet_label=$home_label
   fi
+  fleet_channel=$(fm_buzz_channel_id "$SCRIPT_DIR" "$fleet_label") || {
+    log "could not derive the fleet channel; skipping publish"
+    return 0
+  }
+  addressed_channels=" $fleet_channel "
 
   publish_document "$fleet_label" "$PROJECTION"
   FLEET_STATUS=$?
 
   [ "$FLEET_ONLY" -eq 1 ] && return "$FLEET_STATUS"
+  if [ "$PUBLISH_DEADLINE_REACHED" -eq 1 ]; then
+    log "refresh deadline reached after the fleet channel; crew lanes and cached queue replay were skipped"
+    return "$FLEET_STATUS"
+  fi
 
   LANES=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-lanes.XXXXXX") || {
     log "could not create a temporary file for the crew lanes"
@@ -181,13 +259,15 @@ refresh() {
     return "$FLEET_STATUS"
   fi
 
-  local lane id label
+  local lane id label channel publish_status
   DOCUMENT=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-lane.XXXXXX") || {
     log "could not create a temporary file for a crew lane"
     return "$FLEET_STATUS"
   }
+  lane_total=$(jq 'length' "$LANES" 2>/dev/null) || lane_total=0
   while IFS= read -r lane; do
     [ -n "$lane" ] || continue
+    lane_index=$((lane_index + 1))
     id=$(printf '%s' "$lane" | jq -r '.id // empty') || id=""
     if [ -z "$id" ]; then
       log "a crew lane carried no task id; skipping it"
@@ -199,28 +279,85 @@ refresh() {
       lane_failures=$((lane_failures + 1))
       continue
     fi
+    if ! channel=$(fm_buzz_channel_id "$SCRIPT_DIR" "$label" 2>/dev/null); then
+      log "could not derive a lane channel for $id; skipping it"
+      lane_failures=$((lane_failures + 1))
+      continue
+    fi
+    addressed_channels="${addressed_channels}${channel} "
     if ! printf '%s' "$lane" | jq -e '.projection' > "$DOCUMENT"; then
       log "could not read the lane projection for $id; skipping it"
       lane_failures=$((lane_failures + 1))
       continue
     fi
-    # No length guard here: a task id is restricted to 64 characters by
-    # crewChannelLabel, which the label derivation above has already enforced, so
-    # `crew-<id>` cannot reach the publisher's 100-character bound.
-    if publish_document "$label" "$DOCUMENT" "crew-$id"; then
+    if publish_document "$label" "$DOCUMENT" "crew-${home_qualifier}-$id"; then
       lane_count=$((lane_count + 1))
     else
       log "the lane for $id did not publish; the fleet channel is unaffected"
       lane_failures=$((lane_failures + 1))
     fi
+    if [ "$PUBLISH_DEADLINE_REACHED" -eq 1 ]; then
+      skipped=$((lane_total - lane_index))
+      [ "$PUBLISH_STARTED" -eq 0 ] && skipped=$((skipped + 1))
+      log "refresh deadline reached; ${skipped} live crew lane(s) and cached queue replay were skipped"
+      break
+    fi
   done < <(jq -c '.[]' "$LANES" 2>/dev/null)
   rm -f -- "$DOCUMENT"
   DOCUMENT=""
+
+  if [ "$PUBLISH_DEADLINE_REACHED" -eq 0 ]; then
+    # shellcheck disable=SC2016 # Node source, not a shell expansion.
+    if fm_buzz_capture node -e '
+      import(process.argv[1]).then(({ listPendingReplayChannels }) => {
+        process.stdout.write(`${listPendingReplayChannels(process.argv[2], process.argv[3]).join("\n")}\n`);
+      }).catch((error) => {
+        process.stderr.write(`${error.message}\n`);
+        process.exitCode = 1;
+      });
+    ' "$SCRIPT_DIR/fm-buzz-publish.mjs" "$(fm_buzz_replay_cache_dir "$STATE")" "$RELAY"; then
+      pending_channels=$FM_BUZZ_CAPTURED_OUTPUT
+    else
+      log "could not inspect cached queue replay: $FM_BUZZ_CAPTURED_DIAGNOSTIC"
+      replay_failures=$((replay_failures + 1))
+    fi
+    while IFS= read -r channel; do
+      [ -n "$channel" ] || continue
+      case $addressed_channels in *" $channel "*) continue ;; esac
+      replay_channels="${replay_channels}${channel}
+"
+      replay_total=$((replay_total + 1))
+    done <<EOF
+$pending_channels
+EOF
+    while IFS= read -r channel; do
+      [ -n "$channel" ] || continue
+      replay_index=$((replay_index + 1))
+      replay_channel "$channel"
+      publish_status=$?
+      if [ "$publish_status" -eq 0 ]; then
+        replay_count=$((replay_count + 1))
+      else
+        log "cached queue $channel did not replay; the fleet channel is unaffected"
+        replay_failures=$((replay_failures + 1))
+      fi
+      if [ "$PUBLISH_DEADLINE_REACHED" -eq 1 ]; then
+        skipped=$((replay_total - replay_index))
+        [ "$PUBLISH_STARTED" -eq 0 ] && skipped=$((skipped + 1))
+        log "refresh deadline reached; ${skipped} cached queue(s) were skipped"
+        break
+      fi
+    done <<EOF
+$replay_channels
+EOF
+  fi
 
   # Deliberately not "published": the publisher owns delivery and reports its own
   # failures, and a fire-and-forget run cannot truthfully claim one landed.
   log "handed the fleet channel and ${lane_count} crew lane(s) to the publisher"
   [ "$lane_failures" -gt 0 ] && log "${lane_failures} crew lane(s) were skipped"
+  [ "$replay_count" -gt 0 ] && log "retried ${replay_count} cached queue(s)"
+  [ "$replay_failures" -gt 0 ] && log "${replay_failures} cached queue replay attempt(s) were skipped"
   return "$FLEET_STATUS"
 }
 
@@ -228,6 +365,12 @@ if ! command -v jq >/dev/null 2>&1; then
   log "jq is unavailable; skipping publish"
   exit 0
 fi
+case $REFRESH_TIMEOUT_S in
+  ''|*[!0-9]*|0|0*)
+    log "FM_BUZZ_REFRESH_TIMEOUT_S must be a positive integer without a leading zero"
+    exit 0
+    ;;
+esac
 
 FLEET_STATUS=0
 if [ "$ARGUMENT_ERROR" -eq 1 ]; then

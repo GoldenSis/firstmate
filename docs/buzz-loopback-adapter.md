@@ -69,29 +69,31 @@ Two mechanisms were on the table: a derived channel per task, or Buzz's native t
 This ships the derived channel, and did not half-build the other.
 `channelIdForLabel` was made derivable on purpose - it hashes `firstmate-buzz-channel:<label>`, takes 16 bytes, and sets the v5 and variant bits - so a per-crew channel is a new NAME through a function that is already tested, and the replay cache is already partitioned by `<endpoint-digest>/<channel-id>/`, so multi-channel publication needs no new storage, no new lock, and no new wire protocol.
 Threads would be tidier for a reader, but this adapter speaks only the NIP-01 and NIP-29 subset it needs; nothing in `bin/fm-buzz-lib.mjs` addresses a thread, so taking that route means new protocol surface on a pre-1.0 relay that can move under the adapter at any time.
-Channel sprawl is the price paid, and it is the cheaper one: a channel per live task is bounded by the fleet, and every lane id is recomputable from the home and the task id with nothing to persist.
+Channel sprawl is the price paid, and it grows with lifetime task count because completed-task channels remain in the relay with their last projection.
+Every lane id is recomputable from the home and the task id with nothing to persist, and `docker compose -f docker-compose.buzz-loopback.yml down -v` is the accepted cleanup for this disposable stack.
 
 ### The label
 
 `crewChannelLabel(<fleet label>, <task id>)` returns `firstmate-crew:<sha256(fleet label)>:<task id>`, which is then hashed by the unchanged `channelIdForLabel`.
 The fleet label is hashed rather than concatenated because appending is not injective: a home path that happened to end in the separator plus another id would derive the same string as a different home publishing that task.
-A task id is restricted to `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, which excludes the separator, so the encoding is unambiguous by construction; an id outside that set is refused rather than published to some other channel.
+A task id is restricted to `[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}`, matching the canonical task-creation validator while excluding the separator and a leading dot, so the encoding is unambiguous by construction; an id outside that set is refused rather than published to some other channel.
 The fleet label itself is untouched, so the fleet channel keeps the exact id it has always had and a captain reading it does not silently lose their history.
 `tests/fm-buzz-crew-lanes.test.sh` pins the derived id of a fixed label against its literal value, so a change to that derivation fails rather than quietly re-homing the channel.
 
 ### The name
 
 The label decides where a lane goes; the name decides whether a human can find it.
-Each lane is published with `--channel-name crew-<task id>`, which reaches the relay on the channel-creation event's `name` tag and is what a Buzz client lists the channel under.
+Each lane is published with `--channel-name crew-<home qualifier>-<task id>`, where the stable eight-hex qualifier is the first segment of the unchanged channel id derived from the resolved home path.
+The display name reaches the relay on the channel-creation event's `name` tag and is what a Buzz client lists the channel under.
 Without it every lane inherits the publisher's default, `firstmate-bearings`, and a captain browsing the client reads one identical row per lane, separable only by UUID - correctly addressed and unreadable, which defeats the point of a lane.
 The fleet channel is published with no name option at all, so that default still applies to it and the name a captain has been reading stays put alongside the id.
 A name is display metadata and never touches the id derivation, which is why the two are separate options rather than one.
-`crew-<task id>` cannot exceed the publisher's 100-character bound, because a task id is already restricted to 64 characters by the grammar above.
+`crew-<home qualifier>-<task id>` cannot exceed the publisher's 100-character bound, because the qualifier is eight characters and a task id is already restricted to 64 characters by the grammar above.
 `tests/fm-buzz-crew-lanes.test.sh` reads the channel-creation events back off the stub relay and asserts the published set is one name per crew plus the fleet's.
 
 The name is set when the channel is created and never afterwards, which is a property of the relay rather than a choice made here.
 Channel creation is idempotent by design - the publisher re-sends it on every run and the relay answers `duplicate: channel already exists` - so a channel that already exists keeps the name it was created with and a changed `--channel-name` has no visible effect on it.
-Verified on the running loopback relay on 2026-08-20: after republishing every lane with `crew-<task id>`, `select id, name from channels` still returned `firstmate-bearings` for all ten pre-existing lanes.
+Verified on the running loopback relay on 2026-08-20: after republishing every lane with task-specific display names, `select id, name from channels` still returned `firstmate-bearings` for all ten pre-existing lanes.
 Renaming an existing channel would need a NIP-29 metadata-edit event, which is the new protocol surface this adapter declined to take on for threads and declines again here.
 On this disposable stack the recovery is the one the compose file already documents: `docker compose -f docker-compose.buzz-loopback.yml down -v` drops the datastores, and the next refresh recreates every channel under its current name.
 
@@ -118,6 +120,8 @@ Nothing auto-invokes any of this.
 `bin/fm-buzz-refresh.sh` is one explicit call firstmate can make after a wake drain, and it is deliberately not a daemon, a watcher hook, a timer, or anything in a crewmate's own execution path.
 That is what keeps invariant 3 real: Buzz stays off the critical path of both firstmate and every crewmate, so a relay that is down, slow, or absent cannot break a merge, a teardown, a wake drain, or a turn end.
 The refresh forwards the fleet publication's exit status unchanged - the contract `bin/fm-buzz-publish.sh` already owned - and treats every crew-lane failure as a logged non-event, because an additive surface may never make anything louder than it was.
+It also retries every nonempty cache partition for the selected relay, including lanes whose tasks have already completed, without signing a replacement projection.
+The complete refresh has a default 30-second budget, shortens each publisher relay timeout to the remaining budget, and logs the live lanes or cached queues skipped when that budget is spent.
 
 ## Using it
 

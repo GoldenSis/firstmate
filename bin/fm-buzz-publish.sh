@@ -75,6 +75,9 @@
 #                                      the channel's display name, at most 100
 #                                      printable characters (default
 #                                      firstmate-bearings)
+#   fm-buzz-publish.sh --replay-channel <uuid>
+#                                      drain one existing cache partition without
+#                                      signing a new projection
 #   fm-buzz-publish.sh --timeout <ms>  relay timeout, integer 1..2147483647 (default 15000)
 #   fm-buzz-publish.sh --help          this text
 #
@@ -110,6 +113,7 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 RELAY=${FM_BUZZ_RELAY:-ws://localhost:3000}
 CHANNEL_LABEL=""
 CHANNEL_NAME=""
+REPLAY_CHANNEL=""
 TIMEOUT_MS=${FM_BUZZ_TIMEOUT_MS:-15000}
 MAX_CACHE=${FM_BUZZ_MAX_CACHE:-100}
 REFRESH=0
@@ -413,74 +417,74 @@ publish() {
     return 1
   fi
 
-  STDIN_SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-stdin.XXXXXX") || {
-    log "could not create a temporary file for the projection"
-    return 1
-  }
-  if [ "$REFRESH" -eq 1 ]; then
-    "$SCRIPT_DIR/fm-bearings-snapshot.sh" --json > "$STDIN_SPOOL" 2>/dev/null || {
-      drop_stdin_spool
-      log "bearings snapshot failed; skipping publish"
+  if [ -z "$REPLAY_CHANNEL" ]; then
+    STDIN_SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-stdin.XXXXXX") || {
+      log "could not create a temporary file for the projection"
       return 1
     }
-  else
-    if ! validate_stdin_timeout; then
-      drop_stdin_spool
-      log "FM_BUZZ_STDIN_TIMEOUT_S must be a positive integer no greater than 2147483647"
-      return 1
-    fi
-    # A terminal on stdin means nobody is piping a projection in at all, so this
-    # is answerable without waiting out the deadline below.
-    if [ -t 0 ]; then
-      log "stdin is a terminal; pipe the projection in or use --refresh"
-      return 1
-    fi
-    read_stdin_bounded "$STDIN_SPOOL"
-    read_status=$?
-    if [ "$read_status" -ne 0 ]; then
-      drop_stdin_spool
-      if [ "$read_status" -eq 42 ]; then
-        log "the projection exceeds FM_BUZZ_MAX_PROJECTION_BYTES (${MAX_PROJECTION_BYTES} bytes)"
-        return 2
+    if [ "$REFRESH" -eq 1 ]; then
+      "$SCRIPT_DIR/fm-bearings-snapshot.sh" --json > "$STDIN_SPOOL" 2>/dev/null || {
+        drop_stdin_spool
+        log "bearings snapshot failed; skipping publish"
+        return 1
+      }
+    else
+      if ! validate_stdin_timeout; then
+        drop_stdin_spool
+        log "FM_BUZZ_STDIN_TIMEOUT_S must be a positive integer no greater than 2147483647"
+        return 1
       fi
-      log "could not read the projection from stdin within ${STDIN_TIMEOUT_S}s"
-      return 1
+      if [ -t 0 ]; then
+        log "stdin is a terminal; pipe the projection in or use --refresh"
+        return 1
+      fi
+      read_stdin_bounded "$STDIN_SPOOL"
+      read_status=$?
+      if [ "$read_status" -ne 0 ]; then
+        drop_stdin_spool
+        if [ "$read_status" -eq 42 ]; then
+          log "the projection exceeds FM_BUZZ_MAX_PROJECTION_BYTES (${MAX_PROJECTION_BYTES} bytes)"
+          return 2
+        fi
+        log "could not read the projection from stdin within ${STDIN_TIMEOUT_S}s"
+        return 1
+      fi
     fi
-  fi
-  projection_bytes=$(wc -c < "$STDIN_SPOOL" | tr -d '[:space:]') || {
-    drop_stdin_spool
-    log "could not measure the projection"
-    return 1
-  }
-  if [ "$projection_bytes" -gt "$MAX_PROJECTION_BYTES" ]; then
-    drop_stdin_spool
-    log "the projection exceeds FM_BUZZ_MAX_PROJECTION_BYTES (${MAX_PROJECTION_BYTES} bytes)"
-    return 2
-  fi
-  [ -s "$STDIN_SPOOL" ] || {
-    drop_stdin_spool
-    log "the projection is empty; skipping publish"
-    return 1
-  }
-  validate_projection_json "$STDIN_SPOOL" || {
-    drop_stdin_spool
-    return 2
-  }
-  validate_projection_contract "$STDIN_SPOOL" || {
-    drop_stdin_spool
-    return 2
-  }
-
-  local label=$CHANNEL_LABEL
-  if [ -z "$label" ]; then
-    label=$(fm_buzz_key_account "$FM_HOME")
+    projection_bytes=$(wc -c < "$STDIN_SPOOL" | tr -d '[:space:]') || {
+      drop_stdin_spool
+      log "could not measure the projection"
+      return 1
+    }
+    if [ "$projection_bytes" -gt "$MAX_PROJECTION_BYTES" ]; then
+      drop_stdin_spool
+      log "the projection exceeds FM_BUZZ_MAX_PROJECTION_BYTES (${MAX_PROJECTION_BYTES} bytes)"
+      return 2
+    fi
+    [ -s "$STDIN_SPOOL" ] || {
+      drop_stdin_spool
+      log "the projection is empty; skipping publish"
+      return 1
+    }
+    validate_projection_json "$STDIN_SPOOL" || {
+      drop_stdin_spool
+      return 2
+    }
+    validate_projection_contract "$STDIN_SPOOL" || {
+      drop_stdin_spool
+      return 2
+    }
   fi
 
-  local channel
-  channel=$(fm_buzz_channel_id "$SCRIPT_DIR" "$label") || {
-    log "could not derive the channel id"
-    return 1
-  }
+  local label=$CHANNEL_LABEL channel=$REPLAY_CHANNEL
+  if [ -z "$channel" ]; then
+    if [ -z "$label" ]; then
+      label=$(fm_buzz_key_account "$FM_HOME")
+    fi
+    channel=$(fm_buzz_channel_id "$SCRIPT_DIR" "$label") || {
+      log "could not derive the channel id"
+      return 1
+    }
+  fi
 
   # The delivery lock is scoped to the queue this run owns, so it has to agree
   # with the cache partitioning on what "this relay" means - hence the same
@@ -624,22 +628,40 @@ publish() {
   # which would put it in jq's world-readable argv. The key reaches jq through a
   # file descriptor, while --rawfile reads the projection spool's bytes verbatim.
   # The remaining --arg values - relay URL, channel id, cache path - are not secrets.
-  preparation=$(jq -n \
-    --rawfile privateKey <(printf '%s' "$key") \
-    --rawfile content "$STDIN_SPOOL" \
-    --arg phase prepare \
-    --arg relay "$RELAY" \
-    --arg channelId "$channel" \
-    --arg replayDir "$REPLAY_DIR" \
-    --arg targetsFile "$TARGETS_FILE" \
-    --argjson timeoutMs "$TIMEOUT_MS" \
-    --argjson maxCache "$MAX_CACHE" \
-    --argjson migration "$migration" \
-    --argjson channelName "$name_field" \
-    '{phase:$phase, privateKey:$privateKey, content:$content, relay:$relay, channelId:$channelId,
-      replayDir:$replayDir, targetsFile:$targetsFile, migration:$migration,
-      timeoutMs:$timeoutMs, maxCache:$maxCache} + $channelName' \
-    | node "$SCRIPT_DIR/fm-buzz-publish.mjs")
+  if [ -n "$REPLAY_CHANNEL" ]; then
+    preparation=$(jq -n \
+      --rawfile privateKey <(printf '%s' "$key") \
+      --arg phase replay \
+      --arg relay "$RELAY" \
+      --arg channelId "$channel" \
+      --arg replayDir "$REPLAY_DIR" \
+      --arg targetsFile "$TARGETS_FILE" \
+      --argjson timeoutMs "$TIMEOUT_MS" \
+      --argjson maxCache "$MAX_CACHE" \
+      --argjson migration "$migration" \
+      --argjson channelName "$name_field" \
+      '{phase:$phase, privateKey:$privateKey, relay:$relay, channelId:$channelId,
+        replayDir:$replayDir, targetsFile:$targetsFile, migration:$migration,
+        timeoutMs:$timeoutMs, maxCache:$maxCache} + $channelName' \
+      | node "$SCRIPT_DIR/fm-buzz-publish.mjs")
+  else
+    preparation=$(jq -n \
+      --rawfile privateKey <(printf '%s' "$key") \
+      --rawfile content "$STDIN_SPOOL" \
+      --arg phase prepare \
+      --arg relay "$RELAY" \
+      --arg channelId "$channel" \
+      --arg replayDir "$REPLAY_DIR" \
+      --arg targetsFile "$TARGETS_FILE" \
+      --argjson timeoutMs "$TIMEOUT_MS" \
+      --argjson maxCache "$MAX_CACHE" \
+      --argjson migration "$migration" \
+      --argjson channelName "$name_field" \
+      '{phase:$phase, privateKey:$privateKey, content:$content, relay:$relay, channelId:$channelId,
+        replayDir:$replayDir, targetsFile:$targetsFile, migration:$migration,
+        timeoutMs:$timeoutMs, maxCache:$maxCache} + $channelName' \
+      | node "$SCRIPT_DIR/fm-buzz-publish.mjs")
+  fi
   rc=$?
   fm_lock_release "$KEYPAIR_LOCK"
   KEYPAIR_LOCK=""
@@ -652,7 +674,6 @@ publish() {
 
   jq -n \
     --rawfile privateKey <(printf '%s' "$key") \
-    --rawfile content "$STDIN_SPOOL" \
     --arg phase deliver \
     --arg relay "$RELAY" \
     --arg channelId "$channel" \
@@ -663,7 +684,7 @@ publish() {
     --argjson migration "$migration" \
     --argjson preparation "$preparation" \
     --argjson channelName "$name_field" \
-    '{phase:$phase, privateKey:$privateKey, content:$content, relay:$relay, channelId:$channelId,
+    '{phase:$phase, privateKey:$privateKey, relay:$relay, channelId:$channelId,
       replayDir:$replayDir, targetsFile:$targetsFile, migration:$migration,
       preparation:$preparation, timeoutMs:$timeoutMs, maxCache:$maxCache} + $channelName' \
     | node "$SCRIPT_DIR/fm-buzz-publish.mjs"
@@ -693,7 +714,7 @@ ARGUMENT_ERROR=0
 while [ "$#" -gt 0 ]; do
   case $1 in
     --refresh) REFRESH=1 ;;
-    --relay|--channel-label|--channel-name|--timeout)
+    --relay|--channel-label|--channel-name|--replay-channel|--timeout)
       option=$1
       if [ "$#" -lt 2 ] || [ -z "$2" ]; then
         log "$option requires a value"
@@ -720,6 +741,7 @@ while [ "$#" -gt 0 ]; do
                   CHANNEL_NAME=$1
                 fi
                 ;;
+              --replay-channel) REPLAY_CHANNEL=$1 ;;
               --timeout) TIMEOUT_MS=$1 ;;
             esac
             ;;
@@ -736,6 +758,11 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+if [ -n "$REPLAY_CHANNEL" ] && { [ "$REFRESH" -eq 1 ] || [ -n "$CHANNEL_LABEL" ]; }; then
+  log "--replay-channel cannot be combined with --refresh or --channel-label"
+  ARGUMENT_ERROR=1
+fi
 
 PREREQUISITE_STATUS=0
 if [ "$ARGUMENT_ERROR" -eq 0 ]; then

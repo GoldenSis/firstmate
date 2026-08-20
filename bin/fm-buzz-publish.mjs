@@ -41,7 +41,7 @@
 // Reads one JSON envelope on stdin so that neither the private key nor the
 // projection - which carries task ids, project names, blockers and PR URLs -
 // appears in a command line or in the process environment. Fields: privateKey,
-// phase, content, relay, channelId, channelName, timeoutMs, replayDir,
+// phase, optional content, relay, channelId, channelName, timeoutMs, replayDir,
 // targetsFile, migration, preparation, maxCache.
 //
 // Legacy and explicitly discarded rotation entries are retained under
@@ -2906,6 +2906,40 @@ export function migrateReplayCache(replayDir) {
   return { legacy: legacy.failures, endpoint: endpoint.failures };
 }
 
+export function listPendingReplayChannels(replayDir, relay) {
+  resolveLoopbackRelayHost(relay);
+  let metadata;
+  try {
+    metadata = lstatSync(replayDir);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`replay cache path ${replayDir} is not a regular directory`);
+  }
+  const cacheRoot = prepareCacheRoot(replayDir);
+  const endpointPath = relayCacheDirectory(cacheRoot, relay);
+  try {
+    metadata = cacheLstatSync(endpointPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`relay cache path ${endpointPath} is not a regular directory`);
+  }
+  const endpoint = pinCacheDirectory(endpointPath);
+  const channels = cacheChannelDirectories(endpoint);
+  if (channels.failures.length > 0) {
+    throw new Error(`could not inspect ${channels.failures.length} replay channel partition(s)`);
+  }
+  return channels.directories
+    .filter((directory) => cacheReaddirSync(directory).length > 0)
+    .map((directory) => path.basename(directory))
+    .sort();
+}
+
 function normalizeMigrationFailures(migration) {
   if (!migration || typeof migration !== "object" || Array.isArray(migration)) {
     throw new Error("missing envelope field: migration");
@@ -2958,7 +2992,32 @@ function normalizePreparation(preparation, relayCacheDir) {
     }
     return entry;
   });
-  return { entries, outcomes, failed: preparation.failed };
+  const channelName = preparation.channelName;
+  if (
+    channelName !== undefined &&
+    (typeof channelName !== "string" || channelName === "" || channelName.length > 100 || /[\u0000-\u001f\u007f-\u009f]/u.test(channelName))
+  ) {
+    throw new Error("invalid envelope field: preparation.channelName");
+  }
+  return { entries, outcomes, failed: preparation.failed, channelName };
+}
+
+function replayChannelName(entries) {
+  let channelName;
+  for (const entry of entries) {
+    try {
+      const raw = readRegularFile(entry.file).bytes.toString("utf8");
+      const event = cachedEventFromFrame(raw, entry);
+      const names = event.tags.filter((tag) => tag[0] === "fm-channel-name");
+      if (names.length !== 1 || names[0].length !== 2) continue;
+      const candidate = names[0][1];
+      if (candidate === "" || candidate.length > 100 || /[\u0000-\u001f\u007f-\u009f]/u.test(candidate)) continue;
+      channelName = candidate;
+    } catch {
+      continue;
+    }
+  }
+  return channelName;
 }
 
 async function main() {
@@ -2968,7 +3027,7 @@ async function main() {
     content,
     relay,
     channelId,
-    channelName = "firstmate-bearings",
+    channelName,
     timeoutMs = 15000,
     replayDir,
     targetsFile,
@@ -2976,8 +3035,11 @@ async function main() {
     phase,
   } = envelope;
 
-  for (const [name, value] of Object.entries({ privateKey, content, relay, channelId, replayDir, targetsFile })) {
+  for (const [name, value] of Object.entries({ privateKey, relay, channelId, replayDir, targetsFile })) {
     if (typeof value !== "string" || value === "") throw new Error(`missing envelope field: ${name}`);
+  }
+  if (phase === "prepare" && (typeof content !== "string" || content === "")) {
+    throw new Error("missing envelope field: content");
   }
   if (!Number.isSafeInteger(maxCache) || maxCache <= 0) {
     throw new Error(`invalid FM_BUZZ_MAX_CACHE value ${JSON.stringify(maxCache)}: expected a positive integer`);
@@ -2986,7 +3048,9 @@ async function main() {
     throw new Error(`invalid relay timeout ${JSON.stringify(timeoutMs)}: expected an integer from 1 to 2147483647`);
   }
   if (!CHANNEL_PARTITION.test(channelId)) throw new Error("channel id must be a canonical UUID");
-  if (phase !== "prepare" && phase !== "deliver") throw new Error("invalid envelope field: phase");
+  if (phase !== "prepare" && phase !== "replay" && phase !== "deliver") {
+    throw new Error("invalid envelope field: phase");
+  }
   resolveLoopbackRelayHost(relay);
   const currentPublisher = publicKeyFromPrivate(privateKey);
   const cacheRoot = prepareCacheRoot(replayDir);
@@ -2995,6 +3059,7 @@ async function main() {
   if (phase === "prepare") {
     const event = buildBearingsEvent(channelId, content, privateKey, [
       ["fm-schema", "fm-bearings.v1"],
+      ["fm-channel-name", channelName ?? "firstmate-bearings"],
       ["nonce", randomBytes(16).toString("hex")],
     ]);
     const currentFile = cacheEvent(relayCacheDir, event);
@@ -3009,6 +3074,18 @@ async function main() {
       entries: cacheMaintenance.entries,
       outcomes: [...cacheMaintenance.outcomes],
       failed: cacheMaintenance.failed,
+      channelName: channelName ?? "firstmate-bearings",
+    }));
+    return 0;
+  }
+
+  if (phase === "replay") {
+    const cacheMaintenance = pruneCache(relayCacheDir, maxCache, null, currentPublisher);
+    process.stdout.write(JSON.stringify({
+      entries: cacheMaintenance.entries,
+      outcomes: [...cacheMaintenance.outcomes],
+      failed: cacheMaintenance.failed,
+      channelName: channelName ?? replayChannelName(cacheMaintenance.entries),
     }));
     return 0;
   }
@@ -3045,7 +3122,7 @@ async function main() {
       try {
         const create = buildChannelCreateEvent(
           channelId,
-          channelName,
+          channelName ?? preparation.channelName ?? "firstmate-bearings",
           "Firstmate bearings projections (read-only publisher)",
           privateKey,
         );

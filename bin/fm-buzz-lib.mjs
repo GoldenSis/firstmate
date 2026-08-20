@@ -206,7 +206,7 @@ export function channelIdForLabel(label) {
 // construction. It also cannot collide with a fleet label, which is an absolute
 // path, and it leaks no more than the fleet label already does: the channel id
 // was never a secret (see docs/buzz-loopback-adapter.md, invariant 2).
-const CREW_TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+const CREW_TASK_ID = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/u;
 
 export function crewChannelLabel(fleetLabel, taskId) {
   if (typeof taskId !== "string" || !CREW_TASK_ID.test(taskId)) {
