@@ -299,6 +299,23 @@ EOF
   pass "each lane reaches the relay and reads back as one crew's stream"
 }
 
+test_inspect_accepts_flag_shaped_crew_ids() {
+  local home relay label readback
+  home=$(make_fleet_home inspect-flag-shaped-crew)
+  label=$(crew_channel_label "$(cd "$home" && pwd -P)" --task)
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  test_projection "flag-shaped-crew" \
+    | run_publish "$home" "$relay" --channel-label "$label" >/dev/null 2>&1
+  readback=$(run_inspect "$home" "$relay" --crew=--task --full 2>&1) \
+    || fail "the inspector rejected a canonical flag-shaped crew id"
+  stop_stub "$STUB_PID"
+  assert_contains "$readback" "flag-shaped-crew" \
+    "the inspector did not read the flag-shaped crew lane"
+  pass "the inspector accepts canonical crew ids beginning with double hyphens"
+}
+
 test_each_lane_is_named_for_its_crew() {
   local home relay names qualifier
   home=$(make_fleet_home lane-naming)
@@ -539,6 +556,28 @@ SH
   assert_contains "$(cat "$errors")" "2 crew lane(s) skipped: current task or status data could not be projected" \
     "the all-skipped diagnostic did not name the count and cause"
   pass "status read failures are not reported as present streams"
+}
+
+test_failed_canonical_snapshot_publishes_an_omission_carrier() {
+  local home projection lanes surfaces errors
+  home=$(make_fleet_home failed-canonical-snapshot)
+  projection="$home/bearings.json"
+  errors="$home/failed-snapshot-errors"
+  bearings_json "$home" > "$projection"
+
+  lanes=$(FM_SNAPSHOT_TERMINAL_TIMEOUT=0 \
+    run_lanes "$home" --projection "$projection" 2>"$errors") \
+    || fail "the lane projector failed instead of disclosing the canonical snapshot failure"
+  [ "$(printf '%s' "$lanes" | jq 'length')" = "1" ] \
+    || fail "the failed canonical snapshot did not produce one omission carrier"
+  [ "$(printf '%s' "$lanes" | jq -r '.[0].disclosure_only')" = true ] \
+    || fail "the failed canonical snapshot produced an ordinary lane"
+  surfaces=$(printf '%s' "$lanes" | jq -r '.[0].projection.omitted[].surface')
+  assert_contains "$surfaces" "canonical fleet snapshot failed for 2 in-flight entries" \
+    "the canonical snapshot failure was absent from the omission carrier"
+  assert_contains "$(cat "$errors")" "canonical fleet snapshot failed; 2 crew lane(s) skipped" \
+    "the canonical snapshot failure diagnostic omitted the skipped lane count"
+  pass "canonical snapshot failures publish an omission carrier"
 }
 
 test_status_byte_disclosure_uses_the_same_bounded_snapshot() {
@@ -817,6 +856,161 @@ PY
   pass "deadline watchdog defers signals until child assignment"
 }
 
+test_deadline_watchdog_ignores_inaccessible_stale_process_groups() {
+  local home hook_dir output channel
+  home=$(make_fleet_home refresh-stale-process-group)
+  hook_dir="$home/python-stale-group-hook"
+  mkdir -p "$hook_dir"
+  cat > "$hook_dir/sitecustomize.py" <<'PY'
+import os
+
+
+original_killpg = os.killpg
+
+
+def inaccessible_stale_group(process_group, signal_number):
+    if signal_number == 0:
+        raise PermissionError(1, "operation not permitted")
+    return original_killpg(process_group, signal_number)
+
+
+os.killpg = inaccessible_stale_group
+PY
+
+  output=$(PYTHONPATH="$hook_dir" run_refresh "$home" "ws://127.0.0.1:1" --fleet-only 2>&1)
+  expect_code 0 "$?" "refresh whose completed child process group became inaccessible"
+  assert_not_contains "$output" "Traceback" \
+    "an inaccessible stale process group escaped the watchdog cleanup"
+  channel=$(default_channel_id "$home")
+  [ "$(cached_event_count "$home" "ws://127.0.0.1:1" "$channel")" = "1" ] \
+    || fail "the stale-process-group race discarded the fleet publication"
+  pass "the deadline watchdog ignores inaccessible stale process groups"
+}
+
+test_refresh_signal_reaps_the_active_watchdog_and_child() {
+  local home guard_bin real_jq process_file output wrapper_pid child_pid group_pid
+  local watchdog_pid refresh_pid waited=0 child_state="" watchdog_state=""
+  home=$(make_fleet_home refresh-outer-signal-cleanup)
+  guard_bin="$home/jq-outer-signal-guard"
+  process_file="$home/outer-signal-processes"
+  output="$home/outer-signal-output"
+  real_jq=$(command -v jq)
+  mkdir -p "$guard_bin"
+  cat > "$guard_bin/jq" <<'SH'
+#!/usr/bin/env bash
+if [ ! -e "$FM_BUZZ_WATCHDOG_PROCESSES" ]; then
+  printf '%s\n' "$$" > "$FM_BUZZ_WATCHDOG_PROCESSES"
+  sleep 30
+fi
+exec "$FM_BUZZ_REAL_JQ" "$@"
+SH
+  chmod +x "$guard_bin/jq"
+
+  (
+    PATH="$guard_bin:$PATH" FM_BUZZ_REAL_JQ="$real_jq" \
+      FM_BUZZ_WATCHDOG_PROCESSES="$process_file" FM_BUZZ_REFRESH_TIMEOUT_S=20 \
+      run_refresh "$home" "ws://127.0.0.1:1" >"$output" 2>&1
+  ) &
+  wrapper_pid=$!
+  while [ ! -s "$process_file" ] && [ "$waited" -lt 100 ]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  [ -s "$process_file" ] || {
+    kill "$wrapper_pid" 2>/dev/null
+    fail "the outer-signal child process never started"
+  }
+  read -r child_pid < "$process_file"
+  group_pid=$(ps -o pgid= -p "$child_pid" | tr -d '[:space:]')
+  watchdog_pid=$(ps -o ppid= -p "$group_pid" | tr -d '[:space:]')
+  refresh_pid=$(ps -o ppid= -p "$watchdog_pid" | tr -d '[:space:]')
+  [ -n "$refresh_pid" ] || {
+    kill "$wrapper_pid" 2>/dev/null
+    fail "the refresh process could not be identified"
+  }
+  kill -TERM "$refresh_pid" 2>/dev/null || {
+    kill "$wrapper_pid" 2>/dev/null
+    fail "the refresh process could not be signalled"
+  }
+  wait "$wrapper_pid"
+  expect_code 0 "$?" "refresh after its outer process was interrupted"
+  waited=0
+  while { kill -0 "$child_pid" 2>/dev/null || kill -0 "$watchdog_pid" 2>/dev/null; } \
+      && [ "$waited" -lt 40 ]; do
+    child_state=$(ps -o stat= -p "$child_pid" 2>/dev/null | tr -d '[:space:]')
+    watchdog_state=$(ps -o stat= -p "$watchdog_pid" 2>/dev/null | tr -d '[:space:]')
+    case "$child_state:$watchdog_state" in
+      :|Z:|:Z|Z:Z) break ;;
+    esac
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  child_state=$(ps -o stat= -p "$child_pid" 2>/dev/null | tr -d '[:space:]')
+  watchdog_state=$(ps -o stat= -p "$watchdog_pid" 2>/dev/null | tr -d '[:space:]')
+  case "$child_state:$watchdog_state" in
+    :|Z:|:Z|Z:Z) ;;
+    *) fail "the interrupted refresh left its watchdog or child group running" ;;
+  esac
+  pass "refresh signals terminate and reap the active watchdog and child group"
+}
+
+test_refresh_migrates_the_replay_tree_once() {
+  local home guard_bin real_node migration_log count
+  home=$(make_fleet_home single-refresh-migration)
+  guard_bin="$home/node-migration-guard"
+  migration_log="$home/migrations"
+  real_node=$(command -v node)
+  mkdir -p "$guard_bin"
+  cat > "$guard_bin/node" <<'SH'
+#!/usr/bin/env bash
+for argument in "$@"; do
+  case $argument in
+    *migrateReplayCache*) printf 'migration\n' >> "$FM_BUZZ_MIGRATION_LOG" ;;
+  esac
+done
+exec "$FM_BUZZ_REAL_NODE" "$@"
+SH
+  chmod +x "$guard_bin/node"
+
+  PATH="$guard_bin:$PATH" FM_BUZZ_REAL_NODE="$real_node" \
+    FM_BUZZ_MIGRATION_LOG="$migration_log" \
+    run_refresh "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
+  expect_code 0 "$?" "refresh with migration instrumentation"
+  count=$(wc -l < "$migration_log" | tr -d '[:space:]')
+  [ "$count" = "1" ] || fail "one refresh migrated the replay tree $count times"
+  pass "one refresh migrates the replay tree once"
+}
+
+test_refresh_does_not_repeat_a_failed_replay_migration() {
+  local home guard_bin real_node migration_log count
+  home=$(make_fleet_home failed-refresh-migration)
+  guard_bin="$home/node-failed-migration-guard"
+  migration_log="$home/failed-migrations"
+  real_node=$(command -v node)
+  mkdir -p "$guard_bin"
+  cat > "$guard_bin/node" <<'SH'
+#!/usr/bin/env bash
+for argument in "$@"; do
+  case $argument in
+    *migrateReplayCache*)
+      printf 'migration\n' >> "$FM_BUZZ_MIGRATION_LOG"
+      exit 1
+      ;;
+  esac
+done
+exec "$FM_BUZZ_REAL_NODE" "$@"
+SH
+  chmod +x "$guard_bin/node"
+
+  PATH="$guard_bin:$PATH" FM_BUZZ_REAL_NODE="$real_node" \
+    FM_BUZZ_MIGRATION_LOG="$migration_log" \
+    run_refresh "$home" "ws://127.0.0.1:1" >/dev/null 2>&1
+  expect_code 0 "$?" "refresh whose replay migration failed"
+  count=$(wc -l < "$migration_log" | tr -d '[:space:]')
+  [ "$count" = "1" ] || fail "one refresh retried its failed replay migration $count times"
+  pass "one refresh attempts a failed replay migration once"
+}
+
 test_refresh_deadline_bounds_snapshot_work() {
   local home guard_bin real_jq sentinel output started ended elapsed
   home=$(make_fleet_home refresh-snapshot-deadline)
@@ -900,6 +1094,7 @@ test_a_lane_carries_its_own_status_lines_and_identity
 test_lane_projector_rejects_the_publishers_invalid_projection_shapes
 test_lane_events_never_land_in_another_lanes_partition
 test_lanes_reach_the_relay_and_read_back_as_one_crews_stream
+test_inspect_accepts_flag_shaped_crew_ids
 test_each_lane_is_named_for_its_crew
 test_two_homes_publish_distinguishable_lane_names
 test_completed_lane_replay_is_not_stranded
@@ -910,6 +1105,7 @@ test_fire_and_forget_contract_is_intact
 test_lane_documents_stay_out_of_process_arguments
 test_refresh_setup_failures_are_non_events
 test_status_read_failures_are_not_reported_as_present
+test_failed_canonical_snapshot_publishes_an_omission_carrier
 test_status_byte_disclosure_uses_the_same_bounded_snapshot
 test_all_missing_tasks_publish_an_omission_carrier
 test_refresh_publishes_an_all_skipped_omission_carrier
@@ -918,6 +1114,10 @@ test_refresh_deadline_bounds_a_silent_relay
 test_fleet_only_reports_its_deadline
 test_deadline_watchdog_reaps_its_child_group_on_signal
 test_deadline_watchdog_defers_signals_until_child_assignment
+test_deadline_watchdog_ignores_inaccessible_stale_process_groups
+test_refresh_signal_reaps_the_active_watchdog_and_child
+test_refresh_migrates_the_replay_tree_once
+test_refresh_does_not_repeat_a_failed_replay_migration
 test_refresh_deadline_bounds_snapshot_work
 test_refresh_deadline_spans_sequential_lock_waits
 test_channel_labels_preserve_embedded_newlines

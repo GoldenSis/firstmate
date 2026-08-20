@@ -60,9 +60,8 @@
 #   FM_BUZZ_CREW_STATUS_LINE_CHARS  characters per status event      (default 200)
 #   FM_BUZZ_CREW_INPUT_BYTES        projection input cap             (default 1048576)
 #
-# Exit status: 0 with the array on stdout, 1 on a bad input or an unreadable
-# snapshot. This script is NOT the fire-and-forget boundary - bin/fm-buzz-refresh.sh
-# is - so a failure here is visible rather than converted.
+# Exit status: 0 with the array on stdout, 1 on bad input. A canonical snapshot
+# failure becomes a disclosure-only lane rather than an undisclosed absence.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -172,10 +171,54 @@ fi
 fm_buzz_validate_projection_json "$SPOOL" || exit 1
 fm_buzz_validate_projection_contract "$SPOOL" || exit 1
 
-SNAPSHOT=$("$SCRIPT_DIR/fm-fleet-snapshot.sh" --json) || {
-  log "the canonical fleet snapshot failed; no lanes projected"
-  exit 1
+build_disclosure_carrier() {  # <task id> <disclosures JSON>
+  jq -c \
+    --arg id "$1" \
+    --argjson disclosures "$2" '
+      first(.in_flight[] | select(.id == $id)) as $row
+      | [{
+          id: $id,
+          disclosure_only: true,
+          projection: {
+            schema: "fm-bearings.v1",
+            view: "crew-lane",
+            home: .home,
+            generated: .generated,
+            prs: .prs,
+            in_flight: [$row],
+            crew: {
+              id: $id,
+              kind: (if ($row.kind // "") == "" then "unknown" else $row.kind end),
+              harness: "unknown",
+              mode: "unknown"
+            },
+            status_events: [],
+            omitted: (.omitted + $disclosures + [{
+              surface: "crew lane for \($id) carries omission disclosure only",
+              reveal: "inspect the projector diagnostics and re-run"
+            }])
+          }
+        }]
+    ' "$SPOOL"
 }
+
+SNAPSHOT=$("$SCRIPT_DIR/fm-fleet-snapshot.sh" --json)
+SNAPSHOT_STATUS=$?
+if [ "$SNAPSHOT_STATUS" -ne 0 ]; then
+  SKIPPED=$(jq '.in_flight | length' "$SPOOL") || exit 1
+  log "the canonical fleet snapshot failed; $SKIPPED crew lane(s) skipped"
+  if [ "$SKIPPED" -eq 0 ]; then
+    printf '[]\n'
+    exit 0
+  fi
+  FIRST_SKIPPED_ID=$(jq -r '.in_flight[0].id' "$SPOOL") || exit 1
+  DISCLOSURES=$(jq -cn --argjson skipped "$SKIPPED" '[{
+    surface: "crew lanes: canonical fleet snapshot failed for \($skipped) in-flight entr\(if $skipped == 1 then "y" else "ies" end)",
+    reveal: "inspect the projector diagnostics and re-run"
+  }]') || exit 1
+  build_disclosure_carrier "$FIRST_SKIPPED_ID" "$DISCLOSURES" || exit 1
+  exit 0
+fi
 
 # Bounded read of one status log, as JSON. The byte bound is applied from the END
 # of the file, because the interesting events are the recent ones and a status log
@@ -315,29 +358,7 @@ if [ "$MISSING_TASKS" -gt 0 ] || [ "$FAILED_LANES" -gt 0 ]; then
     exit 1
   }
   if [ "$(jq 'length' <<<"$LANES")" -eq 0 ]; then
-    LANES=$(jq -c \
-      --arg id "$FIRST_SKIPPED_ID" \
-      --argjson disclosures "$DISCLOSURES" '
-        first(.in_flight[] | select(.id == $id)) as $row
-        | [{
-            id: $id,
-            disclosure_only: true,
-            projection: {
-              schema: "fm-bearings.v1",
-              view: "crew-lane",
-              home: .home,
-              generated: .generated,
-              prs: .prs,
-              in_flight: [$row],
-              crew: {id: $id, kind: $row.kind, harness: "unknown", mode: "unknown"},
-              status_events: [],
-              omitted: (.omitted + $disclosures + [{
-                surface: "crew lane for \($id) carries omission disclosure only",
-                reveal: "inspect the projector diagnostics and re-run"
-              }])
-            }
-          }]' \
-      "$SPOOL") || {
+    LANES=$(build_disclosure_carrier "$FIRST_SKIPPED_ID" "$DISCLOSURES") || {
       log "could not build the all-skipped omission disclosure"
       exit 1
     }

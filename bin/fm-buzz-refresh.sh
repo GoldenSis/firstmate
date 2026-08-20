@@ -92,12 +92,17 @@ FLEET_ONLY=0
 ARGUMENT_ERROR=0
 REFRESH_DEADLINE=""
 PUBLISH_DEADLINE_REACHED=0
+ACTIVE_WATCHDOG_PID=""
+REFRESH_INTERRUPTED=0
+BOUNDED_OUTPUT=""
+BOUNDED_DIAGNOSTIC=""
 
 log() {
   printf 'fm-buzz-refresh: %s\n' "$1" >&2
 }
 
 run_before_deadline() {
+  [ "$REFRESH_INTERRUPTED" -eq 0 ] || exit 0
   python3 -c '
 import os
 import signal
@@ -121,7 +126,7 @@ def signal_group(signum):
         return
     try:
         os.killpg(process.pid, signum)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
 
 
@@ -131,7 +136,7 @@ def group_exists():
     try:
         os.killpg(process.pid, 0)
         return True
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         return False
 
 
@@ -187,7 +192,28 @@ finally:
         if process.poll() is None:
             process.wait()
 raise SystemExit(result)
-' "$REFRESH_DEADLINE" "$@"
+' "$REFRESH_DEADLINE" "$@" <&0 &
+  ACTIVE_WATCHDOG_PID=$!
+  if [ "$REFRESH_INTERRUPTED" -ne 0 ]; then
+    interrupt_refresh
+  fi
+  wait "$ACTIVE_WATCHDOG_PID"
+  local status=$?
+  ACTIVE_WATCHDOG_PID=""
+  return "$status"
+}
+
+capture_before_deadline() {
+  local status
+  BOUNDED_OUTPUT=""
+  BOUNDED_DIAGNOSTIC=""
+  : > "$CAPTURE_OUTPUT" || return 127
+  : > "$CAPTURE_DIAGNOSTIC" || return 127
+  run_before_deadline "$@" > "$CAPTURE_OUTPUT" 2> "$CAPTURE_DIAGNOSTIC"
+  status=$?
+  BOUNDED_OUTPUT=$(cat -- "$CAPTURE_OUTPUT" 2>/dev/null)
+  BOUNDED_DIAGNOSTIC=$(cat -- "$CAPTURE_DIAGNOSTIC" 2>/dev/null)
+  return "$status"
 }
 
 refresh_remaining_ms() {
@@ -227,11 +253,11 @@ report_phase() {  # <status> <deadline message> <failure message>
   return 0
 }
 
-run_key_helper_before_deadline() {
+capture_key_helper_before_deadline() {
   local helper=$1
   shift
   # shellcheck disable=SC2016
-  run_before_deadline bash -c '. "$1"; shift; "$@"' \
+  capture_before_deadline bash -c '. "$1"; shift; "$@"' \
     bash "$SCRIPT_DIR/fm-buzz-key-lib.sh" "$helper" "$@"
 }
 
@@ -271,20 +297,39 @@ done
 PROJECTION=""
 LANES=""
 DOCUMENT=""
+MIGRATION_STATE=""
+CAPTURE_OUTPUT=""
+CAPTURE_DIAGNOSTIC=""
 # shellcheck disable=SC2329 # Invoked by the traps below.
 cleanup() {
   [ -n "$DOCUMENT" ] && rm -f -- "$DOCUMENT"
   [ -n "$PROJECTION" ] && rm -f -- "$PROJECTION"
   [ -n "$LANES" ] && rm -f -- "$LANES"
+  [ -n "$MIGRATION_STATE" ] && rm -f -- "$MIGRATION_STATE"
+  [ -n "$CAPTURE_OUTPUT" ] && rm -f -- "$CAPTURE_OUTPUT"
+  [ -n "$CAPTURE_DIAGNOSTIC" ] && rm -f -- "$CAPTURE_DIAGNOSTIC"
   DOCUMENT=""
   PROJECTION=""
   LANES=""
+  MIGRATION_STATE=""
+  CAPTURE_OUTPUT=""
+  CAPTURE_DIAGNOSTIC=""
 }
 trap cleanup EXIT
 # A signal is still a non-event for the fleet: drop the spools and take the same
 # exit 0 a stopped relay takes, rather than leaving a projection in a shared
 # temporary directory.
-trap 'cleanup; exit 0' INT TERM HUP
+interrupt_refresh() {
+  REFRESH_INTERRUPTED=1
+  [ -n "$ACTIVE_WATCHDOG_PID" ] || return 0
+  trap '' INT TERM HUP
+  kill -TERM "$ACTIVE_WATCHDOG_PID" 2>/dev/null
+  wait "$ACTIVE_WATCHDOG_PID" 2>/dev/null
+  ACTIVE_WATCHDOG_PID=""
+  cleanup
+  exit 0
+}
+trap interrupt_refresh INT TERM HUP
 
 publish_bounded() {  # <file or empty> <publisher arguments...>
   local file=$1 remaining_ms remaining_s requested effective lock_timeout status
@@ -315,10 +360,10 @@ publish_bounded() {  # <file or empty> <publisher arguments...>
     *) [ "$lock_timeout" -gt "$remaining_s" ] && lock_timeout=$remaining_s ;;
   esac
   if [ -n "$file" ]; then
-    FM_BUZZ_LOCK_TIMEOUT_S=$lock_timeout \
+    FM_BUZZ_LOCK_TIMEOUT_S=$lock_timeout FM_BUZZ_MIGRATION_STATE_FILE=$MIGRATION_STATE \
       run_before_deadline "$SCRIPT_DIR/fm-buzz-publish.sh" "${args[@]}" < "$file"
   else
-    FM_BUZZ_LOCK_TIMEOUT_S=$lock_timeout \
+    FM_BUZZ_LOCK_TIMEOUT_S=$lock_timeout FM_BUZZ_MIGRATION_STATE_FILE=$MIGRATION_STATE \
       run_before_deadline "$SCRIPT_DIR/fm-buzz-publish.sh" "${args[@]}" < /dev/null
   fi
   status=$?
@@ -354,17 +399,33 @@ refresh() {
     log "could not create a temporary file for the projection"
     return 0
   }
+  MIGRATION_STATE=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-migration.XXXXXX") || {
+    log "could not create a temporary file for cache migration state"
+    return 0
+  }
+  CAPTURE_OUTPUT=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-bounded-output.XXXXXX") || {
+    log "could not create a temporary file for bounded output"
+    return 0
+  }
+  CAPTURE_DIAGNOSTIC=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-bounded-error.XXXXXX") || {
+    log "could not create a temporary file for bounded diagnostics"
+    return 0
+  }
   run_before_deadline "$SCRIPT_DIR/fm-bearings-snapshot.sh" --json > "$PROJECTION" 2>/dev/null
   report_phase "$?" \
     "refresh deadline reached while taking the bearings snapshot; publish was skipped" \
     "bearings snapshot failed; skipping publish" || return 0
 
-  home_label=$(run_key_helper_before_deadline fm_buzz_key_account "$FM_HOME")
-  report_phase "$?" \
+  capture_key_helper_before_deadline fm_buzz_key_account "$FM_HOME"
+  phase_status=$?
+  home_label=$BOUNDED_OUTPUT
+  report_phase "$phase_status" \
     "refresh deadline reached while deriving the home label; publish was skipped" \
     "could not derive the home label; skipping publish" || return 0
-  home_channel=$(run_key_helper_before_deadline fm_buzz_channel_id "$SCRIPT_DIR" "$home_label")
-  report_phase "$?" \
+  capture_key_helper_before_deadline fm_buzz_channel_id "$SCRIPT_DIR" "$home_label"
+  phase_status=$?
+  home_channel=$BOUNDED_OUTPUT
+  report_phase "$phase_status" \
     "refresh deadline reached while deriving the home qualifier; publish was skipped" \
     "could not derive the home qualifier; skipping publish" || return 0
   home_qualifier=${home_channel%%-*}
@@ -372,8 +433,10 @@ refresh() {
   if [ -z "$fleet_label" ]; then
     fleet_label=$home_label
   fi
-  fleet_channel=$(run_key_helper_before_deadline fm_buzz_channel_id "$SCRIPT_DIR" "$fleet_label")
-  report_phase "$?" \
+  capture_key_helper_before_deadline fm_buzz_channel_id "$SCRIPT_DIR" "$fleet_label"
+  phase_status=$?
+  fleet_channel=$BOUNDED_OUTPUT
+  report_phase "$phase_status" \
     "refresh deadline reached while deriving the fleet channel; publish was skipped" \
     "could not derive the fleet channel; skipping publish" || return 0
   addressed_channels=" $fleet_channel "
@@ -409,19 +472,24 @@ refresh() {
     log "could not create a temporary file for a crew lane"
     return "$FLEET_STATUS"
   }
-  lane_total=$(run_before_deadline jq 'length' "$LANES" 2>/dev/null)
-  report_phase "$?" \
+  capture_before_deadline jq 'length' "$LANES"
+  phase_status=$?
+  lane_total=$BOUNDED_OUTPUT
+  report_phase "$phase_status" \
     "refresh deadline reached while reading the crew lane set; crew lanes and cached queue replay were skipped" \
     "crew lanes could not be read; the fleet channel is unaffected" || return "$FLEET_STATUS"
-  lane_rows=$(run_before_deadline jq -c '.[]' "$LANES" 2>/dev/null)
-  report_phase "$?" \
+  capture_before_deadline jq -c '.[]' "$LANES"
+  phase_status=$?
+  lane_rows=$BOUNDED_OUTPUT
+  report_phase "$phase_status" \
     "refresh deadline reached while reading the crew lane set; crew lanes and cached queue replay were skipped" \
     "crew lanes could not be read; the fleet channel is unaffected" || return "$FLEET_STATUS"
   while IFS= read -r lane; do
     [ -n "$lane" ] || continue
     lane_index=$((lane_index + 1))
-    id=$(printf '%s' "$lane" | run_before_deadline jq -r '.id // empty')
+    capture_before_deadline jq -r '.id // empty' <<<"$lane"
     phase_status=$?
+    id=$BOUNDED_OUTPUT
     skipped=$((lane_total - lane_index + 1))
     report_phase "$phase_status" \
       "refresh deadline reached; ${skipped} live crew lane(s) and cached queue replay were skipped" \
@@ -436,8 +504,9 @@ refresh() {
       lane_failures=$((lane_failures + 1))
       continue
     fi
-    disclosure_only=$(printf '%s' "$lane" | run_before_deadline jq -r '.disclosure_only // false')
+    capture_before_deadline jq -r '.disclosure_only // false' <<<"$lane"
     phase_status=$?
+    disclosure_only=$BOUNDED_OUTPUT
     skipped=$((lane_total - lane_index + 1))
     report_phase "$phase_status" \
       "refresh deadline reached; ${skipped} live crew lane(s) and cached queue replay were skipped" \
@@ -447,9 +516,10 @@ refresh() {
       124) break ;;
       1) lane_failures=$((lane_failures + 1)); continue ;;
     esac
-    label=$(run_key_helper_before_deadline fm_buzz_crew_channel_label \
-      "$SCRIPT_DIR" "$fleet_label" "$id" 2>/dev/null)
+    capture_key_helper_before_deadline fm_buzz_crew_channel_label \
+      "$SCRIPT_DIR" "$fleet_label" "$id"
     phase_status=$?
+    label=$BOUNDED_OUTPUT
     skipped=$((lane_total - lane_index + 1))
     report_phase "$phase_status" \
       "refresh deadline reached; ${skipped} live crew lane(s) and cached queue replay were skipped" \
@@ -459,9 +529,10 @@ refresh() {
       124) break ;;
       1) lane_failures=$((lane_failures + 1)); continue ;;
     esac
-    channel=$(run_key_helper_before_deadline fm_buzz_channel_id \
-      "$SCRIPT_DIR" "$label" 2>/dev/null)
+    capture_key_helper_before_deadline fm_buzz_channel_id \
+      "$SCRIPT_DIR" "$label"
     phase_status=$?
+    channel=$BOUNDED_OUTPUT
     skipped=$((lane_total - lane_index + 1))
     report_phase "$phase_status" \
       "refresh deadline reached; ${skipped} live crew lane(s) and cached queue replay were skipped" \
@@ -472,8 +543,9 @@ refresh() {
       1) lane_failures=$((lane_failures + 1)); continue ;;
     esac
     addressed_channels="${addressed_channels}${channel} "
-    printf '%s' "$lane" | run_before_deadline jq -e '.projection' > "$DOCUMENT"
+    capture_before_deadline jq -e '.projection' <<<"$lane"
     phase_status=$?
+    printf '%s\n' "$BOUNDED_OUTPUT" > "$DOCUMENT"
     skipped=$((lane_total - lane_index + 1))
     report_phase "$phase_status" \
       "refresh deadline reached; ${skipped} live crew lane(s) and cached queue replay were skipped" \
@@ -515,7 +587,7 @@ EOF
 
   if [ "$PUBLISH_DEADLINE_REACHED" -eq 0 ]; then
     # shellcheck disable=SC2016 # Node source, not a shell expansion.
-    fm_buzz_capture run_before_deadline node -e '
+    capture_before_deadline node -e '
       import(process.argv[1]).then(({ listPendingReplayChannels }) => {
         process.stdout.write(`${listPendingReplayChannels(process.argv[2], process.argv[3]).join("\n")}\n`);
       }).catch((error) => {
@@ -526,13 +598,13 @@ EOF
     phase_status=$?
     report_phase "$phase_status" \
       "refresh deadline reached while inspecting cached queue replay" \
-      "could not inspect cached queue replay: $FM_BUZZ_CAPTURED_DIAGNOSTIC"
+      "could not inspect cached queue replay: $BOUNDED_DIAGNOSTIC"
     phase_status=$?
     case $phase_status in
       0)
-        pending_channels=$FM_BUZZ_CAPTURED_OUTPUT
-        [ -z "$FM_BUZZ_CAPTURED_DIAGNOSTIC" ] \
-          || printf '%s\n' "$FM_BUZZ_CAPTURED_DIAGNOSTIC" >&2
+        pending_channels=$BOUNDED_OUTPUT
+        [ -z "$BOUNDED_DIAGNOSTIC" ] \
+          || printf '%s\n' "$BOUNDED_DIAGNOSTIC" >&2
         ;;
       *) replay_failures=$((replay_failures + 1)) ;;
     esac

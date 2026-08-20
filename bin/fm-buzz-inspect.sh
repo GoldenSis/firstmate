@@ -11,7 +11,8 @@
 # --channel-label may select another channel, but this wrapper never reads another
 # home's author records to attribute it.
 #
-# --crew <task id> reads one crewmate's lane instead of the fleet channel. The
+# --crew <task id> reads one crewmate's lane instead of the fleet channel. Use
+# --crew=<task id> when the canonical task id begins with `--`. The
 # lane label is derived from the fleet label (this home's, or --channel-label) by
 # bin/fm-buzz-lib.mjs's crewChannelLabel, which is the same derivation the
 # publisher addresses lanes with - so a lane read here is the lane the captain
@@ -42,7 +43,8 @@
 #
 # Usage:
 #   fm-buzz-inspect.sh [--limit N] [--full] [--anonymous]
-#                      [--relay <url>] [--channel-label <s>] [--crew <task id>]
+#                      [--relay <url>] [--channel-label <s>]
+#                      [--crew <task id> | --crew=<task id>]
 #   fm-buzz-inspect.sh --help
 set -u
 
@@ -63,6 +65,13 @@ ANONYMOUS=0
 
 while [ "$#" -gt 0 ]; do
   case $1 in
+    --crew=*)
+      CREW_ID=${1#--crew=}
+      if [ -z "$CREW_ID" ]; then
+        printf 'fm-buzz-inspect.sh: --crew requires a value\n' >&2
+        exit 2
+      fi
+      ;;
     --relay|--channel-label|--crew|--limit)
       option=$1
       if [ "$#" -lt 2 ] || [ -z "$2" ]; then

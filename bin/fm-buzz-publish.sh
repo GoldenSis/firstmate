@@ -128,6 +128,7 @@ TARGETS_FILE="$DATA/buzz-publisher-targets.jsonl"
 STDIN_TIMEOUT_S=${FM_BUZZ_STDIN_TIMEOUT_S:-30}
 MAX_PROJECTION_BYTES=${FM_BUZZ_MAX_PROJECTION_BYTES:-1048576}
 PUBLISH_LOCK_TIMEOUT_S=${FM_BUZZ_LOCK_TIMEOUT_S:-30}
+MIGRATION_STATE_FILE=${FM_BUZZ_MIGRATION_STATE_FILE:-}
 
 log() {
   printf 'fm-buzz-publish: %s\n' "$1" >&2
@@ -435,20 +436,59 @@ publish() {
   # failures still have to reach this run's accounting, so they travel to the
   # delivery step in the envelope instead of being recomputed there.
   local migration
-  # shellcheck disable=SC2016
-  migration=$(node -e '
-    const [modulePath, replayDir] = process.argv.slice(1);
-    import(modulePath).then(({ migrateReplayCache }) => {
-      process.stdout.write(JSON.stringify(migrateReplayCache(replayDir)));
-    }).catch((error) => {
-      process.stderr.write(`${error.message}\n`);
-      process.exitCode = 1;
-    });
-  ' "$SCRIPT_DIR/fm-buzz-publish.mjs" "$REPLAY_DIR") || {
-    log "could not settle the replay cache; skipping publish"
-    drop_stdin_spool
-    return 1
-  }
+  if [ -n "$MIGRATION_STATE_FILE" ]; then
+    if [ -L "$MIGRATION_STATE_FILE" ] || [ ! -f "$MIGRATION_STATE_FILE" ]; then
+      log "cache migration state is not a regular file"
+      drop_stdin_spool
+      return 1
+    fi
+    if [ -s "$MIGRATION_STATE_FILE" ]; then
+      if jq -e 'type == "object" and .failed == true and (keys == ["failed"])' \
+          "$MIGRATION_STATE_FILE" >/dev/null 2>&1; then
+        log "cache migration already failed during this refresh"
+        drop_stdin_spool
+        return 1
+      fi
+      migration=$(jq -ce '
+        select(type == "object"
+          and (.legacy | type == "array")
+          and (.legacy | all(type == "string"))
+          and (.endpoint | type == "array")
+          and (.endpoint | all(type == "string")))
+      ' "$MIGRATION_STATE_FILE") || {
+        log "cache migration state is invalid"
+        drop_stdin_spool
+        return 1
+      }
+    fi
+  fi
+  if [ -z "${migration:-}" ]; then
+    # shellcheck disable=SC2016
+    migration=$(node -e '
+      const [modulePath, replayDir] = process.argv.slice(1);
+      import(modulePath).then(({ migrateReplayCache }) => {
+        process.stdout.write(JSON.stringify(migrateReplayCache(replayDir)));
+      }).catch((error) => {
+        process.stderr.write(`${error.message}\n`);
+        process.exitCode = 1;
+      });
+    ' "$SCRIPT_DIR/fm-buzz-publish.mjs" "$REPLAY_DIR") || {
+      if [ -n "$MIGRATION_STATE_FILE" ]; then
+        printf '{"failed":true}\n' > "$MIGRATION_STATE_FILE" \
+          || log "could not record cache migration failure"
+      fi
+      log "could not settle the replay cache; skipping publish"
+      drop_stdin_spool
+      return 1
+    }
+    if [ -n "$MIGRATION_STATE_FILE" ]; then
+      printf '%s\n' "$migration" > "$MIGRATION_STATE_FILE" || {
+        log "could not record cache migration state"
+        drop_stdin_spool
+        return 1
+      }
+    fi
+  fi
   DELIVERY_LOCK=$(fm_buzz_replay_delivery_lock "$STATE" "$normalized_relay" "$channel") || {
     log "could not resolve this queue's delivery ownership"
     drop_stdin_spool
