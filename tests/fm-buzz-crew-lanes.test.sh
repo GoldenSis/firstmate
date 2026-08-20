@@ -258,6 +258,25 @@ EOF
   pass "each lane reaches the relay and reads back as one crew's stream"
 }
 
+test_each_lane_is_named_for_its_crew() {
+  local home relay names
+  home=$(make_fleet_home lane-naming)
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  run_refresh "$home" "$relay" >/dev/null 2>&1
+  expect_code 0 "$?" "refresh with the relay up"
+  names=$(query_channel_names "$relay") || fail "the stub served no channel-creation events"
+  stop_stub "$STUB_PID"
+
+  # What a captain browsing a Buzz client actually reads. Addressing the lanes
+  # correctly is not enough: three channels sharing one name are three identical
+  # rows, which is the state this test exists to keep the adapter out of.
+  [ "$names" = "$(printf 'crew-task-a\ncrew-task-b\nfirstmate-bearings')" ] \
+    || fail "the published channel names were not one per crew plus the fleet: $names"
+  pass "each lane is named for its crew and the fleet channel keeps its name"
+}
+
 test_the_fleet_omitted_disclosure_survives_untouched() {
   local home projection fleet_omitted lane_omitted
   home=$(make_fleet_home omitted-passthrough)
@@ -320,6 +339,7 @@ test_two_task_ids_derive_two_well_formed_distinct_channels
 test_a_lane_carries_its_own_status_lines_and_identity
 test_lane_events_never_land_in_another_lanes_partition
 test_lanes_reach_the_relay_and_read_back_as_one_crews_stream
+test_each_lane_is_named_for_its_crew
 test_the_fleet_omitted_disclosure_survives_untouched
 test_an_unreachable_or_refusing_relay_is_a_non_event
 test_fire_and_forget_contract_is_intact

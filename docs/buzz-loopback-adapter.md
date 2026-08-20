@@ -79,6 +79,22 @@ A task id is restricted to `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, which excludes the
 The fleet label itself is untouched, so the fleet channel keeps the exact id it has always had and a captain reading it does not silently lose their history.
 `tests/fm-buzz-crew-lanes.test.sh` pins the derived id of a fixed label against its literal value, so a change to that derivation fails rather than quietly re-homing the channel.
 
+### The name
+
+The label decides where a lane goes; the name decides whether a human can find it.
+Each lane is published with `--channel-name crew-<task id>`, which reaches the relay on the channel-creation event's `name` tag and is what a Buzz client lists the channel under.
+Without it every lane inherits the publisher's default, `firstmate-bearings`, and a captain browsing the client reads one identical row per lane, separable only by UUID - correctly addressed and unreadable, which defeats the point of a lane.
+The fleet channel is published with no name option at all, so that default still applies to it and the name a captain has been reading stays put alongside the id.
+A name is display metadata and never touches the id derivation, which is why the two are separate options rather than one.
+`crew-<task id>` cannot exceed the publisher's 100-character bound, because a task id is already restricted to 64 characters by the grammar above.
+`tests/fm-buzz-crew-lanes.test.sh` reads the channel-creation events back off the stub relay and asserts the published set is one name per crew plus the fleet's.
+
+The name is set when the channel is created and never afterwards, which is a property of the relay rather than a choice made here.
+Channel creation is idempotent by design - the publisher re-sends it on every run and the relay answers `duplicate: channel already exists` - so a channel that already exists keeps the name it was created with and a changed `--channel-name` has no visible effect on it.
+Verified on the running loopback relay on 2026-08-20: after republishing every lane with `crew-<task id>`, `select id, name from channels` still returned `firstmate-bearings` for all ten pre-existing lanes.
+Renaming an existing channel would need a NIP-29 metadata-edit event, which is the new protocol surface this adapter declined to take on for threads and declines again here.
+On this disposable stack the recovery is the one the compose file already documents: `docker compose -f docker-compose.buzz-loopback.yml down -v` drops the datastores, and the next refresh recreates every channel under its current name.
+
 ### What a lane carries
 
 Each lane is itself a valid `fm-bearings.v1` projection with `view: "crew-lane"`: the same `home`, `generated` and `prs` identity, an `in_flight[]` narrowed to exactly one row, plus `crew{id,kind,harness,mode}` and the bounded `status_events[]` for that task.

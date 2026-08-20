@@ -38,6 +38,13 @@
 #      is a new NAME through the same channelIdForLabel derivation, not a new
 #      derivation. bin/fm-buzz-crew-lanes.sh owns what a lane contains.
 #
+# HOW A LANE IS NAMED, AND WHY IT IS NOT THE LABEL. Each lane is published with
+# --channel-name crew-<task id>, so a captain browsing a Buzz client reads a list
+# of crews rather than a column of UUIDs. The name is display metadata and never
+# touches the id derivation. The fleet channel is published with NO name option,
+# which leaves the publisher's own default in place and keeps the name a captain
+# has been reading alongside the id they have been reading.
+#
 # The replay cache already partitions by <endpoint-digest>/<channel-id>, and the
 # delivery lock is already scoped per endpoint-and-channel, so publishing into
 # several channels needs no new storage, no new lock, and no new protocol: each
@@ -133,11 +140,15 @@ trap cleanup EXIT
 # temporary directory.
 trap 'cleanup; exit 0' INT TERM HUP
 
-publish_args() {  # <channel label>
+publish_args() {  # <channel label> [channel name]
   printf '%s\n' --relay
   printf '%s\n' "$RELAY"
   printf '%s\n' --channel-label
   printf '%s\n' "$1"
+  if [ -n "${2:-}" ]; then
+    printf '%s\n' --channel-name
+    printf '%s\n' "$2"
+  fi
   if [ -n "$TIMEOUT_MS" ]; then
     printf '%s\n' --timeout
     printf '%s\n' "$TIMEOUT_MS"
@@ -146,11 +157,11 @@ publish_args() {  # <channel label>
 
 # Publish one already-built projection into one channel. Every caller feeds the
 # document on stdin, which is how it stays off a command line.
-publish_document() {  # <channel label> <file>
-  local label=$1 file=$2 args=()
+publish_document() {  # <channel label> <file> [channel name]
+  local label=$1 file=$2 name=${3:-} args=()
   while IFS= read -r argument; do
     args+=("$argument")
-  done < <(publish_args "$label")
+  done < <(publish_args "$label" "$name")
   "$SCRIPT_DIR/fm-buzz-publish.sh" "${args[@]}" < "$file"
 }
 
@@ -208,7 +219,10 @@ refresh() {
       lane_failures=$((lane_failures + 1))
       continue
     fi
-    if publish_document "$label" "$DOCUMENT"; then
+    # No length guard here: a task id is restricted to 64 characters by
+    # crewChannelLabel, which the label derivation above has already enforced, so
+    # `crew-<id>` cannot reach the publisher's 100-character bound.
+    if publish_document "$label" "$DOCUMENT" "crew-$id"; then
       lane_count=$((lane_count + 1))
     else
       log "the lane for $id did not publish; the fleet channel is unaffected"

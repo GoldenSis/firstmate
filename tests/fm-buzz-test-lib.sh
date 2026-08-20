@@ -176,6 +176,35 @@ query_membership_signer() {  # <private-key> <relay> <channel>
   ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay" "$channel"
 }
 
+# Every channel-creation event the stub has stored, as one display name per line,
+# sorted. This is how a test sees what a Buzz client's channel list would show:
+# the name lives on the kind-9007 event's `name` tag and nowhere in the projection
+# the message carries.
+query_channel_names() {  # <relay>
+  # shellcheck disable=SC2016
+  node -e '
+    const socket = new WebSocket(process.argv[1]);
+    const names = [];
+    const finish = (code) => { try { socket.close(); } catch { /* already closed */ } process.exit(code); };
+    const timer = setTimeout(() => finish(1), 15000);
+    socket.addEventListener("open", () => {
+      socket.send(JSON.stringify(["REQ", "names", { kinds: [9007] }]));
+    });
+    socket.addEventListener("message", (message) => {
+      const parsed = JSON.parse(message.data);
+      if (parsed[0] === "EVENT") {
+        const tag = parsed[2].tags.find((entry) => entry[0] === "name");
+        if (tag) names.push(tag[1]);
+      } else if (parsed[0] === "EOSE") {
+        clearTimeout(timer);
+        process.stdout.write(`${names.sort().join("\n")}\n`);
+        finish(0);
+      }
+    });
+    socket.addEventListener("error", () => finish(1));
+  ' "$1"
+}
+
 # Start the stub on an ephemeral port and echo "<pid> <url>".
 start_stub() {  # [stub args...]
   local out pid port line

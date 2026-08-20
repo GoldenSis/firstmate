@@ -1212,7 +1212,7 @@ test_required_option_operands_are_not_consumed_as_flags() {
   local home output code option following
   home=$(make_home missing-option-operands)
 
-  for option in --relay --channel-label --timeout; do
+  for option in --relay --channel-label --channel-name --timeout; do
     following=--refresh
     output=$(FM_HOME="$home" FM_DATA_OVERRIDE="$home/data" FM_STATE_OVERRIDE="$home/state" \
       XDG_DATA_HOME="$home/xdg" FM_BUZZ_FORCE_FILE_STORE=1 \
@@ -1234,6 +1234,36 @@ test_required_option_operands_are_not_consumed_as_flags() {
       "inspect option $option consumed the following flag as its value"
   done
   pass "publish and inspect reject missing option operands before shifting"
+}
+
+test_channel_names_are_bounded_and_printable() {
+  local home output code long
+  home=$(make_home channel-name-validation)
+  run_keypair "$home" >/dev/null 2>&1 || fail "channel-name keypair setup failed"
+
+  # The name is display metadata that reaches the relay and then a reader's
+  # channel list, so it is validated here rather than trusted from the caller.
+  output=$(test_projection "must-not-publish" \
+    | run_publish "$home" ws://127.0.0.1:9 --channel-name "$(printf 'crew-\001')" 2>&1)
+  code=$?
+  expect_code 0 "$code" "a control character in the channel name"
+  assert_contains "$output" "printable characters only" \
+    "a control character in the channel name was not diagnosed"
+  assert_not_contains "$output" "signed event" \
+    "a control character in the channel name reached signing"
+
+  long=$(printf 'c%.0s' $(seq 1 101))
+  output=$(test_projection "must-not-publish" \
+    | run_publish "$home" ws://127.0.0.1:9 --channel-name "$long" 2>&1)
+  code=$?
+  expect_code 0 "$code" "an oversized channel name"
+  assert_contains "$output" "limited to 100 characters" \
+    "an oversized channel name was not diagnosed"
+  assert_not_contains "$output" "signed event" "an oversized channel name reached signing"
+
+  [ "$(replay_count "$home")" = "0" ] \
+    || fail "a rejected channel name still created replay state"
+  pass "channel names are bounded, printable, and rejected before signing"
 }
 
 test_unknown_publish_options_are_safe_non_events() {
@@ -1468,6 +1498,7 @@ test_publish_lock_acquisition_is_validated_bounded_and_interruptible
 test_a_writer_that_never_closes_does_not_hang_the_publish
 test_invalid_stdin_timeouts_are_rejected_before_reading
 test_required_option_operands_are_not_consumed_as_flags
+test_channel_names_are_bounded_and_printable
 test_unknown_publish_options_are_safe_non_events
 test_a_signalled_read_leaves_no_projection_in_temp
 test_a_signalled_read_releases_the_callers_output
