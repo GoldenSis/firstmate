@@ -73,7 +73,8 @@
 #                                      override the channel-derivation label
 #   fm-buzz-publish.sh --channel-name <s>
 #                                      the channel's display name, at most 100
-#                                      printable characters (default
+#                                      printable ASCII characters (bytes
+#                                      0x20-0x7e; default
 #                                      firstmate-bearings)
 #   fm-buzz-publish.sh --replay-channel <uuid>
 #                                      drain one existing cache partition without
@@ -140,7 +141,7 @@ log() {
   printf 'fm-buzz-publish: %s\n' "$1" >&2
 }
 
-channel_name_is_printable() {
+channel_name_is_printable_ascii() {
   local bytes
   bytes=$(printf '%s' "$1" | LC_ALL=C od -An -v -tu1) || return 1
   awk '
@@ -688,8 +689,8 @@ while [ "$#" -gt 0 ]; do
                 # The name reaches the relay and then a reader's channel list, so
                 # it is bounded and printable-only here rather than trusted from
                 # the caller.
-                if ! channel_name_is_printable "$1"; then
-                  log "--channel-name must contain printable characters only"
+                if ! channel_name_is_printable_ascii "$1"; then
+                  log "--channel-name must contain printable ASCII characters only"
                   ARGUMENT_ERROR=1
                 elif [ "${#1}" -gt 100 ]; then
                   log "--channel-name is limited to 100 characters"

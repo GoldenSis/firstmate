@@ -650,6 +650,9 @@ EOF
   return "$FLEET_STATUS"
 }
 
+if [ "$ARGUMENT_ERROR" -eq 1 ]; then
+  exit 0
+fi
 if ! command -v python3 >/dev/null 2>&1; then
   log "python3 is required for safe replay-cache operations; see docs/buzz-loopback-adapter.md#prerequisites"
   exit 1
@@ -666,9 +669,6 @@ case $REFRESH_TIMEOUT_S in
 esac
 
 FLEET_STATUS=0
-if [ "$ARGUMENT_ERROR" -eq 1 ]; then
-  exit 1
-fi
 refresh
 REFRESH_STATUS=$?
 exit "$REFRESH_STATUS"

@@ -914,6 +914,32 @@ EOF
   pass "replay-only pruning preserves the newest deliverable event"
 }
 
+test_replay_channel_names_require_printable_ascii() {
+  local home relay current_private channel cached output names
+  home=$(make_home replay-channel-name-ascii)
+  run_keypair "$home" >/dev/null 2>&1 || fail "replay channel-name keypair setup failed"
+  current_private=$(jq -r '.private_key' "$(key_file "$home" "$home/xdg")")
+  channel=$(channel_id_for_label replay-channel-name-ascii)
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  cached=$(seed_replay_event \
+    "$home" "$relay" "$current_private" 1700000402 "$channel" replay-channel-name-ascii 'crew-café') \
+    || fail "could not seed the non-ASCII replay channel name"
+
+  output=$(run_publish "$home" "$relay" --replay-channel "$channel" </dev/null 2>&1)
+  expect_code 0 "$?" "replay with a non-ASCII cached channel name"
+  names=$(query_channel_names "$relay") || fail "the stub did not answer the channel-name query"
+  stop_stub "$STUB_PID"
+
+  [ "$names" = "firstmate-bearings" ] \
+    || fail "replay accepted a non-ASCII cached channel name: $names"
+  assert_absent "$cached" "the replay event with a rejected display name was not delivered"
+  assert_contains "$output" "delivered=1 retained=0" \
+    "the replay event with a rejected display name did not drain"
+  pass "replay channel names use the printable ASCII grammar"
+}
+
 test_pending_replay_discovery_keeps_healthy_channel_siblings() {
   local home relay endpoint healthy broken output errors
   home=$(make_home pending-replay-siblings)
@@ -1329,7 +1355,7 @@ test_channel_names_are_bounded_and_printable() {
     | run_publish "$home" ws://127.0.0.1:9 --channel-name "$(printf 'crew-\001')" 2>&1)
   code=$?
   expect_code 0 "$code" "a control character in the channel name"
-  assert_contains "$output" "printable characters only" \
+  assert_contains "$output" "printable ASCII characters only" \
     "a control character in the channel name was not diagnosed"
   assert_not_contains "$output" "signed event" \
     "a control character in the channel name reached signing"
@@ -1338,10 +1364,19 @@ test_channel_names_are_bounded_and_printable() {
     | run_publish "$home" ws://127.0.0.1:9 --channel-name $'crew-one\ncrew-two' 2>&1)
   code=$?
   expect_code 0 "$code" "a newline in the channel name"
-  assert_contains "$output" "printable characters only" \
+  assert_contains "$output" "printable ASCII characters only" \
     "a newline in the channel name was not diagnosed"
   assert_not_contains "$output" "signed event" \
     "a newline in the channel name reached signing"
+
+  output=$(test_projection "must-not-publish" \
+    | run_publish "$home" ws://127.0.0.1:9 --channel-name 'crew-café' 2>&1)
+  code=$?
+  expect_code 0 "$code" "a non-ASCII channel name"
+  assert_contains "$output" "printable ASCII characters only" \
+    "a non-ASCII channel name was not diagnosed"
+  assert_not_contains "$output" "signed event" \
+    "a non-ASCII channel name reached signing"
 
   long=$(printf 'c%.0s' $(seq 1 101))
   output=$(test_projection "must-not-publish" \
@@ -1583,6 +1618,7 @@ test_a_challenge_past_the_handshake_window_still_lands_the_event
 test_foreign_author_cache_entries_are_not_drained_by_the_current_publisher
 test_replay_only_foreign_partition_does_not_provision_a_channel
 test_replay_only_pruning_preserves_the_newest_current_event
+test_replay_channel_names_require_printable_ascii
 test_pending_replay_discovery_keeps_healthy_channel_siblings
 test_permanent_rejection_is_not_replayed_forever
 test_retryable_rejection_is_kept

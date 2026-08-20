@@ -266,8 +266,8 @@ channel_cache_dir() {  # <home> <relay> <channel>
   printf '%s/%s\n' "$(relay_cache_dir "$1" "$2")" "$3"
 }
 
-seed_replay_event() {  # <home> <relay> <private-key> <created-at> <channel> <note>
-  local home=$1 relay=$2 private=$3 created_at=$4 channel=$5 note=$6 directory
+seed_replay_event() {  # <home> <relay> <private-key> <created-at> <channel> <note> [channel name]
+  local home=$1 relay=$2 private=$3 created_at=$4 channel=$5 note=$6 channel_name=${7-} directory
   directory=$(channel_cache_dir "$home" "$relay" "$channel") || return 1
   mkdir -p "$directory"
   # shellcheck disable=SC2016
@@ -279,10 +279,12 @@ seed_replay_event() {  # <home> <relay> <private-key> <created-at> <channel> <no
     process.stdin.on("data", (chunk) => { privateKey += chunk; });
     process.stdin.on("end", async () => {
       const { KIND_STREAM_MESSAGE, signEvent } = await import(process.argv[1]);
+      const tags = [["h", process.argv[4]]];
+      if (process.argv[6] !== "") tags.push(["fm-channel-name", process.argv[6]]);
       const event = signEvent({
         created_at: Number(process.argv[3]),
         kind: KIND_STREAM_MESSAGE,
-        tags: [["h", process.argv[4]]],
+        tags,
         content: JSON.stringify({
           schema: "fm-bearings.v1",
           home: "test/home",
@@ -297,7 +299,7 @@ seed_replay_event() {  # <home> <relay> <private-key> <created-at> <channel> <no
       writeFileSync(file, JSON.stringify(["EVENT", event]), { mode: 0o600, flag: "wx" });
       process.stdout.write(`${file}\n`);
     });
-  ' "$ROOT/bin/fm-buzz-lib.mjs" "$directory" "$created_at" "$channel" "$note"
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$directory" "$created_at" "$channel" "$note" "$channel_name"
 }
 
 # Ask the custody library itself where a home's key file is, rather than hardcoding

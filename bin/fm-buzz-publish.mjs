@@ -34,9 +34,18 @@
 // The whole-tree half of a run - quarantine and endpoint-to-channel migration -
 // is migrateReplayCache, a separate entry point so its caller can hold the
 // whole-tree lock across a filesystem walk instead of across a relay round trip.
-// main() therefore never walks outside the queue it was invoked for, and its
-// prepare phase signs, caches, prunes, and tracks before its deliver phase makes
-// network calls. bin/fm-buzz-key-lib.sh owns the lock ordering those phases use.
+// main() therefore never walks outside the queue it was invoked for. Its prepare
+// phase signs, caches, prunes, and tracks one new projection and returns the
+// delivery preparation as JSON. Its replay phase signs nothing, prunes only the
+// invoked queue, and returns preparation for entries owned by the current
+// publisher. Its deliver phase accepts that preparation plus migration results
+// and makes the network calls. bin/fm-buzz-key-lib.sh owns the lock ordering those
+// phases use.
+// listPendingReplayChannels(replayDir, relay) validates the loopback relay and
+// regular cache topology, then returns sorted canonical channel ids for nonempty,
+// inspectable partitions under that relay's endpoint. An absent root or endpoint
+// returns an empty array, while an unreadable channel sibling is logged and
+// skipped without hiding healthy siblings.
 //
 // Reads one JSON envelope on stdin so that neither the private key nor the
 // projection - which carries task ids, project names, blockers and PR URLs -
@@ -2973,6 +2982,15 @@ function normalizeMigrationFailures(migration) {
   return { legacy: read("legacy"), endpoint: read("endpoint") };
 }
 
+function channelNameIsPrintableAscii(value) {
+  return (
+    typeof value === "string" &&
+    value !== "" &&
+    value.length <= 100 &&
+    /^[\u0020-\u007e]+$/u.test(value)
+  );
+}
+
 function normalizePreparation(preparation, relayCacheDir) {
   if (preparation === null || typeof preparation !== "object" || Array.isArray(preparation)) {
     throw new Error("invalid envelope field: preparation");
@@ -3018,10 +3036,7 @@ function normalizePreparation(preparation, relayCacheDir) {
     throw new Error("invalid envelope field: preparation.deliverable");
   }
   const channelName = preparation.channelName;
-  if (
-    channelName !== undefined &&
-    (typeof channelName !== "string" || channelName === "" || channelName.length > 100 || /[\u0000-\u001f\u007f-\u009f]/u.test(channelName))
-  ) {
+  if (channelName !== undefined && !channelNameIsPrintableAscii(channelName)) {
     throw new Error("invalid envelope field: preparation.channelName");
   }
   return {
@@ -3042,7 +3057,7 @@ function replayChannelName(entries) {
       const names = event.tags.filter((tag) => tag[0] === "fm-channel-name");
       if (names.length !== 1 || names[0].length !== 2) continue;
       const candidate = names[0][1];
-      if (candidate === "" || candidate.length > 100 || /[\u0000-\u001f\u007f-\u009f]/u.test(candidate)) continue;
+      if (!channelNameIsPrintableAscii(candidate)) continue;
       channelName = candidate;
     } catch {
       continue;
@@ -3092,6 +3107,9 @@ async function main() {
   }
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) {
     throw new Error(`invalid relay timeout ${JSON.stringify(timeoutMs)}: expected an integer from 1 to 2147483647`);
+  }
+  if (channelName !== undefined && !channelNameIsPrintableAscii(channelName)) {
+    throw new Error("invalid envelope field: channelName");
   }
   if (!CHANNEL_PARTITION.test(channelId)) throw new Error("channel id must be a canonical UUID");
   if (phase !== "prepare" && phase !== "replay" && phase !== "deliver") {

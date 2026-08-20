@@ -76,7 +76,7 @@ Every lane id is recomputable from the home and the task id with nothing to pers
 
 `crewChannelLabel(<fleet label>, <task id>)` returns `firstmate-crew:<sha256(fleet label)>:<task id>`, which is then hashed by the unchanged `channelIdForLabel`.
 The fleet label is hashed rather than concatenated because appending is not injective: a home path that happened to end in the separator plus another id would derive the same string as a different home publishing that task.
-A task id is restricted to `[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}`, matching the canonical task-creation validator while excluding the separator and a leading dot, so the encoding is unambiguous by construction; an id outside that set is refused rather than published to some other channel.
+Task-id validity comes from `fm_task_id_creation_valid` in `bin/fm-pr-lib.sh`; an id rejected by that canonical task-creation validator is refused rather than published to some other channel.
 The fleet label itself is untouched, so the fleet channel keeps the exact id it has always had and a captain reading it does not silently lose their history.
 `tests/fm-buzz-crew-lanes.test.sh` pins the derived id of a fixed label against its literal value, so a change to that derivation fails rather than quietly re-homing the channel.
 
@@ -88,7 +88,7 @@ The display name reaches the relay on the channel-creation event's `name` tag an
 Without it every lane inherits the publisher's default, `firstmate-bearings`, and a captain browsing the client reads one identical row per lane, separable only by UUID - correctly addressed and unreadable, which defeats the point of a lane.
 The fleet channel is published with no name option at all, so that default still applies to it and the name a captain has been reading stays put alongside the id.
 A name is display metadata and never touches the id derivation, which is why the two are separate options rather than one.
-`crew-<home qualifier>-<task id>` cannot exceed the publisher's 100-character bound, because the qualifier is eight characters and a task id is already restricted to 64 characters by the grammar above.
+`crew-<home qualifier>-<task id>` cannot exceed the publisher's 100-character bound, because the qualifier is eight characters and the canonical task-id validator already restricts an id to 64 characters.
 `tests/fm-buzz-crew-lanes.test.sh` reads the channel-creation events back off the stub relay and asserts the published set is one name per crew plus the fleet's.
 
 The name is set when the channel is created and never afterwards, which is a property of the relay rather than a choice made here.

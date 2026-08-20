@@ -469,6 +469,19 @@ test_fire_and_forget_contract_is_intact() {
   pass "the refresh entry point's fire-and-forget contract is intact"
 }
 
+test_refresh_argument_errors_are_non_events() {
+  local home output code
+  home=$(make_fleet_home refresh-argument-error)
+  output=$(run_refresh "$home" "ws://127.0.0.1:1" --relai ws://127.0.0.1:3000 2>&1)
+  code=$?
+  expect_code 0 "$code" "refresh with an unknown argument"
+  assert_contains "$output" "unknown argument: --relai" \
+    "the refresh argument error was not diagnosed"
+  [ "$(replay_count "$home")" = "0" ] \
+    || fail "a malformed refresh invocation created replay state"
+  pass "refresh argument errors are logged non-events"
+}
+
 test_lane_documents_stay_out_of_process_arguments() {
   local home guard_bin leak real_jq
   home=$(make_fleet_home lane-argv)
@@ -1121,6 +1134,7 @@ test_replay_without_deliverable_entries_does_not_create_a_channel
 test_the_fleet_omitted_disclosure_survives_untouched
 test_an_unreachable_or_refusing_relay_is_a_non_event
 test_fire_and_forget_contract_is_intact
+test_refresh_argument_errors_are_non_events
 test_lane_documents_stay_out_of_process_arguments
 test_refresh_setup_failures_are_non_events
 test_status_read_failures_are_not_reported_as_present
