@@ -34,9 +34,9 @@ services:
             let scalar;
             do {
               bytes = randomBytes(32);
-              scalar = BigInt(`0x${bytes.toString("hex")}`);
+              scalar = BigInt(`0x$${bytes.toString("hex")}`);
             } while (scalar === 0n || scalar >= order);
-            writeFileSync(file, `${bytes.toString("hex")}\n`, { flag: "wx", mode: 0o400 });
+            writeFileSync(file, `$${bytes.toString("hex")}\n`, { flag: "wx", mode: 0o400 });
           }
           chownSync(file, 1000, 1000);
           chmodSync(file, 0o400);

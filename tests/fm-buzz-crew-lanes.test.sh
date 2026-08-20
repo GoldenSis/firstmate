@@ -616,6 +616,25 @@ SH
   pass "status truncation and content come from one bounded snapshot"
 }
 
+test_status_byte_window_keeps_a_boundary_aligned_event() {
+  local home projection lanes surfaces events
+  home=$(make_fleet_home status-byte-boundary)
+  projection="$home/bearings.json"
+  bearings_json "$home" > "$projection"
+  printf 'dropped\nkept\n' > "$home/state/task-a.status"
+
+  lanes=$(FM_BUZZ_CREW_STATUS_BYTES=5 run_lanes "$home" --projection "$projection") \
+    || fail "the lane projector failed on a line-aligned byte window"
+  surfaces=$(printf '%s' "$lanes" \
+    | jq -r 'map(select(.id == "task-a"))[0].projection.omitted[].surface')
+  events=$(printf '%s' "$lanes" \
+    | jq -r 'map(select(.id == "task-a"))[0].projection.status_events | join("\n")')
+  assert_contains "$surfaces" "status events for task-a read from the last 5 bytes only" \
+    "the line-aligned byte window did not disclose its bound"
+  [ "$events" = kept ] || fail "the line-aligned byte window dropped a complete event: $events"
+  pass "a line-aligned byte window keeps its first complete event"
+}
+
 test_all_missing_tasks_publish_an_omission_carrier() {
   local home projection lanes surfaces errors
   home=$(make_fleet_home all-missing-tasks)
@@ -1107,6 +1126,7 @@ test_refresh_setup_failures_are_non_events
 test_status_read_failures_are_not_reported_as_present
 test_failed_canonical_snapshot_publishes_an_omission_carrier
 test_status_byte_disclosure_uses_the_same_bounded_snapshot
+test_status_byte_window_keeps_a_boundary_aligned_event
 test_all_missing_tasks_publish_an_omission_carrier
 test_refresh_publishes_an_all_skipped_omission_carrier
 test_status_read_failures_are_disclosed_as_projection_failures

@@ -93,7 +93,7 @@ A name is display metadata and never touches the id derivation, which is why the
 
 The name is set when the channel is created and never afterwards, which is a property of the relay rather than a choice made here.
 Channel creation is idempotent by design - the publisher re-sends it on every run and the relay answers `duplicate: channel already exists` - so a channel that already exists keeps the name it was created with and a changed `--channel-name` has no visible effect on it.
-Verified on the running loopback relay on 2026-08-20: after republishing every lane with task-specific display names, `select id, name from channels` still returned `firstmate-bearings` for all ten pre-existing lanes.
+The running-relay evidence below verifies that republishing cannot rename an existing lane.
 Renaming an existing channel would need a NIP-29 metadata-edit event, which is the new protocol surface this adapter declined to take on for threads and declines again here.
 On this disposable stack the recovery is the one the compose file already documents: `docker compose -f docker-compose.buzz-loopback.yml down -v` drops the datastores, and the next refresh recreates every channel under its current name.
 
@@ -120,9 +120,7 @@ The snapshot is consulted once per refresh, and it is reconciled with the bearin
 Nothing auto-invokes any of this.
 `bin/fm-buzz-refresh.sh` is one explicit call firstmate can make after a wake drain, and it is deliberately not a daemon, a watcher hook, a timer, or anything in a crewmate's own execution path.
 That is what keeps invariant 3 real: Buzz stays off the critical path of both firstmate and every crewmate, so a relay that is down, slow, or absent cannot break a merge, a teardown, a wake drain, or a turn end.
-The refresh forwards the fleet publication's exit status unchanged - the contract `bin/fm-buzz-publish.sh` already owned - and treats every crew-lane failure as a logged non-event, because an additive surface may never make anything louder than it was.
-It also retries every nonempty cache partition for the selected relay, including lanes whose tasks have already completed, without signing a replacement projection.
-The complete refresh has one absolute default 30-second deadline across snapshotting, lane projection, publisher lock waits, relay delivery, and cached replay inspection, and logs the work skipped when that deadline is spent.
+The header of `bin/fm-buzz-refresh.sh` owns invocation, failure, replay, and deadline mechanics.
 
 ## Using it
 
@@ -242,6 +240,16 @@ Run on 2026-07-30 against `ghcr.io/block/buzz:main`, Docker server 29.5.2 under 
 | Kill mid-publish, no duplicate and no loss | **pass** - relay stopped mid-run, event retained in the cache, delivered on restart; relay held 3 events with no duplicate ids |
 | Firstmate operational with Buzz down | **pass** - see below |
 | Boundary respected | **pass** - no change to `AGENTS.md`, `projects/`, or the `state/*.meta` schema |
+
+The lane-name migration check ran on 2026-08-20 against relay image `ghcr.io/block/buzz:main`, Buzz desktop client 0.5.17 installed with `brew install --cask block-buzz`, Docker 29.6.1, and Docker Compose 5.5.0 on macOS via Colima.
+The compose file needed its JavaScript template interpolation escaped before Docker Compose 5.5.0 would start the stack.
+The exact query was:
+
+```sh
+docker compose -f docker-compose.buzz-loopback.yml exec -T postgres psql -U buzz -d buzz -c "select id, name from channels order by name;"
+```
+
+After `bin/fm-buzz-refresh.sh` republished all ten lanes with `crew-<task id>` names, the query returned 17 rows in which every one of the ten pre-existing lane channels was still named `firstmate-bearings`, alongside the `Welcome`, `general`, and `welcome-everyone` channels created by the desktop client.
 
 The independence check is structural as well as behavioral: no operational Firstmate path outside the `bin/fm-buzz-*` family invokes the adapter, so a stopped relay has no path by which to reach supervision.
 `tests/fm-buzz-inspect.test.sh` asserts that as a standing regression test.

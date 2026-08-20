@@ -577,40 +577,29 @@ publish() {
   # which would put it in jq's world-readable argv. The key reaches jq through a
   # file descriptor, while --rawfile reads the projection spool's bytes verbatim.
   # The remaining --arg values - relay URL, channel id, cache path - are not secrets.
-  if [ -n "$REPLAY_CHANNEL" ]; then
-    preparation=$(jq -n \
-      --rawfile privateKey <(printf '%s' "$key") \
-      --arg phase replay \
-      --arg relay "$RELAY" \
-      --arg channelId "$channel" \
-      --arg replayDir "$REPLAY_DIR" \
-      --arg targetsFile "$TARGETS_FILE" \
-      --argjson timeoutMs "$TIMEOUT_MS" \
-      --argjson maxCache "$MAX_CACHE" \
-      --argjson migration "$migration" \
-      --argjson channelName "$name_field" \
-      '{phase:$phase, privateKey:$privateKey, relay:$relay, channelId:$channelId,
-        replayDir:$replayDir, targetsFile:$targetsFile, migration:$migration,
-        timeoutMs:$timeoutMs, maxCache:$maxCache} + $channelName' \
-      | node "$SCRIPT_DIR/fm-buzz-publish.mjs")
-  else
-    preparation=$(jq -n \
-      --rawfile privateKey <(printf '%s' "$key") \
-      --rawfile content "$STDIN_SPOOL" \
-      --arg phase prepare \
-      --arg relay "$RELAY" \
-      --arg channelId "$channel" \
-      --arg replayDir "$REPLAY_DIR" \
-      --arg targetsFile "$TARGETS_FILE" \
-      --argjson timeoutMs "$TIMEOUT_MS" \
-      --argjson maxCache "$MAX_CACHE" \
-      --argjson migration "$migration" \
-      --argjson channelName "$name_field" \
-      '{phase:$phase, privateKey:$privateKey, content:$content, relay:$relay, channelId:$channelId,
-        replayDir:$replayDir, targetsFile:$targetsFile, migration:$migration,
-        timeoutMs:$timeoutMs, maxCache:$maxCache} + $channelName' \
-      | node "$SCRIPT_DIR/fm-buzz-publish.mjs")
+  local phase=replay content_file=/dev/null
+  if [ -z "$REPLAY_CHANNEL" ]; then
+    phase=prepare
+    content_file=$STDIN_SPOOL
   fi
+  preparation=$(jq -n \
+    --rawfile privateKey <(printf '%s' "$key") \
+    --rawfile content "$content_file" \
+    --arg phase "$phase" \
+    --arg relay "$RELAY" \
+    --arg channelId "$channel" \
+    --arg replayDir "$REPLAY_DIR" \
+    --arg targetsFile "$TARGETS_FILE" \
+    --argjson timeoutMs "$TIMEOUT_MS" \
+    --argjson maxCache "$MAX_CACHE" \
+    --argjson migration "$migration" \
+    --argjson channelName "$name_field" \
+    '{phase:$phase, privateKey:$privateKey, relay:$relay, channelId:$channelId,
+      replayDir:$replayDir, targetsFile:$targetsFile, migration:$migration,
+      timeoutMs:$timeoutMs, maxCache:$maxCache}
+      + (if $phase == "prepare" then {content:$content} else {} end)
+      + $channelName' \
+    | node "$SCRIPT_DIR/fm-buzz-publish.mjs")
   rc=$?
   fm_lock_release "$KEYPAIR_LOCK"
   KEYPAIR_LOCK=""

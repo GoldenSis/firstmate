@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
-# Shared fm-bearings.v1 projection validation for Buzz shell entry points.
+# fm-buzz-projection-lib.sh - shared fm-bearings.v1 validation for Buzz shell entry points.
+#
+# Source this internal library after defining a caller-specific `log` function.
+# Both functions take one filesystem path naming the complete projection and
+# require `jq`; JSON validation additionally requires `python3`.
+# `fm_buzz_validate_projection_json` rejects unreadable, malformed, non-finite,
+# or duplicate-key JSON, while `fm_buzz_validate_projection_contract` rejects a
+# parsed value outside the shared fm-bearings.v1 base shape.
+# Diagnostics are passed to the caller's `log` function, stdout stays empty, and
+# each function returns 0 for a valid input or 1 for any read or validation error.
+# Sourcing this file has no side effects.
 
 fm_buzz_validate_projection_contract() {
   local projection=$1

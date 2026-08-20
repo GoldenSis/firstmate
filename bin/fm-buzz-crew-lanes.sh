@@ -225,7 +225,7 @@ fi
 # only grows at the tail. A byte-bounded tail can start mid-line; that partial
 # leading line is dropped rather than published as if it were a whole event.
 status_events_json() {  # <path>
-  local path=$1 bytes=0 byte_truncated=false input=$STATUS_SPOOL
+  local path=$1 bytes=0 byte_truncated=false leading_partial=false input=$STATUS_SPOOL first_byte
   if [ ! -f "$path" ]; then
     jq -n '{present:false,events:[],line_truncated:false,byte_truncated:false,total:0,shown:0}'
     return 0
@@ -237,15 +237,19 @@ status_events_json() {  # <path>
   case $bytes in ''|*[!0-9]*) bytes=0 ;; esac
   if [ "$bytes" -gt "$STATUS_BYTES" ]; then
     byte_truncated=true
+    first_byte=$(od -An -tu1 -N1 < "$STATUS_SPOOL") || return 1
+    first_byte=${first_byte//[[:space:]]/}
+    [ "$first_byte" = 10 ] || leading_partial=true
     tail -c "$STATUS_BYTES" < "$STATUS_SPOOL" > "$STATUS_WINDOW_SPOOL" || return 1
     input=$STATUS_WINDOW_SPOOL
   fi
   jq -Rn \
     --argjson max_lines "$STATUS_LINES" \
     --argjson max_chars "$STATUS_LINE_CHARS" \
-    --argjson byte_truncated "$byte_truncated" '
+    --argjson byte_truncated "$byte_truncated" \
+    --argjson leading_partial "$leading_partial" '
       [inputs | select(test("^[[:space:]]*$") | not)] as $lines
-      | (if $byte_truncated and ($lines | length) > 0 then $lines[1:] else $lines end) as $whole
+      | (if $leading_partial and ($lines | length) > 0 then $lines[1:] else $lines end) as $whole
       | ($whole | length) as $total
       | (if $total > $max_lines then $whole[-$max_lines:] else $whole end) as $kept
       | {
