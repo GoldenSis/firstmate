@@ -2847,6 +2847,9 @@ function pruneCache(replayDir, maxCache, protectedFile, currentPublisher) {
     if (publishers.get(entry.file) === currentPublisher) continue;
     outcomes.set(entry.file, RETRYABLE);
   }
+  const effectiveProtectedFile = protectedFile ?? validEntries.findLast(
+    (entry) => publishers.get(entry.file) === currentPublisher,
+  )?.file;
   const excess = validEntries.length + invalidRetained - maxCache;
   if (excess <= 0) {
     return {
@@ -2861,7 +2864,7 @@ function pruneCache(replayDir, maxCache, protectedFile, currentPublisher) {
   const pruned = new Set();
   for (const entry of validEntries) {
     if (dropped >= excess) break;
-    if (entry.file === protectedFile) continue;
+    if (entry.file === effectiveProtectedFile) continue;
     if (publishers.get(entry.file) !== currentPublisher) continue;
     const removal = removeCacheFile(replayDir, entry.file, `prune cache entry ${entry.name}`);
     if (removal.removed) {

@@ -215,8 +215,8 @@ ssh -F /tmp/colima-ssh.config -L '[::1]:3000:127.0.0.1:3000'   -N colima &   # l
 The tunnel binds loopback only, verified with `lsof -nP -iTCP:3000` showing `127.0.0.1:3000 (LISTEN)` and `[::1]:3000 (LISTEN)`, never `*:3000`.
 On a native Linux Docker host no tunnel is needed and the compose file works as written.
 
-Note also that `docker compose` is not installed on this machine (the Docker CLI and colima are, the compose plugin is not).
-Compose was driven from a throwaway container rather than installing anything durable on the host:
+During the 2026-07-30 run, `docker compose` was not installed on this machine, although the Docker CLI and Colima were present.
+That run drove Compose from a throwaway container rather than installing anything durable on the host:
 
 ```
 docker run -i --rm -v /var/run/docker.sock:/var/run/docker.sock docker:cli \

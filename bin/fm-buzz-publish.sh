@@ -87,6 +87,12 @@
 # hard ceiling 1048576); an oversized projection is rejected before signing.
 # Invalid deadlines, acquisition timeouts, and interrupted waits are logged and
 # converted to the same exit-0 non-event as every other publishing failure.
+# FM_BUZZ_MIGRATION_STATE_FILE is a refresh-owned internal seam whose caller
+# supplies a pre-created regular file for the lifetime of one refresh.
+# The first publisher records either migration results as string arrays under
+# `legacy` and `endpoint`, or `{"failed":true}`; later publishers reuse that
+# result, and an unreadable, malformed, or unwritable file skips publication.
+# Direct callers leave FM_BUZZ_MIGRATION_STATE_FILE unset.
 # bin/fm-buzz-key-lib.sh owns the lock ordering and phase-boundary contract used
 # to isolate whole-tree migration, per-channel delivery, signing, and rotation.
 #
@@ -132,6 +138,19 @@ MIGRATION_STATE_FILE=${FM_BUZZ_MIGRATION_STATE_FILE:-}
 
 log() {
   printf 'fm-buzz-publish: %s\n' "$1" >&2
+}
+
+channel_name_is_printable() {
+  local bytes
+  bytes=$(printf '%s' "$1" | LC_ALL=C od -An -v -tu1) || return 1
+  awk '
+    {
+      for (i = 1; i <= NF; i += 1) {
+        if ($i < 32 || $i > 126) invalid = 1
+      }
+    }
+    END { exit invalid ? 1 : 0 }
+  ' <<< "$bytes"
 }
 
 # The projection spool holds the bearings projection - task ids, project names,
@@ -669,7 +688,7 @@ while [ "$#" -gt 0 ]; do
                 # The name reaches the relay and then a reader's channel list, so
                 # it is bounded and printable-only here rather than trusted from
                 # the caller.
-                if printf '%s' "$1" | LC_ALL=C grep -q '[^[:print:]]'; then
+                if ! channel_name_is_printable "$1"; then
                   log "--channel-name must contain printable characters only"
                   ARGUMENT_ERROR=1
                 elif [ "${#1}" -gt 100 ]; then

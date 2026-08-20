@@ -883,6 +883,37 @@ EOF
   pass "replay-only foreign partitions do not provision empty channels"
 }
 
+test_replay_only_pruning_preserves_the_newest_current_event() {
+  local home relay current_private foreign_private channel foreign_file current_file output names
+  home=$(make_home replay-only-current-protection)
+  run_keypair "$home" >/dev/null 2>&1 || fail "replay-only protection keypair setup failed"
+  current_private=$(jq -r '.private_key' "$(key_file "$home" "$home/xdg")")
+  foreign_private=$(new_private_key) || fail "could not mint a replay-only foreign publisher"
+  channel=$(channel_id_for_label replay-only-current-protection)
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  foreign_file=$(seed_replay_event \
+    "$home" "$relay" "$foreign_private" 1700000400 "$channel" replay-only-foreign) \
+    || fail "could not seed the foreign replay event"
+  current_file=$(seed_replay_event \
+    "$home" "$relay" "$current_private" 1700000401 "$channel" replay-only-current) \
+    || fail "could not seed the current replay event"
+
+  output=$(FM_BUZZ_MAX_CACHE=1 \
+    run_publish "$home" "$relay" --replay-channel "$channel" </dev/null 2>&1)
+  expect_code 0 "$?" "replay-only pruning with a foreign cache entry"
+  names=$(query_channel_names "$relay") || fail "the stub did not answer the channel-name query"
+  stop_stub "$STUB_PID"
+
+  [ -n "$names" ] || fail "replay pruning removed the only deliverable event before provisioning"
+  assert_absent "$current_file" "the newest current-publisher replay event was not delivered"
+  assert_present "$foreign_file" "replay pruning removed a foreign-publisher cache entry"
+  assert_contains "$output" "delivered=1 retained=1" \
+    "replay pruning did not preserve and deliver the newest current-publisher event"
+  pass "replay-only pruning preserves the newest deliverable event"
+}
+
 test_pending_replay_discovery_keeps_healthy_channel_siblings() {
   local home relay endpoint healthy broken output errors
   home=$(make_home pending-replay-siblings)
@@ -1303,6 +1334,15 @@ test_channel_names_are_bounded_and_printable() {
   assert_not_contains "$output" "signed event" \
     "a control character in the channel name reached signing"
 
+  output=$(test_projection "must-not-publish" \
+    | run_publish "$home" ws://127.0.0.1:9 --channel-name $'crew-one\ncrew-two' 2>&1)
+  code=$?
+  expect_code 0 "$code" "a newline in the channel name"
+  assert_contains "$output" "printable characters only" \
+    "a newline in the channel name was not diagnosed"
+  assert_not_contains "$output" "signed event" \
+    "a newline in the channel name reached signing"
+
   long=$(printf 'c%.0s' $(seq 1 101))
   output=$(test_projection "must-not-publish" \
     | run_publish "$home" ws://127.0.0.1:9 --channel-name "$long" 2>&1)
@@ -1542,6 +1582,7 @@ test_a_late_auth_challenge_is_still_answered
 test_a_challenge_past_the_handshake_window_still_lands_the_event
 test_foreign_author_cache_entries_are_not_drained_by_the_current_publisher
 test_replay_only_foreign_partition_does_not_provision_a_channel
+test_replay_only_pruning_preserves_the_newest_current_event
 test_pending_replay_discovery_keeps_healthy_channel_siblings
 test_permanent_rejection_is_not_replayed_forever
 test_retryable_rejection_is_kept
