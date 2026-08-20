@@ -216,6 +216,35 @@ test_a_lane_carries_its_own_status_lines_and_identity() {
   pass "a lane carries its own status lines and identifying fields"
 }
 
+test_lane_projector_rejects_the_publishers_invalid_projection_shapes() {
+  local home projection output code
+  home=$(make_fleet_home lane-invalid-projection)
+
+  projection=$(bearings_json "$home" | jq -c '.in_flight[0] = null') \
+    || fail "could not build the malformed in_flight fixture"
+  output=$(printf '%s' "$projection" | run_lanes "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "lane projection with malformed in_flight"
+  assert_contains "$output" "projection field in_flight" \
+    "the lane projector accepted an in_flight shape the publisher rejects"
+
+  projection=$(bearings_json "$home" | jq -c '.omitted = [{surface:"paths"}]') \
+    || fail "could not build the malformed omitted fixture"
+  output=$(printf '%s' "$projection" | run_lanes "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "lane projection with malformed omitted"
+  assert_contains "$output" "projection field omitted" \
+    "the lane projector accepted an omitted shape the publisher rejects"
+
+  projection='{"schema":"fm-bearings.v1","home":"test/home","generated":"2026-08-10T00:00:00Z","prs":"not_requested","in_flight":[{"id":"task-a","kind":"ship","state":"running","state":"done","doing":"testing"}],"omitted":[]}'
+  output=$(printf '%s' "$projection" | run_lanes "$home" 2>&1)
+  code=$?
+  expect_code 1 "$code" "lane projection with a duplicate field"
+  assert_contains "$output" 'duplicate field "state"' \
+    "the lane projector normalized a duplicate field the publisher rejects"
+  pass "lane projection and publishing share one projection validator"
+}
+
 test_lane_events_never_land_in_another_lanes_partition() {
   local home relay channel_a channel_b fleet_channel content_a content_b
   home=$(make_fleet_home lane-partitions)
@@ -736,6 +765,58 @@ SH
   pass "deadline watchdog signals terminate and reap the child group"
 }
 
+test_deadline_watchdog_defers_signals_until_child_assignment() {
+  local home hook_dir process_file output child_pid waited=0 child_state=""
+  home=$(make_fleet_home refresh-signal-assignment)
+  hook_dir="$home/python-hook"
+  process_file="$home/raced-child"
+  output="$home/raced-output"
+  mkdir -p "$hook_dir"
+  cat > "$hook_dir/sitecustomize.py" <<'PY'
+import os
+import signal
+import subprocess
+
+
+original_popen = subprocess.Popen
+
+
+def race_popen(*args, **kwargs):
+    marker = os.environ.get("FM_BUZZ_RACED_CHILD")
+    if kwargs.get("start_new_session") and marker and not os.path.exists(marker):
+        process = original_popen(["/bin/sh", "-c", "sleep 30"], start_new_session=True)
+        with open(marker, "w", encoding="ascii") as output:
+            output.write(f"{process.pid}\n")
+        os.kill(os.getpid(), signal.SIGTERM)
+        return process
+    return original_popen(*args, **kwargs)
+
+
+subprocess.Popen = race_popen
+PY
+
+  PYTHONPATH="$hook_dir" FM_BUZZ_RACED_CHILD="$process_file" FM_BUZZ_REFRESH_TIMEOUT_S=20 \
+    run_refresh "$home" "ws://127.0.0.1:1" >"$output" 2>&1
+  expect_code 0 "$?" "refresh signalled between child creation and assignment"
+  [ -s "$process_file" ] || fail "the child-assignment race was not exercised"
+  read -r child_pid < "$process_file"
+  while kill -0 "$child_pid" 2>/dev/null && [ "$waited" -lt 40 ]; do
+    child_state=$(ps -o stat= -p "$child_pid" | tr -d '[:space:]')
+    case $child_state in Z*) break ;; esac
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  child_state=$(ps -o stat= -p "$child_pid" 2>/dev/null | tr -d '[:space:]')
+  case $child_state in
+    ''|Z*) ;;
+    *)
+      kill -KILL "-$child_pid" 2>/dev/null
+      fail "a signal before child assignment left the child group running"
+      ;;
+  esac
+  pass "deadline watchdog defers signals until child assignment"
+}
+
 test_refresh_deadline_bounds_snapshot_work() {
   local home guard_bin real_jq sentinel output started ended elapsed
   home=$(make_fleet_home refresh-snapshot-deadline)
@@ -816,6 +897,7 @@ test_channel_labels_preserve_embedded_newlines() {
 test_the_default_fleet_channel_id_is_unchanged
 test_two_task_ids_derive_two_well_formed_distinct_channels
 test_a_lane_carries_its_own_status_lines_and_identity
+test_lane_projector_rejects_the_publishers_invalid_projection_shapes
 test_lane_events_never_land_in_another_lanes_partition
 test_lanes_reach_the_relay_and_read_back_as_one_crews_stream
 test_each_lane_is_named_for_its_crew
@@ -835,6 +917,7 @@ test_status_read_failures_are_disclosed_as_projection_failures
 test_refresh_deadline_bounds_a_silent_relay
 test_fleet_only_reports_its_deadline
 test_deadline_watchdog_reaps_its_child_group_on_signal
+test_deadline_watchdog_defers_signals_until_child_assignment
 test_refresh_deadline_bounds_snapshot_work
 test_refresh_deadline_spans_sequential_lock_waits
 test_channel_labels_preserve_embedded_newlines

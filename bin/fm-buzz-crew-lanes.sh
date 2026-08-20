@@ -67,6 +67,9 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# shellcheck source=bin/fm-buzz-projection-lib.sh
+. "$SCRIPT_DIR/fm-buzz-projection-lib.sh"
+
 STATUS_LINES=${FM_BUZZ_CREW_STATUS_LINES:-40}
 STATUS_BYTES=${FM_BUZZ_CREW_STATUS_BYTES:-16384}
 STATUS_LINE_CHARS=${FM_BUZZ_CREW_STATUS_LINE_CHARS:-200}
@@ -116,6 +119,7 @@ for bound in FM_BUZZ_CREW_STATUS_LINES:$STATUS_LINES \
 done
 
 command -v jq >/dev/null 2>&1 || { log "jq is unavailable"; exit 1; }
+command -v python3 >/dev/null 2>&1 || { log "python3 is unavailable"; exit 1; }
 
 SPOOL=""
 STATUS_SPOOL=""
@@ -165,18 +169,8 @@ if [ "$(wc -c < "$SPOOL" | tr -d '[:space:]')" -gt "$INPUT_BYTES" ]; then
   exit 1
 fi
 
-jq -e '
-  type == "object"
-    and .schema == "fm-bearings.v1"
-    and (.home | type == "string")
-    and (.generated | type == "string")
-    and (.prs | type == "string")
-    and (.in_flight | type == "array")
-    and (.omitted | type == "array")
-' "$SPOOL" >/dev/null 2>&1 || {
-  log "the input is not an fm-bearings.v1 projection"
-  exit 1
-}
+fm_buzz_validate_projection_json "$SPOOL" || exit 1
+fm_buzz_validate_projection_contract "$SPOOL" || exit 1
 
 SNAPSHOT=$("$SCRIPT_DIR/fm-fleet-snapshot.sh" --json) || {
   log "the canonical fleet snapshot failed; no lanes projected"
