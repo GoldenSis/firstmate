@@ -85,10 +85,13 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-x-link.sh`           | Link a spawned task to its originating X-mode mention in task meta                   |
 | `fm-x-followup.sh`       | Detect, post, and cap completion follow-ups for an X-mode-linked task                |
 | `fm-buzz-keypair.sh`     | Manage this home's loopback Buzz publishing identity under `fm-buzz-key-lib.sh` custody |
-| `fm-buzz-publish.sh`     | Publish one validated bearings projection to the loopback Buzz relay; runtime capability failures exit 0, while missing Python 3 and input-contract failures exit nonzero |
-| `fm-buzz-inspect.sh`     | Human diagnostic: read published bearings events back off the loopback relay         |
+| `fm-buzz-publish.sh`     | Publish one validated bearings projection or replay one cached channel queue to the loopback Buzz relay; runtime capability failures exit 0, while missing Python 3 and input-contract failures exit nonzero |
+| `fm-buzz-refresh.sh`     | Publish the fleet channel and every live per-crew lane, then retry pending cached queues, in one bounded explicit call; lane and replay failures are logged non-events |
+| `fm-buzz-crew-lanes.sh`  | Project one bearings projection into per-crew lane documents; read-only, prints JSON |
+| `fm-buzz-inspect.sh`     | Human diagnostic: read published bearings events back off the loopback relay, or one crew lane with `--crew` |
 | `fm-buzz-key-lib.sh`     | Shared custody of the loopback Buzz publishing key (keychain, or a 0600 fallback)    |
-| `fm-buzz-publish.mjs`    | Publishing engine behind `fm-buzz-publish.sh`: sign, cache, and drain to the relay    |
+| `fm-buzz-projection-lib.sh` | Shared validation of the `fm-bearings.v1` projection consumed by Buzz entry points |
+| `fm-buzz-publish.mjs`    | Publishing engine behind `fm-buzz-publish.sh`: sign, cache, discover, replay, and drain per-channel queues to the relay |
 | `fm-buzz-inspect.mjs`    | Read-back engine behind `fm-buzz-inspect.sh`; never consumed by firstmate            |
 | `fm-buzz-lib.mjs`        | NIP-01 event construction and the loopback Buzz relay client                          |
 | `fm-buzz-crypto.mjs`     | Dependency-free BIP-340 Schnorr signing over secp256k1 for the Buzz adapter          |

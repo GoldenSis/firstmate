@@ -176,6 +176,35 @@ query_membership_signer() {  # <private-key> <relay> <channel>
   ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay" "$channel"
 }
 
+# Every channel-creation event the stub has stored, as one display name per line,
+# sorted. This is how a test sees what a Buzz client's channel list would show:
+# the name lives on the kind-9007 event's `name` tag and nowhere in the projection
+# the message carries.
+query_channel_names() {  # <relay>
+  # shellcheck disable=SC2016
+  node -e '
+    const socket = new WebSocket(process.argv[1]);
+    const names = [];
+    const finish = (code) => { try { socket.close(); } catch { /* already closed */ } process.exit(code); };
+    const timer = setTimeout(() => finish(1), 15000);
+    socket.addEventListener("open", () => {
+      socket.send(JSON.stringify(["REQ", "names", { kinds: [9007] }]));
+    });
+    socket.addEventListener("message", (message) => {
+      const parsed = JSON.parse(message.data);
+      if (parsed[0] === "EVENT") {
+        const tag = parsed[2].tags.find((entry) => entry[0] === "name");
+        if (tag) names.push(tag[1]);
+      } else if (parsed[0] === "EOSE") {
+        clearTimeout(timer);
+        process.stdout.write(`${names.sort().join("\n")}\n`);
+        finish(0);
+      }
+    });
+    socket.addEventListener("error", () => finish(1));
+  ' "$1"
+}
+
 # Start the stub on an ephemeral port and echo "<pid> <url>".
 start_stub() {  # [stub args...]
   local out pid port line
@@ -237,8 +266,8 @@ channel_cache_dir() {  # <home> <relay> <channel>
   printf '%s/%s\n' "$(relay_cache_dir "$1" "$2")" "$3"
 }
 
-seed_replay_event() {  # <home> <relay> <private-key> <created-at> <channel> <note>
-  local home=$1 relay=$2 private=$3 created_at=$4 channel=$5 note=$6 directory
+seed_replay_event() {  # <home> <relay> <private-key> <created-at> <channel> <note> [channel name]
+  local home=$1 relay=$2 private=$3 created_at=$4 channel=$5 note=$6 channel_name=${7-} directory
   directory=$(channel_cache_dir "$home" "$relay" "$channel") || return 1
   mkdir -p "$directory"
   # shellcheck disable=SC2016
@@ -250,10 +279,12 @@ seed_replay_event() {  # <home> <relay> <private-key> <created-at> <channel> <no
     process.stdin.on("data", (chunk) => { privateKey += chunk; });
     process.stdin.on("end", async () => {
       const { KIND_STREAM_MESSAGE, signEvent } = await import(process.argv[1]);
+      const tags = [["h", process.argv[4]]];
+      if (process.argv[6] !== "") tags.push(["fm-channel-name", process.argv[6]]);
       const event = signEvent({
         created_at: Number(process.argv[3]),
         kind: KIND_STREAM_MESSAGE,
-        tags: [["h", process.argv[4]]],
+        tags,
         content: JSON.stringify({
           schema: "fm-bearings.v1",
           home: "test/home",
@@ -268,7 +299,7 @@ seed_replay_event() {  # <home> <relay> <private-key> <created-at> <channel> <no
       writeFileSync(file, JSON.stringify(["EVENT", event]), { mode: 0o600, flag: "wx" });
       process.stdout.write(`${file}\n`);
     });
-  ' "$ROOT/bin/fm-buzz-lib.mjs" "$directory" "$created_at" "$channel" "$note"
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$directory" "$created_at" "$channel" "$note" "$channel_name"
 }
 
 # Ask the custody library itself where a home's key file is, rather than hardcoding

@@ -34,15 +34,28 @@
 // The whole-tree half of a run - quarantine and endpoint-to-channel migration -
 // is migrateReplayCache, a separate entry point so its caller can hold the
 // whole-tree lock across a filesystem walk instead of across a relay round trip.
-// main() therefore never walks outside the queue it was invoked for, and its
-// prepare phase signs, caches, prunes, and tracks before its deliver phase makes
-// network calls. bin/fm-buzz-key-lib.sh owns the lock ordering those phases use.
+// main() therefore never walks outside the queue it was invoked for. Its prepare
+// phase signs, caches, prunes, and tracks one new projection and returns the
+// delivery preparation as JSON. Its replay phase signs nothing, prunes only the
+// invoked queue, and returns preparation for entries owned by the current
+// publisher. Its deliver phase accepts that preparation plus migration results
+// and makes the network calls. bin/fm-buzz-key-lib.sh owns the lock ordering those
+// phases use.
+// listPendingReplayChannels(replayDir, relay) validates the loopback relay and
+// regular cache topology, then returns sorted canonical channel ids for nonempty,
+// inspectable partitions under that relay's endpoint. An absent root or endpoint
+// returns an empty array, while an unreadable channel sibling is logged and
+// skipped without hiding healthy siblings.
 //
 // Reads one JSON envelope on stdin so that neither the private key nor the
 // projection - which carries task ids, project names, blockers and PR URLs -
 // appears in a command line or in the process environment. Fields: privateKey,
-// phase, content, relay, channelId, channelName, timeoutMs, replayDir,
+// phase, optional content, relay, channelId, channelName, timeoutMs, replayDir,
 // targetsFile, migration, preparation, maxCache.
+// A newly signed message records its effective display name in one
+// `fm-channel-name` tag so replay-only delivery can provision a missing channel
+// under the original readable name. Replay ignores absent, duplicate, malformed,
+// non-ASCII, or oversized name tags and falls back to the publisher default.
 //
 // Legacy and explicitly discarded rotation entries are retained under
 // _legacy-quarantine with payloads and manifests rather than silently deleted.
@@ -2843,13 +2856,28 @@ function pruneCache(replayDir, maxCache, protectedFile, currentPublisher) {
     }
   }
   validEntries.sort((a, b) => (a.createdAt - b.createdAt) || a.id.localeCompare(b.id));
+  for (const entry of validEntries) {
+    if (publishers.get(entry.file) === currentPublisher) continue;
+    outcomes.set(entry.file, RETRYABLE);
+  }
+  const effectiveProtectedFile = protectedFile ?? validEntries.findLast(
+    (entry) => publishers.get(entry.file) === currentPublisher,
+  )?.file;
   const excess = validEntries.length + invalidRetained - maxCache;
-  if (excess <= 0) return { entries: validEntries, dropped: 0, failed, outcomes };
+  if (excess <= 0) {
+    return {
+      entries: validEntries,
+      currentEntries: validEntries.filter((entry) => publishers.get(entry.file) === currentPublisher),
+      dropped: 0,
+      failed,
+      outcomes,
+    };
+  }
   let dropped = 0;
   const pruned = new Set();
   for (const entry of validEntries) {
     if (dropped >= excess) break;
-    if (entry.file === protectedFile) continue;
+    if (entry.file === effectiveProtectedFile) continue;
     if (publishers.get(entry.file) !== currentPublisher) continue;
     const removal = removeCacheFile(replayDir, entry.file, `prune cache entry ${entry.name}`);
     if (removal.removed) {
@@ -2859,8 +2887,10 @@ function pruneCache(replayDir, maxCache, protectedFile, currentPublisher) {
     if (removal.failed) failed += 1;
   }
   if (dropped > 0) log(`replay cache over ${maxCache}; dropped ${dropped} oldest event(s)`);
+  const retained = validEntries.filter((entry) => !pruned.has(entry.file));
   return {
-    entries: validEntries.filter((entry) => !pruned.has(entry.file)),
+    entries: retained,
+    currentEntries: retained.filter((entry) => publishers.get(entry.file) === currentPublisher),
     dropped,
     failed,
     outcomes,
@@ -2906,6 +2936,42 @@ export function migrateReplayCache(replayDir) {
   return { legacy: legacy.failures, endpoint: endpoint.failures };
 }
 
+export function listPendingReplayChannels(replayDir, relay) {
+  resolveLoopbackRelayHost(relay);
+  let metadata;
+  try {
+    metadata = lstatSync(replayDir);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`replay cache path ${replayDir} is not a regular directory`);
+  }
+  const cacheRoot = prepareCacheRoot(replayDir);
+  const endpointPath = relayCacheDirectory(cacheRoot, relay);
+  try {
+    metadata = cacheLstatSync(endpointPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`relay cache path ${endpointPath} is not a regular directory`);
+  }
+  const endpoint = pinCacheDirectory(endpointPath);
+  const channels = cacheChannelDirectories(endpoint);
+  const pending = [];
+  for (const directory of channels.directories) {
+    try {
+      if (cacheReaddirSync(directory).length > 0) pending.push(path.basename(directory));
+    } catch (error) {
+      log(`could not inspect replay channel partition ${directory}: ${error.message}`);
+    }
+  }
+  return pending.sort();
+}
+
 function normalizeMigrationFailures(migration) {
   if (!migration || typeof migration !== "object" || Array.isArray(migration)) {
     throw new Error("missing envelope field: migration");
@@ -2920,12 +2986,24 @@ function normalizeMigrationFailures(migration) {
   return { legacy: read("legacy"), endpoint: read("endpoint") };
 }
 
+function channelNameIsPrintableAscii(value) {
+  return (
+    typeof value === "string" &&
+    value !== "" &&
+    value.length <= 100 &&
+    /^[\u0020-\u007e]+$/u.test(value)
+  );
+}
+
 function normalizePreparation(preparation, relayCacheDir) {
   if (preparation === null || typeof preparation !== "object" || Array.isArray(preparation)) {
     throw new Error("invalid envelope field: preparation");
   }
   if (!Number.isSafeInteger(preparation.failed) || preparation.failed < 0) {
     throw new Error("invalid envelope field: preparation.failed");
+  }
+  if (!Number.isSafeInteger(preparation.deliverable) || preparation.deliverable < 0) {
+    throw new Error("invalid envelope field: preparation.deliverable");
   }
   if (!Array.isArray(preparation.entries) || !Array.isArray(preparation.outcomes)) {
     throw new Error("invalid envelope field: preparation cache state");
@@ -2958,7 +3036,53 @@ function normalizePreparation(preparation, relayCacheDir) {
     }
     return entry;
   });
-  return { entries, outcomes, failed: preparation.failed };
+  if (preparation.deliverable > entries.length) {
+    throw new Error("invalid envelope field: preparation.deliverable");
+  }
+  const channelName = preparation.channelName;
+  if (channelName !== undefined && !channelNameIsPrintableAscii(channelName)) {
+    throw new Error("invalid envelope field: preparation.channelName");
+  }
+  return {
+    entries,
+    outcomes,
+    failed: preparation.failed,
+    deliverable: preparation.deliverable,
+    channelName,
+  };
+}
+
+function replayChannelName(entries) {
+  let channelName;
+  for (const entry of entries) {
+    try {
+      const raw = readRegularFile(entry.file).bytes.toString("utf8");
+      const event = cachedEventFromFrame(raw, entry);
+      const names = event.tags.filter((tag) => tag[0] === "fm-channel-name");
+      if (names.length !== 1 || names[0].length !== 2) continue;
+      const candidate = names[0][1];
+      if (!channelNameIsPrintableAscii(candidate)) continue;
+      channelName = candidate;
+    } catch {
+      continue;
+    }
+  }
+  return channelName;
+}
+
+function deliveryResult(outcome, cleanupFailures, relay) {
+  let delivered = 0;
+  let kept = 0;
+  let discarded = 0;
+  for (const verdict of outcome.values()) {
+    if (verdict === DELIVERED) delivered += 1;
+    else if (verdict === PERMANENT) discarded += 1;
+    else kept += 1;
+  }
+  log(
+    `delivered=${delivered} retained=${kept} discarded=${discarded} cleanup_failed=${cleanupFailures} relay=${relay}`,
+  );
+  return kept === 0 && cleanupFailures === 0 ? 0 : 1;
 }
 
 async function main() {
@@ -2968,7 +3092,7 @@ async function main() {
     content,
     relay,
     channelId,
-    channelName = "firstmate-bearings",
+    channelName,
     timeoutMs = 15000,
     replayDir,
     targetsFile,
@@ -2976,8 +3100,11 @@ async function main() {
     phase,
   } = envelope;
 
-  for (const [name, value] of Object.entries({ privateKey, content, relay, channelId, replayDir, targetsFile })) {
+  for (const [name, value] of Object.entries({ privateKey, relay, channelId, replayDir, targetsFile })) {
     if (typeof value !== "string" || value === "") throw new Error(`missing envelope field: ${name}`);
+  }
+  if (phase === "prepare" && (typeof content !== "string" || content === "")) {
+    throw new Error("missing envelope field: content");
   }
   if (!Number.isSafeInteger(maxCache) || maxCache <= 0) {
     throw new Error(`invalid FM_BUZZ_MAX_CACHE value ${JSON.stringify(maxCache)}: expected a positive integer`);
@@ -2985,8 +3112,13 @@ async function main() {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) {
     throw new Error(`invalid relay timeout ${JSON.stringify(timeoutMs)}: expected an integer from 1 to 2147483647`);
   }
+  if (channelName !== undefined && !channelNameIsPrintableAscii(channelName)) {
+    throw new Error("invalid envelope field: channelName");
+  }
   if (!CHANNEL_PARTITION.test(channelId)) throw new Error("channel id must be a canonical UUID");
-  if (phase !== "prepare" && phase !== "deliver") throw new Error("invalid envelope field: phase");
+  if (phase !== "prepare" && phase !== "replay" && phase !== "deliver") {
+    throw new Error("invalid envelope field: phase");
+  }
   resolveLoopbackRelayHost(relay);
   const currentPublisher = publicKeyFromPrivate(privateKey);
   const cacheRoot = prepareCacheRoot(replayDir);
@@ -2995,6 +3127,7 @@ async function main() {
   if (phase === "prepare") {
     const event = buildBearingsEvent(channelId, content, privateKey, [
       ["fm-schema", "fm-bearings.v1"],
+      ["fm-channel-name", channelName ?? "firstmate-bearings"],
       ["nonce", randomBytes(16).toString("hex")],
     ]);
     const currentFile = cacheEvent(relayCacheDir, event);
@@ -3009,6 +3142,20 @@ async function main() {
       entries: cacheMaintenance.entries,
       outcomes: [...cacheMaintenance.outcomes],
       failed: cacheMaintenance.failed,
+      deliverable: cacheMaintenance.currentEntries.length,
+      channelName: channelName ?? "firstmate-bearings",
+    }));
+    return 0;
+  }
+
+  if (phase === "replay") {
+    const cacheMaintenance = pruneCache(relayCacheDir, maxCache, null, currentPublisher);
+    process.stdout.write(JSON.stringify({
+      entries: cacheMaintenance.entries,
+      outcomes: [...cacheMaintenance.outcomes],
+      failed: cacheMaintenance.failed,
+      deliverable: cacheMaintenance.currentEntries.length,
+      channelName: channelName ?? replayChannelName(cacheMaintenance.currentEntries),
     }));
     return 0;
   }
@@ -3029,6 +3176,43 @@ async function main() {
   for (const file of migrationFailures.endpoint) outcome.set(`endpoint-migration:${file}`, RETRYABLE);
   const authRefused = new Set();
 
+  if (pending.length === 0) return deliveryResult(outcome, cleanupFailures, relay);
+  if (preparation.deliverable === 0) {
+    for (const entry of pending) {
+      let parsed;
+      let parsedChannelId;
+      try {
+        const raw = readRegularFile(entry.file).bytes.toString("utf8");
+        parsed = cachedEventFromFrame(raw, entry);
+        parsedChannelId = cachedEventChannelId(parsed);
+        if (parsedChannelId !== channelId) {
+          throw new Error(`event channel ${parsedChannelId} does not match queue channel ${channelId}`);
+        }
+      } catch (error) {
+        if (error.code === "ENOENT") outcome.delete(entry.file);
+        else {
+          log(`could not inspect retained cache entry ${entry.name}: ${error.message}`);
+          outcome.set(entry.file, RETRYABLE);
+        }
+        continue;
+      }
+      try {
+        recordPublisherTarget(targetsFile, {
+          relay,
+          channel_id: parsedChannelId,
+          publisher_pubkey: parsed.pubkey,
+        });
+      } catch (error) {
+        log(`could not record publisher target for cached event ${entry.id}: ${error.message}`);
+      }
+      log(
+        `retaining cached event ${entry.id}: publisher ${parsed.pubkey} differs from authenticated publisher ${currentPublisher}`,
+      );
+      outcome.set(entry.file, RETRYABLE);
+    }
+    return deliveryResult(outcome, cleanupFailures, relay);
+  }
+
   await withRelay(relay, privateKey, timeoutMs, async (api) => {
     // A challenged relay that refuses or never answers the response will refuse
     // the events too, and `auth-required:` on its own does not say why. Naming the
@@ -3045,7 +3229,7 @@ async function main() {
       try {
         const create = buildChannelCreateEvent(
           channelId,
-          channelName,
+          channelName ?? preparation.channelName ?? "firstmate-bearings",
           "Firstmate bearings projections (read-only publisher)",
           privateKey,
         );
@@ -3174,19 +3358,7 @@ async function main() {
     }
   });
 
-  let delivered = 0;
-  let kept = 0;
-  let discarded = 0;
-  for (const verdict of outcome.values()) {
-    if (verdict === DELIVERED) delivered += 1;
-    else if (verdict === PERMANENT) discarded += 1;
-    else kept += 1;
-  }
-
-  log(
-    `delivered=${delivered} retained=${kept} discarded=${discarded} cleanup_failed=${cleanupFailures} relay=${relay}`,
-  );
-  return kept === 0 && cleanupFailures === 0 ? 0 : 1;
+  return deliveryResult(outcome, cleanupFailures, relay);
 }
 
 if (

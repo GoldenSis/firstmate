@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fm-buzz-publish.sh - publish one bearings projection to the loopback Buzz relay.
+# fm-buzz-publish.sh - publish one bearings projection or replay one cached channel.
 #
 # ============================ FIRE-AND-FORGET ==============================
 # RUNTIME PUBLISH FAILURES EXIT 0. MISSING PYTHON 3 AND INPUT-CONTRACT FAILURES EXIT NON-ZERO.
@@ -33,9 +33,30 @@
 # greps this file to assert `set -e` has not crept back in.
 # ===========================================================================
 #
+# ONE INVOCATION, ONE CHANNEL. This script publishes one projection into one
+# channel, and that is still true now that the adapter has per-crew lanes: a lane
+# is just another invocation with --channel-label set to that crewmate's derived
+# label. bin/fm-buzz-refresh.sh is the single entry point that walks the fleet
+# channel and every lane; bin/fm-buzz-crew-lanes.sh owns what a lane contains and
+# bin/fm-buzz-lib.mjs's crewChannelLabel owns how a lane label is derived. Nothing
+# here changed for the fleet channel, whose label derivation is byte-identical to
+# what it always was, so it keeps the channel id a captain has been reading.
+#
+# THE NAME IS NOT THE LABEL. The label derives the channel id and must never move
+# for an existing channel; the display name is what a Buzz client lists a channel
+# under, and it can vary without changing that id. The relay applies the name only
+# when creating the channel, so publishing cannot rename one that already exists.
+# Label and name are separate options because every lane needs its own name while
+# the fleet channel keeps the one it has always had. A lane that inherits the
+# default name is addressed correctly and still unreadable: a captain browsing the
+# client sees one row per lane, all called firstmate-bearings, distinguishable only
+# by UUID.
+#
 # The published event is one append-only NIP-29 channel message whose content is
 # the `fm-bearings-snapshot.sh --json` projection VERBATIM, including its
-# omitted[] disclosure array. The disclosure is what makes a bounded projection
+# omitted[] disclosure array. A per-crew lane is itself a valid fm-bearings.v1
+# projection narrowed to one task, so it is validated and signed by this same
+# path with no second contract. The disclosure is what makes a bounded projection
 # honest - it states what was dropped and how to reveal it - so it is passed
 # through untouched rather than summarised or stripped.
 #
@@ -52,6 +73,14 @@
 #   fm-buzz-publish.sh --relay <url>   override the relay (default ws://localhost:3000)
 #   fm-buzz-publish.sh --channel-label <s>
 #                                      override the channel-derivation label
+#   fm-buzz-publish.sh --channel-name <s>
+#                                      the channel's display name, at most 100
+#                                      printable ASCII characters (bytes
+#                                      0x20-0x7e; default
+#                                      firstmate-bearings)
+#   fm-buzz-publish.sh --replay-channel <uuid>
+#                                      drain one existing cache partition without
+#                                      signing a new projection
 #   fm-buzz-publish.sh --timeout <ms>  relay timeout, integer 1..2147483647 (default 15000)
 #   fm-buzz-publish.sh --help          this text
 #
@@ -61,6 +90,12 @@
 # hard ceiling 1048576); an oversized projection is rejected before signing.
 # Invalid deadlines, acquisition timeouts, and interrupted waits are logged and
 # converted to the same exit-0 non-event as every other publishing failure.
+# FM_BUZZ_MIGRATION_STATE_FILE is a refresh-owned internal seam whose caller
+# supplies a pre-created regular file for the lifetime of one refresh.
+# The first publisher records either migration results as string arrays under
+# `legacy` and `endpoint`, or `{"failed":true}`; later publishers reuse that
+# result, and an unreadable, malformed, or unwritable file skips publication.
+# Direct callers leave FM_BUZZ_MIGRATION_STATE_FILE unset.
 # bin/fm-buzz-key-lib.sh owns the lock ordering and phase-boundary contract used
 # to isolate whole-tree migration, per-channel delivery, signing, and rotation.
 #
@@ -81,11 +116,15 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 # shellcheck source=bin/fm-buzz-key-lib.sh
 . "$SCRIPT_DIR/fm-buzz-key-lib.sh"
+# shellcheck source=bin/fm-buzz-projection-lib.sh
+. "$SCRIPT_DIR/fm-buzz-projection-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
 RELAY=${FM_BUZZ_RELAY:-ws://localhost:3000}
 CHANNEL_LABEL=""
+CHANNEL_NAME=""
+REPLAY_CHANNEL=""
 TIMEOUT_MS=${FM_BUZZ_TIMEOUT_MS:-15000}
 MAX_CACHE=${FM_BUZZ_MAX_CACHE:-100}
 REFRESH=0
@@ -98,102 +137,23 @@ TARGETS_FILE="$DATA/buzz-publisher-targets.jsonl"
 STDIN_TIMEOUT_S=${FM_BUZZ_STDIN_TIMEOUT_S:-30}
 MAX_PROJECTION_BYTES=${FM_BUZZ_MAX_PROJECTION_BYTES:-1048576}
 PUBLISH_LOCK_TIMEOUT_S=${FM_BUZZ_LOCK_TIMEOUT_S:-30}
+MIGRATION_STATE_FILE=${FM_BUZZ_MIGRATION_STATE_FILE:-}
 
 log() {
   printf 'fm-buzz-publish: %s\n' "$1" >&2
 }
 
-validate_projection_contract() {
-  local projection=$1
-  jq -e 'type == "object"' "$projection" >/dev/null 2>&1 || {
-    log "the projection root must be an object"
-    return 1
-  }
-  jq -e '.schema == "fm-bearings.v1"' "$projection" >/dev/null 2>&1 || {
-    log 'the projection field schema must equal "fm-bearings.v1"'
-    return 1
-  }
-  jq -e 'has("home") and (.home | type == "string")' "$projection" >/dev/null 2>&1 || {
-    log "the projection field home must be a string"
-    return 1
-  }
-  jq -e 'has("generated") and (.generated | type == "string")' "$projection" >/dev/null 2>&1 || {
-    log "the projection field generated must be a string"
-    return 1
-  }
-  jq -e 'has("prs") and (.prs | type == "string")' "$projection" >/dev/null 2>&1 || {
-    log "the projection field prs must be a string"
-    return 1
-  }
-  jq -e '
-    has("in_flight")
-      and (.in_flight | type == "array")
-      and all(.in_flight[];
-        type == "object"
-          and ((keys | sort) == ["doing", "id", "kind", "state"])
-          and (.id | type == "string")
-          and (.kind | type == "string")
-          and (.state | type == "string")
-          and (.doing | type == "string"))
-  ' "$projection" >/dev/null 2>&1 || {
-    log "the projection field in_flight must be an array of {id,kind,state,doing} strings"
-    return 1
-  }
-  jq -e '
-    has("omitted")
-      and (.omitted | type == "array")
-      and all(.omitted[];
-        type == "object"
-          and ((keys | sort) == ["reveal", "surface"])
-          and (.surface | type == "string" and length > 0)
-          and (.reveal | type == "string" and length > 0))
-  ' "$projection" >/dev/null 2>&1 || {
-    log "the projection field omitted must be an array of {surface,reveal} non-empty strings"
-    return 1
-  }
-}
-
-validate_projection_json() {
-  local projection=$1 duplicate rc
-  duplicate=$(python3 - "$projection" <<'PY'
-import json
-import sys
-
-
-class DuplicateKey(Exception):
-    pass
-
-
-def reject_duplicate_keys(pairs):
-    seen = set()
-    for key, _ in pairs:
-        if key in seen:
-            print(json.dumps(key, ensure_ascii=True))
-            raise DuplicateKey
-        seen.add(key)
-    return dict(pairs)
-
-
-try:
-    with open(sys.argv[1], "rb") as projection:
-        json.load(
-            projection,
-            object_pairs_hook=reject_duplicate_keys,
-            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
-        )
-except DuplicateKey:
-    raise SystemExit(42)
-except (OSError, UnicodeError, ValueError):
-    raise SystemExit(43)
-PY
-  )
-  rc=$?
-  case $rc in
-    0) return 0 ;;
-    42) log "the projection contains duplicate field $duplicate" ;;
-    *) log "the projection is not one valid JSON value; skipping publish" ;;
-  esac
-  return 1
+channel_name_is_printable_ascii() {
+  local bytes
+  bytes=$(printf '%s' "$1" | LC_ALL=C od -An -v -tu1) || return 1
+  awk '
+    {
+      for (i = 1; i <= NF; i += 1) {
+        if ($i < 32 || $i > 126) invalid = 1
+      }
+    }
+    END { exit invalid ? 1 : 0 }
+  ' <<< "$bytes"
 }
 
 # The projection spool holds the bearings projection - task ids, project names,
@@ -389,74 +349,74 @@ publish() {
     return 1
   fi
 
-  STDIN_SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-stdin.XXXXXX") || {
-    log "could not create a temporary file for the projection"
-    return 1
-  }
-  if [ "$REFRESH" -eq 1 ]; then
-    "$SCRIPT_DIR/fm-bearings-snapshot.sh" --json > "$STDIN_SPOOL" 2>/dev/null || {
-      drop_stdin_spool
-      log "bearings snapshot failed; skipping publish"
+  if [ -z "$REPLAY_CHANNEL" ]; then
+    STDIN_SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-stdin.XXXXXX") || {
+      log "could not create a temporary file for the projection"
       return 1
     }
-  else
-    if ! validate_stdin_timeout; then
-      drop_stdin_spool
-      log "FM_BUZZ_STDIN_TIMEOUT_S must be a positive integer no greater than 2147483647"
-      return 1
-    fi
-    # A terminal on stdin means nobody is piping a projection in at all, so this
-    # is answerable without waiting out the deadline below.
-    if [ -t 0 ]; then
-      log "stdin is a terminal; pipe the projection in or use --refresh"
-      return 1
-    fi
-    read_stdin_bounded "$STDIN_SPOOL"
-    read_status=$?
-    if [ "$read_status" -ne 0 ]; then
-      drop_stdin_spool
-      if [ "$read_status" -eq 42 ]; then
-        log "the projection exceeds FM_BUZZ_MAX_PROJECTION_BYTES (${MAX_PROJECTION_BYTES} bytes)"
-        return 2
+    if [ "$REFRESH" -eq 1 ]; then
+      "$SCRIPT_DIR/fm-bearings-snapshot.sh" --json > "$STDIN_SPOOL" 2>/dev/null || {
+        drop_stdin_spool
+        log "bearings snapshot failed; skipping publish"
+        return 1
+      }
+    else
+      if ! validate_stdin_timeout; then
+        drop_stdin_spool
+        log "FM_BUZZ_STDIN_TIMEOUT_S must be a positive integer no greater than 2147483647"
+        return 1
       fi
-      log "could not read the projection from stdin within ${STDIN_TIMEOUT_S}s"
-      return 1
+      if [ -t 0 ]; then
+        log "stdin is a terminal; pipe the projection in or use --refresh"
+        return 1
+      fi
+      read_stdin_bounded "$STDIN_SPOOL"
+      read_status=$?
+      if [ "$read_status" -ne 0 ]; then
+        drop_stdin_spool
+        if [ "$read_status" -eq 42 ]; then
+          log "the projection exceeds FM_BUZZ_MAX_PROJECTION_BYTES (${MAX_PROJECTION_BYTES} bytes)"
+          return 2
+        fi
+        log "could not read the projection from stdin within ${STDIN_TIMEOUT_S}s"
+        return 1
+      fi
     fi
-  fi
-  projection_bytes=$(wc -c < "$STDIN_SPOOL" | tr -d '[:space:]') || {
-    drop_stdin_spool
-    log "could not measure the projection"
-    return 1
-  }
-  if [ "$projection_bytes" -gt "$MAX_PROJECTION_BYTES" ]; then
-    drop_stdin_spool
-    log "the projection exceeds FM_BUZZ_MAX_PROJECTION_BYTES (${MAX_PROJECTION_BYTES} bytes)"
-    return 2
-  fi
-  [ -s "$STDIN_SPOOL" ] || {
-    drop_stdin_spool
-    log "the projection is empty; skipping publish"
-    return 1
-  }
-  validate_projection_json "$STDIN_SPOOL" || {
-    drop_stdin_spool
-    return 2
-  }
-  validate_projection_contract "$STDIN_SPOOL" || {
-    drop_stdin_spool
-    return 2
-  }
-
-  local label=$CHANNEL_LABEL
-  if [ -z "$label" ]; then
-    label=$(fm_buzz_key_account "$FM_HOME")
+    projection_bytes=$(wc -c < "$STDIN_SPOOL" | tr -d '[:space:]') || {
+      drop_stdin_spool
+      log "could not measure the projection"
+      return 1
+    }
+    if [ "$projection_bytes" -gt "$MAX_PROJECTION_BYTES" ]; then
+      drop_stdin_spool
+      log "the projection exceeds FM_BUZZ_MAX_PROJECTION_BYTES (${MAX_PROJECTION_BYTES} bytes)"
+      return 2
+    fi
+    [ -s "$STDIN_SPOOL" ] || {
+      drop_stdin_spool
+      log "the projection is empty; skipping publish"
+      return 1
+    }
+    fm_buzz_validate_projection_json "$STDIN_SPOOL" || {
+      drop_stdin_spool
+      return 2
+    }
+    fm_buzz_validate_projection_contract "$STDIN_SPOOL" || {
+      drop_stdin_spool
+      return 2
+    }
   fi
 
-  local channel
-  channel=$(fm_buzz_channel_id "$SCRIPT_DIR" "$label") || {
-    log "could not derive the channel id"
-    return 1
-  }
+  local label=$CHANNEL_LABEL channel=$REPLAY_CHANNEL
+  if [ -z "$channel" ]; then
+    if [ -z "$label" ]; then
+      label=$(fm_buzz_key_account "$FM_HOME")
+    fi
+    channel=$(fm_buzz_channel_id "$SCRIPT_DIR" "$label") || {
+      log "could not derive the channel id"
+      return 1
+    }
+  fi
 
   # The delivery lock is scoped to the queue this run owns, so it has to agree
   # with the cache partitioning on what "this relay" means - hence the same
@@ -498,20 +458,59 @@ publish() {
   # failures still have to reach this run's accounting, so they travel to the
   # delivery step in the envelope instead of being recomputed there.
   local migration
-  # shellcheck disable=SC2016
-  migration=$(node -e '
-    const [modulePath, replayDir] = process.argv.slice(1);
-    import(modulePath).then(({ migrateReplayCache }) => {
-      process.stdout.write(JSON.stringify(migrateReplayCache(replayDir)));
-    }).catch((error) => {
-      process.stderr.write(`${error.message}\n`);
-      process.exitCode = 1;
-    });
-  ' "$SCRIPT_DIR/fm-buzz-publish.mjs" "$REPLAY_DIR") || {
-    log "could not settle the replay cache; skipping publish"
-    drop_stdin_spool
-    return 1
-  }
+  if [ -n "$MIGRATION_STATE_FILE" ]; then
+    if [ -L "$MIGRATION_STATE_FILE" ] || [ ! -f "$MIGRATION_STATE_FILE" ]; then
+      log "cache migration state is not a regular file"
+      drop_stdin_spool
+      return 1
+    fi
+    if [ -s "$MIGRATION_STATE_FILE" ]; then
+      if jq -e 'type == "object" and .failed == true and (keys == ["failed"])' \
+          "$MIGRATION_STATE_FILE" >/dev/null 2>&1; then
+        log "cache migration already failed during this refresh"
+        drop_stdin_spool
+        return 1
+      fi
+      migration=$(jq -ce '
+        select(type == "object"
+          and (.legacy | type == "array")
+          and (.legacy | all(type == "string"))
+          and (.endpoint | type == "array")
+          and (.endpoint | all(type == "string")))
+      ' "$MIGRATION_STATE_FILE") || {
+        log "cache migration state is invalid"
+        drop_stdin_spool
+        return 1
+      }
+    fi
+  fi
+  if [ -z "${migration:-}" ]; then
+    # shellcheck disable=SC2016
+    migration=$(node -e '
+      const [modulePath, replayDir] = process.argv.slice(1);
+      import(modulePath).then(({ migrateReplayCache }) => {
+        process.stdout.write(JSON.stringify(migrateReplayCache(replayDir)));
+      }).catch((error) => {
+        process.stderr.write(`${error.message}\n`);
+        process.exitCode = 1;
+      });
+    ' "$SCRIPT_DIR/fm-buzz-publish.mjs" "$REPLAY_DIR") || {
+      if [ -n "$MIGRATION_STATE_FILE" ]; then
+        printf '{"failed":true}\n' > "$MIGRATION_STATE_FILE" \
+          || log "could not record cache migration failure"
+      fi
+      log "could not settle the replay cache; skipping publish"
+      drop_stdin_spool
+      return 1
+    }
+    if [ -n "$MIGRATION_STATE_FILE" ]; then
+      printf '%s\n' "$migration" > "$MIGRATION_STATE_FILE" || {
+        log "could not record cache migration state"
+        drop_stdin_spool
+        return 1
+      }
+    fi
+  fi
   DELIVERY_LOCK=$(fm_buzz_replay_delivery_lock "$STATE" "$normalized_relay" "$channel") || {
     log "could not resolve this queue's delivery ownership"
     drop_stdin_spool
@@ -584,14 +583,31 @@ publish() {
   fi
   [ -n "$key" ] || { drop_stdin_spool; log "the stored publishing key is empty"; return 1; }
 
+  # An unset name is an ABSENT envelope field, not an empty one: the engine's
+  # default is what keeps the fleet channel named as it always was, and an empty
+  # string would rename it to nothing.
+  local name_field='{}'
+  if [ -n "$CHANNEL_NAME" ]; then
+    name_field=$(jq -n --arg channelName "$CHANNEL_NAME" '{channelName:$channelName}') || {
+      drop_stdin_spool
+      log "could not encode the channel name"
+      return 1
+    }
+  fi
+
   # The envelope goes down a pipe, and neither private value is passed with `--arg`,
   # which would put it in jq's world-readable argv. The key reaches jq through a
   # file descriptor, while --rawfile reads the projection spool's bytes verbatim.
   # The remaining --arg values - relay URL, channel id, cache path - are not secrets.
+  local phase=replay content_file=/dev/null
+  if [ -z "$REPLAY_CHANNEL" ]; then
+    phase=prepare
+    content_file=$STDIN_SPOOL
+  fi
   preparation=$(jq -n \
     --rawfile privateKey <(printf '%s' "$key") \
-    --rawfile content "$STDIN_SPOOL" \
-    --arg phase prepare \
+    --rawfile content "$content_file" \
+    --arg phase "$phase" \
     --arg relay "$RELAY" \
     --arg channelId "$channel" \
     --arg replayDir "$REPLAY_DIR" \
@@ -599,9 +615,12 @@ publish() {
     --argjson timeoutMs "$TIMEOUT_MS" \
     --argjson maxCache "$MAX_CACHE" \
     --argjson migration "$migration" \
-    '{phase:$phase, privateKey:$privateKey, content:$content, relay:$relay, channelId:$channelId,
+    --argjson channelName "$name_field" \
+    '{phase:$phase, privateKey:$privateKey, relay:$relay, channelId:$channelId,
       replayDir:$replayDir, targetsFile:$targetsFile, migration:$migration,
-      timeoutMs:$timeoutMs, maxCache:$maxCache}' \
+      timeoutMs:$timeoutMs, maxCache:$maxCache}
+      + (if $phase == "prepare" then {content:$content} else {} end)
+      + $channelName' \
     | node "$SCRIPT_DIR/fm-buzz-publish.mjs")
   rc=$?
   fm_lock_release "$KEYPAIR_LOCK"
@@ -615,7 +634,6 @@ publish() {
 
   jq -n \
     --rawfile privateKey <(printf '%s' "$key") \
-    --rawfile content "$STDIN_SPOOL" \
     --arg phase deliver \
     --arg relay "$RELAY" \
     --arg channelId "$channel" \
@@ -625,9 +643,10 @@ publish() {
     --argjson maxCache "$MAX_CACHE" \
     --argjson migration "$migration" \
     --argjson preparation "$preparation" \
-    '{phase:$phase, privateKey:$privateKey, content:$content, relay:$relay, channelId:$channelId,
+    --argjson channelName "$name_field" \
+    '{phase:$phase, privateKey:$privateKey, relay:$relay, channelId:$channelId,
       replayDir:$replayDir, targetsFile:$targetsFile, migration:$migration,
-      preparation:$preparation, timeoutMs:$timeoutMs, maxCache:$maxCache}' \
+      preparation:$preparation, timeoutMs:$timeoutMs, maxCache:$maxCache} + $channelName' \
     | node "$SCRIPT_DIR/fm-buzz-publish.mjs"
   rc=$?
   fm_lock_release "$DELIVERY_LOCK"
@@ -655,7 +674,7 @@ ARGUMENT_ERROR=0
 while [ "$#" -gt 0 ]; do
   case $1 in
     --refresh) REFRESH=1 ;;
-    --relay|--channel-label|--timeout)
+    --relay|--channel-label|--channel-name|--replay-channel|--timeout)
       option=$1
       if [ "$#" -lt 2 ] || [ -z "$2" ]; then
         log "$option requires a value"
@@ -668,6 +687,21 @@ while [ "$#" -gt 0 ]; do
             case $option in
               --relay) RELAY=$1 ;;
               --channel-label) CHANNEL_LABEL=$1 ;;
+              --channel-name)
+                # The name reaches the relay and then a reader's channel list, so
+                # it is bounded and printable-only here rather than trusted from
+                # the caller.
+                if ! channel_name_is_printable_ascii "$1"; then
+                  log "--channel-name must contain printable ASCII characters only"
+                  ARGUMENT_ERROR=1
+                elif [ "${#1}" -gt 100 ]; then
+                  log "--channel-name is limited to 100 characters"
+                  ARGUMENT_ERROR=1
+                else
+                  CHANNEL_NAME=$1
+                fi
+                ;;
+              --replay-channel) REPLAY_CHANNEL=$1 ;;
               --timeout) TIMEOUT_MS=$1 ;;
             esac
             ;;
@@ -684,6 +718,11 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+if [ -n "$REPLAY_CHANNEL" ] && { [ "$REFRESH" -eq 1 ] || [ -n "$CHANNEL_LABEL" ]; }; then
+  log "--replay-channel cannot be combined with --refresh or --channel-label"
+  ARGUMENT_ERROR=1
+fi
 
 PREREQUISITE_STATUS=0
 if [ "$ARGUMENT_ERROR" -eq 0 ]; then

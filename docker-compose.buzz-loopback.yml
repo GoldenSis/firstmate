@@ -1,8 +1,8 @@
-# docker-compose.buzz-loopback.yml - loopback-only Buzz relay for the M1 proof of concept.
+# docker-compose.buzz-loopback.yml - loopback-only Buzz relay for the additive bearings adapter.
 #
-# Disposable proof-of-concept infrastructure for bin/fm-buzz-publish.sh.
+# Disposable proof-of-concept infrastructure for bin/fm-buzz-refresh.sh and bin/fm-buzz-publish.sh.
 # Warning: the relay is open to local processes, and its datastores retain fleet
-# projections across reboots until the volumes are removed with `down -v`.
+# and per-crew projections across reboots until the volumes are removed with `down -v`.
 # See docs/buzz-loopback-adapter.md for the full threat model, invariants, and
 # reboot-persistence contract.
 #
@@ -34,9 +34,9 @@ services:
             let scalar;
             do {
               bytes = randomBytes(32);
-              scalar = BigInt(`0x${bytes.toString("hex")}`);
+              scalar = BigInt(`0x$${bytes.toString("hex")}`);
             } while (scalar === 0n || scalar >= order);
-            writeFileSync(file, `${bytes.toString("hex")}\n`, { flag: "wx", mode: 0o400 });
+            writeFileSync(file, `$${bytes.toString("hex")}\n`, { flag: "wx", mode: 0o400 });
           }
           chownSync(file, 1000, 1000);
           chmodSync(file, 0o400);

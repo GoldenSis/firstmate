@@ -27,8 +27,8 @@ jobs:
   tests:
     name: Behavior tests
     runs-on: ubuntu-latest
-    # Suite currently finishes near ~15 minutes on ubuntu-latest after Buzz M1
-    # coverage landed; keep a margin so growth fails on hangs, not wall-clock.
+    # Suite currently finishes near ~15 minutes on ubuntu-latest with the Buzz
+    # adapter coverage; keep a margin so growth fails on hangs, not wall-clock.
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6

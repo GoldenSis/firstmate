@@ -11,6 +11,14 @@
 # --channel-label may select another channel, but this wrapper never reads another
 # home's author records to attribute it.
 #
+# --crew <task id> reads one crewmate's lane instead of the fleet channel. Use
+# --crew=<task id> when the canonical task id begins with `--`. The
+# lane label is derived from the fleet label (this home's, or --channel-label) by
+# bin/fm-buzz-lib.mjs's crewChannelLabel, which is the same derivation the
+# publisher addresses lanes with - so a lane read here is the lane the captain
+# opens in a Buzz client, not a second spelling of it. A lane under this home's
+# own fleet label is this home's own channel for attribution purposes.
+#
 # Unlike bin/fm-buzz-publish.sh this is NOT fire-and-forget: it is a diagnostic run
 # by hand, and a failure to reach the relay should be visible in its exit status.
 #
@@ -36,6 +44,7 @@
 # Usage:
 #   fm-buzz-inspect.sh [--limit N] [--full] [--anonymous]
 #                      [--relay <url>] [--channel-label <s>]
+#                      [--crew <task id> | --crew=<task id>]
 #   fm-buzz-inspect.sh --help
 set -u
 
@@ -49,13 +58,21 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 RELAY=${FM_BUZZ_RELAY:-ws://localhost:3000}
 CHANNEL_LABEL=""
+CREW_ID=""
 LIMIT=3
 FULL=false
 ANONYMOUS=0
 
 while [ "$#" -gt 0 ]; do
   case $1 in
-    --relay|--channel-label|--limit)
+    --crew=*)
+      CREW_ID=${1#--crew=}
+      if [ -z "$CREW_ID" ]; then
+        printf 'fm-buzz-inspect.sh: --crew requires a value\n' >&2
+        exit 2
+      fi
+      ;;
+    --relay|--channel-label|--crew|--limit)
       option=$1
       if [ "$#" -lt 2 ] || [ -z "$2" ]; then
         printf 'fm-buzz-inspect.sh: %s requires a value\n' "$option" >&2
@@ -71,6 +88,7 @@ while [ "$#" -gt 0 ]; do
       case $option in
         --relay) RELAY=$1 ;;
         --channel-label) CHANNEL_LABEL=$1 ;;
+        --crew) CREW_ID=$1 ;;
         --limit) LIMIT=$1 ;;
       esac
       ;;
@@ -88,13 +106,28 @@ command -v jq >/dev/null 2>&1 || { printf 'fm-buzz-inspect.sh: jq is required\n'
 OWN_LABEL=$(fm_buzz_key_account "$FM_HOME")
 [ -n "$CHANNEL_LABEL" ] || CHANNEL_LABEL=$OWN_LABEL
 
+# --crew narrows the resolved label to one crewmate's lane under the fleet label
+# above, and narrows the own-channel comparison the same way, so the check below
+# keeps comparing like with like.
+OWN_COMPARISON_LABEL=$OWN_LABEL
+if [ -n "$CREW_ID" ]; then
+  CHANNEL_LABEL=$(fm_buzz_crew_channel_label "$SCRIPT_DIR" "$CHANNEL_LABEL" "$CREW_ID") || {
+    printf 'fm-buzz-inspect.sh: could not derive the lane channel for %s\n' "$CREW_ID" >&2
+    exit 2
+  }
+  OWN_COMPARISON_LABEL=$(fm_buzz_crew_channel_label "$SCRIPT_DIR" "$OWN_LABEL" "$CREW_ID") || {
+    printf 'fm-buzz-inspect.sh: could not derive the lane channel for %s\n' "$CREW_ID" >&2
+    exit 2
+  }
+fi
+
 # Whether the recorded keys can attribute what the relay serves is a property of
 # the RESOLVED label, not of whether --channel-label was typed. Deciding it from
 # the flag's presence throws the conclusive answer away for an operator who
 # spelled their own home path out - a natural thing to do when checking which
 # channel id a label derives to - and that is a false negative over a real leak of
 # this home's own content.
-if [ "$CHANNEL_LABEL" = "$OWN_LABEL" ]; then
+if [ "$CHANNEL_LABEL" = "$OWN_COMPARISON_LABEL" ]; then
   OWN_CHANNEL=true
 else
   OWN_CHANNEL=false
