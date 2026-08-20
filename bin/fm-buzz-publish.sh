@@ -42,6 +42,14 @@
 # here changed for the fleet channel, whose label derivation is byte-identical to
 # what it always was, so it keeps the channel id a captain has been reading.
 #
+# THE NAME IS NOT THE LABEL. The label derives the channel id and must never move
+# for an existing channel; the display name is what a Buzz client lists a channel
+# under, and it is free to change. They are separate options because every lane
+# needs its own name while the fleet channel keeps the one it has always had. A
+# lane that inherits the default name is addressed correctly and still unreadable:
+# a captain browsing the client sees one row per lane, all called
+# firstmate-bearings, distinguishable only by UUID.
+#
 # The published event is one append-only NIP-29 channel message whose content is
 # the `fm-bearings-snapshot.sh --json` projection VERBATIM, including its
 # omitted[] disclosure array. A per-crew lane is itself a valid fm-bearings.v1
@@ -63,6 +71,10 @@
 #   fm-buzz-publish.sh --relay <url>   override the relay (default ws://localhost:3000)
 #   fm-buzz-publish.sh --channel-label <s>
 #                                      override the channel-derivation label
+#   fm-buzz-publish.sh --channel-name <s>
+#                                      the channel's display name, at most 100
+#                                      printable characters (default
+#                                      firstmate-bearings)
 #   fm-buzz-publish.sh --timeout <ms>  relay timeout, integer 1..2147483647 (default 15000)
 #   fm-buzz-publish.sh --help          this text
 #
@@ -97,6 +109,7 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 RELAY=${FM_BUZZ_RELAY:-ws://localhost:3000}
 CHANNEL_LABEL=""
+CHANNEL_NAME=""
 TIMEOUT_MS=${FM_BUZZ_TIMEOUT_MS:-15000}
 MAX_CACHE=${FM_BUZZ_MAX_CACHE:-100}
 REFRESH=0
@@ -595,6 +608,18 @@ publish() {
   fi
   [ -n "$key" ] || { drop_stdin_spool; log "the stored publishing key is empty"; return 1; }
 
+  # An unset name is an ABSENT envelope field, not an empty one: the engine's
+  # default is what keeps the fleet channel named as it always was, and an empty
+  # string would rename it to nothing.
+  local name_field='{}'
+  if [ -n "$CHANNEL_NAME" ]; then
+    name_field=$(jq -n --arg channelName "$CHANNEL_NAME" '{channelName:$channelName}') || {
+      drop_stdin_spool
+      log "could not encode the channel name"
+      return 1
+    }
+  fi
+
   # The envelope goes down a pipe, and neither private value is passed with `--arg`,
   # which would put it in jq's world-readable argv. The key reaches jq through a
   # file descriptor, while --rawfile reads the projection spool's bytes verbatim.
@@ -610,9 +635,10 @@ publish() {
     --argjson timeoutMs "$TIMEOUT_MS" \
     --argjson maxCache "$MAX_CACHE" \
     --argjson migration "$migration" \
+    --argjson channelName "$name_field" \
     '{phase:$phase, privateKey:$privateKey, content:$content, relay:$relay, channelId:$channelId,
       replayDir:$replayDir, targetsFile:$targetsFile, migration:$migration,
-      timeoutMs:$timeoutMs, maxCache:$maxCache}' \
+      timeoutMs:$timeoutMs, maxCache:$maxCache} + $channelName' \
     | node "$SCRIPT_DIR/fm-buzz-publish.mjs")
   rc=$?
   fm_lock_release "$KEYPAIR_LOCK"
@@ -636,9 +662,10 @@ publish() {
     --argjson maxCache "$MAX_CACHE" \
     --argjson migration "$migration" \
     --argjson preparation "$preparation" \
+    --argjson channelName "$name_field" \
     '{phase:$phase, privateKey:$privateKey, content:$content, relay:$relay, channelId:$channelId,
       replayDir:$replayDir, targetsFile:$targetsFile, migration:$migration,
-      preparation:$preparation, timeoutMs:$timeoutMs, maxCache:$maxCache}' \
+      preparation:$preparation, timeoutMs:$timeoutMs, maxCache:$maxCache} + $channelName' \
     | node "$SCRIPT_DIR/fm-buzz-publish.mjs"
   rc=$?
   fm_lock_release "$DELIVERY_LOCK"
@@ -666,7 +693,7 @@ ARGUMENT_ERROR=0
 while [ "$#" -gt 0 ]; do
   case $1 in
     --refresh) REFRESH=1 ;;
-    --relay|--channel-label|--timeout)
+    --relay|--channel-label|--channel-name|--timeout)
       option=$1
       if [ "$#" -lt 2 ] || [ -z "$2" ]; then
         log "$option requires a value"
@@ -679,6 +706,20 @@ while [ "$#" -gt 0 ]; do
             case $option in
               --relay) RELAY=$1 ;;
               --channel-label) CHANNEL_LABEL=$1 ;;
+              --channel-name)
+                # The name reaches the relay and then a reader's channel list, so
+                # it is bounded and printable-only here rather than trusted from
+                # the caller.
+                if printf '%s' "$1" | LC_ALL=C grep -q '[^[:print:]]'; then
+                  log "--channel-name must contain printable characters only"
+                  ARGUMENT_ERROR=1
+                elif [ "${#1}" -gt 100 ]; then
+                  log "--channel-name is limited to 100 characters"
+                  ARGUMENT_ERROR=1
+                else
+                  CHANNEL_NAME=$1
+                fi
+                ;;
               --timeout) TIMEOUT_MS=$1 ;;
             esac
             ;;
