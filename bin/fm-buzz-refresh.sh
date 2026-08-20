@@ -98,6 +98,52 @@ log() {
   printf 'fm-buzz-refresh: %s\n' "$1" >&2
 }
 
+run_before_deadline() {
+  python3 -c '
+import os
+import signal
+import subprocess
+import sys
+import time
+
+deadline = float(sys.argv[1])
+remaining = deadline - time.time()
+if remaining <= 0:
+    raise SystemExit(124)
+try:
+    process = subprocess.Popen(sys.argv[2:], start_new_session=True)
+except OSError as error:
+    print(error, file=sys.stderr)
+    raise SystemExit(127)
+grace = min(0.2, remaining / 4)
+try:
+    result = process.wait(timeout=max(0, remaining - grace))
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=max(0, deadline - time.time()))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+    raise SystemExit(124)
+raise SystemExit(result)
+' "$REFRESH_DEADLINE" "$@"
+}
+
+run_key_helper_before_deadline() {
+  local helper=$1
+  shift
+  # shellcheck disable=SC2016
+  run_before_deadline bash -c '. "$1"; shift; "$@"' \
+    bash "$SCRIPT_DIR/fm-buzz-key-lib.sh" "$helper" "$@"
+}
+
 while [ "$#" -gt 0 ]; do
   case $1 in
     --fleet-only) FLEET_ONLY=1 ;;
@@ -186,14 +232,16 @@ publish_bounded() {  # <file or empty> <publisher arguments...>
   PUBLISH_STARTED=1
   if [ -n "$file" ]; then
     FM_BUZZ_LOCK_TIMEOUT_S=$lock_timeout \
-      "$SCRIPT_DIR/fm-buzz-publish.sh" "${args[@]}" < "$file"
+      run_before_deadline "$SCRIPT_DIR/fm-buzz-publish.sh" "${args[@]}" < "$file"
   else
     FM_BUZZ_LOCK_TIMEOUT_S=$lock_timeout \
-      "$SCRIPT_DIR/fm-buzz-publish.sh" "${args[@]}" < /dev/null
+      run_before_deadline "$SCRIPT_DIR/fm-buzz-publish.sh" "${args[@]}" < /dev/null
   fi
   status=$?
   now=$(date +%s)
-  [ "$now" -ge "$REFRESH_DEADLINE" ] && PUBLISH_DEADLINE_REACHED=1
+  if [ "$status" -eq 124 ] || [ "$now" -ge "$REFRESH_DEADLINE" ]; then
+    PUBLISH_DEADLINE_REACHED=1
+  fi
   return "$status"
 }
 
@@ -213,6 +261,7 @@ refresh() {
   local lane_count=0 lane_failures=0 replay_count=0 replay_failures=0
   local addressed_channels="" pending_channels="" replay_channels=""
   local replay_total=0 replay_index=0 lane_total=0 lane_index=0 skipped=0
+  local phase_status=0
 
   REFRESH_DEADLINE=$(($(date +%s) + REFRESH_TIMEOUT_S))
 
@@ -220,13 +269,22 @@ refresh() {
     log "could not create a temporary file for the projection"
     return 0
   }
-  if ! "$SCRIPT_DIR/fm-bearings-snapshot.sh" --json > "$PROJECTION" 2>/dev/null; then
-    log "bearings snapshot failed; skipping publish"
+  run_before_deadline "$SCRIPT_DIR/fm-bearings-snapshot.sh" --json > "$PROJECTION" 2>/dev/null
+  phase_status=$?
+  if [ "$phase_status" -ne 0 ]; then
+    if [ "$phase_status" -eq 124 ]; then
+      log "refresh deadline reached while taking the bearings snapshot; publish was skipped"
+    else
+      log "bearings snapshot failed; skipping publish"
+    fi
     return 0
   fi
 
-  home_label=$(fm_buzz_key_account "$FM_HOME")
-  home_channel=$(fm_buzz_channel_id "$SCRIPT_DIR" "$home_label") || {
+  home_label=$(run_key_helper_before_deadline fm_buzz_key_account "$FM_HOME") || {
+    log "could not derive the home label; skipping publish"
+    return 0
+  }
+  home_channel=$(run_key_helper_before_deadline fm_buzz_channel_id "$SCRIPT_DIR" "$home_label") || {
     log "could not derive the home qualifier; skipping publish"
     return 0
   }
@@ -235,7 +293,7 @@ refresh() {
   if [ -z "$fleet_label" ]; then
     fleet_label=$home_label
   fi
-  fleet_channel=$(fm_buzz_channel_id "$SCRIPT_DIR" "$fleet_label") || {
+  fleet_channel=$(run_key_helper_before_deadline fm_buzz_channel_id "$SCRIPT_DIR" "$fleet_label") || {
     log "could not derive the fleet channel; skipping publish"
     return 0
   }
@@ -243,6 +301,9 @@ refresh() {
 
   publish_document "$fleet_label" "$PROJECTION"
   FLEET_STATUS=$?
+  if [ "$FLEET_STATUS" -eq 124 ] && [ "$PUBLISH_DEADLINE_REACHED" -eq 1 ]; then
+    FLEET_STATUS=0
+  fi
 
   [ "$FLEET_ONLY" -eq 1 ] && return "$FLEET_STATUS"
   if [ "$PUBLISH_DEADLINE_REACHED" -eq 1 ]; then
@@ -254,8 +315,14 @@ refresh() {
     log "could not create a temporary file for the crew lanes"
     return "$FLEET_STATUS"
   }
-  if ! "$SCRIPT_DIR/fm-buzz-crew-lanes.sh" --projection "$PROJECTION" > "$LANES"; then
-    log "crew lanes could not be projected; the fleet channel is unaffected"
+  run_before_deadline "$SCRIPT_DIR/fm-buzz-crew-lanes.sh" --projection "$PROJECTION" > "$LANES"
+  phase_status=$?
+  if [ "$phase_status" -ne 0 ]; then
+    if [ "$phase_status" -eq 124 ]; then
+      log "refresh deadline reached while projecting crew lanes; cached queue replay was skipped"
+    else
+      log "crew lanes could not be projected; the fleet channel is unaffected"
+    fi
     return "$FLEET_STATUS"
   fi
 
@@ -264,28 +331,30 @@ refresh() {
     log "could not create a temporary file for a crew lane"
     return "$FLEET_STATUS"
   }
-  lane_total=$(jq 'length' "$LANES" 2>/dev/null) || lane_total=0
+  lane_total=$(run_before_deadline jq 'length' "$LANES" 2>/dev/null) || lane_total=0
   while IFS= read -r lane; do
     [ -n "$lane" ] || continue
     lane_index=$((lane_index + 1))
-    id=$(printf '%s' "$lane" | jq -r '.id // empty') || id=""
+    id=$(printf '%s' "$lane" | run_before_deadline jq -r '.id // empty') || id=""
     if [ -z "$id" ]; then
       log "a crew lane carried no task id; skipping it"
       lane_failures=$((lane_failures + 1))
       continue
     fi
-    if ! label=$(fm_buzz_crew_channel_label "$SCRIPT_DIR" "$fleet_label" "$id" 2>/dev/null); then
+    if ! label=$(run_key_helper_before_deadline fm_buzz_crew_channel_label \
+      "$SCRIPT_DIR" "$fleet_label" "$id" 2>/dev/null); then
       log "could not derive a lane channel for $id; skipping it"
       lane_failures=$((lane_failures + 1))
       continue
     fi
-    if ! channel=$(fm_buzz_channel_id "$SCRIPT_DIR" "$label" 2>/dev/null); then
+    if ! channel=$(run_key_helper_before_deadline fm_buzz_channel_id \
+      "$SCRIPT_DIR" "$label" 2>/dev/null); then
       log "could not derive a lane channel for $id; skipping it"
       lane_failures=$((lane_failures + 1))
       continue
     fi
     addressed_channels="${addressed_channels}${channel} "
-    if ! printf '%s' "$lane" | jq -e '.projection' > "$DOCUMENT"; then
+    if ! printf '%s' "$lane" | run_before_deadline jq -e '.projection' > "$DOCUMENT"; then
       log "could not read the lane projection for $id; skipping it"
       lane_failures=$((lane_failures + 1))
       continue
@@ -302,13 +371,13 @@ refresh() {
       log "refresh deadline reached; ${skipped} live crew lane(s) and cached queue replay were skipped"
       break
     fi
-  done < <(jq -c '.[]' "$LANES" 2>/dev/null)
+  done < <(run_before_deadline jq -c '.[]' "$LANES" 2>/dev/null)
   rm -f -- "$DOCUMENT"
   DOCUMENT=""
 
   if [ "$PUBLISH_DEADLINE_REACHED" -eq 0 ]; then
     # shellcheck disable=SC2016 # Node source, not a shell expansion.
-    if fm_buzz_capture node -e '
+    if fm_buzz_capture run_before_deadline node -e '
       import(process.argv[1]).then(({ listPendingReplayChannels }) => {
         process.stdout.write(`${listPendingReplayChannels(process.argv[2], process.argv[3]).join("\n")}\n`);
       }).catch((error) => {
@@ -318,7 +387,13 @@ refresh() {
     ' "$SCRIPT_DIR/fm-buzz-publish.mjs" "$(fm_buzz_replay_cache_dir "$STATE")" "$RELAY"; then
       pending_channels=$FM_BUZZ_CAPTURED_OUTPUT
     else
-      log "could not inspect cached queue replay: $FM_BUZZ_CAPTURED_DIAGNOSTIC"
+      phase_status=$?
+      if [ "$phase_status" -eq 124 ] || [ "$(date +%s)" -ge "$REFRESH_DEADLINE" ]; then
+        log "refresh deadline reached while inspecting cached queue replay"
+        PUBLISH_DEADLINE_REACHED=1
+      else
+        log "could not inspect cached queue replay: $FM_BUZZ_CAPTURED_DIAGNOSTIC"
+      fi
       replay_failures=$((replay_failures + 1))
     fi
     while IFS= read -r channel; do
@@ -361,6 +436,10 @@ EOF
   return "$FLEET_STATUS"
 }
 
+if ! command -v python3 >/dev/null 2>&1; then
+  log "python3 is required for safe replay-cache operations; see docs/buzz-loopback-adapter.md#prerequisites"
+  exit 1
+fi
 if ! command -v jq >/dev/null 2>&1; then
   log "jq is unavailable; skipping publish"
   exit 0

@@ -3020,6 +3020,21 @@ function replayChannelName(entries) {
   return channelName;
 }
 
+function deliveryResult(outcome, cleanupFailures, relay) {
+  let delivered = 0;
+  let kept = 0;
+  let discarded = 0;
+  for (const verdict of outcome.values()) {
+    if (verdict === DELIVERED) delivered += 1;
+    else if (verdict === PERMANENT) discarded += 1;
+    else kept += 1;
+  }
+  log(
+    `delivered=${delivered} retained=${kept} discarded=${discarded} cleanup_failed=${cleanupFailures} relay=${relay}`,
+  );
+  return kept === 0 && cleanupFailures === 0 ? 0 : 1;
+}
+
 async function main() {
   const envelope = JSON.parse(await readStdin());
   const {
@@ -3105,6 +3120,8 @@ async function main() {
   for (const file of migrationFailures.legacy) outcome.set(`legacy:${file}`, RETRYABLE);
   for (const file of migrationFailures.endpoint) outcome.set(`endpoint-migration:${file}`, RETRYABLE);
   const authRefused = new Set();
+
+  if (pending.length === 0) return deliveryResult(outcome, cleanupFailures, relay);
 
   await withRelay(relay, privateKey, timeoutMs, async (api) => {
     // A challenged relay that refuses or never answers the response will refuse
@@ -3251,19 +3268,7 @@ async function main() {
     }
   });
 
-  let delivered = 0;
-  let kept = 0;
-  let discarded = 0;
-  for (const verdict of outcome.values()) {
-    if (verdict === DELIVERED) delivered += 1;
-    else if (verdict === PERMANENT) discarded += 1;
-    else kept += 1;
-  }
-
-  log(
-    `delivered=${delivered} retained=${kept} discarded=${discarded} cleanup_failed=${cleanupFailures} relay=${relay}`,
-  );
-  return kept === 0 && cleanupFailures === 0 ? 0 : 1;
+  return deliveryResult(outcome, cleanupFailures, relay);
 }
 
 if (

@@ -211,18 +211,19 @@ status_events_json() {  # <path>
 }
 
 LANES='[]'
-MISSING=0
+MISSING_TASKS=0
+FAILED_LANES=0
 while IFS= read -r id; do
   [ -n "$id" ] || continue
   task=$(printf '%s' "$SNAPSHOT" | jq -c --arg id "$id" 'first(.tasks[] | select(.id == $id)) // empty')
   if [ -z "$task" ]; then
-    MISSING=$((MISSING + 1))
+    MISSING_TASKS=$((MISSING_TASKS + 1))
     continue
   fi
   status_path=$(printf '%s' "$task" | jq -r '.paths.status_log.path // ""')
   status=$(status_events_json "$status_path") || {
     log "could not read the status stream for $id"
-    MISSING=$((MISSING + 1))
+    FAILED_LANES=$((FAILED_LANES + 1))
     continue
   }
   lane=$(printf '%s\n%s\n' "$task" "$status" | jq -sc \
@@ -265,7 +266,7 @@ while IFS= read -r id; do
         }
     ') || {
     log "could not project a lane for $id"
-    MISSING=$((MISSING + 1))
+    FAILED_LANES=$((FAILED_LANES + 1))
     continue
   }
   LANES=$(printf '%s\n%s\n' "$LANES" "$lane" \
@@ -280,13 +281,23 @@ EOF
 # A lane that could not be projected is disclosed in every lane that could, for
 # the same reason every other bound is: a reader must never mistake a bounded
 # lane set for the whole fleet.
-if [ "$MISSING" -gt 0 ]; then
-  LANES=$(jq -c --argjson missing "$MISSING" '
+if [ "$MISSING_TASKS" -gt 0 ]; then
+  LANES=$(jq -c --argjson missing "$MISSING_TASKS" '
     map(.projection.omitted += [{
       surface: "crew lanes: \($missing) in-flight entr\(if $missing == 1 then "y" else "ies" end) had no current task record",
       reveal: "re-run after the fleet settles"
     }])' <<<"$LANES") || {
     log "could not record the unprojected-lane disclosure"
+    exit 1
+  }
+fi
+if [ "$FAILED_LANES" -gt 0 ]; then
+  LANES=$(jq -c --argjson failed "$FAILED_LANES" '
+    map(.projection.omitted += [{
+      surface: "crew lanes: \($failed) in-flight entr\(if $failed == 1 then "y" else "ies" end) could not be projected from current task or status data",
+      reveal: "inspect the projector diagnostics and re-run"
+    }])' <<<"$LANES") || {
+    log "could not record the failed-lane disclosure"
     exit 1
   }
 fi

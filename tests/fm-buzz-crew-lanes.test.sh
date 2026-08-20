@@ -344,6 +344,28 @@ EOF
   pass "completed lane replay drains independently of current liveness"
 }
 
+test_replay_without_deliverable_entries_does_not_create_a_channel() {
+  local home relay channel directory names
+  home=$(make_fleet_home empty-replay)
+  channel=$(channel_id_for_label interrupted-completed-lane)
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  directory=$(channel_cache_dir "$home" "$relay" "$channel")
+  mkdir -p "$directory"
+  printf '%s\n' interrupted > "$directory/interrupted.json.tmp"
+
+  run_refresh "$home" "$relay" >/dev/null 2>&1
+  expect_code 0 "$?" "refresh with a fresh interrupted replay entry"
+  names=$(query_channel_names "$relay") || fail "the stub served no channel-creation events"
+  stop_stub "$STUB_PID"
+  [ "$(printf '%s\n' "$names" | grep -c '^firstmate-bearings$')" = "1" ] \
+    || fail "an undeliverable replay partition created a default-named channel: $names"
+  assert_present "$directory/interrupted.json.tmp" \
+    "fresh interrupted replay state was not left for age-bounded recovery"
+  pass "replay without deliverable entries does not provision a channel"
+}
+
 test_the_fleet_omitted_disclosure_survives_untouched() {
   local home projection fleet_omitted lane_omitted
   home=$(make_fleet_home omitted-passthrough)
@@ -481,8 +503,39 @@ SH
   pass "status read failures are not reported as present streams"
 }
 
+test_status_read_failures_are_disclosed_as_projection_failures() {
+  local home guard_bin real_tail sentinel lanes surfaces errors
+  home=$(make_fleet_home partial-status-read-race)
+  guard_bin="$home/tail-once-guard"
+  sentinel="$home/tail-failed-once"
+  errors="$home/partial-status-read-errors"
+  real_tail=$(command -v tail)
+  mkdir -p "$guard_bin"
+  cat > "$guard_bin/tail" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-c" ] && [ ! -e "$FM_BUZZ_TAIL_SENTINEL" ]; then
+  : > "$FM_BUZZ_TAIL_SENTINEL"
+  exit 1
+fi
+exec "$FM_BUZZ_REAL_TAIL" "$@"
+SH
+  chmod +x "$guard_bin/tail"
+  lanes=$(PATH="$guard_bin:$PATH" FM_BUZZ_REAL_TAIL="$real_tail" \
+    FM_BUZZ_TAIL_SENTINEL="$sentinel" \
+    run_lanes "$home" --projection <(bearings_json "$home") 2>"$errors") \
+    || fail "the lane projector failed after one raced status read"
+  [ "$(printf '%s' "$lanes" | jq 'length')" = "1" ] \
+    || fail "a single status-read failure did not leave the other lane available"
+  surfaces=$(printf '%s' "$lanes" | jq -r '.[0].projection.omitted[].surface')
+  assert_contains "$surfaces" "1 in-flight entry could not be projected from current task or status data" \
+    "the status-read failure was not categorized as a projection failure"
+  assert_not_contains "$surfaces" "had no current task record" \
+    "the status-read failure was misreported as a missing task"
+  pass "status read failures carry an accurate lane-omission disclosure"
+}
+
 test_refresh_deadline_bounds_a_silent_relay() {
-  local home relay output started elapsed
+  local home relay output started elapsed cached
   home=$(make_fleet_home refresh-deadline)
   read -r STUB_PID relay <<EOF
 $(start_stub --silent-ok)
@@ -495,9 +548,73 @@ EOF
   [ "$elapsed" -le 5 ] || fail "the two-second refresh budget took ${elapsed}s"
   assert_contains "$output" "refresh deadline reached after the fleet channel" \
     "the refresh did not report which work its deadline skipped"
-  [ "$(replay_count "$home")" = "1" ] \
-    || fail "the refresh continued publishing crew lanes after its deadline"
+  cached=$(replay_count "$home")
+  [ "$cached" -le 1 ] \
+    || fail "the refresh cached $cached events instead of stopping after the fleet deadline"
   pass "one refresh-wide deadline bounds a silent relay"
+}
+
+test_refresh_deadline_bounds_snapshot_work() {
+  local home guard_bin real_jq sentinel output started ended elapsed
+  home=$(make_fleet_home refresh-snapshot-deadline)
+  guard_bin="$home/jq-deadline-guard"
+  real_jq=$(command -v jq)
+  sentinel="$home/jq-slept"
+  mkdir -p "$guard_bin"
+  cat > "$guard_bin/jq" <<'SH'
+#!/usr/bin/env bash
+if [ ! -e "$FM_BUZZ_JQ_SENTINEL" ]; then
+  : > "$FM_BUZZ_JQ_SENTINEL"
+  sleep 10
+fi
+exec "$FM_BUZZ_REAL_JQ" "$@"
+SH
+  chmod +x "$guard_bin/jq"
+  started=$(python3 -c 'import time; print(time.monotonic())')
+  output=$(PATH="$guard_bin:$PATH" FM_BUZZ_REAL_JQ="$real_jq" \
+    FM_BUZZ_JQ_SENTINEL="$sentinel" FM_BUZZ_REFRESH_TIMEOUT_S=2 \
+    run_refresh "$home" "ws://127.0.0.1:1" 2>&1)
+  expect_code 0 "$?" "refresh whose bearings snapshot exceeds the deadline"
+  ended=$(python3 -c 'import time; print(time.monotonic())')
+  elapsed=$(python3 -c 'import sys; print(float(sys.argv[2]) - float(sys.argv[1]))' "$started" "$ended")
+  python3 -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) <= 2.5 else 1)' "$elapsed" \
+    || fail "the two-second refresh budget spent ${elapsed}s in the bearings snapshot"
+  assert_contains "$output" "refresh deadline reached while taking the bearings snapshot" \
+    "the bounded snapshot did not report the work it skipped"
+  pass "the refresh deadline includes bearings snapshot work"
+}
+
+test_refresh_deadline_spans_sequential_lock_waits() {
+  local home relay channel transaction_lock delivery_lock transaction_holder delivery_holder releaser
+  local output code started ended elapsed
+  home=$(make_fleet_home refresh-lock-deadline)
+  relay=ws://127.0.0.1:1
+  channel=$(default_channel_id "$home")
+  transaction_lock="$home/state/.buzz-replay-publish.lock"
+  delivery_lock=$(delivery_lock_path "$home" "$relay" "$channel")
+  transaction_holder=$(hold_lock "$transaction_lock") || fail "could not hold the replay transaction lock"
+  delivery_holder=$(hold_lock "$delivery_lock") || {
+    release_lock "$transaction_holder"
+    fail "could not hold the delivery lock"
+  }
+  ( sleep 2; kill -TERM "$transaction_holder" 2>/dev/null ) &
+  releaser=$!
+
+  started=$(python3 -c 'import time; print(time.monotonic())')
+  output=$(FM_BUZZ_REFRESH_TIMEOUT_S=3 FM_BUZZ_LOCK_TIMEOUT_S=30 \
+    run_refresh "$home" "$relay" 2>&1)
+  code=$?
+  ended=$(python3 -c 'import time; print(time.monotonic())')
+  elapsed=$(python3 -c 'import sys; print(float(sys.argv[2]) - float(sys.argv[1]))' "$started" "$ended")
+  wait "$releaser" 2>/dev/null
+  release_lock "$transaction_holder"
+  release_lock "$delivery_holder"
+  expect_code 0 "$code" "refresh blocked by sequential publisher locks"
+  python3 -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) <= 3.5 else 1)' "$elapsed" \
+    || fail "sequential publisher lock waits exceeded the three-second refresh budget (${elapsed}s)"
+  assert_contains "$output" "refresh deadline reached after the fleet channel" \
+    "the lock-bound refresh did not report skipped lane work"
+  pass "one absolute refresh deadline spans sequential publisher lock waits"
 }
 
 test_channel_labels_preserve_embedded_newlines() {
@@ -522,11 +639,15 @@ test_lanes_reach_the_relay_and_read_back_as_one_crews_stream
 test_each_lane_is_named_for_its_crew
 test_two_homes_publish_distinguishable_lane_names
 test_completed_lane_replay_is_not_stranded
+test_replay_without_deliverable_entries_does_not_create_a_channel
 test_the_fleet_omitted_disclosure_survives_untouched
 test_an_unreachable_or_refusing_relay_is_a_non_event
 test_fire_and_forget_contract_is_intact
 test_lane_documents_stay_out_of_process_arguments
 test_refresh_setup_failures_are_non_events
 test_status_read_failures_are_not_reported_as_present
+test_status_read_failures_are_disclosed_as_projection_failures
 test_refresh_deadline_bounds_a_silent_relay
+test_refresh_deadline_bounds_snapshot_work
+test_refresh_deadline_spans_sequential_lock_waits
 test_channel_labels_preserve_embedded_newlines

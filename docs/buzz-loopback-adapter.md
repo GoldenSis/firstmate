@@ -11,8 +11,8 @@ Mechanics live in each script's own header and `--help`; this file covers the sh
 Buzz is Block's open-source Nostr-based workspace (Apache-2.0).
 Its relevant property is that every message is an individually signed, individually verified event in an append-only log, and a private channel is enforced server-side - when membership is required - rather than trusted from the client.
 The M1 stack deliberately does not require it, so nothing here relies on that enforcement; see invariant 2.
-The adapter uses exactly that and nothing else: it signs one event per invocation carrying `bin/fm-bearings-snapshot.sh --json` verbatim, and publishes it to a private channel on a relay bound to loopback.
-`bin/fm-buzz-refresh.sh` is the single call that publishes the fleet channel and then one lane per live crewmate, each lane an ordinary invocation of the same publisher against its own channel.
+The fleet invocation signs an event carrying `bin/fm-bearings-snapshot.sh --json` verbatim and publishes it to a private channel on a relay bound to loopback.
+`bin/fm-buzz-refresh.sh` is the single call that publishes that fleet event and then one validated single-task projection per live crewmate, each lane an ordinary invocation of the same publisher against its own channel.
 
 The projection is already report-shaped, so the adapter is a renderer rather than a data model.
 In particular the projection's `omitted[]` disclosure array is passed through untouched, because a bounded projection whose truncation disclosure was stripped in transit is worse than no projection at all: an absence stops being unambiguous.
@@ -101,7 +101,7 @@ On this disposable stack the recovery is the one the compose file already docume
 
 Each lane is itself a valid `fm-bearings.v1` projection with `view: "crew-lane"`: the same `home`, `generated` and `prs` identity, an `in_flight[]` narrowed to exactly one row, plus `crew{id,kind,harness,mode}` and the bounded `status_events[]` for that task.
 Being a valid projection is what lets the publisher validate and sign it through the path it already had, with no second contract to keep in sync.
-The fleet projection's `omitted[]` is carried through untouched and each lane's own bounds - events dropped by the line cap, a status log read only from its last bytes, per-event text truncation, an absent status log, an in-flight entry with no current task record - are appended after it.
+The fleet projection's `omitted[]` is carried through untouched and each lane's own bounds - events dropped by the line cap, a status log read only from its last bytes, per-event text truncation, an absent status log, an in-flight entry with no current task record, or a lane that could not be projected - are appended after it.
 
 The per-crew lane non-widening contract was the load-bearing question here, so the reasoning is recorded rather than assumed.
 A lane may carry only what the fleet projection already publishes about a task, at more depth, and never a surface that projection deliberately dropped.
@@ -121,7 +121,7 @@ Nothing auto-invokes any of this.
 That is what keeps invariant 3 real: Buzz stays off the critical path of both firstmate and every crewmate, so a relay that is down, slow, or absent cannot break a merge, a teardown, a wake drain, or a turn end.
 The refresh forwards the fleet publication's exit status unchanged - the contract `bin/fm-buzz-publish.sh` already owned - and treats every crew-lane failure as a logged non-event, because an additive surface may never make anything louder than it was.
 It also retries every nonempty cache partition for the selected relay, including lanes whose tasks have already completed, without signing a replacement projection.
-The complete refresh has a default 30-second budget, shortens each publisher relay timeout to the remaining budget, and logs the live lanes or cached queues skipped when that budget is spent.
+The complete refresh has one absolute default 30-second deadline across snapshotting, lane projection, publisher lock waits, relay delivery, and cached replay inspection, and logs the work skipped when that deadline is spent.
 
 ## Using it
 
