@@ -102,6 +102,7 @@ On this disposable stack the recovery is the one the compose file already docume
 Each lane is itself a valid `fm-bearings.v1` projection with `view: "crew-lane"`: the same `home`, `generated` and `prs` identity, an `in_flight[]` narrowed to exactly one row, plus `crew{id,kind,harness,mode}` and the bounded `status_events[]` for that task.
 Being a valid projection is what lets the publisher validate and sign it through the path it already had, with no second contract to keep in sync.
 The fleet projection's `omitted[]` is carried through untouched and each lane's own bounds - events dropped by the line cap, a status log read only from its last bytes, per-event text truncation, an absent status log, an in-flight entry with no current task record, or a lane that could not be projected - are appended after it.
+If every ordinary lane is skipped, the first skipped task's channel carries an omission-only projection so an empty lane set cannot erase that disclosure.
 
 The per-crew lane non-widening contract was the load-bearing question here, so the reasoning is recorded rather than assumed.
 A lane may carry only what the fleet projection already publishes about a task, at more depth, and never a surface that projection deliberately dropped.

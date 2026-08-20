@@ -479,7 +479,7 @@ SH
 }
 
 test_status_read_failures_are_not_reported_as_present() {
-  local home guard_bin real_tail lanes errors
+  local home guard_bin real_tail lanes surfaces errors
   home=$(make_fleet_home status-read-race)
   guard_bin="$home/tail-guard"
   errors="$home/status-read-errors"
@@ -496,11 +496,117 @@ SH
   lanes=$(PATH="$guard_bin:$PATH" FM_BUZZ_REAL_TAIL="$real_tail" \
     run_lanes "$home" --projection <(bearings_json "$home") 2>"$errors") \
     || fail "the lane projector failed after a raced status read"
-  [ "$(printf '%s' "$lanes" | jq 'length')" = "0" ] \
-    || fail "a failed status read still produced a present status stream"
+  [ "$(printf '%s' "$lanes" | jq 'length')" = "1" ] \
+    || fail "an all-skipped lane set did not carry one omission disclosure"
+  [ "$(printf '%s' "$lanes" | jq -r '.[0].disclosure_only')" = true ] \
+    || fail "a failed status read produced an ordinary lane instead of an omission carrier"
+  [ "$(printf '%s' "$lanes" | jq '.[0].projection.status_events | length')" = "0" ] \
+    || fail "the omission carrier claimed status events from a failed read"
+  surfaces=$(printf '%s' "$lanes" | jq -r '.[0].projection.omitted[].surface')
+  assert_contains "$surfaces" "2 in-flight entries could not be projected from current task or status data" \
+    "the all-skipped status failure was not disclosed"
   assert_contains "$(cat "$errors")" "could not read the status stream" \
     "the failed status read was not disclosed"
+  assert_contains "$(cat "$errors")" "2 crew lane(s) skipped: current task or status data could not be projected" \
+    "the all-skipped diagnostic did not name the count and cause"
   pass "status read failures are not reported as present streams"
+}
+
+test_status_byte_disclosure_uses_the_same_bounded_snapshot() {
+  local home projection guard_bin real_tail sentinel lanes surfaces events
+  home=$(make_fleet_home status-append-race)
+  projection="$home/bearings.json"
+  bearings_json "$home" > "$projection"
+  printf '%s\n' old > "$home/state/task-a.status"
+  guard_bin="$home/tail-append-guard"
+  sentinel="$home/status-appended"
+  real_tail=$(command -v tail)
+  mkdir -p "$guard_bin"
+  cat > "$guard_bin/tail" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-c" ] && [ ! -e "$FM_BUZZ_TAIL_SENTINEL" ]; then
+  : > "$FM_BUZZ_TAIL_SENTINEL"
+  printf '0123456789\nnew\n' >> "$FM_BUZZ_STATUS_APPEND_TARGET"
+fi
+exec "$FM_BUZZ_REAL_TAIL" "$@"
+SH
+  chmod +x "$guard_bin/tail"
+
+  lanes=$(PATH="$guard_bin:$PATH" FM_BUZZ_REAL_TAIL="$real_tail" \
+    FM_BUZZ_TAIL_SENTINEL="$sentinel" \
+    FM_BUZZ_STATUS_APPEND_TARGET="$home/state/task-a.status" \
+    FM_BUZZ_CREW_STATUS_BYTES=12 \
+    run_lanes "$home" --projection "$projection") \
+    || fail "the lane projector failed during an append race"
+  surfaces=$(printf '%s' "$lanes" \
+    | jq -r 'map(select(.id == "task-a"))[0].projection.omitted[].surface')
+  events=$(printf '%s' "$lanes" \
+    | jq -r 'map(select(.id == "task-a"))[0].projection.status_events | join("\n")')
+  assert_contains "$surfaces" "status events for task-a read from the last 12 bytes only" \
+    "the bounded snapshot did not disclose the append that crossed its byte limit"
+  [ "$events" = new ] || fail "the bounded snapshot published a partial leading event: $events"
+  pass "status truncation and content come from one bounded snapshot"
+}
+
+test_all_missing_tasks_publish_an_omission_carrier() {
+  local home projection lanes surfaces errors
+  home=$(make_fleet_home all-missing-tasks)
+  projection="$home/bearings.json"
+  errors="$home/all-missing-errors"
+  bearings_json "$home" > "$projection"
+  rm -f "$home/state/task-a.meta" "$home/state/task-a.status" \
+    "$home/state/task-b.meta" "$home/state/task-b.status"
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+## Done
+EOF
+
+  lanes=$(run_lanes "$home" --projection "$projection" 2>"$errors") \
+    || fail "the lane projector failed after every task record disappeared"
+  [ "$(printf '%s' "$lanes" | jq 'length')" = "1" ] \
+    || fail "all missing tasks did not produce one omission carrier"
+  [ "$(printf '%s' "$lanes" | jq -r '.[0].disclosure_only')" = true ] \
+    || fail "the all-missing result was not marked as disclosure-only"
+  surfaces=$(printf '%s' "$lanes" | jq -r '.[0].projection.omitted[].surface')
+  assert_contains "$surfaces" "2 in-flight entries had no current task record" \
+    "the missing task count was absent from the published omission"
+  assert_contains "$(cat "$errors")" "2 crew lane(s) skipped: no current task record" \
+    "the missing task diagnostic did not name the count and cause"
+  pass "all missing tasks still publish their omission disclosure"
+}
+
+test_refresh_publishes_an_all_skipped_omission_carrier() {
+  local home guard_bin real_tail relay output readback
+  home=$(make_fleet_home publish-all-skipped)
+  guard_bin="$home/tail-publish-guard"
+  real_tail=$(command -v tail)
+  mkdir -p "$guard_bin"
+  cat > "$guard_bin/tail" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-c" ]; then
+  exit 1
+fi
+exec "$FM_BUZZ_REAL_TAIL" "$@"
+SH
+  chmod +x "$guard_bin/tail"
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+
+  output=$(PATH="$guard_bin:$PATH" FM_BUZZ_REAL_TAIL="$real_tail" \
+    run_refresh "$home" "$relay" 2>&1)
+  expect_code 0 "$?" "refresh whose ordinary crew lanes were all skipped"
+  readback=$(run_inspect "$home" "$relay" --crew task-a --full 2>&1) \
+    || fail "the omission-only lane did not reach the relay"
+  stop_stub "$STUB_PID"
+  assert_contains "$output" "handed 1 crew-lane omission disclosure(s) to the publisher" \
+    "the refresh did not report the published omission carrier"
+  assert_contains "$readback" "2 in-flight entries could not be projected from current task or status data" \
+    "the all-skipped omission was absent from Buzz"
+  pass "refresh publishes all-skipped omission disclosures"
 }
 
 test_status_read_failures_are_disclosed_as_projection_failures() {
@@ -552,6 +658,82 @@ EOF
   [ "$cached" -le 1 ] \
     || fail "the refresh cached $cached events instead of stopping after the fleet deadline"
   pass "one refresh-wide deadline bounds a silent relay"
+}
+
+test_fleet_only_reports_its_deadline() {
+  local home relay output
+  home=$(make_fleet_home fleet-only-deadline)
+  read -r STUB_PID relay <<EOF
+$(start_stub --silent-ok)
+EOF
+  output=$(FM_BUZZ_REFRESH_TIMEOUT_S=2 run_refresh "$home" "$relay" --fleet-only 2>&1)
+  expect_code 0 "$?" "fleet-only refresh against a silent relay"
+  stop_stub "$STUB_PID"
+  assert_contains "$output" "refresh deadline reached while publishing the fleet channel" \
+    "fleet-only returned without reporting its deadline"
+  pass "fleet-only refreshes report deadline expiry"
+}
+
+test_deadline_watchdog_reaps_its_child_group_on_signal() {
+  local home guard_bin real_jq process_file output refresh_pid child_pid group_pid watchdog_pid
+  local waited=0 child_state=""
+  home=$(make_fleet_home refresh-signal-cleanup)
+  guard_bin="$home/jq-signal-guard"
+  process_file="$home/watchdog-processes"
+  output="$home/watchdog-output"
+  real_jq=$(command -v jq)
+  mkdir -p "$guard_bin"
+  cat > "$guard_bin/jq" <<'SH'
+#!/usr/bin/env bash
+if [ ! -e "$FM_BUZZ_WATCHDOG_PROCESSES" ]; then
+  printf '%s\n' "$$" > "$FM_BUZZ_WATCHDOG_PROCESSES"
+  sleep 30
+fi
+exec "$FM_BUZZ_REAL_JQ" "$@"
+SH
+  chmod +x "$guard_bin/jq"
+
+  (
+    PATH="$guard_bin:$PATH" FM_BUZZ_REAL_JQ="$real_jq" \
+      FM_BUZZ_WATCHDOG_PROCESSES="$process_file" FM_BUZZ_REFRESH_TIMEOUT_S=20 \
+      run_refresh "$home" "ws://127.0.0.1:1" >"$output" 2>&1
+  ) &
+  refresh_pid=$!
+  while [ ! -s "$process_file" ] && [ "$waited" -lt 100 ]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  [ -s "$process_file" ] || {
+    kill "$refresh_pid" 2>/dev/null
+    fail "the bounded child process never started"
+  }
+  read -r child_pid < "$process_file"
+  group_pid=$(ps -o pgid= -p "$child_pid" | tr -d '[:space:]')
+  watchdog_pid=$(ps -o ppid= -p "$group_pid" | tr -d '[:space:]')
+  [ -n "$watchdog_pid" ] || {
+    kill "$refresh_pid" 2>/dev/null
+    fail "the deadline watchdog process could not be identified"
+  }
+  kill -TERM "$watchdog_pid" 2>/dev/null || {
+    kill "$refresh_pid" 2>/dev/null
+    fail "the deadline watchdog could not be signalled"
+  }
+  wait "$refresh_pid"
+  expect_code 0 "$?" "refresh after its deadline watchdog was interrupted"
+  waited=0
+  while kill -0 "$child_pid" 2>/dev/null && [ "$waited" -lt 40 ]; do
+    child_state=$(ps -o stat= -p "$child_pid" | tr -d '[:space:]')
+    case $child_state in Z*) break ;; esac
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  child_state=$(ps -o stat= -p "$child_pid" 2>/dev/null | tr -d '[:space:]')
+  case $child_state in ''|Z*) ;; *) fail "the interrupted deadline watchdog left its child group running" ;; esac
+  grep -q 'time.monotonic()' "$REFRESH" \
+    || fail "the refresh deadline is not based on a monotonic clock"
+  ! grep -q 'time.time()' "$REFRESH" \
+    || fail "the refresh watchdog still compares its deadline to wall time"
+  pass "deadline watchdog signals terminate and reap the child group"
 }
 
 test_refresh_deadline_bounds_snapshot_work() {
@@ -646,8 +828,13 @@ test_fire_and_forget_contract_is_intact
 test_lane_documents_stay_out_of_process_arguments
 test_refresh_setup_failures_are_non_events
 test_status_read_failures_are_not_reported_as_present
+test_status_byte_disclosure_uses_the_same_bounded_snapshot
+test_all_missing_tasks_publish_an_omission_carrier
+test_refresh_publishes_an_all_skipped_omission_carrier
 test_status_read_failures_are_disclosed_as_projection_failures
 test_refresh_deadline_bounds_a_silent_relay
+test_fleet_only_reports_its_deadline
+test_deadline_watchdog_reaps_its_child_group_on_signal
 test_refresh_deadline_bounds_snapshot_work
 test_refresh_deadline_spans_sequential_lock_waits
 test_channel_labels_preserve_embedded_newlines

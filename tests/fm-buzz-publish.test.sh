@@ -858,6 +858,57 @@ EOF
   pass "relay drains retain events authored by another publisher identity"
 }
 
+test_replay_only_foreign_partition_does_not_provision_a_channel() {
+  local home relay foreign_private channel foreign_file output names
+  home=$(make_home replay-only-foreign-author)
+  run_keypair "$home" >/dev/null 2>&1 || fail "replay-only foreign keypair setup failed"
+  foreign_private=$(new_private_key) || fail "could not mint a replay-only foreign publisher"
+  channel=$(channel_id_for_label replay-only-foreign-author)
+  read -r STUB_PID relay <<EOF
+$(start_stub)
+EOF
+  foreign_file=$(seed_replay_event \
+    "$home" "$relay" "$foreign_private" 1700000401 "$channel" replay-only-foreign-author) \
+    || fail "could not seed a replay-only foreign cache entry"
+
+  output=$(run_publish "$home" "$relay" --replay-channel "$channel" </dev/null 2>&1)
+  expect_code 0 "$?" "replay-only foreign cache partition"
+  names=$(query_channel_names "$relay") || fail "the stub did not answer the channel-name query"
+  stop_stub "$STUB_PID"
+
+  [ -z "$names" ] || fail "a replay-only foreign partition provisioned a channel: $names"
+  assert_present "$foreign_file" "replay-only delivery removed a foreign cache entry"
+  assert_contains "$output" "delivered=0 retained=1" \
+    "the replay-only foreign entry was not retained without relay delivery"
+  pass "replay-only foreign partitions do not provision empty channels"
+}
+
+test_pending_replay_discovery_keeps_healthy_channel_siblings() {
+  local home relay endpoint healthy broken output errors
+  home=$(make_home pending-replay-siblings)
+  relay=ws://127.0.0.1:1
+  endpoint=$(relay_cache_dir "$home" "$relay")
+  healthy=$(channel_id_for_label pending-replay-healthy)
+  broken=$(channel_id_for_label pending-replay-broken)
+  mkdir -p "$endpoint/$healthy"
+  printf '%s\n' pending > "$endpoint/$healthy/pending.json.tmp"
+  ln -s "$home/missing-channel-partition" "$endpoint/$broken"
+  errors="$home/pending-replay-errors"
+
+  # shellcheck disable=SC2016
+  output=$(node -e '
+    import(process.argv[1]).then(({ listPendingReplayChannels }) => {
+      process.stdout.write(`${listPendingReplayChannels(process.argv[2], process.argv[3]).join("\n")}\n`);
+    });
+  ' "$ROOT/bin/fm-buzz-publish.mjs" "$home/state/buzz-replay" "$relay" 2>"$errors") \
+    || fail "one malformed replay partition aborted discovery"
+
+  [ "$output" = "$healthy" ] || fail "healthy replay partition was not discovered: $output"
+  assert_contains "$(cat "$errors")" "rejected channel cache path" \
+    "the malformed replay partition was not diagnosed"
+  pass "pending replay discovery isolates malformed channel siblings"
+}
+
 test_permanent_rejection_is_not_replayed_forever() {
   local home relay
   home=$(make_home permanent)
@@ -1490,6 +1541,8 @@ test_an_unacknowledged_publish_does_not_starve_the_drain
 test_a_late_auth_challenge_is_still_answered
 test_a_challenge_past_the_handshake_window_still_lands_the_event
 test_foreign_author_cache_entries_are_not_drained_by_the_current_publisher
+test_replay_only_foreign_partition_does_not_provision_a_channel
+test_pending_replay_discovery_keeps_healthy_channel_siblings
 test_permanent_rejection_is_not_replayed_forever
 test_retryable_rejection_is_kept
 test_relay_rejection_diagnostics_escape_terminal_controls

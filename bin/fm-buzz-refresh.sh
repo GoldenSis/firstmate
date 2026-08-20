@@ -90,9 +90,8 @@ TIMEOUT_MS=""
 REFRESH_TIMEOUT_S=${FM_BUZZ_REFRESH_TIMEOUT_S:-30}
 FLEET_ONLY=0
 ARGUMENT_ERROR=0
-REFRESH_DEADLINE=0
+REFRESH_DEADLINE=""
 PUBLISH_DEADLINE_REACHED=0
-PUBLISH_STARTED=0
 
 log() {
   printf 'fm-buzz-refresh: %s\n' "$1" >&2
@@ -106,34 +105,103 @@ import subprocess
 import sys
 import time
 
+class ForwardedSignal(BaseException):
+    def __init__(self, signum):
+        self.signum = signum
+
+
 deadline = float(sys.argv[1])
-remaining = deadline - time.time()
-if remaining <= 0:
-    raise SystemExit(124)
-try:
-    process = subprocess.Popen(sys.argv[2:], start_new_session=True)
-except OSError as error:
-    print(error, file=sys.stderr)
-    raise SystemExit(127)
-grace = min(0.2, remaining / 4)
-try:
-    result = process.wait(timeout=max(0, remaining - grace))
-except subprocess.TimeoutExpired:
+process = None
+finished = False
+
+
+def signal_group(signum):
+    if process is None:
+        return
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process.pid, signum)
     except ProcessLookupError:
         pass
+
+
+def group_exists():
+    if process is None:
+        return False
     try:
-        process.wait(timeout=max(0, deadline - time.time()))
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
+        os.killpg(process.pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def forward_signal(signum, _frame):
+    signal_group(signum)
+    raise ForwardedSignal(signum)
+
+
+for forwarded in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(forwarded, forward_signal)
+
+remaining = deadline - time.monotonic()
+if remaining <= 0:
     raise SystemExit(124)
+
+result = 124
+try:
+    process = subprocess.Popen(sys.argv[2:], start_new_session=True)
+    grace = min(0.2, remaining / 4)
+    result = process.wait(timeout=max(0, deadline - time.monotonic() - grace))
+    finished = True
+except OSError as error:
+    print(error, file=sys.stderr)
+    result = 127
+except subprocess.TimeoutExpired:
+    result = 124
+except ForwardedSignal as interrupted:
+    result = 128 + interrupted.signum
+finally:
+    for forwarded in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(forwarded, signal.SIG_IGN)
+    if process is not None:
+        signal_group(signal.SIGTERM)
+        cleanup_deadline = time.monotonic() + min(0.2, max(0, deadline - time.monotonic()))
+        if not finished:
+            try:
+                process.wait(timeout=max(0, cleanup_deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+        while group_exists() and time.monotonic() < cleanup_deadline:
+            time.sleep(0.01)
+        if group_exists():
+            signal_group(signal.SIGKILL)
+        if process.poll() is None:
+            process.wait()
 raise SystemExit(result)
 ' "$REFRESH_DEADLINE" "$@"
+}
+
+refresh_remaining_ms() {
+  python3 -c '
+import sys
+import time
+
+remaining = max(0, int((float(sys.argv[1]) - time.monotonic()) * 1000))
+print(remaining)
+' "$REFRESH_DEADLINE"
+}
+
+classify_deadline() {
+  local status=$1 remaining
+  if [ "$status" -eq 124 ]; then
+    PUBLISH_DEADLINE_REACHED=1
+    return 0
+  fi
+  remaining=$(refresh_remaining_ms) || return 1
+  if [ "$remaining" -le 0 ]; then
+    PUBLISH_DEADLINE_REACHED=1
+    return 0
+  fi
+  return 1
 }
 
 run_key_helper_before_deadline() {
@@ -196,14 +264,12 @@ trap cleanup EXIT
 trap 'cleanup; exit 0' INT TERM HUP
 
 publish_bounded() {  # <file or empty> <publisher arguments...>
-  local file=$1 now remaining remaining_ms requested effective lock_timeout status
+  local file=$1 remaining_ms remaining_s requested effective lock_timeout status
   shift
   local args=("$@")
   PUBLISH_DEADLINE_REACHED=0
-  PUBLISH_STARTED=0
-  now=$(date +%s)
-  remaining=$((REFRESH_DEADLINE - now))
-  if [ "$remaining" -le 0 ]; then
+  remaining_ms=$(refresh_remaining_ms) || return 127
+  if [ "$remaining_ms" -le 0 ]; then
     PUBLISH_DEADLINE_REACHED=1
     return 124
   fi
@@ -211,11 +277,6 @@ publish_bounded() {  # <file or empty> <publisher arguments...>
   case $requested in
     ''|*[!0-9]*|0|0*) ;;
     *)
-      if [ "$remaining" -gt 2147483 ]; then
-        remaining_ms=2147483000
-      else
-        remaining_ms=$((remaining * 1000))
-      fi
       effective=$requested
       [ "$effective" -gt "$remaining_ms" ] && effective=$remaining_ms
       args+=(--timeout "$effective")
@@ -225,11 +286,11 @@ publish_bounded() {  # <file or empty> <publisher arguments...>
     case $TIMEOUT_MS in ''|*[!0-9]*|0|0*) args+=(--timeout "$TIMEOUT_MS") ;; esac
   fi
   lock_timeout=${FM_BUZZ_LOCK_TIMEOUT_S:-30}
+  remaining_s=$(((remaining_ms + 999) / 1000))
   case $lock_timeout in
     ''|*[!0-9]*|0|0*) ;;
-    *) [ "$lock_timeout" -gt "$remaining" ] && lock_timeout=$remaining ;;
+    *) [ "$lock_timeout" -gt "$remaining_s" ] && lock_timeout=$remaining_s ;;
   esac
-  PUBLISH_STARTED=1
   if [ -n "$file" ]; then
     FM_BUZZ_LOCK_TIMEOUT_S=$lock_timeout \
       run_before_deadline "$SCRIPT_DIR/fm-buzz-publish.sh" "${args[@]}" < "$file"
@@ -238,10 +299,7 @@ publish_bounded() {  # <file or empty> <publisher arguments...>
       run_before_deadline "$SCRIPT_DIR/fm-buzz-publish.sh" "${args[@]}" < /dev/null
   fi
   status=$?
-  now=$(date +%s)
-  if [ "$status" -eq 124 ] || [ "$now" -ge "$REFRESH_DEADLINE" ]; then
-    PUBLISH_DEADLINE_REACHED=1
-  fi
+  classify_deadline "$status" >/dev/null
   return "$status"
 }
 
@@ -258,12 +316,16 @@ replay_channel() {  # <channel id>
 
 refresh() {
   local home_label home_channel home_qualifier fleet_label fleet_channel
-  local lane_count=0 lane_failures=0 replay_count=0 replay_failures=0
+  local lane_count=0 disclosure_count=0 lane_failures=0 replay_count=0 replay_failures=0
   local addressed_channels="" pending_channels="" replay_channels=""
   local replay_total=0 replay_index=0 lane_total=0 lane_index=0 skipped=0
-  local phase_status=0
+  local phase_status=0 lane_rows=""
 
-  REFRESH_DEADLINE=$(($(date +%s) + REFRESH_TIMEOUT_S))
+  REFRESH_DEADLINE=$(python3 -c \
+    'import sys, time; print(time.monotonic() + int(sys.argv[1]))' "$REFRESH_TIMEOUT_S") || {
+    log "could not start the refresh deadline"
+    return 0
+  }
 
   PROJECTION=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-refresh.XXXXXX") || {
     log "could not create a temporary file for the projection"
@@ -271,45 +333,64 @@ refresh() {
   }
   run_before_deadline "$SCRIPT_DIR/fm-bearings-snapshot.sh" --json > "$PROJECTION" 2>/dev/null
   phase_status=$?
-  if [ "$phase_status" -ne 0 ]; then
-    if [ "$phase_status" -eq 124 ]; then
-      log "refresh deadline reached while taking the bearings snapshot; publish was skipped"
-    else
-      log "bearings snapshot failed; skipping publish"
-    fi
+  if classify_deadline "$phase_status"; then
+    log "refresh deadline reached while taking the bearings snapshot; publish was skipped"
+    return 0
+  elif [ "$phase_status" -ne 0 ]; then
+    log "bearings snapshot failed; skipping publish"
     return 0
   fi
 
-  home_label=$(run_key_helper_before_deadline fm_buzz_key_account "$FM_HOME") || {
+  home_label=$(run_key_helper_before_deadline fm_buzz_key_account "$FM_HOME")
+  phase_status=$?
+  if classify_deadline "$phase_status"; then
+    log "refresh deadline reached while deriving the home label; publish was skipped"
+    return 0
+  elif [ "$phase_status" -ne 0 ]; then
     log "could not derive the home label; skipping publish"
     return 0
-  }
-  home_channel=$(run_key_helper_before_deadline fm_buzz_channel_id "$SCRIPT_DIR" "$home_label") || {
+  fi
+  home_channel=$(run_key_helper_before_deadline fm_buzz_channel_id "$SCRIPT_DIR" "$home_label")
+  phase_status=$?
+  if classify_deadline "$phase_status"; then
+    log "refresh deadline reached while deriving the home qualifier; publish was skipped"
+    return 0
+  elif [ "$phase_status" -ne 0 ]; then
     log "could not derive the home qualifier; skipping publish"
     return 0
-  }
+  fi
   home_qualifier=${home_channel%%-*}
   fleet_label=$CHANNEL_LABEL
   if [ -z "$fleet_label" ]; then
     fleet_label=$home_label
   fi
-  fleet_channel=$(run_key_helper_before_deadline fm_buzz_channel_id "$SCRIPT_DIR" "$fleet_label") || {
+  fleet_channel=$(run_key_helper_before_deadline fm_buzz_channel_id "$SCRIPT_DIR" "$fleet_label")
+  phase_status=$?
+  if classify_deadline "$phase_status"; then
+    log "refresh deadline reached while deriving the fleet channel; publish was skipped"
+    return 0
+  elif [ "$phase_status" -ne 0 ]; then
     log "could not derive the fleet channel; skipping publish"
     return 0
-  }
+  fi
   addressed_channels=" $fleet_channel "
 
   publish_document "$fleet_label" "$PROJECTION"
   FLEET_STATUS=$?
-  if [ "$FLEET_STATUS" -eq 124 ] && [ "$PUBLISH_DEADLINE_REACHED" -eq 1 ]; then
+  classify_deadline "$FLEET_STATUS" >/dev/null
+  if [ "$FLEET_STATUS" -eq 124 ]; then
     FLEET_STATUS=0
   fi
 
-  [ "$FLEET_ONLY" -eq 1 ] && return "$FLEET_STATUS"
   if [ "$PUBLISH_DEADLINE_REACHED" -eq 1 ]; then
-    log "refresh deadline reached after the fleet channel; crew lanes and cached queue replay were skipped"
+    if [ "$FLEET_ONLY" -eq 1 ]; then
+      log "refresh deadline reached while publishing the fleet channel"
+    else
+      log "refresh deadline reached after the fleet channel; crew lanes and cached queue replay were skipped"
+    fi
     return "$FLEET_STATUS"
   fi
+  [ "$FLEET_ONLY" -eq 1 ] && return "$FLEET_STATUS"
 
   LANES=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-lanes.XXXXXX") || {
     log "could not create a temporary file for the crew lanes"
@@ -317,83 +398,149 @@ refresh() {
   }
   run_before_deadline "$SCRIPT_DIR/fm-buzz-crew-lanes.sh" --projection "$PROJECTION" > "$LANES"
   phase_status=$?
-  if [ "$phase_status" -ne 0 ]; then
-    if [ "$phase_status" -eq 124 ]; then
-      log "refresh deadline reached while projecting crew lanes; cached queue replay was skipped"
-    else
-      log "crew lanes could not be projected; the fleet channel is unaffected"
-    fi
+  if classify_deadline "$phase_status"; then
+    log "refresh deadline reached while projecting crew lanes; cached queue replay was skipped"
+    return "$FLEET_STATUS"
+  elif [ "$phase_status" -ne 0 ]; then
+    log "crew lanes could not be projected; the fleet channel is unaffected"
     return "$FLEET_STATUS"
   fi
 
-  local lane id label channel publish_status
+  local lane id label channel disclosure_only publish_status
   DOCUMENT=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-lane.XXXXXX") || {
     log "could not create a temporary file for a crew lane"
     return "$FLEET_STATUS"
   }
-  lane_total=$(run_before_deadline jq 'length' "$LANES" 2>/dev/null) || lane_total=0
+  lane_total=$(run_before_deadline jq 'length' "$LANES" 2>/dev/null)
+  phase_status=$?
+  if classify_deadline "$phase_status"; then
+    log "refresh deadline reached while reading the crew lane set; crew lanes and cached queue replay were skipped"
+    return "$FLEET_STATUS"
+  elif [ "$phase_status" -ne 0 ]; then
+    log "crew lanes could not be read; the fleet channel is unaffected"
+    return "$FLEET_STATUS"
+  fi
+  lane_rows=$(run_before_deadline jq -c '.[]' "$LANES" 2>/dev/null)
+  phase_status=$?
+  if classify_deadline "$phase_status"; then
+    log "refresh deadline reached while reading the crew lane set; crew lanes and cached queue replay were skipped"
+    return "$FLEET_STATUS"
+  elif [ "$phase_status" -ne 0 ]; then
+    log "crew lanes could not be read; the fleet channel is unaffected"
+    return "$FLEET_STATUS"
+  fi
   while IFS= read -r lane; do
     [ -n "$lane" ] || continue
     lane_index=$((lane_index + 1))
-    id=$(printf '%s' "$lane" | run_before_deadline jq -r '.id // empty') || id=""
+    id=$(printf '%s' "$lane" | run_before_deadline jq -r '.id // empty')
+    phase_status=$?
+    if classify_deadline "$phase_status"; then
+      skipped=$((lane_total - lane_index + 1))
+      log "refresh deadline reached; ${skipped} live crew lane(s) and cached queue replay were skipped"
+      break
+    fi
     if [ -z "$id" ]; then
       log "a crew lane carried no task id; skipping it"
       lane_failures=$((lane_failures + 1))
       continue
     fi
-    if ! label=$(run_key_helper_before_deadline fm_buzz_crew_channel_label \
-      "$SCRIPT_DIR" "$fleet_label" "$id" 2>/dev/null); then
+    disclosure_only=$(printf '%s' "$lane" | run_before_deadline jq -r '.disclosure_only // false')
+    phase_status=$?
+    if classify_deadline "$phase_status"; then
+      skipped=$((lane_total - lane_index + 1))
+      log "refresh deadline reached; ${skipped} live crew lane(s) and cached queue replay were skipped"
+      break
+    elif [ "$phase_status" -ne 0 ]; then
+      log "could not read the lane kind for $id; skipping it"
+      lane_failures=$((lane_failures + 1))
+      continue
+    fi
+    label=$(run_key_helper_before_deadline fm_buzz_crew_channel_label \
+      "$SCRIPT_DIR" "$fleet_label" "$id" 2>/dev/null)
+    phase_status=$?
+    if classify_deadline "$phase_status"; then
+      skipped=$((lane_total - lane_index + 1))
+      log "refresh deadline reached; ${skipped} live crew lane(s) and cached queue replay were skipped"
+      break
+    elif [ "$phase_status" -ne 0 ]; then
       log "could not derive a lane channel for $id; skipping it"
       lane_failures=$((lane_failures + 1))
       continue
     fi
-    if ! channel=$(run_key_helper_before_deadline fm_buzz_channel_id \
-      "$SCRIPT_DIR" "$label" 2>/dev/null); then
+    channel=$(run_key_helper_before_deadline fm_buzz_channel_id \
+      "$SCRIPT_DIR" "$label" 2>/dev/null)
+    phase_status=$?
+    if classify_deadline "$phase_status"; then
+      skipped=$((lane_total - lane_index + 1))
+      log "refresh deadline reached; ${skipped} live crew lane(s) and cached queue replay were skipped"
+      break
+    elif [ "$phase_status" -ne 0 ]; then
       log "could not derive a lane channel for $id; skipping it"
       lane_failures=$((lane_failures + 1))
       continue
     fi
     addressed_channels="${addressed_channels}${channel} "
-    if ! printf '%s' "$lane" | run_before_deadline jq -e '.projection' > "$DOCUMENT"; then
+    printf '%s' "$lane" | run_before_deadline jq -e '.projection' > "$DOCUMENT"
+    phase_status=$?
+    if classify_deadline "$phase_status"; then
+      skipped=$((lane_total - lane_index + 1))
+      log "refresh deadline reached; ${skipped} live crew lane(s) and cached queue replay were skipped"
+      break
+    elif [ "$phase_status" -ne 0 ]; then
       log "could not read the lane projection for $id; skipping it"
       lane_failures=$((lane_failures + 1))
       continue
     fi
-    if publish_document "$label" "$DOCUMENT" "crew-${home_qualifier}-$id"; then
-      lane_count=$((lane_count + 1))
+    publish_document "$label" "$DOCUMENT" "crew-${home_qualifier}-$id"
+    publish_status=$?
+    if classify_deadline "$publish_status"; then
+      if [ "$publish_status" -eq 0 ]; then
+        if [ "$disclosure_only" = true ]; then
+          disclosure_count=$((disclosure_count + 1))
+        else
+          lane_count=$((lane_count + 1))
+        fi
+      fi
+      skipped=$((lane_total - lane_index))
+      [ "$publish_status" -ne 0 ] && skipped=$((skipped + 1))
+      log "refresh deadline reached; ${skipped} live crew lane(s) and cached queue replay were skipped"
+      break
+    elif [ "$publish_status" -eq 0 ]; then
+      if [ "$disclosure_only" = true ]; then
+        disclosure_count=$((disclosure_count + 1))
+      else
+        lane_count=$((lane_count + 1))
+      fi
     else
       log "the lane for $id did not publish; the fleet channel is unaffected"
       lane_failures=$((lane_failures + 1))
     fi
-    if [ "$PUBLISH_DEADLINE_REACHED" -eq 1 ]; then
-      skipped=$((lane_total - lane_index))
-      [ "$PUBLISH_STARTED" -eq 0 ] && skipped=$((skipped + 1))
-      log "refresh deadline reached; ${skipped} live crew lane(s) and cached queue replay were skipped"
-      break
-    fi
-  done < <(run_before_deadline jq -c '.[]' "$LANES" 2>/dev/null)
+  done <<EOF
+$lane_rows
+EOF
   rm -f -- "$DOCUMENT"
   DOCUMENT=""
 
   if [ "$PUBLISH_DEADLINE_REACHED" -eq 0 ]; then
     # shellcheck disable=SC2016 # Node source, not a shell expansion.
-    if fm_buzz_capture run_before_deadline node -e '
+    fm_buzz_capture run_before_deadline node -e '
       import(process.argv[1]).then(({ listPendingReplayChannels }) => {
         process.stdout.write(`${listPendingReplayChannels(process.argv[2], process.argv[3]).join("\n")}\n`);
       }).catch((error) => {
         process.stderr.write(`${error.message}\n`);
         process.exitCode = 1;
       });
-    ' "$SCRIPT_DIR/fm-buzz-publish.mjs" "$(fm_buzz_replay_cache_dir "$STATE")" "$RELAY"; then
+    ' "$SCRIPT_DIR/fm-buzz-publish.mjs" "$(fm_buzz_replay_cache_dir "$STATE")" "$RELAY"
+    phase_status=$?
+    if classify_deadline "$phase_status"; then
+      log "refresh deadline reached while inspecting cached queue replay"
+      replay_failures=$((replay_failures + 1))
+    elif [ "$phase_status" -eq 0 ]; then
       pending_channels=$FM_BUZZ_CAPTURED_OUTPUT
+      [ -z "$FM_BUZZ_CAPTURED_DIAGNOSTIC" ] \
+        || printf '%s\n' "$FM_BUZZ_CAPTURED_DIAGNOSTIC" >&2
     else
-      phase_status=$?
-      if [ "$phase_status" -eq 124 ] || [ "$(date +%s)" -ge "$REFRESH_DEADLINE" ]; then
-        log "refresh deadline reached while inspecting cached queue replay"
-        PUBLISH_DEADLINE_REACHED=1
-      else
-        log "could not inspect cached queue replay: $FM_BUZZ_CAPTURED_DIAGNOSTIC"
-      fi
+      log "could not inspect cached queue replay: $FM_BUZZ_CAPTURED_DIAGNOSTIC"
       replay_failures=$((replay_failures + 1))
     fi
     while IFS= read -r channel; do
@@ -410,17 +557,17 @@ EOF
       replay_index=$((replay_index + 1))
       replay_channel "$channel"
       publish_status=$?
-      if [ "$publish_status" -eq 0 ]; then
+      if classify_deadline "$publish_status"; then
+        [ "$publish_status" -eq 0 ] && replay_count=$((replay_count + 1))
+        skipped=$((replay_total - replay_index))
+        [ "$publish_status" -ne 0 ] && skipped=$((skipped + 1))
+        log "refresh deadline reached; ${skipped} cached queue(s) were skipped"
+        break
+      elif [ "$publish_status" -eq 0 ]; then
         replay_count=$((replay_count + 1))
       else
         log "cached queue $channel did not replay; the fleet channel is unaffected"
         replay_failures=$((replay_failures + 1))
-      fi
-      if [ "$PUBLISH_DEADLINE_REACHED" -eq 1 ]; then
-        skipped=$((replay_total - replay_index))
-        [ "$PUBLISH_STARTED" -eq 0 ] && skipped=$((skipped + 1))
-        log "refresh deadline reached; ${skipped} cached queue(s) were skipped"
-        break
       fi
     done <<EOF
 $replay_channels
@@ -430,6 +577,8 @@ EOF
   # Deliberately not "published": the publisher owns delivery and reports its own
   # failures, and a fire-and-forget run cannot truthfully claim one landed.
   log "handed the fleet channel and ${lane_count} crew lane(s) to the publisher"
+  [ "$disclosure_count" -gt 0 ] \
+    && log "handed ${disclosure_count} crew-lane omission disclosure(s) to the publisher"
   [ "$lane_failures" -gt 0 ] && log "${lane_failures} crew lane(s) were skipped"
   [ "$replay_count" -gt 0 ] && log "retried ${replay_count} cached queue(s)"
   [ "$replay_failures" -gt 0 ] && log "${replay_failures} cached queue replay attempt(s) were skipped"

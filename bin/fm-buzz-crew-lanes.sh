@@ -119,9 +119,12 @@ command -v jq >/dev/null 2>&1 || { log "jq is unavailable"; exit 1; }
 
 SPOOL=""
 STATUS_SPOOL=""
+STATUS_WINDOW_SPOOL=""
 cleanup() {
+  [ -n "$STATUS_WINDOW_SPOOL" ] && rm -f -- "$STATUS_WINDOW_SPOOL"
   [ -n "$STATUS_SPOOL" ] && rm -f -- "$STATUS_SPOOL"
   [ -n "$SPOOL" ] && rm -f -- "$SPOOL"
+  STATUS_WINDOW_SPOOL=""
   STATUS_SPOOL=""
   SPOOL=""
 }
@@ -133,6 +136,10 @@ SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-crew-lanes.XXXXXX") || {
 }
 STATUS_SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-crew-status.XXXXXX") || {
   log "could not create a temporary file for status events"
+  exit 1
+}
+STATUS_WINDOW_SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-buzz-crew-status-window.XXXXXX") || {
+  log "could not create a temporary file for the bounded status window"
   exit 1
 }
 
@@ -181,16 +188,20 @@ SNAPSHOT=$("$SCRIPT_DIR/fm-fleet-snapshot.sh" --json) || {
 # only grows at the tail. A byte-bounded tail can start mid-line; that partial
 # leading line is dropped rather than published as if it were a whole event.
 status_events_json() {  # <path>
-  local path=$1 bytes=0 byte_truncated=false
+  local path=$1 bytes=0 byte_truncated=false input=$STATUS_SPOOL
   if [ ! -f "$path" ]; then
     jq -n '{present:false,events:[],line_truncated:false,byte_truncated:false,total:0,shown:0}'
     return 0
   fi
-  bytes=$(wc -c < "$path" | tr -d '[:space:]')
-  case $bytes in ''|*[!0-9]*) bytes=0 ;; esac
-  [ "$bytes" -gt "$STATUS_BYTES" ] && byte_truncated=true
-  if ! tail -c "$STATUS_BYTES" < "$path" > "$STATUS_SPOOL"; then
+  if ! tail -c "$((STATUS_BYTES + 1))" < "$path" > "$STATUS_SPOOL"; then
     return 1
+  fi
+  bytes=$(wc -c < "$STATUS_SPOOL" | tr -d '[:space:]')
+  case $bytes in ''|*[!0-9]*) bytes=0 ;; esac
+  if [ "$bytes" -gt "$STATUS_BYTES" ]; then
+    byte_truncated=true
+    tail -c "$STATUS_BYTES" < "$STATUS_SPOOL" > "$STATUS_WINDOW_SPOOL" || return 1
+    input=$STATUS_WINDOW_SPOOL
   fi
   jq -Rn \
     --argjson max_lines "$STATUS_LINES" \
@@ -207,23 +218,26 @@ status_events_json() {  # <path>
           line_truncated: ($kept | any(. | length > $max_chars)),
           byte_truncated: $byte_truncated,
           events: ($kept | map(if length > $max_chars then .[:$max_chars] else . end))
-        }' < "$STATUS_SPOOL"
+        }' < "$input"
 }
 
 LANES='[]'
 MISSING_TASKS=0
 FAILED_LANES=0
+FIRST_SKIPPED_ID=""
 while IFS= read -r id; do
   [ -n "$id" ] || continue
   task=$(printf '%s' "$SNAPSHOT" | jq -c --arg id "$id" 'first(.tasks[] | select(.id == $id)) // empty')
   if [ -z "$task" ]; then
     MISSING_TASKS=$((MISSING_TASKS + 1))
+    [ -n "$FIRST_SKIPPED_ID" ] || FIRST_SKIPPED_ID=$id
     continue
   fi
   status_path=$(printf '%s' "$task" | jq -r '.paths.status_log.path // ""')
   status=$(status_events_json "$status_path") || {
     log "could not read the status stream for $id"
     FAILED_LANES=$((FAILED_LANES + 1))
+    [ -n "$FIRST_SKIPPED_ID" ] || FIRST_SKIPPED_ID=$id
     continue
   }
   lane=$(printf '%s\n%s\n' "$task" "$status" | jq -sc \
@@ -267,6 +281,7 @@ while IFS= read -r id; do
     ') || {
     log "could not project a lane for $id"
     FAILED_LANES=$((FAILED_LANES + 1))
+    [ -n "$FIRST_SKIPPED_ID" ] || FIRST_SKIPPED_ID=$id
     continue
   }
   LANES=$(printf '%s\n%s\n' "$LANES" "$lane" \
@@ -281,25 +296,58 @@ EOF
 # A lane that could not be projected is disclosed in every lane that could, for
 # the same reason every other bound is: a reader must never mistake a bounded
 # lane set for the whole fleet.
-if [ "$MISSING_TASKS" -gt 0 ]; then
-  LANES=$(jq -c --argjson missing "$MISSING_TASKS" '
-    map(.projection.omitted += [{
-      surface: "crew lanes: \($missing) in-flight entr\(if $missing == 1 then "y" else "ies" end) had no current task record",
-      reveal: "re-run after the fleet settles"
-    }])' <<<"$LANES") || {
+if [ "$MISSING_TASKS" -gt 0 ] || [ "$FAILED_LANES" -gt 0 ]; then
+  [ "$MISSING_TASKS" -eq 0 ] \
+    || log "$MISSING_TASKS crew lane(s) skipped: no current task record"
+  [ "$FAILED_LANES" -eq 0 ] \
+    || log "$FAILED_LANES crew lane(s) skipped: current task or status data could not be projected"
+  DISCLOSURES=$(jq -cn \
+    --argjson missing "$MISSING_TASKS" \
+    --argjson failed "$FAILED_LANES" '
+      (if $missing > 0 then [{
+        surface: "crew lanes: \($missing) in-flight entr\(if $missing == 1 then "y" else "ies" end) had no current task record",
+        reveal: "re-run after the fleet settles"
+      }] else [] end)
+      + (if $failed > 0 then [{
+        surface: "crew lanes: \($failed) in-flight entr\(if $failed == 1 then "y" else "ies" end) could not be projected from current task or status data",
+        reveal: "inspect the projector diagnostics and re-run"
+      }] else [] end)') || {
+    log "could not build the unprojected-lane disclosure"
+    exit 1
+  }
+  LANES=$(jq -c --argjson disclosures "$DISCLOSURES" \
+    'map(.projection.omitted += $disclosures)' <<<"$LANES") || {
     log "could not record the unprojected-lane disclosure"
     exit 1
   }
-fi
-if [ "$FAILED_LANES" -gt 0 ]; then
-  LANES=$(jq -c --argjson failed "$FAILED_LANES" '
-    map(.projection.omitted += [{
-      surface: "crew lanes: \($failed) in-flight entr\(if $failed == 1 then "y" else "ies" end) could not be projected from current task or status data",
-      reveal: "inspect the projector diagnostics and re-run"
-    }])' <<<"$LANES") || {
-    log "could not record the failed-lane disclosure"
-    exit 1
-  }
+  if [ "$(jq 'length' <<<"$LANES")" -eq 0 ]; then
+    LANES=$(jq -c \
+      --arg id "$FIRST_SKIPPED_ID" \
+      --argjson disclosures "$DISCLOSURES" '
+        first(.in_flight[] | select(.id == $id)) as $row
+        | [{
+            id: $id,
+            disclosure_only: true,
+            projection: {
+              schema: "fm-bearings.v1",
+              view: "crew-lane",
+              home: .home,
+              generated: .generated,
+              prs: .prs,
+              in_flight: [$row],
+              crew: {id: $id, kind: $row.kind, harness: "unknown", mode: "unknown"},
+              status_events: [],
+              omitted: (.omitted + $disclosures + [{
+                surface: "crew lane for \($id) carries omission disclosure only",
+                reveal: "inspect the projector diagnostics and re-run"
+              }])
+            }
+          }]' \
+      "$SPOOL") || {
+      log "could not build the all-skipped omission disclosure"
+      exit 1
+    }
+  fi
 fi
 
 printf '%s\n' "$LANES"
