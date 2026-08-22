@@ -7,6 +7,7 @@ config/
 .fm-secondmate-home
 .DS_Store
 /AGENTS.md.bak-*
+/.codex/hooks.json.bak-*
 __pycache__/
 *.pyc
 .env
