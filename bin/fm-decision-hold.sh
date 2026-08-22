@@ -8,7 +8,8 @@
 # routes dependent work. This script supplies deterministic identities, creates
 # and verifies structured tasks-axi captain holds, records completion attestation
 # in the originating task's metadata, and closes a hold only after a durable
-# decision record has been linked to existing dependent work.
+# decision record has been linked to existing dependent work or explicitly
+# attested to route to no dependent work.
 #
 # A hold identity is <origin-id>-decision-<decision-key>. Origin ids and decision
 # keys must already be privacy-safe slugs. Repeating `hold` with the same identity
@@ -23,7 +24,8 @@
 #   fm-decision-hold.sh complete <origin-id> (--none | <decision-key>...)
 #   fm-decision-hold.sh verify <origin-id>
 #   fm-decision-hold.sh resolve <origin-id> <decision-key> \
-#     --decision-file <path> --routed-to <task-id> [--routed-to <task-id>...]
+#     --decision-file <path> \
+#     (--routed-none | --routed-to <task-id> [--routed-to <task-id>...])
 #
 # `complete` is the shared investigation and visual-review completion gate.
 # `--none` is an explicit semantic attestation that the just-reviewed surface has
@@ -33,10 +35,15 @@
 # `verify` is read-only and is called by scout teardown so teardown cannot erase a
 # source before this gate has succeeded.
 #
-# `resolve` requires every --routed-to task to exist and to be blocked by the hold.
-# It writes the captain decision and routed identities into the hold body, clears
-# those dependency edges, and only then marks the hold Done. A failure before the
-# final step leaves the captain hold open.
+# `resolve --routed-none` explicitly attests that the decision creates no
+# dependent work, such as a decline, a not-now decision, or a duplicate answered
+# by another hold. It checks one canonical tasks-axi dependency snapshot and is
+# invalid when dependent work exists. `resolve --routed-to` requires every named
+# task to exist and to be blocked by the hold. Both forms write the captain
+# decision and routed-work marker into the hold body. The routed form clears
+# dependency edges before marking the hold Done. A failure before the final close
+# leaves an active captain hold open. A failed repair of an already-Done captain
+# hold leaves it Done and safe to retry.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -113,6 +120,83 @@ task_show() {  # <id>
 show_field() {  # <show-output> <field>
   local output=$1 field=$2
   printf '%s\n' "$output" | sed -n "s/^  $field: //p" | head -1
+}
+
+backlog_dependents() {  # <blocker-id>
+  local blocker=$1 snapshot
+  snapshot=$(tasks_axi list --fields deps) || return 1
+  printf '%s\n' "$snapshot" | awk -v blocker="$blocker" '
+    function split_row(line, values,    ch, escaped, i, n, quoted) {
+      n = 1
+      values[n] = ""
+      for (i = 1; i <= length(line); i++) {
+        ch = substr(line, i, 1)
+        if (escaped) {
+          values[n] = values[n] ch
+          escaped = 0
+        } else if (quoted && ch == "\\") {
+          escaped = 1
+        } else if (ch == "\"") {
+          quoted = !quoted
+        } else if (!quoted && ch == ",") {
+          n++
+          values[n] = ""
+        } else {
+          values[n] = values[n] ch
+        }
+      }
+      if (quoted || escaped) return 0
+      return n
+    }
+    /^count: [0-9]+$/ {
+      count = $0
+      sub(/^count: /, "", count)
+      count_seen = 1
+      next
+    }
+    /^tasks\[[0-9]+\]\{id,state,kind,repo,title,deps\}:$/ {
+      header_count = $0
+      sub(/^tasks\[/, "", header_count)
+      sub(/\].*$/, "", header_count)
+      header_seen = 1
+      table = 1
+      next
+    }
+    table && /^  / {
+      rows++
+      fields = split_row(substr($0, 3), values)
+      if (fields != 6) {
+        invalid = 1
+        next
+      }
+      dependencies = values[6]
+      dependency_count = split(dependencies, dependency, ",")
+      for (i = 1; i <= dependency_count; i++) {
+        if (dependency[i] == "blocked-by:" blocker) {
+          print values[1]
+          break
+        }
+      }
+      next
+    }
+    table { table = 0 }
+    END {
+      if (!count_seen) exit 1
+      if (count == 0) {
+        if (header_seen || rows != 0) exit 1
+        exit 0
+      }
+      if (!header_seen || header_count != count || rows != count || invalid) exit 1
+    }
+  '
+}
+
+require_no_backlog_dependents() {  # <hold-id>
+  local id=$1 dependents
+  dependents=$(backlog_dependents "$id") \
+    || fail "could not inspect backlog dependencies for $id"
+  [ -z "$dependents" ] \
+    || fail "--routed-none cannot resolve $id while backlog tasks remain blocked by it: $(printf '%s\n' "$dependents" | paste -sd, -)"
 }
 
 origin_exists_here() {  # <origin-id>
@@ -368,13 +452,14 @@ EOF
 }
 
 command_resolve() {
-  local origin=${1:-} key=${2:-} decision_file='' id='' decision='' decision_digest='' body='' routed='' routed_csv='' dep show blocked state hold_show hold_body resolution_recorded=0
+  local origin=${1:-} key=${2:-} decision_file='' id='' decision='' decision_digest='' body='' routed='' routed_csv='' dep show blocked state kind hold_kind hold_show hold_body resolution_recorded=0 routed_none=0 hold_was_done=0
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
   shift 2
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --decision-file) shift; decision_file=${1:-} ;;
       --routed-to) shift; validate_slug routed-task "${1:-}"; routed="${routed}${routed:+ }${1:-}" ;;
+      --routed-none) routed_none=1 ;;
       *) usage >&2; exit 2 ;;
     esac
     shift
@@ -387,20 +472,42 @@ command_resolve() {
   [ -n "$decision" ] || fail "decision file must not be empty"
   [ "$(printf '%s' "$decision" | LC_ALL=C wc -c | tr -d ' ')" -le 8192 ] \
     || fail "decision file exceeds 8192 bytes"
-  [ -n "$routed" ] || fail "at least one --routed-to task is required"
-  routed=$(printf '%s\n' "$routed" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u | paste -sd' ' -)
-  routed_csv=$(printf '%s\n' "$routed" | tr ' ' ',')
+  if [ "$routed_none" = 1 ]; then
+    [ -z "$routed" ] || fail "--routed-none cannot be combined with --routed-to"
+    routed_csv='(none)'
+  else
+    [ -n "$routed" ] || fail "at least one --routed-to task or --routed-none is required"
+    routed=$(printf '%s\n' "$routed" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u | paste -sd' ' -)
+    routed_csv=$(printf '%s\n' "$routed" | tr ' ' ',')
+  fi
   decision_digest=$(sha256_text "$decision")
   require_tasks_axi
   id=$(hold_id "$origin" "$key")
   if verify_hold_resolved "$id"; then
+    if [ "$routed_none" = 1 ]; then
+      require_no_backlog_dependents "$id"
+    fi
     hold_show=$(task_show "$id")
     hold_body=$(show_field "$hold_show" body)
     verify_resolution_identity "$id" "$hold_body" "$decision_digest" "$routed_csv"
     printf 'resolved: %s\n' "$id"
     return 0
   fi
-  verify_hold_active "$id"
+  if [ "$routed_none" = 1 ]; then
+    hold_show=$(task_show "$id") || fail "captain hold $id is absent from $FM_HOME/data/backlog.md"
+    state=$(show_field "$hold_show" state)
+    kind=$(show_field "$hold_show" kind)
+    hold_kind=$(show_field "$hold_show" hold_kind)
+    if [ "$state" = "done" ]; then
+      [ "$kind" = captain ] || fail "backlog item $id is not kind captain"
+      [ "$hold_kind" = captain ] || fail "backlog item $id is not held for the captain"
+      hold_was_done=1
+    else
+      verify_hold_active "$id"
+    fi
+  else
+    verify_hold_active "$id"
+  fi
   hold_show=$(task_show "$id")
   hold_body=$(show_field "$hold_show" body)
   case "$hold_body" in
@@ -430,10 +537,18 @@ command_resolve() {
     esac
   done
 
+  if [ "$routed_none" = 1 ]; then
+    require_no_backlog_dependents "$id"
+  fi
+
   body=$(printf 'Resolution recorded by fm-decision-hold.\nDecision digest: %s\nRouted identities: %s\n\nCaptain decision:\n%s\n\nRouted work:\n' "$decision_digest" "$routed_csv" "$decision")
-  for dep in $routed; do
-    body="${body}- ${dep}"$'\n'
-  done
+  if [ "$routed_none" = 1 ]; then
+    body="${body}- None (no dependent work)."$'\n'
+  else
+    for dep in $routed; do
+      body="${body}- ${dep}"$'\n'
+    done
+  fi
   tasks_axi update "$id" --body "$body" >/dev/null \
     || fail "could not record the captain decision on $id"
   for dep in $routed; do
@@ -448,9 +563,15 @@ command_resolve() {
         ;;
     esac
   done
-  tasks_axi "done" "$id" >/dev/null || fail "could not close resolved captain hold $id"
+  if [ "$hold_was_done" = 0 ]; then
+    tasks_axi "done" "$id" >/dev/null || fail "could not close resolved captain hold $id"
+  fi
   verify_hold_resolved "$id" || fail "captain hold $id did not retain its durable resolution record"
-  printf 'resolved: %s -> %s\n' "$id" "$routed"
+  if [ "$routed_none" = 1 ]; then
+    printf 'resolved: %s -> no dependent work\n' "$id"
+  else
+    printf 'resolved: %s -> %s\n' "$id" "$routed"
+  fi
 }
 
 case "${1:-}" in
