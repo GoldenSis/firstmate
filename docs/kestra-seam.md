@@ -42,6 +42,8 @@ A data-driven branch would need an allow-listed expression grammar, which is a d
 
 Git review decides what a flow says; the revision record decides what runs.
 Deployment updates the namespace, reads every flow back at the revision Kestra reported, requires that revision's source to be the reviewed bytes, and only then records the revision against the flow's Git blob id.
+Multipart uploads protect newline-terminated sources with a final, unindented comment so Kestra's upload trimming cannot change literal artifact content.
+Revision verification accepts that exact framing and preserves source EOF newlines; a source ending in whitespace without a final newline is refused before upload.
 A run refuses when the flow has no record, when the tracked flow's blob no longer matches the recorded one, when Kestra cannot return the recorded revision with matching source, or when the created execution reports another revision.
 The thing reviewed in Git is therefore provably the thing that runs, and a flow edited on the server or redeployed outside this path cannot be executed through the seam.
 
@@ -50,6 +52,7 @@ The thing reviewed in Git is therefore provably the thing that runs, and a flow 
 Git review is the authority for which flow identities and source bytes are addressable.
 The deploy and run script headers own the exact source-resolution, verification, and refusal rules, while `bin/fm-kestra-lib.sh` owns the supported YAML shape, task and input allow-lists, validator regex subset, and request matrix.
 Unsupported source constructs fail closed because approximating Kestra's semantics locally would make the adapter a weaker validator.
+INT bounds must use unquoted decimal integers without leading zeros, avoiding YAML octal interpretation.
 
 Kestra is never given permission to pull and reconcile Git itself, because upstream documents that Git-driven synchronization can delete objects depending on the source-of-truth setting.
 The seam pushes reviewed source while keeping reconciliation authority outside Kestra.

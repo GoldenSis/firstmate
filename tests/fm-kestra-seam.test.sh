@@ -271,6 +271,14 @@ if [ "$method" = POST ] && [[ "$path" == /flows/* ]]; then
     file=${file#\"}
     file=${file%\"}
     cp "$file" "$destination/$index.yaml" || exit 1
+    if [ "${FAKE_ROUNDTRIP_UPLOADS:-0}" = 1 ]; then
+      jq -Rsj 'gsub("^[\u0000-\u0020]+|[\u0000-\u0020]+$"; "")' "$file" \
+        > "$destination/$index.trimmed.yaml" || exit 1
+      if [ "$path" = '/flows/firstmate.m1?delete=false' ]; then
+        flow=$(awk '/^id: / { print $2; exit }' "$file")
+        cp "$destination/$index.trimmed.yaml" "$FAKE_FLOW_DIR/$flow@1.yaml" || exit 1
+      fi
+    fi
     index=$((index + 1))
   done
 fi
@@ -377,6 +385,7 @@ seam() {
     FAKE_CURL_FAIL_BODY="${SEAM_FAIL_BODY:-}" \
     FAKE_CURL_FAIL_CODE="${SEAM_FAIL_CODE:-22}" \
     FAKE_ARTIFACT_BINARY="${SEAM_ARTIFACT_BINARY:-0}" \
+    FAKE_ROUNDTRIP_UPLOADS="${SEAM_ROUNDTRIP_UPLOADS:-0}" \
     FM_KESTRA_CONFIG="$workdir/absent-kestra.env" \
     FM_KESTRA_BASE_URL="${SEAM_BASE_URL:-http://127.0.0.1:18080}" \
     FM_KESTRA_TENANT=main \
@@ -1906,9 +1915,10 @@ tasks:
   cp "$d/literal.yaml" "$d/fake-flows/m1_shape@1.yaml"
   out=$(SEAM_VALIDATE_RESPONSE='[{"constraints":null}]' seam "$d" "$d/repo/bin/fm-kestra-deploy.sh" 2>&1) || rc=$?
   expect_code 0 "$rc" "literal separators must deploy as one flow: $out"
-  cmp -s "$d/literal.yaml" "$d/fake-flows/uploads/validate/0.yaml" \
+  { cat "$d/literal.yaml"; printf '# firstmate-source-end'; } > "$d/expected"
+  cmp -s "$d/expected" "$d/fake-flows/uploads/validate/0.yaml" \
     || fail "validation must receive the original flow as a separate uploaded file"
-  cmp -s "$d/literal.yaml" "$d/fake-flows/uploads/firstmate.m1/0.yaml" \
+  cmp -s "$d/expected" "$d/fake-flows/uploads/firstmate.m1/0.yaml" \
     || fail "deployment must receive the same separate file, including literal separators"
   assert_absent "$d/fake-flows/uploads/firstmate.m1/1.yaml" "literal YAML must not become another uploaded flow"
   assert_no_grep '/flows/bulk' "$d/curl.log" "deployment must not use the delimiter-splitting endpoint"
@@ -1974,7 +1984,7 @@ test_revision_verification_preserves_literal_whitespace() {
     assert_absent "$d/home/data/kestra/revisions" "whitespace drift must not record a verified revision"
   done
   d=$(workdir source-padding)
-  { printf '\n'; cat "$d/fake-flows/m1_shape@1.yaml"; printf '\n'; } > "$d/padded.yaml"
+  { printf '\n'; cat "$d/fake-flows/m1_shape@1.yaml"; } > "$d/padded.yaml"
   mv "$d/padded.yaml" "$d/fake-flows/m1_shape@1.yaml"
   run_shape "$d" >/dev/null || fail "empty transport padding outside content must remain harmless"
   pass "revision verification preserves literal whitespace while allowing empty transport padding"
@@ -2012,6 +2022,117 @@ $MINIMAL_HEAD"
   pass "STRING validators count Unicode characters and exclude Java line terminators"
 }
 
+test_revision_verification_preserves_eof_newlines() {
+  local d ending out rc mutation file
+  for ending in newline no-newline blank-lines trailing-spaces; do
+    d=$(workdir "eof-$ending")
+    fixture_flow "$d" eof 'id: m1_shape
+namespace: firstmate.m1
+labels:
+  system.readOnly: "true"
+tasks:
+  - id: artifact
+    type: io.kestra.plugin.core.storage.Write
+    extension: .txt
+    content: |
+      x'
+    case "$ending" in
+      no-newline) printf '%s' "$(cat "$d/eof.yaml")" > "$d/source"; mv "$d/source" "$d/eof.yaml" ;;
+      blank-lines) printf '\n\n' >> "$d/eof.yaml" ;;
+      trailing-spaces) sed 's/      x$/      x  /' "$d/eof.yaml" > "$d/source"; mv "$d/source" "$d/eof.yaml" ;;
+    esac
+    check_fixture "$d" >/dev/null || fail "EOF fixture must be accepted: $ending"
+    cp "$ROOT/bin/fm-kestra-run.sh" "$d/repo/bin/"
+    cp "$d/eof.yaml" "$d/fake-flows/m1_shape@1.yaml"
+    rc=0
+    out=$(SEAM_VALIDATE_RESPONSE='[{"constraints":null}]' SEAM_ROUNDTRIP_UPLOADS=1 \
+      seam "$d" "$d/repo/bin/fm-kestra-deploy.sh" 2>&1) || rc=$?
+    expect_code 0 "$rc" "EOF bytes must survive the trimming upload endpoint: $ending: $out"
+    cp "$d/eof.yaml" "$d/expected"
+    [ "$ending" = no-newline ] || printf '# firstmate-source-end' >> "$d/expected"
+    for file in validate/0.trimmed.yaml firstmate.m1/0.trimmed.yaml; do
+      cmp -s "$d/expected" "$d/fake-flows/uploads/$file" \
+        || fail "multipart trimming changed artifact content: $ending: $file"
+    done
+    seam "$d" "$d/repo/bin/fm-kestra-run.sh" --flow m1_shape >/dev/null \
+      || fail "a faithfully deployed EOF scalar must run: $ending"
+    for mutation in missing-newline added-newline; do
+      case "$mutation" in
+        missing-newline) printf '%s' "$(cat "$d/eof.yaml")" > "$d/fake-flows/m1_shape@1.yaml" ;;
+        added-newline) { cat "$d/eof.yaml"; printf '\n'; } > "$d/fake-flows/m1_shape@1.yaml" ;;
+      esac
+      if cmp -s "$d/eof.yaml" "$d/fake-flows/m1_shape@1.yaml"; then continue; fi
+      : > "$d/curl.log"
+      rc=0
+      out=$(seam "$d" "$d/repo/bin/fm-kestra-run.sh" --flow m1_shape 2>&1) || rc=$?
+      expect_code 2 "$rc" "EOF source drift must refuse execution: $ending $mutation: $out"
+      assert_contains "$out" 'does not carry the reviewed source' "EOF mismatch must remain visible"
+      assert_no_grep '^POST ' "$d/curl.log" "EOF source drift must not create an execution"
+      rm -f "$d/home/data/kestra/revisions"
+      rc=0
+      out=$(SEAM_VALIDATE_RESPONSE='[{"constraints":null}]' \
+        seam "$d" "$d/repo/bin/fm-kestra-deploy.sh" 2>&1) || rc=$?
+      expect_code 2 "$rc" "EOF drift must refuse deployment verification: $ending $mutation: $out"
+      assert_absent "$d/home/data/kestra/revisions" "EOF drift must not record a verified revision"
+      SEAM_VALIDATE_RESPONSE='[{"constraints":null}]' SEAM_ROUNDTRIP_UPLOADS=1 \
+        seam "$d" "$d/repo/bin/fm-kestra-deploy.sh" >/dev/null || fail "restore verified revision"
+    done
+  done
+  d=$(workdir eof-unterminated-whitespace)
+  fixture_flow "$d" eof 'id: m1_shape
+namespace: firstmate.m1
+labels:
+  system.readOnly: "true"
+tasks:
+  - id: artifact
+    type: io.kestra.plugin.core.storage.Write
+    extension: .txt
+    content: |
+      x'
+  printf '%s  ' "$(cat "$d/eof.yaml")" > "$d/source"
+  mv "$d/source" "$d/eof.yaml"
+  rc=0
+  out=$(check_fixture "$d") || rc=$?
+  expect_code 2 "$rc" "unterminated trailing spaces cannot survive server trimming: $out"
+  assert_contains "$out" 'trailing whitespace at EOF requires a final newline' "unsafe EOF must explain the repair"
+  rc=0
+  out=$(seam "$d" "$d/repo/bin/fm-kestra-deploy.sh" 2>&1) || rc=$?
+  expect_code 2 "$rc" "unpreservable EOF whitespace must be refused before deployment: $out"
+  [ ! -s "$d/curl.log" ] || fail "unpreservable whitespace must never reach Kestra"
+  pass "EOF newlines survive multipart trimming and remain significant during revision verification"
+}
+
+test_integer_bounds_use_unambiguous_decimal_scalars() {
+  local d key bound out rc expected
+  for key in min max; do
+    for bound in 010 -010 00 -00 08 -08 0 -0 10 -10 2147483647 -2147483648; do
+      d=$(workdir "decimal-$key-$bound")
+      fixture_flow "$d" bounds "id: bounds
+namespace: firstmate.m1
+inputs:
+  - id: count
+    type: INT
+    $key: $bound
+$MINIMAL_HEAD"
+      expected=0
+      case "$bound" in 0[0-9]*|-0[0-9]*) expected=2 ;; esac
+      rc=0
+      out=$(check_fixture "$d") || rc=$?
+      expect_code "$expected" "$rc" "INT $key bound $bound must have one YAML/decimal meaning: $out"
+      if [ "$expected" = 2 ]; then
+        assert_contains "$out" 'without leading zeros' "ambiguous bound must name the refused form"
+        rc=0
+        out=$(seam "$d" "$d/repo/bin/fm-kestra-deploy.sh" 2>&1) || rc=$?
+        expect_code 2 "$rc" "ambiguous bounds must be refused before deployment: $out"
+        [ ! -s "$d/curl.log" ] || fail "ambiguous bounds must never reach Kestra"
+      fi
+    done
+  done
+  pass "INT bounds reject ambiguous leading zeros and retain signed decimal limits"
+}
+
+test_revision_verification_preserves_eof_newlines
+test_integer_bounds_use_unambiguous_decimal_scalars
 test_deploy_preserves_literal_document_separators
 test_request_urls_cannot_escape_the_role_path
 test_revision_verification_preserves_literal_whitespace

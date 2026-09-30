@@ -178,6 +178,12 @@ fm_kestra_ensure_flow_snapshot() {
 
 fm_kestra_parse_flow() {
   local file=$1 source=${2:-$1}
+  case "$(tail -c 1 "$file")" in
+    ' '|$'\t'|$'\r')
+      printf '%s: trailing whitespace at EOF requires a final newline\n' "$source" >&2
+      return 1
+      ;;
+  esac
   awk -v source="$source" '
     BEGIN {
       US = sprintf("%c", 31)
@@ -216,7 +222,7 @@ fm_kestra_parse_flow() {
     function is_ident(value) { return value ~ /^[A-Za-z0-9_-]+$/ }
     function is_text(value) { return value ~ TEXT_RE }
     function is_bool(value) { return value ~ /^(true|false)$/ }
-    function is_int(value) { return value ~ /^-?[0-9]+$/ }
+    function is_int(value) { return value ~ /^-?(0|[1-9][0-9]*)$/ }
     function is_select_value(value, lower) {
       if (value !~ /^[A-Za-z][A-Za-z0-9_ -]*$/) return 0
       if (value ~ /  / || value ~ / $/) return 0
@@ -380,7 +386,7 @@ fm_kestra_parse_flow() {
           if (!is_bool(value)) fail("input required must be true or false")
           input_required[input_count] = value
         } else if (key == "min" || key == "max") {
-          if (!is_int(value)) fail("input " key " must be an unquoted integer")
+          if (!is_int(value)) fail("input " key " must be an unquoted decimal integer without leading zeros")
           input_bound[input_count, key] = value
         } else if (key == "validator") {
           if (!is_validator(value)) {
@@ -912,20 +918,19 @@ fm_kestra_recorded_revision() {
   printf -v "$fkrr_blob_var" '%s' "$fkrr_blob"
 }
 
-# fm_kestra_normalize_source: stdin to stdout, with leading/trailing empty lines
-# dropped and all whitespace within source lines preserved.
 fm_kestra_normalize_source() {
-  awk '
-    { lines[NR] = $0; if ($0 != "") { last = NR; if (!first) first = NR } }
-    END { for (i = first; i <= last; i++) print lines[i] }
-  '
+  jq -Rsec 'sub("^\\n+"; "") | select(length > 0)'
+}
+
+fm_kestra_deploy_source() {
+  jq -Rsj 'if endswith("\n") then . + "# firstmate-source-end" else . end'
 }
 
 # fm_kestra_verify_revision_source <flow-id> <namespace> <revision> <snapshot-file>:
 # read the flow at that exact revision from Kestra and require its source to be the
 # reviewed HEAD bytes. Exit 1 on a transport or server failure, 2 on a mismatch.
 fm_kestra_verify_revision_source() {
-  local flow=$1 ns=$2 revision=$3 snapshot=$4 rc=0 response returned server_source expected
+  local flow=$1 ns=$2 revision=$3 snapshot=$4 rc=0 response returned server_source expected uploaded
   response=$(fm_kestra_request read GET "/flows/$ns/$flow?revision=$revision&source=true") || rc=$?
   if [ "$rc" -eq 2 ]; then
     exit 2
@@ -939,11 +944,13 @@ fm_kestra_verify_revision_source() {
   ' 2>/dev/null) || returned=""
   [ "$returned" = "$revision" ] \
     || fm_kestra_die "refused: Kestra did not return revision $revision of flow $ns/$flow"
-  server_source=$(printf '%s' "$response" | jq -r '.source | select(type == "string")' 2>/dev/null \
+  server_source=$(printf '%s' "$response" | jq -j '.source | select(type == "string")' 2>/dev/null \
     | fm_kestra_normalize_source) || server_source=""
   expected=$(fm_kestra_normalize_source < "$snapshot")
-  [ -n "$server_source" ] && [ "$server_source" = "$expected" ] \
-    || fm_kestra_die "refused: revision $revision of flow $ns/$flow does not carry the reviewed source; redeploy before running"
+  uploaded=$(fm_kestra_deploy_source < "$snapshot" | fm_kestra_normalize_source)
+  if [ -z "$server_source" ] || { [ "$server_source" != "$expected" ] && [ "$server_source" != "$uploaded" ]; }; then
+    fm_kestra_die "refused: revision $revision of flow $ns/$flow does not carry the reviewed source; redeploy before running"
+  fi
 }
 
 # --- private temporary files ------------------------------------------------
@@ -1148,7 +1155,7 @@ fm_kestra_request_to_file() {
 FM_KESTRA_DEPLOY_FILES=()
 
 fm_kestra_stage_deploy_files() {
-  local file
+  local file staged
   if [ "${#FM_KESTRA_DEPLOY_FILES[@]}" -gt 0 ]; then
     return 0
   fi
@@ -1160,7 +1167,11 @@ fm_kestra_stage_deploy_files() {
     fm_kestra_check_flow "$file" >/dev/null 2>&1 \
       || fm_kestra_die "refused: a snapshot flow failed validation and cannot be deployed"
   done
-  FM_KESTRA_DEPLOY_FILES=("${FM_KESTRA_SNAPSHOT_FILES[@]}")
+  for file in "${FM_KESTRA_SNAPSHOT_FILES[@]}"; do
+    fm_kestra_tempfile upload staged || fm_kestra_die "could not stage flow upload" 1
+    fm_kestra_deploy_source < "$file" > "$staged" || fm_kestra_die "could not encode flow upload" 1
+    FM_KESTRA_DEPLOY_FILES+=("$staged")
+  done
 }
 
 # fm_kestra_request <role> <method> <path> [structured payload...]
