@@ -322,6 +322,36 @@ ok - fm_backend_cmux_create_task: caller window controls duplicate refusal, crea
 ok - fm_backend_cmux_create_task: unresolved caller context refuses creation without falling back to the focused window
 ```
 
+Live verification on 2026-09-30 used the installed `cmux 0.64.25 (106) [b685a275c]`, one `fm-test-title-settle-0f866168` workspace, and a fresh git repository at `/private/tmp/fm-cmux-title-settle.ldU6nb`.
+With `FM_ROOT` and `FM_HOME` set to this test's source directory, no inherited `CMUX_WORKSPACE_ID`, and `FM_CMUX_TITLE_SETTLE_SECS` unset, the unchanged adapter used its default five-second window.
+Python's `time.monotonic()` timestamped Bash trace lines as they arrived: the first title lookup returned empty approximately 0.026 seconds after `new-workspace` returned, and the second found the workspace after one 250 ms sleep, approximately 0.422 seconds after creation returned.
+The complete `fm_backend_cmux_create_task` call took approximately 0.688 seconds; the 0.422-second observation includes lookup overhead and polling granularity, so it does not establish the exact instant the title became visible.
+The shell commands used for creation were:
+
+```bash
+export FM_ROOT="$PWD" FM_HOME="$PWD"
+unset FM_ROOT_OVERRIDE FM_CONFIG_OVERRIDE FM_CMUX_TITLE_SETTLE_SECS
+source bin/fm-backend.sh
+fm_backend_source cmux
+source tests/cmux-test-safety.sh
+fm_backend_cmux_version_check
+[ "$(fm_backend_cmux_ping_state)" = ok ]
+fm_backend_cmux_cli version
+REPO=$(mktemp -d /tmp/fm-cmux-title-settle.XXXXXX)
+REPO=$(cd "$REPO" && pwd -P)
+git -c init.templateDir= init -q "$REPO"
+LABEL=fm-test-title-settle-0f866168
+PS4='+ '
+set -x
+TASK_IDS=$(fm_backend_cmux_create_task "$LABEL" "$REPO")
+set +x
+```
+
+The adapter returned workspace `B7C38110-27B3-43C9-ADE1-D6364E8CB0F6` and surface `4DB2E3B5-38A1-4B76-A00E-1085034B1CAD`; a window-scoped `workspace list` confirmed the scoped title, and `fm_backend_cmux_surface_exists "$WSID" "$SFID"` succeeded.
+Cleanup ran `CMUX_WORKSPACE_ID="$WSID" cmux_safe_close_workspace "$WSID" "$LABEL"` exactly once through the loaded safety helper.
+The immediate removal assertion failed because the workspace was still listed, but a subsequent `fm_backend_cmux_cli workspace list --json --id-format uuids --window 13D7E12A-2E4C-42CD-AF9D-E731D31DF560` confirmed zero entries for that workspace and 38 total workspaces, matching the pre-test count, without another close call.
+The temporary repository was removed with `rm -rf -- "$REPO"` and its absence verified; no app quit, relaunch, or unrelated workspace close was performed.
+
 ## Workspace ids do not survive a relaunch (verified from source, not a live restart)
 
 Per this task's explicit instruction NOT to relaunch the captain's app just to test this, this was verified by reading the actual shipped Swift source instead (`Sources/Workspace.swift`, cloned read-only from `github.com/manaflow-ai/cmux` at the commit current on 2026-07-04):
