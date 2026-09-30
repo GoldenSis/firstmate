@@ -353,7 +353,7 @@ fm_backend_cmux_surface_id_for_workspace() {  # <workspace_id>
 # FM_CMUX_TITLE_SETTLE_SECS: non-negative whole seconds (default 5), polled
 # every 250 ms because a git cwd can delay title publication after creation.
 fm_backend_cmux_create_task() {  # <label> <cwd>
-  local label=$1 cwd=$2 title dup out wsid sfid before after cleanup win
+  local label=$1 cwd=$2 title dup out wsid sfid before after candidates win
   local settle=${FM_CMUX_TITLE_SETTLE_SECS:-5} attempts i
   case "$settle" in
     ''|*[!0-9]*) echo "error: FM_CMUX_TITLE_SETTLE_SECS must be non-negative whole seconds" >&2; return 1 ;;
@@ -392,25 +392,12 @@ fm_backend_cmux_create_task() {  # <label> <cwd>
     [ "$i" -ge "$attempts" ] || sleep 0.25
   done
   if [ -z "$wsid" ]; then
-    # Only one new cwd match is safe: list order is not proof of ownership
-    # when another caller concurrently creates a workspace in the same cwd.
     after=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$win" 2>/dev/null) || after=''
-    wsid=$(printf '%s' "$after" | jq -r --arg cwd "$cwd" --argjson before "$before" '
-      [.workspaces[]? | select(.current_directory == $cwd)
-        | select(.id as $id | $before | map(.id) | index($id) | not)]
-      | if length == 1 then .[0].id // empty else empty end' 2>/dev/null)
-    cleanup="workspace left open because the newly created workspace could not be identified unambiguously"
-    if [ -n "$wsid" ]; then
-      cleanup="workspace $wsid left open because cleanup failed or could not be verified"
-      if fm_backend_cmux_cli close-workspace --workspace "$wsid" --window "$win" >/dev/null 2>&1; then
-        after=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$win" 2>/dev/null) || after=''
-        if printf '%s' "$after" | jq -e --arg id "$wsid" '
-          .workspaces | select(type == "array") | all(.id != $id)' >/dev/null 2>&1; then
-          cleanup="closed newly created workspace $wsid"
-        fi
-      fi
-    fi
-    echo "error: could not resolve a cmux workspace id for '$title' after creation (${settle}s title settle window); $cleanup" >&2
+    candidates=$(printf '%s' "$after" | jq -ce --arg cwd "$cwd" --argjson before "$before" '
+      .workspaces | select(type == "array")
+      | map(select(.current_directory == $cwd)
+        | select(.id as $id | $before | map(.id) | index($id) | not) | .id)' 2>/dev/null) || candidates=unavailable
+    echo "error: could not resolve a cmux workspace id for '$title' after creation (${settle}s title settle window); all workspaces left untouched; candidate IDs in window $win (diagnostic hints only, not proof of ownership): $candidates; inspect manually before cleanup" >&2
     return 1
   fi
   sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")

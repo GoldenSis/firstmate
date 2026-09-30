@@ -84,7 +84,6 @@ if [ -f "$RESP/windows.out" ] && [ "${1:-}" != current-window ]; then
       printf '%s' "$updated" > "$RESP/window-$win.json"
       ;;
     close-workspace)
-      [ ! -f "$RESP/close-noop" ] || exit 0
       updated=$(jq --arg id "$wsid" '.workspaces |= map(select(.id != $id))' "$RESP/window-$win.json") || exit 1
       printf '%s' "$updated" > "$RESP/window-$win.json"
       ;;
@@ -573,45 +572,48 @@ test_create_task_waits_for_title() {
   pass "fm_backend_cmux_create_task: waits for the title to appear on the second poll"
 }
 
-test_create_task_title_timeout_cleanup() {
-  local dir fb out status scenario
-  for scenario in unique ambiguous close-failed close-noop; do
+test_create_task_title_timeout_leaves_workspaces_untouched() {
+  local dir fb out status scenario candidates log
+  for scenario in disappeared-owned unique multiple absent changed-owned failed-list malformed-list missing-list; do
     dir="$TMP_ROOT/create-timeout-$scenario"; mkdir -p "$dir/responses"
-    printf '{"workspaces":[{"id":"existing","title":"zsh","current_directory":"/tmp/proj"}]}' > "$dir/responses/1.out"
-    jq '.workspaces += [{id:"new-workspace",title:"zsh",current_directory:"/tmp/proj"}, {id:"unrelated",title:"zsh",current_directory:"/tmp/other"}]' \
+    printf '{"workspaces":[{"id":"existing","title":"zsh","current_directory":"/tmp/proj"},{"id":"existing-other","title":"zsh","current_directory":"/tmp/other"}]}' > "$dir/responses/1.out"
+    jq '(.workspaces[] | select(.id == "existing-other")).current_directory = "/tmp/proj"
+      | .workspaces += [{id:"new-workspace",title:"zsh",current_directory:"/tmp/proj"}, {id:"unrelated",title:"zsh",current_directory:"/tmp/other"}]' \
       "$dir/responses/1.out" > "$dir/responses/3.out"
-    if [ "$scenario" = ambiguous ]; then
-      jq '.workspaces += [{id:"concurrent",title:"zsh",current_directory:"/tmp/proj"}]' \
-        "$dir/responses/3.out" > "$dir/responses/4.out"
-    else
-      cp "$dir/responses/3.out" "$dir/responses/4.out"
-      # 5: close just the newly created workspace; 6: verify it disappeared.
-      cp "$dir/responses/1.out" "$dir/responses/6.out"
-      if [ "$scenario" = close-failed ]; then
-        printf '1' > "$dir/responses/5.exit"
-      elif [ "$scenario" = close-noop ]; then
-        cp "$dir/responses/3.out" "$dir/responses/6.out"
-      fi
-    fi
+    cp "$dir/responses/3.out" "$dir/responses/4.out"
+    case "$scenario" in
+      disappeared-owned|changed-owned|multiple)
+        jq --arg scenario "$scenario" '
+          if $scenario == "disappeared-owned" then .workspaces |= map(select(.id != "new-workspace"))
+          elif $scenario == "changed-owned" then (.workspaces[] | select(.id == "new-workspace")).current_directory = "/tmp/other"
+          else . end
+          | .workspaces += [{id:"concurrent",title:"zsh",current_directory:"/tmp/proj"}]' \
+          "$dir/responses/3.out" > "$dir/responses/4.out"
+        candidates='["concurrent"]'
+        [ "$scenario" != multiple ] || candidates='["new-workspace","concurrent"]'
+        ;;
+      unique) candidates='["new-workspace"]' ;;
+      absent)
+        jq '.workspaces |= map(select(.id != "new-workspace"))' "$dir/responses/3.out" > "$dir/responses/4.out"
+        candidates='[]'
+        ;;
+      failed-list) printf '1' > "$dir/responses/4.exit"; candidates=unavailable ;;
+      malformed-list) printf 'not-json' > "$dir/responses/4.out"; candidates=unavailable ;;
+      missing-list) printf '{}' > "$dir/responses/4.out"; candidates=unavailable ;;
+    esac
     fb=$(make_cmux_fakebin "$dir")
     out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" FM_CMUX_TITLE_SETTLE_SECS=0 \
       bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-test-timeout /tmp/proj' "$ROOT" 2>&1 )
     status=$?
-    expect_code 1 "$status" "title timeout should fail creation"
-    if [ "$scenario" != ambiguous ]; then
-      assert_contains "$(cat "$dir/log")" $'\x1fclose-workspace\x1f--workspace\x1fnew-workspace' "timeout must close only the new matching workspace"
-      [ "$(grep -c 'close-workspace' "$dir/log")" = 1 ] || fail "cleanup must close exactly one workspace"
-      if [ "$scenario" = unique ]; then
-        assert_contains "$out" 'closed newly created workspace' "timeout should report cleanup"
-      else
-        assert_contains "$out" 'left open because cleanup failed or could not be verified' "timeout must report unsuccessful cleanup"
-      fi
-    else
-      ! grep -q 'close-workspace' "$dir/log" || fail "ambiguous cleanup must not close any workspace"
-      assert_contains "$out" 'left open' "ambiguous cleanup must report the possible stray"
-    fi
+    log=$(cat "$dir/log")
+    expect_code 1 "$status" "title timeout should fail creation ($scenario)"
+    assert_not_contains "$log" $'\x1fclose-' "timeout must not close any workspace or surface ($scenario)"
+    assert_contains "$out" 'all workspaces left untouched' "timeout must report manual cleanup ($scenario)"
+    assert_contains "$out" "candidate IDs in window eeeeeeee-0000-0000-0000-000000000000 (diagnostic hints only, not proof of ownership): $candidates" \
+      "timeout must report only new cwd matches from the final snapshot ($scenario)"
+    [ "$(cat "$dir/responses/.count")" = 4 ] || fail "zero settle seconds must perform one title poll and one diagnostic list ($scenario)"
   done
-  pass "fm_backend_cmux_create_task: cleans up only an unambiguous new workspace on title timeout"
+  pass "fm_backend_cmux_create_task: timeout leaves every workspace untouched and reports diagnostic candidate IDs"
 }
 
 test_create_task_refuses_unreadable_snapshot() {
@@ -630,7 +632,7 @@ test_create_task_refuses_unreadable_snapshot() {
 test_create_task_pins_original_window() {
   local dir fb out status title scenario n log call
   local win=eeeeeeee-0000-0000-0000-000000000000
-  for scenario in cleanup close-noop delayed-title; do
+  for scenario in timeout delayed-title; do
     dir="$TMP_ROOT/create-window-switch-$scenario"; mkdir -p "$dir/responses"
     title=$(cmux_expected_scoped_title fm-test-window-switch)
     cmux_workspace_list_response "$dir" 1 original-existing zsh
@@ -640,45 +642,35 @@ test_create_task_pins_original_window() {
     jq '.workspaces += [{id:"new-workspace",title:"zsh",current_directory:"/tmp/proj"}]' \
       "$dir/responses/1.out" > "$dir/responses/3.$win.out"
     cp "$dir/responses/3.$win.out" "$dir/responses/4.$win.out"
-    cmux_workspace_list_response "$dir" 6
     if [ "$scenario" = delayed-title ]; then
       jq --arg title "$title" '(.workspaces[] | select(.id == "new-workspace")).title = $title' \
         "$dir/responses/3.$win.out" > "$dir/responses/4.$win.out"
       cmux_panes_response "$dir" 5 new-surface
-    elif [ "$scenario" = close-noop ]; then
-      cp "$dir/responses/3.$win.out" "$dir/responses/6.$win.out"
-    else
-      cp "$dir/responses/1.out" "$dir/responses/6.$win.out"
     fi
     fb=$(make_cmux_fakebin "$dir")
     out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" FM_CMUX_TITLE_SETTLE_SECS=1 \
       bash -c '. "$0/bin/backends/cmux.sh"; [ "$1" = delayed-title ] || FM_CMUX_TITLE_SETTLE_SECS=0; fm_backend_cmux_create_task fm-test-window-switch /tmp/proj' "$ROOT" "$scenario" 2>&1 )
     status=$?
     log=$(cat "$dir/log")
-    assert_not_contains "$log" $'\x1fclose-workspace\x1f--workspace\x1fother-window-existing' \
-      "window switching must never close existing work in the other window"
+    assert_not_contains "$log" $'\x1fclose-' "window switching must never close any workspace or surface"
     if [ "$scenario" = delayed-title ]; then
       expect_code 0 "$status" "title polling should stay in the original window"
       [ "$out" = 'new-workspace new-surface' ] || fail "should resolve the original window's workspace and surface"
-      assert_not_contains "$log" $'\x1fclose-workspace' "published title must not trigger cleanup"
     else
       expect_code 1 "$status" "title timeout should fail creation after a window switch"
-      assert_contains "$log" $'\x1fclose-workspace\x1f--workspace\x1fnew-workspace' "must clean up the original window's new workspace"
-      [ "$(grep -c 'close-workspace' "$dir/log")" = 1 ] || fail "must close exactly one new workspace"
-      if [ "$scenario" = close-noop ]; then
-        assert_contains "$out" 'left open because cleanup failed or could not be verified' "must verify cleanup in the original window"
-      else
-        assert_contains "$out" 'closed newly created workspace new-workspace' "must report verified cleanup"
-      fi
+      assert_contains "$out" 'all workspaces left untouched' "timeout must leave manual cleanup to the caller"
+      assert_contains "$out" "candidate IDs in window $win (diagnostic hints only, not proof of ownership): [\"new-workspace\"]" \
+        "diagnostics must identify only candidates in the original window"
+      assert_not_contains "$out" 'other-window-existing' "diagnostics must exclude workspaces in the other window"
     fi
     [ "$(grep -c 'current-window' "$dir/log")" = 1 ] || fail "must resolve the original window exactly once"
-    for n in workspace new-workspace close-workspace; do
+    for n in workspace new-workspace; do
       while IFS= read -r call; do
-        assert_contains "$call" $'\x1f--window\x1f'"$win" "every creation and cleanup call must use the original window"
+        assert_contains "$call" $'\x1f--window\x1f'"$win" "every creation, polling and diagnostic call must use the original window"
       done < <(awk -F $'\x1f' -v cmd="$n" '$2 == cmd' "$dir/log")
     done
   done
-  pass "fm_backend_cmux_create_task: window switching preserves unrelated work and pins title polling and cleanup verification"
+  pass "fm_backend_cmux_create_task: window switching preserves all workspaces and pins title polling and timeout diagnostics"
 }
 
 test_create_task_refuses_unknown_window() {
@@ -709,7 +701,7 @@ test_create_task_preserves_caller_window() {
   local caller=aaaaaaaa-0000-0000-0000-000000000000
   local win=eeeeeeee-0000-0000-0000-000000000000
   local focused=ffffffff-0000-0000-0000-000000000000
-  for scenario in duplicate success cleanup close-noop; do
+  for scenario in duplicate success timeout; do
     dir="$TMP_ROOT/create-caller-window-$scenario"; mkdir -p "$dir/responses"
     title=$(cmux_expected_scoped_title fm-test-caller)
     cmux_windows_response "$dir" windows "$focused" 1 "$win" 1
@@ -720,10 +712,7 @@ test_create_task_preserves_caller_window() {
     focused_before=$(jq -n --arg win "$focused" \
       '{window_id:$win,workspaces:[{id:"other-window-existing",title:"zsh",current_directory:"/tmp/proj"}]}')
     printf '%s' "$focused_before" > "$dir/responses/window-$focused.json"
-    case "$scenario" in
-      cleanup|close-noop) touch "$dir/responses/unpublished" ;;
-    esac
-    [ "$scenario" != close-noop ] || touch "$dir/responses/close-noop"
+    [ "$scenario" != timeout ] || touch "$dir/responses/unpublished"
     fb=$(make_cmux_fakebin "$dir")
     out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" CMUX_WORKSPACE_ID="$caller" FM_CMUX_TITLE_SETTLE_SECS=0 \
       bash -c '. "$0/bin/backends/cmux.sh"
@@ -735,6 +724,7 @@ test_create_task_preserves_caller_window() {
         fi' "$ROOT" "$scenario" 2>&1 )
     status=$?
     log=$(cat "$dir/log")
+    assert_not_contains "$log" $'\x1fclose-' "creation must never close any workspace or surface"
     case "$scenario" in
       duplicate)
         expect_code 1 "$status" "must refuse a duplicate in the caller's window while another window is focused"
@@ -746,24 +736,23 @@ test_create_task_preserves_caller_window() {
         [ "$out" = 'new-workspace new-surface' ] || fail "must return the new task's workspace and surface"
         jq -e 'any(.workspaces[]; .id == "new-workspace")' "$dir/responses/window-$win.json" >/dev/null || fail "task must be created in the caller's window"
         ;;
-      cleanup|close-noop)
+      timeout)
         expect_code 1 "$status" "title timeout must fail creation in the caller's window"
-        assert_contains "$log" $'\x1fclose-workspace\x1f--workspace\x1fnew-workspace' "must clean up only the caller window's new workspace"
-        [ "$(grep -c 'close-workspace' "$dir/log")" = 1 ] || fail "cleanup must close exactly one workspace"
-        if [ "$scenario" = cleanup ]; then
-          assert_contains "$out" 'closed newly created workspace new-workspace' "must verify cleanup in the caller's window"
-        else
-          assert_contains "$out" 'left open because cleanup failed or could not be verified' "must detect ineffective cleanup in the caller's window"
-        fi
+        assert_contains "$out" 'all workspaces left untouched' "timeout must report manual cleanup in the caller's window"
+        assert_contains "$out" "candidate IDs in window $win (diagnostic hints only, not proof of ownership): [\"new-workspace\"]" \
+          "diagnostics must identify only candidates in the caller's window"
+        assert_not_contains "$out" 'other-window-existing' "diagnostics must exclude workspaces in the focused window"
+        jq -e --arg caller "$caller" '.workspaces | length == 2 and any(.[]; .id == "new-workspace") and any(.[]; .id == $caller)' \
+          "$dir/responses/window-$win.json" >/dev/null || fail "timeout must leave both caller and new workspace open"
         ;;
     esac
     [ "$(cat "$dir/responses/window-$focused.json")" = "$focused_before" ] || fail "must preserve existing work in the focused window"
     assert_not_contains "$log" $'\x1fcurrent-window' "caller context must take precedence over the focused window"
     while IFS= read -r call; do
-      assert_contains "$call" $'\x1f--window\x1f'"$win" "creation and cleanup must use the caller's window"
-    done < <(awk -F $'\x1f' '$2 == "new-workspace" || $2 == "close-workspace"' "$dir/log")
+      assert_contains "$call" $'\x1f--window\x1f'"$win" "creation must use the caller's window"
+    done < <(awk -F $'\x1f' '$2 == "new-workspace"' "$dir/log")
   done
-  pass "fm_backend_cmux_create_task: caller window controls duplicate refusal, creation, task lookup and timeout cleanup"
+  pass "fm_backend_cmux_create_task: caller window controls duplicate refusal, creation, task lookup and timeout diagnostics"
 }
 
 test_create_task_refuses_unknown_caller_window() {
@@ -1330,7 +1319,7 @@ test_ensure_running_fails_fast_on_unauth_without_launching
 test_create_task_refuses_duplicate_label
 test_create_task_creates_and_parses_ids
 test_create_task_waits_for_title
-test_create_task_title_timeout_cleanup
+test_create_task_title_timeout_leaves_workspaces_untouched
 test_create_task_refuses_unreadable_snapshot
 test_create_task_pins_original_window
 test_create_task_refuses_unknown_window
