@@ -342,16 +342,21 @@ fm_backend_cmux_surface_id_for_workspace() {  # <workspace_id>
 }
 
 # fm_backend_cmux_create_task: create the task's workspace (one surface),
-# refusing an existing live <label> (finding #6: cmux enforces no uniqueness
-# itself). Resolves the fresh workspace's default surface via one list-panes
-# call (finding: a freshly created workspace already has exactly one surface,
-# so no separate new-surface call is needed). --focus false is passed for
-# defense in depth though verified to already be the default (finding:
-# workspace/surface/pane create all default focus to false) - no
-# focus-restore dance is needed, unlike zellij. Echoes "<workspace_id>
-# <surface_id>" on success.
-# FM_CMUX_TITLE_SETTLE_SECS: non-negative whole seconds (default 5), polled
-# every 250 ms because a git cwd can delay title publication after creation.
+# refusing an existing home-scoped title in the chosen window (finding #6:
+# cmux enforces no uniqueness itself). Resolves the fresh workspace's default
+# surface via one list-panes call (finding: a freshly created workspace already
+# has exactly one surface, so no separate new-surface call is needed).
+# --focus false is passed for defense in depth though verified to already be
+# the default (finding: workspace/surface/pane create all default focus to
+# false) - no focus-restore dance is needed, unlike zellij. Echoes
+# "<workspace_id> <surface_id>" on success.
+# docs/cmux-backend.md "Workspace titles can settle after creation" owns
+# window selection, pre-create snapshot requirements and timeout diagnostics.
+# FM_CMUX_TITLE_SETTLE_SECS: non-negative whole seconds (unset/empty: 5).
+# One immediate title lookup plus up to 4 * FM_CMUX_TITLE_SETTLE_SECS retries,
+# separated by 250 ms sleeps; 0 disables retries. CLI runtime is additional,
+# so this is a sleep budget, not a wall-clock deadline. Nonempty invalid values
+# fail before any cmux call. A git cwd can delay title publication after creation.
 fm_backend_cmux_create_task() {  # <label> <cwd>
   local label=$1 cwd=$2 title dup out wsid sfid before after candidates win
   local settle=${FM_CMUX_TITLE_SETTLE_SECS:-5} attempts i
