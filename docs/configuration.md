@@ -104,6 +104,20 @@ An absent file means `auto`, i.e. default-on on macOS: the alarm exists precisel
 A missing or failing channel logs and falls through to the next, never crashing the daemon.
 See [`wedge-alarm.md`](wedge-alarm.md) for the channel reference and macOS verification evidence, and [`examples/wedge-alarm`](examples/wedge-alarm) for a copyable config.
 
+## Kestra execution seam (config/kestra.env)
+
+`config/kestra.env` (local, gitignored) carries the loopback endpoint, tenant, the one allow-listed namespace, and the Basic Auth identity for the Kestra seam.
+It is home-local and is never inherited or propagated to a secondmate home.
+Real endpoint and credential values stay local; [`examples/kestra-env`](examples/kestra-env) is the copyable shape and [`kestra-seam.md`](kestra-seam.md) owns the seam's rationale, workflow, boundaries, and deferred decisions.
+The config path resolves from non-empty `FM_KESTRA_CONFIG`, then `$FM_CONFIG_OVERRIDE/kestra.env`, then `$FM_HOME/config/kestra.env`, with the scripts' code root as the default home.
+Non-empty environment values override the five file keys shown in the example, so the file is optional when those values are supplied externally.
+`bin/fm-kestra-lib.sh` owns the exact file syntax, permission checks, value defaults, credential handling, and endpoint validation.
+Without a configured endpoint and namespace, network operations refuse; `bin/fm-kestra-deploy.sh --check` and the entrypoints' `--help` remain available offline.
+`FM_KESTRA_TIMEOUT_S` is an environment-only request timeout in seconds, defaulting to 30; adding it to `kestra.env` has no effect.
+`$FM_HOME/data/kestra/revisions` (local, gitignored with the rest of `data/`) is the deployed-revision record the deploy script writes and the run adapter binds to; `bin/fm-kestra-lib.sh` owns its format, and a run refuses when it is absent or stale.
+The record always uses the effective home; `FM_DATA_OVERRIDE` does not relocate it.
+Flow sources always come from `kestra/flows/` beside the scripts, independently of `FM_HOME` and `FM_ROOT_OVERRIDE`.
+
 ## Gate defaults (.no-mistakes.yaml)
 
 The tracked `.no-mistakes.yaml` keeps test evidence outside the repo and defines `commands.test` so no-mistakes runs firstmate's bash behavior suite directly.
@@ -486,6 +500,7 @@ README.md            public overview and development notes
 .claude/skills       symlink to .agents/skills for claude compatibility
 skills/              standalone public installer-facing skills, committed; not loaded by firstmate
 bin/                 helper scripts, committed; read each script's header before first use
+kestra/flows/        shared static flow sources, committed; see docs/kestra-seam.md
 docker-compose.buzz-loopback.yml  loopback-only Buzz relay stack for the additive fleet and per-crew bearings publisher, committed; the running instance is disposable (docs/buzz-loopback-adapter.md)
 .env                 optional X-mode pairing token; LOCAL, gitignored; presence-gates section 14
 config/crew-harness  crewmate harness override; LOCAL, gitignored; absent or "default" = same as firstmate. Inherited as the literal file: a concrete primary adapter value also controls a secondmate home's own crewmates (section 4)
@@ -495,9 +510,11 @@ config/backlog-backend  backlog backend override; LOCAL, gitignored; absent or "
 config/backend  runtime session-provider backend override for new tasks; LOCAL, gitignored; absent = falls through to runtime auto-detection (the runtime firstmate itself is executing inside), then tmux; tmux is the verified reference backend (docs/tmux-backend.md), while herdr, zellij, orca, and cmux are experimental spawn backends (docs/herdr-backend.md, docs/zellij-backend.md, docs/orca-backend.md, docs/cmux-backend.md) - herdr and cmux can also be selected by runtime auto-detection, zellij and orca never are (always explicit), and codex-app is not accepted; see docs/codex-app-backend.md; not inherited into secondmate homes
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
+config/kestra.env   loopback Kestra endpoint, namespace, and Basic Auth identity; LOCAL, gitignored, mode 0600; never inherited or propagated to secondmate homes
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
 data/                personal fleet records; LOCAL, gitignored as a whole
   backlog.md         task queue, dependencies, history
+  kestra/revisions   deployed Kestra flow revisions verified against reviewed HEAD blobs; written only by bin/fm-kestra-deploy.sh, read by bin/fm-kestra-run.sh; home-local
   captain.md         this home's domain-local captain preferences and working style; LOCAL, gitignored, canonical even if harness memory mirrors it, and updated with inspect-then-update
   captain-shared.md  main-authoritative shared captain preferences propagated read-only to secondmate homes; LOCAL, gitignored, owned by secondmate-provisioning
   learnings.md       fleet-local operational facts and gotchas; LOCAL, gitignored; dated, evidence-backed, curated, and updated with inspect-then-update - rewrite and prune rather than append forever, the same contract as captain.md; created lazily, absent until this home has a learning to store

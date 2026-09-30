@@ -12,10 +12,15 @@
 # tests/cmux-test-safety.sh's guarded close. The adapter turns those plain
 # labels into home-scoped cmux workspace titles internally.
 #
-# Skips cleanly when cmux (or jq) is not installed/reachable, so CI/dev
-# machines without cmux, or without the one-time password-mode setup
-# (docs/cmux-backend.md "Setup"), are unaffected.
+# Opt in with FM_CMUX_LIVE=1: a portable test run must not depend on or
+# modify the shared desktop app. Also skips cleanly when cmux (or jq) is
+# not installed/reachable (docs/cmux-backend.md "Setup").
 set -u
+
+if [ "${FM_CMUX_LIVE:-0}" != 1 ]; then
+  echo "skip: set FM_CMUX_LIVE=1 to run the shared-app cmux smoke test"
+  exit 0
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

@@ -96,3 +96,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-buzz-lib.mjs`        | NIP-01 event construction and the loopback Buzz relay client                          |
 | `fm-buzz-crypto.mjs`     | Dependency-free BIP-340 Schnorr signing over secp256k1 for the Buzz adapter          |
 | `fm-buzz-targets.mjs`    | Durable Buzz target, relay-authority, and compromised-recovery registries             |
+| `fm-kestra-lib.sh`       | Own the Kestra seam's config, loopback rule, static-flow grammar, input validation, revision record, and role-gated HTTP |
+| `fm-kestra-deploy.sh`    | Validate tracked `kestra/flows/`, update the one allow-listed namespace with deletion disabled, verify and record each deployed revision |
+| `fm-kestra-run.sh`       | Launch one execution of one allow-listed flow at its recorded revision with typed inputs; print the opaque execution id |
+| `fm-kestra-status.sh`    | Read-only Kestra evidence: execution state, task logs, task outputs, replay lineage, declared artifacts |
