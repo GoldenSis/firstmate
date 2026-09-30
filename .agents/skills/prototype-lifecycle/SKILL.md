@@ -30,6 +30,9 @@ If the question genuinely requires one of those boundaries, stop and use an exis
 
 The surviving report must capture the registered question, classification, assumptions, alternatives, observed evidence, chosen decision, rejected options, unresolved risks, and expiry or disposal expectation.
 A logic-state report must also state whether it reproduced a failure and therefore creates a regression-test obligation.
+For `logic-state`, retain the validated artifact at report-only completion on the throwaway branch `proto/<task-id>` through `bin/fm-prototype.sh`, which records its branch and commit independently of promotion.
+Keep only the decision-bearing artifact on that branch; remove credentials, debug artifacts, ignored residue, and unrelated experiment state before completion.
+Completion retries verify the same artifact, and evidence updates preserve its recorded identity.
 Use `bin/fm-prototype.sh` for registration, worktree binding, evidence completion, verification, and promotion preparation.
 Its header and help own command syntax, manifest schema, exact evidence headings, digest rules, idempotency, and clean-worktree checks.
 
@@ -40,11 +43,10 @@ The decision-hold lifecycle remains the only owner of unresolved captain decisio
 
 A completed prototype still stops as knowledge-only work unless implementation is separately authorized.
 When implementation is authorized, preserve the validated decision in the durable prototype record.
-For `logic-state`, retain the validated artifact on the throwaway branch `proto/<task-id>` and prepare promotion with `bin/fm-prototype.sh`, which records the branch and commit in `data/<task-id>/prototype.json`.
-Keep only the decision-bearing artifact on that branch; remove credentials, debug artifacts, ignored residue, and unrelated experiment state before preparation.
+For `logic-state`, promotion preparation verifies the artifact recorded at completion.
 For `ui`, remove all scratch code and commits, fixtures, credentials, debug artifacts, ignored residue, and other experiment state, and prepare promotion from the registered clean baseline; the report remains the surviving record.
 `bin/fm-promote.sh` verifies that preparation and restores the clean baseline before changing the scout into a ship task, excluding any retained artifact from the ship branch.
-Teardown preserves the recorded logic-state branch for consultation under the report's expiry or disposal expectation.
+Teardown verifies and preserves the recorded logic-state branch before and after promotion for consultation under the report's expiry or disposal expectation; a missing, renamed, or moved reference blocks cleanup.
 
 Implement the validated decision afresh on the normal ship branch and follow the project's existing selected delivery path with its normal tests and review.
 Do not copy the prototype wholesale or treat a working experiment as production readiness.

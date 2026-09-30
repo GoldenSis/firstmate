@@ -31,6 +31,8 @@
 # unresolved-decision completion gate verifies its captain-held inventory.
 # A scout marked by data/<task-id>/prototype.json must also pass the prototype
 # evidence and digest verification owned by fm-prototype.sh before teardown.
+# Marked tasks, including promoted ships, must pass its retained-branch check
+# before cleanup; a missing or moved logic-state artifact ref refuses teardown.
 # Before destructive cleanup, teardown validates task check artifacts and any
 # matching quarantine entries as ordinary single-link files on the state
 # device. It refuses and preserves task state when that proof fails; otherwise
@@ -1094,10 +1096,12 @@ fi
 
 # Keep the recorded logic-state artifact; all other task branches remain disposable.
 RETAINED_PROTOTYPE_BRANCH=
-if [ -f "$DATA/$ID/prototype.json" ]; then
-  RETAINED_PROTOTYPE_BRANCH=$(jq -r '
-    select(.class == "logic-state") | .promotion.retained_artifact.branch // empty
-  ' "$DATA/$ID/prototype.json")
+if [ -e "$DATA/$ID/prototype.json" ] || [ -L "$DATA/$ID/prototype.json" ]; then
+  if ! RETAINED_PROTOTYPE_BRANCH=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" \
+      "$SCRIPT_DIR/fm-prototype.sh" retained-branch "$ID" "$WT"); then
+    echo "REFUSED: prototype $ID has no verified retained artifact; preserving task and worktree." >&2
+    exit 1
+  fi
 fi
 
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.

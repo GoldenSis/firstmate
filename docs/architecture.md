@@ -131,7 +131,7 @@ Scout teardown additionally requires `fm-prototype.sh verify`, and `fm-promote.s
 The [`prototype-lifecycle` skill](../.agents/skills/prototype-lifecycle/SKILL.md) owns the policy overlay, while `bin/fm-prototype.sh`'s header owns the manifest schema, evidence headings, and idempotency rules; prototype code stays evidence, and the promoted ship task implements the validated decision afresh through the project's normal delivery path.
 
 The captain's 2026-09-30 decision (Wayfinder review, section 7 Question 3, option 3; roadmap row 19) retains decision-bearing logic-state artifacts as primary evidence while UI prototypes continue to leave only their report.
-The prototype lifecycle skill owns that two-way policy; the manifest links the retained branch and commit, promotion restores the registered clean baseline, and cleanup leaves the retained branch intact.
+The prototype lifecycle skill owns that two-way policy; completion records the retained branch and commit independently of implementation authorization, evidence updates preserve that identity, promotion restores the registered clean baseline, and cleanup verifies the recorded reference before preserving it, including after promotion.
 
 ## Dispatch profiles
 
