@@ -1092,6 +1092,14 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
+# Keep the recorded logic-state artifact; all other task branches remain disposable.
+RETAINED_PROTOTYPE_BRANCH=
+if [ -f "$DATA/$ID/prototype.json" ]; then
+  RETAINED_PROTOTYPE_BRANCH=$(jq -r '
+    select(.class == "logic-state") | .promotion.retained_artifact.branch // empty
+  ' "$DATA/$ID/prototype.json")
+fi
+
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then
@@ -1102,7 +1110,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
     if [ "$branch" != "HEAD" ]; then
       if git -C "$WT" checkout --detach -q 2>/dev/null; then
-        git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
+        [ "$branch" = "$RETAINED_PROTOTYPE_BRANCH" ] || git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
       fi
     fi
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
@@ -1113,7 +1121,7 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
   if [ "$branch" != "HEAD" ]; then
     if git -C "$WT" checkout --detach -q 2>/dev/null; then
-      git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
+      [ "$branch" = "$RETAINED_PROTOTYPE_BRANCH" ] || git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
     fi
   fi
   # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.

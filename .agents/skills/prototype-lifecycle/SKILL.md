@@ -39,8 +39,12 @@ The decision-hold lifecycle remains the only owner of unresolved captain decisio
 ## Promotion
 
 A completed prototype still stops as knowledge-only work unless implementation is separately authorized.
-When implementation is authorized, preserve the validated decision in the durable prototype record, remove all scratch code and commits, fixtures, credentials, debug artifacts, ignored residue, and other experiment state, and prepare promotion from the registered clean baseline.
-`bin/fm-promote.sh` verifies that preparation before changing the scout into a ship task.
+When implementation is authorized, preserve the validated decision in the durable prototype record.
+For `logic-state`, retain the validated artifact on the throwaway branch `proto/<task-id>` and prepare promotion with `bin/fm-prototype.sh`, which records the branch and commit in `data/<task-id>/prototype.json`.
+Keep only the decision-bearing artifact on that branch; remove credentials, debug artifacts, ignored residue, and unrelated experiment state before preparation.
+For `ui`, remove all scratch code and commits, fixtures, credentials, debug artifacts, ignored residue, and other experiment state, and prepare promotion from the registered clean baseline; the report remains the surviving record.
+`bin/fm-promote.sh` verifies that preparation and restores the clean baseline before changing the scout into a ship task, excluding any retained artifact from the ship branch.
+Teardown preserves the recorded logic-state branch for consultation under the report's expiry or disposal expectation.
 
 Implement the validated decision afresh on the normal ship branch and follow the project's existing selected delivery path with its normal tests and review.
 Do not copy the prototype wholesale or treat a working experiment as production readiness.

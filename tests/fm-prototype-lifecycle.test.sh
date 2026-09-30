@@ -17,6 +17,7 @@ PROMOTE="$ROOT/bin/fm-promote.sh"
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 TMP_ROOT=$(fm_test_tmproot fm-prototype)
+trap 'rm -rf "$TMP_ROOT"' EXIT
 
 setup_case() {
   local id=$1 class=$2 question=$3 injected_hook=${4:-}
@@ -77,7 +78,7 @@ Choose alternative A because the observed transition remained deterministic.
 
 ### Expiry or disposal
 
-Discard all experiment state at promotion or scout teardown.
+Dispose of UI scratch at promotion; retain decision-bearing logic-state evidence until the decision expires.
 
 ### Regression-test obligation
 
@@ -185,6 +186,7 @@ test_registration_completion_and_preparation_are_idempotent() {
   after=$(sha256_file "$CASE_HOME/data/$id/prototype.json")
   [ "$before" = "$after" ] || fail "identical completion retry changed manifest bytes"
 
+  git -C "$CASE_WT" checkout -qb "proto/$id"
   FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null
   before=$(sha256_file "$CASE_HOME/data/$id/prototype.json")
   FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null
@@ -217,10 +219,10 @@ test_sensitive_defaults_have_no_worker_bypass() {
   pass "fm-prototype.sh: sensitive boundaries are immutable and expose no worker bypass"
 }
 
-test_promotion_rejects_scratch_and_ignored_residue() {
-  local id=hygiene question='Which state representation survives retries?' rc baseline exclude
-  setup_case "$id" logic-state "$question" with-hook
-  write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
+test_ui_promotion_rejects_scratch_and_ignored_residue() {
+  local id=hygiene question='Which layout exposes retries?' rc baseline exclude
+  setup_case "$id" ui "$question" with-hook
+  write_report "$id" "$question" ui 'not-required: no failure was reproduced'
   FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null
 
   printf 'debug\n' > "$CASE_WT/debug.log"
@@ -241,17 +243,115 @@ test_promotion_rejects_scratch_and_ignored_residue() {
   printf '{}\n' > "$CASE_WT/.claude/settings.local.json"
 
   baseline=$(git -C "$CASE_WT" rev-parse HEAD)
+  git -C "$CASE_WT" checkout -qb "proto/$id"
   printf '# scratch\n' >> "$CASE_WT/README.md"
   git -C "$CASE_WT" add README.md
   git -C "$CASE_WT" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
     commit -qm scratch
   FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
-  [ "$rc" -ne 0 ] || fail "promotion preparation accepted a scratch commit"
+  [ "$rc" -ne 0 ] || fail "UI preparation accepted a scratch commit on a prototype branch"
+  touch "$CASE_HOME/state/.last-watcher-beat"
+  fm_write_meta "$CASE_HOME/state/$id.meta" \
+    "window=w:$id" "worktree=$CASE_WT" "project=$CASE_REPO" "kind=scout"
+  FM_HOME="$CASE_HOME" FM_ROOT_OVERRIDE="$ROOT" "$PROMOTE" "$id" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "UI promotion accepted retained scratch"
+  assert_grep 'kind=scout' "$CASE_HOME/state/$id.meta" "refused UI promotion changed task kind"
   git -C "$CASE_WT" checkout --detach -q "$baseline"
 
   FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null
   FM_HOME="$CASE_HOME" "$PROTOTYPE" promotion-verify "$id" "$CASE_WT" >/dev/null
-  pass "fm-prototype.sh: promotion rejects scratch state while allowing only the known injected hook"
+  pass "fm-prototype.sh: UI promotion rejects scratch state while allowing only the known injected hook"
+}
+
+test_logic_promotion_retains_artifact_off_ship_branch() {
+  local id=retained question='Does the reducer preserve retry order?' baseline artifact manifest before rc backend fakebin
+  setup_case "$id" logic-state "$question" with-hook
+  baseline=$(git -C "$CASE_WT" rev-parse HEAD)
+  git -C "$CASE_WT" checkout -qb "proto/$id"
+  printf 'queued -> retry -> completed\n' > "$CASE_WT/reducer.txt"
+  git -C "$CASE_WT" add reducer.txt
+  git -C "$CASE_WT" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm 'Prototype reducer'
+  artifact=$(git -C "$CASE_WT" rev-parse HEAD)
+  write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null \
+    || fail "logic-state preparation refused the clean retained artifact"
+  manifest="$CASE_HOME/data/$id/prototype.json"
+  jq -e --arg branch "proto/$id" --arg commit "$artifact" \
+    '.promotion.retained_artifact == {branch: $branch, commit: $commit}' "$manifest" >/dev/null \
+    || fail "promotion did not record the retained artifact branch and commit"
+  before=$(sha256_file "$manifest")
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null
+  [ "$before" = "$(sha256_file "$manifest")" ] || fail "retention preparation was not idempotent"
+
+  printf 'debug\n' > "$CASE_WT/debug.log"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" promotion-verify "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "retention accepted untracked scratch"
+  rm "$CASE_WT/debug.log"
+  printf '{"changed":true}\n' > "$CASE_WT/.claude/settings.local.json"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" promotion-verify "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "retention accepted modified ignored residue"
+  printf '{}\n' > "$CASE_WT/.claude/settings.local.json"
+
+  git -C "$CASE_WT" checkout --detach -q "$baseline"
+  git -C "$CASE_WT" branch -f "proto/$id" "$baseline" >/dev/null
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" promotion-verify "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "retention accepted a moved artifact branch"
+  git -C "$CASE_WT" branch -f "proto/$id" "$artifact" >/dev/null
+  git -C "$CASE_WT" checkout -q "proto/$id"
+
+  touch "$CASE_HOME/state/.last-watcher-beat"
+  fm_write_meta "$CASE_HOME/state/$id.meta" \
+    "window=w:$id" "worktree=$CASE_WT" "project=$CASE_REPO" \
+    "harness=echo" "kind=scout" "mode=no-mistakes" "yolo=off"
+  FM_HOME="$CASE_HOME" FM_ROOT_OVERRIDE="$ROOT" "$PROMOTE" "$id" >/dev/null \
+    || fail "logic-state promotion failed"
+  [ "$(git -C "$CASE_WT" rev-parse HEAD)" = "$baseline" ] \
+    || fail "ship task did not start at the clean baseline"
+  assert_absent "$CASE_WT/reducer.txt" "retained scratch reached the promoted worktree"
+  git -C "$CASE_WT" checkout -qb "fm/$id"
+  if git -C "$CASE_WT" merge-base --is-ancestor "$artifact" HEAD; then
+    fail "retained prototype commit reached the ship branch"
+  fi
+  [ "$(git -C "$CASE_REPO" rev-parse "proto/$id")" = "$artifact" ] \
+    || fail "promotion lost the retained prototype branch"
+  # Exercise both teardown worktree owners with hermetic runtime shims.
+  fakebin=$(fm_fakebin "$CASE_HOME")
+  fm_fake_exit0 "$fakebin" tmux treehouse
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  --version) echo 'tasks-axi 0.2.2' ;;
+  'update --help') echo '--archive-body' ;;
+  'mv --help') echo '[<id>...]' ;;
+  'hold --help') echo '--kind captain' ;;
+  *) exit 1 ;;
+esac
+SH
+  cat > "$fakebin/orca" <<'SH'
+#!/usr/bin/env bash
+case "$1 $2" in
+  'worktree show') jq -n --arg path "$PROTOTYPE_TEST_WT" '{result: {path: $path}}' ;;
+  'worktree rm') printf '{"ok":true}\n' ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/tasks-axi" "$fakebin/orca"
+  for backend in tmux orca; do
+    git -C "$CASE_WT" checkout -q "proto/$id"
+    fm_write_meta "$CASE_HOME/state/$id.meta" \
+      "window=w:$id" "worktree=$CASE_WT" "project=$CASE_REPO" \
+      "kind=scout" "backend=$backend" "orca_worktree_id=fixture" \
+      'decisions_reviewed=1' 'decision_keys='
+    PATH="$fakebin:$PATH" PROTOTYPE_TEST_WT="$CASE_WT" FM_HOME="$CASE_HOME" \
+      FM_ROOT_OVERRIDE="$ROOT" "$TEARDOWN" "$id" >/dev/null \
+      || fail "$backend teardown failed for retained logic-state artifact"
+    [ "$(git -C "$CASE_REPO" rev-parse "proto/$id")" = "$artifact" ] \
+      || fail "$backend teardown deleted the retained artifact branch"
+    assert_present "$manifest" "$backend teardown removed the durable artifact link"
+  done
+  pass "fm-prototype.sh: logic-state artifact survives promotion and both cleanup paths outside the ship branch"
 }
 
 test_logic_failure_carries_regression_test_obligation() {
@@ -260,6 +360,7 @@ test_logic_failure_carries_regression_test_obligation() {
   write_report "$id" "$question" logic-state \
     'required: replay duplicated the completed transition'
   FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null
+  git -C "$CASE_WT" checkout -qb "proto/$id"
   obligation=$(FM_HOME="$CASE_HOME" "$PROTOTYPE" regression-obligation "$id")
   assert_contains "$obligation" "required: replay duplicated" \
     "logic-state failure did not persist its regression-test obligation"
@@ -318,8 +419,9 @@ sha256_file() {
 test_positive_evidence_and_decision
 test_brief_requires_question_and_exact_class
 test_incomplete_or_changed_evidence_fails
+test_logic_promotion_retains_artifact_off_ship_branch
 test_registration_completion_and_preparation_are_idempotent
 test_sensitive_defaults_have_no_worker_bypass
-test_promotion_rejects_scratch_and_ignored_residue
+test_ui_promotion_rejects_scratch_and_ignored_residue
 test_logic_failure_carries_regression_test_obligation
 test_tool_neutral_lifecycle_boundaries_are_central

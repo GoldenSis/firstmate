@@ -12,8 +12,9 @@
 # edits and green before the selected delivery path begins.
 # A scout carrying data/<task-id>/prototype.json is refused until
 # fm-prototype.sh promotion-verify confirms completed evidence, the validated
-# decision, its regression-test obligation, and a residue-free detached worktree
-# at the exact pre-experiment baseline. The emitted ship instructions implement
+# decision, its regression-test obligation, and the class-specific retention
+# checks. Promotion detaches at the exact pre-experiment baseline before changing
+# kind, leaving any retained logic-state branch intact. Ship instructions implement
 # that decision afresh and continue through the existing delivery path.
 # --expect red is the required pre-edit observation.
 # --expect green is the required pre-delivery observation.
@@ -54,6 +55,12 @@ if [ -e "$DATA/$ID/prototype.json" ] || [ -L "$DATA/$ID/prototype.json" ]; then
     echo "error: prototype $ID has no valid clean promotion preparation; promotion refused" >&2
     exit 1
   fi
+  # Never let retained prototype commits become the ship branch's starting point.
+  BASELINE=$(jq -r '.binding.baseline_head' "$DATA/$ID/prototype.json")
+  git -C "$WT" checkout --detach -q "$BASELINE" || {
+    echo "error: could not restore the prototype baseline; promotion refused" >&2
+    exit 1
+  }
 fi
 
 TMP="$META.tmp"
