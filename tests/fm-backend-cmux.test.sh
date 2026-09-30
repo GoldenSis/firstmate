@@ -9,6 +9,7 @@
 # tests/fm-backend-cmux-smoke.test.sh, gated on the cmux binary actually
 # being installed and reachable.
 set -u
+unset CMUX_WORKSPACE_ID CMUX_SURFACE_ID
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -50,6 +51,50 @@ fi
 if [ "${1:-}" = ping ]; then
   printf '%s\n' "${FM_CMUX_FAKE_PING:-PONG}"
   exit "${FM_CMUX_FAKE_PING_EXIT:-0}"
+fi
+if [ -f "$RESP/windows.out" ] && [ "${1:-}" != current-window ]; then
+  cmd=$1
+  shift
+  win='' wsid='' title='' cwd=''
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --window) win=$2; shift ;;
+      --workspace) wsid=$2; shift ;;
+      --name) title=$2; shift ;;
+      --cwd) cwd=$2; shift ;;
+    esac
+    shift
+  done
+  if [ "$cmd" = list-windows ]; then
+    cat "$RESP/windows.out"
+    exit "$(cat "$RESP/windows.exit" 2>/dev/null || echo 0)"
+  fi
+  if [ -z "$win" ]; then
+    if [ -n "${CMUX_WORKSPACE_ID:-}" ]; then
+      win=$(jq -r --arg id "$CMUX_WORKSPACE_ID" 'select(any(.workspaces[]; .id == $id)) | .window_id' "$RESP"/window-*.json)
+    else
+      win=$(jq -r '.window_id' "$RESP/current-window.out")
+    fi
+  fi
+  case "$cmd" in
+    workspace) cat "$RESP/window-$win.json" ;;
+    new-workspace)
+      [ ! -f "$RESP/unpublished" ] || title=zsh
+      updated=$(jq --arg title "$title" --arg cwd "$cwd" '.workspaces += [{id:"new-workspace",title:$title,current_directory:$cwd}]' "$RESP/window-$win.json") || exit 1
+      printf '%s' "$updated" > "$RESP/window-$win.json"
+      ;;
+    close-workspace)
+      [ ! -f "$RESP/close-noop" ] || exit 0
+      updated=$(jq --arg id "$wsid" '.workspaces |= map(select(.id != $id))' "$RESP/window-$win.json") || exit 1
+      printf '%s' "$updated" > "$RESP/window-$win.json"
+      ;;
+    list-panes)
+      [ "$wsid" = new-workspace ] || exit 1
+      printf '{"panes":[{"selected_surface_id":"new-surface","surface_ids":["new-surface"]}]}'
+      ;;
+    *) exit 1 ;;
+  esac
+  exit $?
 fi
 if [ "${1:-}" = current-window ]; then
   if [ -f "$RESP/current-window.out" ]; then
@@ -653,10 +698,98 @@ test_create_task_refuses_unknown_window() {
     out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
       bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-test-window /tmp/proj' "$ROOT" 2>&1 )
     expect_code 1 "$?" "creation must fail when the original window cannot be identified"
-    assert_contains "$out" 'could not resolve the current cmux window' "must report the missing window identity"
+    assert_contains "$out" 'could not resolve the cmux window' "must report the missing window identity"
     [ "$(wc -l < "$dir/log" | tr -d ' ')" = 1 ] || fail "must stop before snapshot or mutation without a window identity"
   done
   pass "fm_backend_cmux_create_task: refuses creation without a valid original window UUID"
+}
+
+test_create_task_preserves_caller_window() {
+  local dir fb out status title scenario log call focused_before
+  local caller=aaaaaaaa-0000-0000-0000-000000000000
+  local win=eeeeeeee-0000-0000-0000-000000000000
+  local focused=ffffffff-0000-0000-0000-000000000000
+  for scenario in duplicate success cleanup close-noop; do
+    dir="$TMP_ROOT/create-caller-window-$scenario"; mkdir -p "$dir/responses"
+    title=$(cmux_expected_scoped_title fm-test-caller)
+    cmux_windows_response "$dir" windows "$focused" 1 "$win" 1
+    printf '{"window_id":"%s"}' "$focused" > "$dir/responses/current-window.out"
+    jq -n --arg win "$win" --arg caller "$caller" --arg title "$title" --arg scenario "$scenario" \
+      '{window_id:$win,workspaces:([{id:$caller,title:"firstmate"}] +
+        if $scenario == "duplicate" then [{id:"existing-task",title:$title}] else [] end)}' > "$dir/responses/window-$win.json"
+    focused_before=$(jq -n --arg win "$focused" \
+      '{window_id:$win,workspaces:[{id:"other-window-existing",title:"zsh",current_directory:"/tmp/proj"}]}')
+    printf '%s' "$focused_before" > "$dir/responses/window-$focused.json"
+    case "$scenario" in
+      cleanup|close-noop) touch "$dir/responses/unpublished" ;;
+    esac
+    [ "$scenario" != close-noop ] || touch "$dir/responses/close-noop"
+    fb=$(make_cmux_fakebin "$dir")
+    out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" CMUX_WORKSPACE_ID="$caller" FM_CMUX_TITLE_SETTLE_SECS=0 \
+      bash -c '. "$0/bin/backends/cmux.sh"
+        result=$(fm_backend_cmux_create_task fm-test-caller /tmp/proj) || exit $?
+        printf "%s" "$result"
+        if [ "$1" = success ]; then
+          fm_backend_cmux_target_ready "${result/ /:}" fm-test-caller || exit 1
+          [ "$FM_BACKEND_CMUX_WORKSPACE:$FM_BACKEND_CMUX_SURFACE" = new-workspace:new-surface ]
+        fi' "$ROOT" "$scenario" 2>&1 )
+    status=$?
+    log=$(cat "$dir/log")
+    case "$scenario" in
+      duplicate)
+        expect_code 1 "$status" "must refuse a duplicate in the caller's window while another window is focused"
+        assert_contains "$out" 'already exists' "must detect the caller window's duplicate"
+        assert_not_contains "$log" $'\x1fnew-workspace' "duplicate refusal must precede creation"
+        ;;
+      success)
+        expect_code 0 "$status" "new task must remain discoverable from the caller's workspace context"
+        [ "$out" = 'new-workspace new-surface' ] || fail "must return the new task's workspace and surface"
+        jq -e 'any(.workspaces[]; .id == "new-workspace")' "$dir/responses/window-$win.json" >/dev/null || fail "task must be created in the caller's window"
+        ;;
+      cleanup|close-noop)
+        expect_code 1 "$status" "title timeout must fail creation in the caller's window"
+        assert_contains "$log" $'\x1fclose-workspace\x1f--workspace\x1fnew-workspace' "must clean up only the caller window's new workspace"
+        [ "$(grep -c 'close-workspace' "$dir/log")" = 1 ] || fail "cleanup must close exactly one workspace"
+        if [ "$scenario" = cleanup ]; then
+          assert_contains "$out" 'closed newly created workspace new-workspace' "must verify cleanup in the caller's window"
+        else
+          assert_contains "$out" 'left open because cleanup failed or could not be verified' "must detect ineffective cleanup in the caller's window"
+        fi
+        ;;
+    esac
+    [ "$(cat "$dir/responses/window-$focused.json")" = "$focused_before" ] || fail "must preserve existing work in the focused window"
+    assert_not_contains "$log" $'\x1fcurrent-window' "caller context must take precedence over the focused window"
+    while IFS= read -r call; do
+      assert_contains "$call" $'\x1f--window\x1f'"$win" "creation and cleanup must use the caller's window"
+    done < <(awk -F $'\x1f' '$2 == "new-workspace" || $2 == "close-workspace"' "$dir/log")
+  done
+  pass "fm_backend_cmux_create_task: caller window controls duplicate refusal, creation, task lookup and timeout cleanup"
+}
+
+test_create_task_refuses_unknown_caller_window() {
+  local dir fb out scenario win
+  local caller=aaaaaaaa-0000-0000-0000-000000000000
+  for scenario in missing failed malformed invalid-window; do
+    dir="$TMP_ROOT/create-caller-window-$scenario"; mkdir -p "$dir/responses"
+    win=eeeeeeee-0000-0000-0000-000000000000
+    [ "$scenario" != invalid-window ] || win=window:1
+    cmux_windows_response "$dir" windows "$win" 1
+    jq -n --arg win "$win" --arg caller "$caller" --arg scenario "$scenario" \
+      '{window_id:$win,workspaces:(if $scenario == "missing" then [] else [{id:$caller,title:"firstmate"}] end)}' > "$dir/responses/window-$win.json"
+    case "$scenario" in
+      failed) printf '1' > "$dir/responses/windows.exit" ;;
+      malformed) printf 'not-json' > "$dir/responses/window-$win.json" ;;
+    esac
+    fb=$(make_cmux_fakebin "$dir")
+    out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" CMUX_WORKSPACE_ID="$caller" FM_CMUX_TITLE_SETTLE_SECS=0 \
+      bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-test-caller /tmp/proj' "$ROOT" 2>&1 )
+    expect_code 1 "$?" "creation must fail when the caller's window cannot be resolved"
+    assert_contains "$out" 'could not resolve' "must report missing caller window identity"
+    assert_not_contains "$(cat "$dir/log")" $'\x1fcurrent-window' "unknown caller window must not fall back to the focused window"
+    assert_not_contains "$(cat "$dir/log")" $'\x1fnew-workspace' "must not create without resolving the caller's window"
+    assert_not_contains "$(cat "$dir/log")" $'\x1fclose-workspace' "must not close anything without resolving the caller's window"
+  done
+  pass "fm_backend_cmux_create_task: unresolved caller context refuses creation without falling back to the focused window"
 }
 
 # --- target_ready / capture ---------------------------------------------------
@@ -1201,6 +1334,8 @@ test_create_task_title_timeout_cleanup
 test_create_task_refuses_unreadable_snapshot
 test_create_task_pins_original_window
 test_create_task_refuses_unknown_window
+test_create_task_preserves_caller_window
+test_create_task_refuses_unknown_caller_window
 test_target_ready_fails_when_target_absent
 test_target_ready_checks_expected_label
 test_target_ready_rejects_label_mismatch

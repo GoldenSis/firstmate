@@ -360,10 +360,15 @@ fm_backend_cmux_create_task() {  # <label> <cwd>
   esac
   attempts=$(awk -v secs="$settle" 'BEGIN { printf "%.0f", secs * 4 }')
   title=$(fm_backend_cmux_scoped_title "$label")
-  if ! win=$(fm_backend_cmux_cli current-window --json --id-format uuids 2>/dev/null) ||
-    ! win=$(printf '%s' "$win" | jq -er '.window_id | select(type == "string")
-      | select(test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"))' 2>/dev/null); then
-    echo "error: could not resolve the current cmux window before creating '$title'" >&2
+  if [ -n "${CMUX_WORKSPACE_ID:-}" ]; then
+    win=$(fm_backend_cmux_window_of_workspace "$CMUX_WORKSPACE_ID")
+    win=${win%% *}
+  else
+    win=$(fm_backend_cmux_cli current-window --json --id-format uuids 2>/dev/null) || win=''
+    win=$(printf '%s' "$win" | jq -er '.window_id | select(type == "string")' 2>/dev/null) || win=''
+  fi
+  if ! [[ "$win" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]; then
+    echo "error: could not resolve the cmux window before creating '$title'" >&2
     return 1
   fi
   if ! before=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$win" 2>/dev/null) ||

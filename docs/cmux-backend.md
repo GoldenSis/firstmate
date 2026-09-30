@@ -306,16 +306,20 @@ That is correct for the selected-workspace teardown case (a selected workspace i
 ## Workspace titles can settle after creation
 
 Reported on 2026-09-30 with cmux 0.64.25 (106), macOS: `new-workspace --name <title> --cwd <git-repo> --focus false` followed immediately by `workspace list --json --id-format uuids` failed title resolution three consecutive times with `error: could not resolve a cmux workspace id for '<title>' after creation`, although `title` and `custom_title` appeared a second or two later; `/tmp` exposed the title immediately.
-The adapter captures the original window UUID before the duplicate check, pins the snapshot, creation, title polling, timeout cleanup and cleanup verification to that window with `--window`, and refuses creation if the window cannot be identified.
+The adapter resolves the window containing the inherited `CMUX_WORKSPACE_ID`, falling back to `current-window` only when that caller workspace context is absent, then pins the snapshot, duplicate check, creation, title polling, timeout cleanup and cleanup verification to that window with `--window`.
+It refuses creation if that window cannot be identified, including when inherited caller context no longer resolves.
 It waits for title publication and, on timeout, closes only a single new workspace matching the requested directory and absent from the pre-create list, reporting explicitly when cleanup cannot safely complete.
 `tests/fm-backend-cmux.test.sh` reproduces delayed publication and timeout cleanup with a fake CLI; no live app relaunch is required, and `bin/backends/cmux.sh` owns the settle-window configuration.
 
-Fixture verification on 2026-09-30 uses the `current-window --json --id-format uuids` response's `window_id` field, confirmed in the [cmux 0.64.25 CLI source](https://github.com/manaflow-ai/cmux/blob/v0.64.25/CLI/cmux.swift#L6756-L6762).
+Fixture verification on 2026-09-30 covers the distinction between [cmux 0.64.25 caller-context routing](https://github.com/manaflow-ai/cmux/blob/v0.64.25/CLI/cmux.swift#L20658-L20672) and the [`current-window --json --id-format uuids` response's `window_id` field](https://github.com/manaflow-ai/cmux/blob/v0.64.25/CLI/cmux.swift#L6756-L6762).
+With the caller in window A and window B focused, `bash tests/fm-backend-cmux.test.sh` reproduced duplicate creation before the caller-window fix (`expected exit 1, got 0`); the fixtures now verify duplicate refusal, successful creation followed by task lookup, timeout cleanup and refusal when caller context cannot be resolved.
 `bash tests/fm-backend-cmux.test.sh` first reproduced an attempted close of `other-window-existing` after a window switch; with window pinning, it prints the following results, covering delayed titles, ineffective closes and invalid window identities without using the live app:
 
 ```text
 ok - fm_backend_cmux_create_task: window switching preserves unrelated work and pins title polling and cleanup verification
 ok - fm_backend_cmux_create_task: refuses creation without a valid original window UUID
+ok - fm_backend_cmux_create_task: caller window controls duplicate refusal, creation, task lookup and timeout cleanup
+ok - fm_backend_cmux_create_task: unresolved caller context refuses creation without falling back to the focused window
 ```
 
 ## Workspace ids do not survive a relaunch (verified from source, not a live restart)
