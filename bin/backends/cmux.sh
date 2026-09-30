@@ -353,14 +353,20 @@ fm_backend_cmux_surface_id_for_workspace() {  # <workspace_id>
 # FM_CMUX_TITLE_SETTLE_SECS: non-negative whole seconds (default 5), polled
 # every 250 ms because a git cwd can delay title publication after creation.
 fm_backend_cmux_create_task() {  # <label> <cwd>
-  local label=$1 cwd=$2 title dup out wsid sfid before after cleanup
+  local label=$1 cwd=$2 title dup out wsid sfid before after cleanup win
   local settle=${FM_CMUX_TITLE_SETTLE_SECS:-5} attempts i
   case "$settle" in
     ''|*[!0-9]*) echo "error: FM_CMUX_TITLE_SETTLE_SECS must be non-negative whole seconds" >&2; return 1 ;;
   esac
   attempts=$(awk -v secs="$settle" 'BEGIN { printf "%.0f", secs * 4 }')
   title=$(fm_backend_cmux_scoped_title "$label")
-  if ! before=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) ||
+  if ! win=$(fm_backend_cmux_cli current-window --json --id-format uuids 2>/dev/null) ||
+    ! win=$(printf '%s' "$win" | jq -er '.window_id | select(type == "string")
+      | select(test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"))' 2>/dev/null); then
+    echo "error: could not resolve the current cmux window before creating '$title'" >&2
+    return 1
+  fi
+  if ! before=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$win" 2>/dev/null) ||
     ! before=$(printf '%s' "$before" | jq -ce '.workspaces | select(type == "array")' 2>/dev/null); then
     echo "error: could not snapshot cmux workspaces before creating '$title'" >&2
     return 1
@@ -370,19 +376,20 @@ fm_backend_cmux_create_task() {  # <label> <cwd>
     echo "error: cmux workspace '$title' already exists" >&2
     return 1
   fi
-  out=$(fm_backend_cmux_cli new-workspace --name "$title" --cwd "$cwd" --focus false --id-format uuids 2>&1) || {
+  out=$(fm_backend_cmux_cli new-workspace --name "$title" --cwd "$cwd" --focus false --id-format uuids --window "$win" 2>&1) || {
     echo "error: cmux new-workspace failed for '$title': $out" >&2
     return 1
   }
   for ((i=0; i<=attempts; i++)); do
-    wsid=$(fm_backend_cmux_workspace_id_for_label "$title")
+    wsid=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$win" 2>/dev/null \
+      | jq -r --arg want "$title" '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null | head -1)
     [ -z "$wsid" ] || break
     [ "$i" -ge "$attempts" ] || sleep 0.25
   done
   if [ -z "$wsid" ]; then
     # Only one new cwd match is safe: list order is not proof of ownership
     # when another caller concurrently creates a workspace in the same cwd.
-    after=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) || after=''
+    after=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$win" 2>/dev/null) || after=''
     wsid=$(printf '%s' "$after" | jq -r --arg cwd "$cwd" --argjson before "$before" '
       [.workspaces[]? | select(.current_directory == $cwd)
         | select(.id as $id | $before | map(.id) | index($id) | not)]
@@ -390,8 +397,8 @@ fm_backend_cmux_create_task() {  # <label> <cwd>
     cleanup="workspace left open because the newly created workspace could not be identified unambiguously"
     if [ -n "$wsid" ]; then
       cleanup="workspace $wsid left open because cleanup failed or could not be verified"
-      if fm_backend_cmux_cli close-workspace --workspace "$wsid" >/dev/null 2>&1; then
-        after=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) || after=''
+      if fm_backend_cmux_cli close-workspace --workspace "$wsid" --window "$win" >/dev/null 2>&1; then
+        after=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$win" 2>/dev/null) || after=''
         if printf '%s' "$after" | jq -e --arg id "$wsid" '
           .workspaces | select(type == "array") | all(.id != $id)' >/dev/null 2>&1; then
           cleanup="closed newly created workspace $wsid"
