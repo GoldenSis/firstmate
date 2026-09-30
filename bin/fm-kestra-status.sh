@@ -10,6 +10,13 @@
 # GET shapes used here. Performing a replay is not offered by any subcommand and is
 # refused by the gate.
 #
+# Evidence reads require the flow identity to remain in unchanged local HEAD,
+# but do not consult the deployed-revision record or require historical source
+# bytes to match HEAD. `state` uses the execution's own revision for not-run
+# evidence, even if the currently deployed revision differs; the other modes need
+# no flow-revision read. Reading an execution does not attest that this adapter
+# launched it or that its revision passed deployment verification.
+#
 # A state this prints is evidence that a task ran. It is never approval, never
 # authorization, and never a business decision; nothing downstream may treat a
 # SUCCESS as permission to merge, route, or unlock anything.
@@ -36,6 +43,10 @@
 #
 # `artifact` refuses any URI no task of the execution declared as an output, so
 # this adapter cannot be used to walk Kestra's internal storage.
+# Without --out it prints the raw artifact bytes, preserving binary data and EOF
+# newlines. With --out the parent directory must already exist; a mode-0600 file
+# is staged beside the destination and replaces it only after a successful read.
+# A failed download leaves an existing destination untouched.
 #
 # Exit status: 0 on success, 2 on a refusal or usage error, 1 on a transport or
 # server failure.

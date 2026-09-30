@@ -34,7 +34,7 @@ See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/star
 
 - This repo is a template for running a firstmate orchestrator agent.
   `AGENTS.md` is the agent's main job description and names when to load bundled firstmate skills; `CLAUDE.md` is a symlink to it, and `.claude/skills` is a symlink to `.agents/skills`.
-- Only shared material is tracked: `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `.agents/skills/`, and `skills/`.
+- Only shared material is tracked, including `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `docs/`, `tests/`, `kestra/flows/`, `.agents/skills/`, and `skills/`.
   `.agents/skills/` holds agent-loaded skills that assume a live firstmate home and carry `metadata.internal: true` so installers such as [skills.sh](https://skills.sh) hide them from discovery; `skills/` holds standalone, installer-facing public skills with no firstmate dependency (see the README's "Two-tier skill layout").
   Adding a skill to either tier is fail-closed: clear the skill-admission rubric in [`.agents/skills/firstmate-coding-guidelines/SKILL.md`](.agents/skills/firstmate-coding-guidelines/SKILL.md) first, which also owns the `trigger`, `trigger-owner`, and `standalone` frontmatter escapes the audit honors.
   `tests/fm-skill-contract.test.sh` then audits every tracked skill for directory/frontmatter name parity and placeholder stubs, and additionally holds `.agents/skills/` to declared `user-invocable` plus `metadata.internal: true`, exactly one precise `AGENTS.md` trigger pointer per referenced agent-only skill, no unowned trigger collision between skills, and locally resolvable script, doc, test, fixture, and skill references.
@@ -60,7 +60,7 @@ See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/star
 
 ## Development
 
-Tracked changes to firstmate itself - `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `.tasks.toml`, `.github/workflows/`, `bin/`, `.agents/skills/`, and `skills/` - ship through the `no-mistakes` pipeline on a feature branch and require an explicit merge approval.
+Tracked changes to firstmate itself ship through the `no-mistakes` pipeline on a feature branch and require an explicit merge approval.
 Before making any such change, load the agent-only `firstmate-coding-guidelines` skill (`.agents/skills/firstmate-coding-guidelines/SKILL.md`).
 It has the knowledge-placement rules that keep `AGENTS.md` from regrowing after each diet pass.
 There is no reliable way for `bin/fm-brief.sh`'s scaffold to detect that a task's repo is firstmate itself, so firstmate adds this skill's load line to firstmate-repo briefs by hand.
@@ -83,7 +83,9 @@ tmp=$(mktemp -d) && printf 'done: smoke\n' > "$tmp/smoke.status" && FM_STATE_OVE
 ```
 
 Discover tests by listing `tests/*.test.sh`: each is a self-contained bash script named `<subject>.test.sh`, and its header comment describes what it covers, so run one directly to focus on a subject.
-Tests that need a real optional backend or an explicit opt-in (real herdr/zellij/cmux smoke tests, the live Pi regression) skip themselves and print the tool or environment gate needed to enable them, so the run-all loop above is always safe.
+Tests that need a real optional backend or an explicit opt-in (real herdr/zellij/cmux smoke tests, the live Pi regression, the live Kestra engine check) skip themselves and print the tool or environment gate needed to enable them.
+Keep live-test opt-ins unset for a portable run; [cmux test safety](docs/cmux-backend.md#test-safety) and [Kestra testing](docs/kestra-seam.md#testing) describe those live checks.
+The hermetic Kestra suite requires real `jq` and Git, but uses a fake `curl` and needs no Kestra installation.
 
 ## Questions
 

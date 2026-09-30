@@ -7,6 +7,11 @@
 # documents that Git-driven synchronization can DELETE objects depending on the
 # source-of-truth setting, so this script pushes instead, always with `delete=false`.
 #
+# Invoke deployment only after merge and with deployment authorization. These are
+# caller preconditions: the script checks unchanged HEAD sources, not branch name,
+# merge ancestry, PR approval, or the caller's identity. No merge hook invokes it.
+# Removing a flow from Git does not delete its existing server-side copy.
+#
 # What it refuses, before any request leaves the machine:
 #   - a flow whose namespace is not the one allow-listed namespace in local config;
 #   - a flow missing the `system.readOnly: "true"` label (without it, the Kestra UI
@@ -22,6 +27,8 @@
 # format), which is what fm-kestra-run.sh binds each execution to. A read-back
 # that does not match leaves the record untouched and fails, so a run can never be
 # bound to a revision that was not verified.
+# The namespace update may already have happened when read-back fails; this script
+# does not roll it back. The previous record, if any, remains in place.
 #
 # Usage:
 #   fm-kestra-deploy.sh --check    validate tracked flows only; no config, no network

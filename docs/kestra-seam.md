@@ -11,7 +11,7 @@ A `SUCCESS` state is evidence that a task ran; it is not approval, not authoriza
 ## Data flow
 
 ```text
-unchanged Git YAML -> authorized deployer -> immutable Kestra flow -> verified revision record
+unchanged Git YAML -> authorized deployer -> verified Kestra revision -> revision record
 firstmate request  -> allow-list/input adapter -> execution bound to the recorded revision
 execution state/logs/task outputs at that revision -> read-only adapter -> firstmate report
 ```
@@ -28,6 +28,32 @@ Four pieces implement it.
 Each script's header comment is the authoritative description of its behavior, flags, and refusals; `bin/fm-kestra-lib.sh` owns the shared configuration, the static-flow grammar, the revision record format, and the HTTP gate.
 Read the header before first use rather than relying on this page.
 
+## Using the seam
+
+Provision the runtime separately, using the version and checksum checks in the [library header](../bin/fm-kestra-lib.sh).
+The adapters do not install Kestra, start it, configure its server bindings, or check the running server version.
+That header also lists local command dependencies; the [configuration guide](configuration.md#kestra-execution-seam-configkestraenv) explains the private config and home selection.
+Use the same effective home for deployment and execution so the run adapter can find the revision record.
+
+Run these commands from the code root after the tracked flows have been reviewed and merged and deployment is authorized:
+
+```sh
+bin/fm-kestra-deploy.sh --check
+bin/fm-kestra-deploy.sh
+execution_id=$(bin/fm-kestra-run.sh --flow m1_shape \
+  --input units=3 --input route=safe --input label=synthetic-alpha)
+bin/fm-kestra-status.sh state "$execution_id"
+bin/fm-kestra-status.sh logs "$execution_id"
+bin/fm-kestra-status.sh outputs "$execution_id"
+bin/fm-kestra-status.sh lineage "$execution_id"
+```
+
+Stop if any command fails; `--check` validates committed flow sources offline and can also be run before merge, but refuses local flow edits.
+Deployment is an explicit operation; its [header](../bin/fm-kestra-deploy.sh) distinguishes caller authorization from the checks enforced by the script and explains failure recovery limits.
+Execution creation returns immediately with an ID, so repeat `state` until it reports a terminal state before interpreting missing tasks.
+Use the URI printed as `output: artifact.uri=...` with `bin/fm-kestra-status.sh artifact "$execution_id" '<declared-uri>'` to read the synthetic artifact; see `--help` for file output semantics.
+To exercise retries and suppression, launch `bin/fm-kestra-run.sh --flow m1_controlled_failure` and inspect that returned ID with the same status commands.
+
 ## Static flows only
 
 M1 permits only static tracked flows (captain decision, 2026-09-30).
@@ -35,7 +61,8 @@ Every task field is literal text, no Pebble expression appears anywhere in a flo
 The seam therefore never has to reproduce Kestra's template semantics locally, and a permitted task cannot render an input, a secret, or any other server-side value.
 Four review rounds had kept finding new gaps between a local approximation of those semantics and Kestra's own; narrowing the grammar removed the surface instead of patching it again.
 
-The cost is visible in `kestra/flows/m1_shape.yaml`: its typed inputs are declared, validated on both sides, and recorded on the execution as evidence, but no task reads them, and its branch has a literal condition so one arm always runs and the other is always reported as never run.
+The cost is visible in `kestra/flows/m1_shape.yaml`: its typed inputs are declared, validated on both sides, and recorded on the execution as evidence, but no task reads them, and its branch has a literal condition that always selects `safe_branch`, even for `route=fast`.
+After successful completion, `fast_branch` is reported as never run.
 A data-driven branch would need an allow-listed expression grammar, which is a deferred decision below.
 
 ## Revision binding
@@ -44,8 +71,10 @@ Git review decides what a flow says; the revision record decides what runs.
 Deployment updates the namespace, reads every flow back at the revision Kestra reported, requires that revision's source to be the reviewed bytes, and only then records the revision against the flow's Git blob id.
 Multipart uploads protect newline-terminated sources with a final, unindented comment so Kestra's upload trimming cannot change literal artifact content.
 Revision verification accepts that exact framing and preserves source EOF newlines; a source ending in whitespace without a final newline is refused before upload.
+Leading blank transport lines are ignored during comparison; other source whitespace remains significant.
 A run refuses when the flow has no record, when the tracked flow's blob no longer matches the recorded one, when Kestra cannot return the recorded revision with matching source, or when the created execution reports another revision.
-The thing reviewed in Git is therefore provably the thing that runs, and a flow edited on the server or redeployed outside this path cannot be executed through the seam.
+The run adapter selects only the verified source revision: a newer server-side edit does not replace the recorded revision, and an unchanged older recorded revision can still run.
+The status adapter has a different purpose: its [header](../bin/fm-kestra-status.sh) explains historical evidence reads and why those reads are not a deployment attestation.
 
 ## Boundary rationale and ownership
 
@@ -75,13 +104,17 @@ The broad Kestra OSS identity remains a disclosure risk even though the adapters
 ## Synthetic data only
 
 No captain-private, financial, personal, or otherwise sensitive data goes through any M1 flow.
-Retention, redaction, and artifact-size limits are not designed yet, and Kestra persists inputs in logs, outputs, and artifacts.
+Retention, redaction, and artifact-size limits are not designed yet, and execution inputs and task evidence persist in Kestra.
 Every M1 task is read-only or synthetic for a second reason as well: retries duplicate side effects, and no idempotency rules exist yet.
 
 ## Testing
 
 `tests/fm-kestra-seam.test.sh` is the contract suite and runs hermetically by default: no network, no Java, no Kestra server.
 It drives the adapters against a fakebin `curl` that serves recorded response shapes and logs every request, which is what lets a test prove the seam never *attempted* a denied call.
+
+```sh
+FM_KESTRA_LIVE=0 bash tests/fm-kestra-seam.test.sh
+```
 
 One boundary is worth stating plainly rather than leaving implied.
 The hermetic suite asserts what the seam does; it cannot assert what Kestra's engine does.
@@ -92,7 +125,10 @@ The retry obligation is therefore split into three claims:
 3. Kestra's engine actually performing three attempts, which the hermetic suite does not assert.
 
 Claim 3 is covered by the opt-in live section at the end of that file, which runs only when `FM_KESTRA_LIVE=1` is set and the pinned loopback runtime has the tracked flows deployed through the deploy script.
-The same live section is what confirms that Kestra returns a flow's submitted source unchanged at a recorded revision; the hermetic fake models that round trip, it does not prove it.
+Use `FM_KESTRA_LIVE=1 bash tests/fm-kestra-seam.test.sh` with the same configured home used for deployment.
+That opt-in creates a real controlled-failure execution, polls for up to 60 seconds, and reads its state and logs; it does not clean up the server-side execution.
+The live section also exercises the run adapter's source verification for the controlled-failure flow at its recorded revision; the hermetic fake models that round trip, it does not prove it.
+It does not run the shape flow or verify its artifact against a live engine.
 Every test name says which claim it belongs to, so no assertion reads as stronger than it is.
 
 ## Deferred decisions and where they attach

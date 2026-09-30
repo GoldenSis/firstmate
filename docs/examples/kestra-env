@@ -2,7 +2,11 @@
 #
 # Copy to config/kestra.env in your firstmate home and fill in real values. That
 # path is gitignored: no endpoint and no credential belongs in kestra/ or bin/.
-# Run `chmod 0600 config/kestra.env` after copying; the seam refuses any other mode.
+# Use a regular, non-symlink file and run `chmod 0600 config/kestra.env` after
+# copying; the seam refuses any other mode. See docs/configuration.md for path
+# overrides and environment precedence, and bin/fm-kestra-lib.sh for value rules.
+# This is a literal KEY=value file, not a sourced shell script: do not use export,
+# variable expansion, or inline comments. Matching double quotes are optional.
 #
 # Kestra OSS authenticates one broad Basic Auth identity that can create, execute,
 # replay, change state, and delete through the same API. Treat this file as a
@@ -10,7 +14,8 @@
 # line, a log, or a chat message.
 
 # Loopback only. The seam refuses any host other than 127.0.0.1, localhost, or
-# [::1], because M1 binds Kestra's main and management servers to loopback.
+# [::1]. Configure the runtime's main and management servers to bind to loopback
+# separately; the seam does not start or configure the server.
 FM_KESTRA_BASE_URL=http://127.0.0.1:18080
 
 # Kestra's tenant segment in the API path. OSS local mode uses "main".

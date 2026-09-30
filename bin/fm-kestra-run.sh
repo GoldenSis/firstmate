@@ -25,7 +25,8 @@
 # Two independent things enforce that. This script accepts only `--flow` and
 # `--input` and refuses every other argument, and fm-kestra-lib.sh's HTTP gate
 # refuses any method or path outside the `run` role, so a bug here still cannot
-# reach a mutating endpoint. tests/fm-kestra-seam.test.sh asserts both.
+# reach those denied endpoints. Creating the execution is the permitted mutation.
+# tests/fm-kestra-seam.test.sh asserts both boundaries.
 #
 # A returned execution ID is a handle for reading evidence with
 # bin/fm-kestra-status.sh. It is not an approval, and a later SUCCESS state is
@@ -39,6 +40,10 @@
 # request is made, so a rejected input never creates an execution. Values are sent
 # with curl's --form-string, which never interprets a leading `@` or `<` as a file
 # reference.
+# Inputs are required unless the schema says required: false; omitted optional
+# inputs are not sent. Repeated names use the last supplied value. Unknown names
+# and values containing CR or LF are refused; INT values must fit signed 32-bit
+# bounds as well as the flow's min/max. The library owns the full schema grammar.
 #
 # M1 is synthetic-data only: no captain-private, financial, or personal data goes
 # through a flow, because retention, redaction, and artifact-size controls are not

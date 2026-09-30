@@ -108,9 +108,15 @@ See [`wedge-alarm.md`](wedge-alarm.md) for the channel reference and macOS verif
 
 `config/kestra.env` (local, gitignored) carries the loopback endpoint, tenant, the one allow-listed namespace, and the Basic Auth identity for the Kestra seam.
 It is home-local and is never inherited or propagated to a secondmate home.
-No value is committed anywhere; [`examples/kestra-env`](examples/kestra-env) is the copyable shape and [`kestra-seam.md`](kestra-seam.md) owns the seam's rationale, boundaries, and deferred decisions.
-The seam is inert without that file: `bin/fm-kestra-deploy.sh --check` still validates the tracked flows offline, and every other entrypoint refuses until an endpoint and namespace are configured.
-`data/kestra/revisions` (local, gitignored with the rest of `data/`) is the deployed-revision record the deploy script writes and the run adapter binds to; `bin/fm-kestra-lib.sh` owns its format, and a run refuses when it is absent or stale.
+Real endpoint and credential values stay local; [`examples/kestra-env`](examples/kestra-env) is the copyable shape and [`kestra-seam.md`](kestra-seam.md) owns the seam's rationale, workflow, boundaries, and deferred decisions.
+The config path resolves from non-empty `FM_KESTRA_CONFIG`, then `$FM_CONFIG_OVERRIDE/kestra.env`, then `$FM_HOME/config/kestra.env`, with the scripts' code root as the default home.
+Non-empty environment values override the five file keys shown in the example, so the file is optional when those values are supplied externally.
+`bin/fm-kestra-lib.sh` owns the exact file syntax, permission checks, value defaults, credential handling, and endpoint validation.
+Without a configured endpoint and namespace, network operations refuse; `bin/fm-kestra-deploy.sh --check` and the entrypoints' `--help` remain available offline.
+`FM_KESTRA_TIMEOUT_S` is an environment-only request timeout in seconds, defaulting to 30; adding it to `kestra.env` has no effect.
+`$FM_HOME/data/kestra/revisions` (local, gitignored with the rest of `data/`) is the deployed-revision record the deploy script writes and the run adapter binds to; `bin/fm-kestra-lib.sh` owns its format, and a run refuses when it is absent or stale.
+The record always uses the effective home; `FM_DATA_OVERRIDE` does not relocate it.
+Flow sources always come from `kestra/flows/` beside the scripts, independently of `FM_HOME` and `FM_ROOT_OVERRIDE`.
 
 ## Gate defaults (.no-mistakes.yaml)
 
@@ -494,6 +500,7 @@ README.md            public overview and development notes
 .claude/skills       symlink to .agents/skills for claude compatibility
 skills/              standalone public installer-facing skills, committed; not loaded by firstmate
 bin/                 helper scripts, committed; read each script's header before first use
+kestra/flows/        shared static flow sources, committed; see docs/kestra-seam.md
 docker-compose.buzz-loopback.yml  loopback-only Buzz relay stack for the additive fleet and per-crew bearings publisher, committed; the running instance is disposable (docs/buzz-loopback-adapter.md)
 .env                 optional X-mode pairing token; LOCAL, gitignored; presence-gates section 14
 config/crew-harness  crewmate harness override; LOCAL, gitignored; absent or "default" = same as firstmate. Inherited as the literal file: a concrete primary adapter value also controls a secondmate home's own crewmates (section 4)

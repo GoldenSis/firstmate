@@ -11,19 +11,20 @@
 #   3. The M1 static-flow grammar. One parser (fm_kestra_parse_flow) accepts exactly
 #      the YAML shape, task types, and input schema M1 supports and emits one
 #      validated record stream that every consumer reads. Pebble templating
-#      (`{{ }}`, `{% %}`, `{# #}`) is refused everywhere: a permitted task can only
+#      (`{{ }}`, `{% %}`, `{# #}`) is refused in flow data: a permitted task can only
 #      carry literal text, so no task can render a secret, an input, or any other
 #      server-side value. Unsupported syntax, triggers, and side-effecting task
 #      types are refused rather than approximated.
 #   4. The deployed-revision record. Deployment records, per flow, the Kestra
 #      revision that was verified to carry the reviewed HEAD bytes; a run binds to
 #      that revision and refuses when the record is absent, stale, or unverifiable.
-#   5. The HTTP gate. Every request goes through fm_kestra_request, which takes a
-#      ROLE and refuses any method/path the role does not positively allow. Replay,
-#      restart, resume, kill, state override, flow deletion, secrets, and namespace
-#      administration are unreachable from every role, so a coding mistake in a
-#      caller cannot reach them either. The deploy role builds its own payload from
-#      the HEAD snapshot; no caller can hand it a body.
+#   5. The HTTP gate. fm_kestra_request takes a ROLE and refuses any method/path
+#      the role does not positively allow; fm_kestra_request_to_file applies the
+#      same gate for read-only downloads. Replay, restart, resume, kill, state
+#      override, flow deletion, secrets, and namespace administration are
+#      unreachable from every role, so a coding mistake in a caller cannot reach
+#      them either. The deploy role builds its own payload from the HEAD snapshot;
+#      no caller can hand it a body.
 #
 # Authority stays outside Kestra. Nothing here lets a flow result approve, merge,
 # route, or unlock anything: a Kestra state is evidence that a task ran and nothing
@@ -33,15 +34,23 @@
 # owners of the pinned Kestra Open Source Edition version and the official
 # standalone asset's publisher-listed SHA-256. No `latest` tag and no unversioned
 # image is supported. Verify a downloaded asset before running it:
+#   . bin/fm-kestra-lib.sh
+#   fm_kestra_pinned_version
+#   fm_kestra_pinned_sha256
 #   shasum -a 256 <asset>    # must equal the value fm_kestra_pinned_sha256 prints
+# The operator provisions the runtime and binds both its main and management
+# servers to loopback. The seam neither starts/configures the server nor probes
+# its running version; the pin and checksum are operator checks, not API checks.
+# Offline flow checks need Bash, Git, and standard Unix tools including awk.
+# Network operations additionally need jq and curl with --fail-with-body support.
 #
 # Credentials. Kestra OSS authenticates one broad Basic Auth identity, so the
 # credential is treated as a disclosure risk throughout: it is read from gitignored
-# local config, handed to curl through a mode-0600 temp config file that is removed
-# on exit, and never placed in argv, in an exported environment variable curl
-# inherits by name, or in any diagnostic this library prints. Curl ignores user
-# config, bypasses every proxy, and treats HTTP errors as failures with their
-# response body retained as a diagnostic.
+# local config or the caller's environment, handed to curl through a mode-0600
+# temp config file removed on exit, and never placed in argv, in an exported
+# environment variable curl inherits by name, or in any diagnostic this library
+# prints. Curl ignores user config, bypasses every proxy, and treats HTTP errors
+# as failures with their response body retained as a diagnostic.
 #
 # Sourced, not executed. Callers source it and then call fm_kestra_load_config.
 # shellcheck shell=bash
@@ -157,13 +166,15 @@ fm_kestra_ensure_flow_snapshot() {
 # not understand would under-validate and call it a pass:
 #   - two-space indentation, no tabs, no flow style, no anchors, aliases, merge
 #     keys, directives, document markers, single quotes, or inline comments;
-#   - no Pebble templating anywhere in the file: every task field is literal text;
+#   - standalone YAML comments are ignored; no Pebble templating in flow data;
 #   - top-level keys: id, namespace, labels, inputs, tasks - nothing else, and
 #     `triggers` is refused by name because executions start only through the run
 #     adapter;
-#   - labels: exactly `system.readOnly: "true"`;
+#   - labels: only `system.readOnly: "true"` (unquoted true is also accepted);
 #   - inputs: INT (min/max), SELECT (block-list values), STRING (validator in the
-#     regex subset below), plus required and a double-quoted description;
+#     regex subset below), plus required and a double-quoted description; bounds
+#     must be signed 32-bit decimal integers without leading zeros, and SELECT
+#     values are unquoted words excluding YAML boolean/null spellings;
 #   - tasks: exactly the M1-safe core task types with exactly their supported
 #     fields; text fields are double-quoted literals from a printable subset;
 #     `content: |` is the only block scalar; `then`, `else`, and `tasks` are the
@@ -174,7 +185,8 @@ fm_kestra_ensure_flow_snapshot() {
 # Kestra evaluates the same pattern with Java's Pattern.matches. The supported
 # grammar is `^` ... `$` anchors, literal [A-Za-z0-9_-], dot, bracket expressions of
 # [A-Za-z0-9_-] and their ranges, groups, alternation, and the quantifiers
-# `* + ? {n} {n,m}`. No backslash, so no escapes or classes, and no `(?` extensions.
+# `* + ? {n} {n,m} {n,}`. No backslash, so no escapes or classes, and no `(?`
+# extensions.
 
 fm_kestra_parse_flow() {
   local file=$1 source=${2:-$1}
@@ -751,6 +763,13 @@ fm_kestra_validate_inputs() {
 # Endpoint and credential live in gitignored local config, never in kestra/ or
 # bin/. docs/configuration.md owns where the file lives; docs/examples/kestra-env
 # is its copyable shape; no value is committed.
+# The file is parsed as literal KEY=value lines, never sourced: only the five
+# keys in fm_kestra_load_config are read, with optional outer double quotes and
+# no shell expansion, export syntax, or inline-comment handling. A present file
+# must be regular, non-symlink, and mode 0600 even when environment overrides exist.
+# Base URL and namespace are required; tenant defaults to main, and user/password
+# default to empty (the server decides whether that credential authenticates).
+# Credential values containing a double quote, backslash, or newline are refused.
 
 fm_kestra_config_file() {
   printf '%s\n' "${FM_KESTRA_CONFIG:-${FM_CONFIG_OVERRIDE:-$FM_KESTRA_HOME/config}/kestra.env}"
@@ -830,7 +849,7 @@ fm_kestra_load_config() {
 }
 
 # fm_kestra_assert_loopback <url>: refuse anything but a loopback http(s) endpoint.
-# M1 binds Kestra's main and management servers to loopback, so a non-loopback URL
+# M1 requires Kestra's main and management servers on loopback, so a non-loopback URL
 # means the seam is pointed at something it was never authorized to reach.
 fm_kestra_assert_loopback() {
   local url=$1 rest hostport host port
@@ -870,6 +889,7 @@ fm_kestra_assert_loopback() {
 # Kestra revision that fm-kestra-deploy.sh verified to carry the reviewed HEAD
 # bytes:
 #   <flow-id> TAB <namespace> TAB <revision> TAB <git blob id> TAB <HEAD commit>
+# The commit is provenance, not a merge attestation; run matching uses the blob.
 # The blob id is the content identity: a run refuses when the current HEAD blob
 # differs from the recorded one, because the reviewed flow has changed since it was
 # deployed and the record no longer describes what would run. The file is replaced
@@ -928,7 +948,9 @@ fm_kestra_deploy_source() {
 
 # fm_kestra_verify_revision_source <flow-id> <namespace> <revision> <snapshot-file>:
 # read the flow at that exact revision from Kestra and require its source to be the
-# reviewed HEAD bytes. Exit 1 on a transport or server failure, 2 on a mismatch.
+# reviewed HEAD bytes, ignoring leading blank transport lines and accepting the
+# deploy framing comment. All other bytes, including EOF newlines, must match.
+# Exit 1 on a transport or server failure, 2 on a mismatch.
 fm_kestra_verify_revision_source() {
   local flow=$1 ns=$2 revision=$3 snapshot=$4 rc=0 response returned server_source expected uploaded
   response=$(fm_kestra_request read GET "/flows/$ns/$flow?revision=$revision&source=true") || rc=$?
@@ -1002,8 +1024,9 @@ fm_kestra_tempfile() {
 
 # --- the HTTP gate ----------------------------------------------------------
 #
-# fm_kestra_request is the ONLY place this seam speaks HTTP. Each role positively
-# allows a small set of (method, path) shapes and refuses everything else, so
+# fm_kestra_request and fm_kestra_request_to_file gate requests before the shared
+# fm_kestra_curl_request transport sends them. Each role positively allows a small
+# set of (method, path) shapes and refuses everything else, so
 # replay, restart, resume, kill, state override, flow deletion, secret access, and
 # namespace administration are denied structurally rather than left undocumented.
 
