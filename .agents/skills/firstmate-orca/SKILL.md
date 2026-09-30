@@ -75,6 +75,7 @@ For a messy Orca-backed task:
 
 Teardown remains governed by the normal firstmate landing rules.
 Scout work can be torn down after the report exists and the `decision-hold-lifecycle` completion gate passes.
+For registered prototypes, also follow `prototype-lifecycle` before teardown, including after promotion.
 Ship work can be torn down only after the work is landed by its project mode.
 
 ## Smoke Test

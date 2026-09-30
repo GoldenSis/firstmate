@@ -12,6 +12,8 @@
 #   question: the explicit uncertainty
 #   safety.fixtures: "synthetic-or-minimized"
 #   safety.persistence: "none"
+#     Runtime experiment state is not persisted; retained source evidence below
+#     does not relax the safe envelope.
 #   safety.external_side_effects: "none"
 #   safety.sensitive_live_access: "forbidden"
 #   binding: null, or {worktree, baseline_head, ignored_snapshot[]}
@@ -63,9 +65,17 @@
 # artifact on proto/<task-id>, descended from the baseline; HEAD may be on that
 # branch or detached at the baseline. Completion records its identity once and
 # rejects later changes. Preparation only verifies that recorded artifact.
+# The worker creates and commits the artifact branch; these commands never create
+# or move it. UI completion validates the report without requiring scratch cleanup;
+# UI promotion preparation still requires the clean detached baseline.
 # `retained-branch` verifies the recorded branch still resolves to its commit in
 # the bound worktree, or the supplied recorded project if that worktree is absent,
 # and prints its name (nothing for UI or --allow-unrecorded without an identity).
+# The project fallback requires both the supplied and bound worktree paths to be
+# absent, not dangling symlinks; it never replaces a present but invalid worktree
+# or relaxes completion/promotion's original-worktree requirement.
+# --allow-unrecorded is used by explicitly approved teardown --force cancellation:
+# it permits no recorded identity, but never bypasses verification of one that exists.
 # Teardown calls it for scouts and promoted tasks before either cleanup path,
 # refusing missing or moved refs and preserving the branch.
 # fm-promote.sh detaches at the recorded baseline

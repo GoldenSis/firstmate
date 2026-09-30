@@ -87,6 +87,7 @@ Operation routing:
 Teardown:
 
 - Scout teardown still requires `data/<id>/report.md` and the shared unresolved-decision completion gate unless `--force` is explicitly used.
+- Registered prototypes also follow the shared [prototype lifecycle](../.agents/skills/prototype-lifecycle/SKILL.md) retention checks, including forced cleanup and cleanup after promotion.
 - Ship teardown still refuses dirty or unlanded work before any terminal/worktree cleanup.
 - Ship teardown resolves `orca_worktree_id` back through Orca and verifies it matches the inspected `worktree=` path before removing anything; mismatches or uninspectable paths preserve metadata and fail closed.
 - After the existing firstmate safety checks pass, teardown closes the recorded Orca terminal and releases the recorded worktree through `orca worktree rm --worktree id:<orca_worktree_id> --force`.

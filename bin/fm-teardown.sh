@@ -32,7 +32,9 @@
 # A scout marked by data/<task-id>/prototype.json must also pass the prototype
 # evidence and digest verification owned by fm-prototype.sh before teardown.
 # Marked tasks, including promoted ships, must pass its retained-branch check
-# before cleanup; a missing or moved logic-state artifact ref refuses teardown.
+# before cleanup; a missing, renamed, or moved logic-state artifact ref refuses
+# teardown. The verified artifact branch and durable prototype record survive
+# both cleanup paths; fm-prototype.sh owns verification and absent-worktree recovery.
 # Before destructive cleanup, teardown validates task check artifacts and any
 # matching quarantine entries as ordinary single-link files on the state
 # device. It refuses and preserves task state when that proof fails; otherwise
@@ -52,6 +54,8 @@
 #   --force skips ordinary-task dirty and landed-work checks, skips scout report
 #   checks, and discards secondmate child work for kind=secondmate. Only use it
 #   when the captain has explicitly said to discard the work.
+#   For registered prototypes it permits unfinished cancellation without a recorded
+#   artifact, but still verifies and preserves any recorded logic-state artifact.
 #
 # Transient / stale worktree git lock recovery (teardown-lock-race): a crew process
 # killed mid-git-operation can leave a .git/worktrees/<wt>/index.lock (or, for a
