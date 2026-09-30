@@ -496,6 +496,75 @@ test_create_task_creates_and_parses_ids() {
   pass "fm_backend_cmux_create_task: creates a workspace and parses workspace_id/surface_id from list responses"
 }
 
+test_create_task_waits_for_title() {
+  local dir fb out title
+  dir="$TMP_ROOT/create-delayed"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-test-delayed)
+  cmux_workspace_list_response "$dir" 1
+  cmux_workspace_list_response "$dir" 3 new-workspace zsh
+  cmux_workspace_list_response "$dir" 4 new-workspace "$title"
+  cmux_panes_response "$dir" 5 new-surface
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" FM_CMUX_TITLE_SETTLE_SECS=1 \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-test-delayed /tmp/proj' "$ROOT" )
+  [ "$out" = 'new-workspace new-surface' ] || fail "delayed title should resolve on the second poll, got '$out'"
+  pass "fm_backend_cmux_create_task: waits for the title to appear on the second poll"
+}
+
+test_create_task_title_timeout_cleanup() {
+  local dir fb out status scenario
+  for scenario in unique ambiguous close-failed close-noop; do
+    dir="$TMP_ROOT/create-timeout-$scenario"; mkdir -p "$dir/responses"
+    printf '{"workspaces":[{"id":"existing","title":"zsh","current_directory":"/tmp/proj"}]}' > "$dir/responses/1.out"
+    jq '.workspaces += [{id:"new-workspace",title:"zsh",current_directory:"/tmp/proj"}, {id:"unrelated",title:"zsh",current_directory:"/tmp/other"}]' \
+      "$dir/responses/1.out" > "$dir/responses/3.out"
+    if [ "$scenario" = ambiguous ]; then
+      jq '.workspaces += [{id:"concurrent",title:"zsh",current_directory:"/tmp/proj"}]' \
+        "$dir/responses/3.out" > "$dir/responses/4.out"
+    else
+      cp "$dir/responses/3.out" "$dir/responses/4.out"
+      # 5: close just the newly created workspace; 6: verify it disappeared.
+      cp "$dir/responses/1.out" "$dir/responses/6.out"
+      if [ "$scenario" = close-failed ]; then
+        printf '1' > "$dir/responses/5.exit"
+      elif [ "$scenario" = close-noop ]; then
+        cp "$dir/responses/3.out" "$dir/responses/6.out"
+      fi
+    fi
+    fb=$(make_cmux_fakebin "$dir")
+    out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" FM_CMUX_TITLE_SETTLE_SECS=0 \
+      bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-test-timeout /tmp/proj' "$ROOT" 2>&1 )
+    status=$?
+    expect_code 1 "$status" "title timeout should fail creation"
+    if [ "$scenario" != ambiguous ]; then
+      assert_contains "$(cat "$dir/log")" $'\x1fclose-workspace\x1f--workspace\x1fnew-workspace' "timeout must close only the new matching workspace"
+      [ "$(grep -c 'close-workspace' "$dir/log")" = 1 ] || fail "cleanup must close exactly one workspace"
+      if [ "$scenario" = unique ]; then
+        assert_contains "$out" 'closed newly created workspace' "timeout should report cleanup"
+      else
+        assert_contains "$out" 'left open because cleanup failed or could not be verified' "timeout must report unsuccessful cleanup"
+      fi
+    else
+      ! grep -q 'close-workspace' "$dir/log" || fail "ambiguous cleanup must not close any workspace"
+      assert_contains "$out" 'left open' "ambiguous cleanup must report the possible stray"
+    fi
+  done
+  pass "fm_backend_cmux_create_task: cleans up only an unambiguous new workspace on title timeout"
+}
+
+test_create_task_refuses_unreadable_snapshot() {
+  local dir fb out
+  dir="$TMP_ROOT/create-snapshot-failed"; mkdir -p "$dir/responses"
+  printf '1' > "$dir/responses/1.exit"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-test-snapshot /tmp/proj' "$ROOT" 2>&1 )
+  expect_code 1 "$?" "creation must stop if the pre-create list cannot be read"
+  assert_contains "$out" 'could not snapshot' "missing snapshot should be reported"
+  ! grep -q 'new-workspace' "$dir/log" || fail "must not create without a pre-create snapshot"
+  pass "fm_backend_cmux_create_task: refuses creation without a readable pre-create list"
+}
+
 # --- target_ready / capture ---------------------------------------------------
 
 test_target_ready_fails_when_target_absent() {
@@ -1033,6 +1102,9 @@ test_ensure_running_fails_fast_on_denied_without_launching
 test_ensure_running_fails_fast_on_unauth_without_launching
 test_create_task_refuses_duplicate_label
 test_create_task_creates_and_parses_ids
+test_create_task_waits_for_title
+test_create_task_title_timeout_cleanup
+test_create_task_refuses_unreadable_snapshot
 test_target_ready_fails_when_target_absent
 test_target_ready_checks_expected_label
 test_target_ready_rejects_label_mismatch

@@ -303,6 +303,12 @@ Related current-window scoping, observed during this work and left out of scope 
 `fm_backend_cmux_window_of_workspace` passes `--window` per window and is unaffected, but `fm_backend_cmux_workspace_id_for_label` and `fm_backend_cmux_list_live` see only the current window's workspaces, and `fm_backend_cmux_target_ready`'s label recovery inherits that scope.
 That is correct for the selected-workspace teardown case (a selected workspace is in the current window) but is a known limitation for a task workspace parked in a non-current window.
 
+## Workspace titles can settle after creation
+
+Reported on 2026-09-30 with cmux 0.64.25 (106), macOS: `new-workspace --name <title> --cwd <git-repo> --focus false` followed immediately by `workspace list --json --id-format uuids` failed title resolution three consecutive times with `error: could not resolve a cmux workspace id for '<title>' after creation`, although `title` and `custom_title` appeared a second or two later; `/tmp` exposed the title immediately.
+The adapter now waits for title publication and, on timeout, closes only a single new workspace matching the requested directory and absent from the pre-create list, reporting explicitly when cleanup cannot safely complete.
+`tests/fm-backend-cmux.test.sh` reproduces delayed publication and timeout cleanup with a fake CLI; no live app relaunch is required, and `bin/backends/cmux.sh` owns the settle-window configuration.
+
 ## Workspace ids do not survive a relaunch (verified from source, not a live restart)
 
 Per this task's explicit instruction NOT to relaunch the captain's app just to test this, this was verified by reading the actual shipped Swift source instead (`Sources/Workspace.swift`, cloned read-only from `github.com/manaflow-ai/cmux` at the commit current on 2026-07-04):
