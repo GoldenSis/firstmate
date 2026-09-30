@@ -112,7 +112,9 @@ case "$1 $2" in
   'worktree show') jq -n --arg path "$PROTOTYPE_TEST_WT" '{result: {path: $path}}' ;;
   'worktree rm')
     touch "$PROTOTYPE_TEST_CLEANUP"
-    git -C "$PROTOTYPE_TEST_REPO" worktree remove --force "$PROTOTYPE_TEST_WT" || exit 1
+    if [ -d "$PROTOTYPE_TEST_WT" ]; then
+      git -C "$PROTOTYPE_TEST_REPO" worktree remove --force "$PROTOTYPE_TEST_WT" || exit 1
+    fi
     printf '{"ok":true}\n'
     ;;
   *) exit 1 ;;
@@ -130,6 +132,138 @@ run_teardown() {
   PATH="$CASE_FAKEBIN:$PATH" PROTOTYPE_TEST_WT="$CASE_WT" \
     PROTOTYPE_TEST_REPO="$CASE_REPO" PROTOTYPE_TEST_CLEANUP="$CASE_HOME/cleanup-called" \
     FM_HOME="$CASE_HOME" FM_ROOT_OVERRIDE="$ROOT" "$TEARDOWN" "$@"
+}
+
+test_unfinished_logic_cancellation_requires_force() {
+  local backend id before rc out
+  for backend in tmux orca; do
+    id="cancel-$backend"
+    setup_case "$id" logic-state 'Does cancellation preserve state?'
+    commit_logic_artifact "$id"
+    printf 'unfinished experiment\n' >> "$CASE_WT/reducer.txt"
+    setup_teardown "$id" "$backend"
+    before=$(sha256_file "$CASE_HOME/data/$id/prototype.json")
+    out=$(run_teardown "$id" 2>&1); rc=$?
+    [ "$rc" -ne 0 ] || fail "$backend allowed unfinished cancellation without approval"
+    assert_contains "$out" 'has no report' "unfinished cancellation failed for an unrelated reason"
+    assert_present "$CASE_WT" "unapproved cancellation discarded unfinished work"
+    assert_absent "$CASE_HOME/cleanup-called" "unapproved cancellation invoked backend cleanup"
+    run_teardown "$id" --force >/dev/null || fail "$backend refused approved unfinished cancellation"
+    assert_absent "$CASE_WT" "approved cancellation kept the disposable worktree"
+    assert_absent "$CASE_HOME/state/$id.meta" "approved cancellation kept task metadata"
+    if git -C "$CASE_REPO" show-ref --verify --quiet "refs/heads/proto/$id"; then
+      fail "approved cancellation retained an unrecorded scratch branch"
+    fi
+    [ "$before" = "$(sha256_file "$CASE_HOME/data/$id/prototype.json")" ] \
+      || fail "approved cancellation changed the prototype record"
+  done
+  pass "fm-teardown.sh: approved cancellation discards unfinished logic-state scratch without a retention record"
+}
+
+test_forced_teardown_preserves_recorded_artifacts() {
+  local backend stage id question='Does forced cleanup retain evidence?' artifact
+  for backend in tmux orca; do
+    for stage in completed legacy promoted; do
+      id="force-$backend-$stage"
+      setup_case "$id" logic-state "$question"
+      commit_logic_artifact "$id"
+      artifact=$(git -C "$CASE_WT" rev-parse HEAD)
+      write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
+      FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null || fail "completion failed"
+      setup_teardown "$id" "$backend"
+      if [ "$stage" != completed ]; then
+        FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null \
+          || fail "preparation failed"
+      fi
+      if [ "$stage" = legacy ]; then
+        jq '.promotion.retained_artifact = .retained_artifact | del(.retained_artifact)' \
+          "$CASE_HOME/data/$id/prototype.json" > "$CASE_HOME/data/$id/prototype.json.tmp"
+        mv "$CASE_HOME/data/$id/prototype.json.tmp" "$CASE_HOME/data/$id/prototype.json"
+      elif [ "$stage" = promoted ]; then
+        FM_HOME="$CASE_HOME" FM_ROOT_OVERRIDE="$ROOT" "$PROMOTE" "$id" >/dev/null \
+          || fail "promotion failed"
+        git -C "$CASE_WT" checkout -qb "fm/$id"
+      fi
+      printf 'discardable changes\n' >> "$CASE_WT/README.md"
+      printf 'unfinished experiment\n' > "$CASE_WT/debug.log"
+      rm "$CASE_HOME/data/$id/report.md"
+      run_teardown "$id" --force >/dev/null || fail "$backend $stage forced cleanup failed"
+      assert_absent "$CASE_WT" "forced cleanup kept the disposable worktree"
+      assert_absent "$CASE_HOME/state/$id.meta" "forced cleanup kept task metadata"
+      [ "$(git -C "$CASE_REPO" rev-parse --verify "refs/heads/proto/$id")" = "$artifact" ] \
+        || fail "$backend $stage forced cleanup lost recorded artifact evidence"
+    done
+  done
+  pass "fm-teardown.sh: forced cleanup preserves recorded artifacts before and after promotion"
+}
+
+test_retention_verification_recovers_missing_worktree() {
+  local backend damage id question='Does evidence outlive the disposable copy?' baseline artifact before out rc
+  for backend in tmux orca; do
+    for damage in intact missing renamed moved; do
+      id="absent-$backend-$damage"
+      setup_case "$id" logic-state "$question"
+      baseline=$(git -C "$CASE_WT" rev-parse HEAD)
+      commit_logic_artifact "$id"
+      artifact=$(git -C "$CASE_WT" rev-parse HEAD)
+      write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
+      FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null || fail "completion failed"
+      setup_teardown "$id" "$backend"
+      before=$(sha256_file "$CASE_HOME/data/$id/prototype.json")
+      git -C "$CASE_REPO" worktree remove --force "$CASE_WT"
+      if [ "$damage" != intact ]; then
+        case "$damage" in
+          missing) git -C "$CASE_REPO" branch -D "proto/$id" >/dev/null ;;
+          renamed) git -C "$CASE_REPO" branch -m "proto/$id" "renamed/$id" ;;
+          moved) git -C "$CASE_REPO" branch -f "proto/$id" "$baseline" >/dev/null ;;
+        esac
+        out=$(run_teardown "$id" 2>&1); rc=$?
+        [ "$rc" -ne 0 ] || fail "$backend missing-worktree cleanup accepted a $damage artifact"
+        assert_contains "$out" 'retained artifact branch' "cleanup did not verify the project's artifact ref"
+        assert_present "$CASE_HOME/state/$id.meta" "refused recovery removed task metadata"
+        assert_absent "$CASE_HOME/cleanup-called" "refused recovery invoked backend cleanup"
+        if [ "$damage" = renamed ]; then
+          git -C "$CASE_REPO" branch -m "renamed/$id" "proto/$id"
+        else
+          git -C "$CASE_REPO" branch -f "proto/$id" "$artifact" >/dev/null
+        fi
+      fi
+      run_teardown "$id" >/dev/null || fail "$backend missing-worktree recovery failed"
+      assert_absent "$CASE_HOME/state/$id.meta" "missing-worktree recovery kept task metadata"
+      assert_present "$CASE_HOME/data/$id/report.md" "missing-worktree recovery lost the report"
+      [ "$(git -C "$CASE_REPO" rev-parse --verify "refs/heads/proto/$id")" = "$artifact" ] \
+        || fail "missing-worktree recovery lost the retained branch"
+      [ "$before" = "$(sha256_file "$CASE_HOME/data/$id/prototype.json")" ] \
+        || fail "missing-worktree recovery changed the recorded identity"
+    done
+  done
+  pass "fm-teardown.sh: missing-worktree recovery verifies retained artifacts through the recorded project"
+}
+
+test_retention_recovery_requires_absent_worktree_and_project() {
+  local id=recovery-boundary question='Does recovery verify the durable evidence?' rc branch
+  setup_case "$id" logic-state "$question"
+  commit_logic_artifact "$id"
+  write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null || fail "completion failed"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" retained-branch "$id" "$CASE_WT-missing" "$CASE_REPO" \
+    >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "recovery ignored a still-present registered worktree"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" retained-branch "$id" "$CASE_REPO" "$CASE_REPO" \
+    >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "recovery accepted a different existing worktree"
+  git -C "$CASE_REPO" worktree remove --force "$CASE_WT"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" retained-branch "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "recovery guessed a repository without a recorded project"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" retained-branch "$id" "$CASE_WT" "$CASE_REPO-missing" \
+    >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "recovery accepted an absent recorded project"
+  branch=$(FM_HOME="$CASE_HOME" "$PROTOTYPE" retained-branch "$id" "$CASE_WT" "$CASE_REPO") \
+    || fail "recovery refused the recorded project"
+  [ "$branch" = "proto/$id" ] || fail "recovery returned the wrong retained branch"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "recovery bypassed promotion's original worktree requirement"
+  pass "fm-prototype.sh: recovery requires an absent bound worktree and an explicit accessible project"
 }
 
 test_logic_completion_retains_artifact_without_promotion() {
@@ -195,6 +329,9 @@ test_teardown_refuses_changed_retained_refs() {
         out=$(run_teardown "$id" 2>&1); rc=$?
         [ "$rc" -ne 0 ] || fail "$backend $stage teardown accepted a $damage artifact ref"
         assert_contains "$out" 'retained artifact' "teardown failed for a reason unrelated to retention"
+        out=$(run_teardown "$id" --force 2>&1); rc=$?
+        [ "$rc" -ne 0 ] || fail "$backend $stage forced teardown accepted a $damage artifact ref"
+        assert_contains "$out" 'retained artifact' "forced teardown failed for a reason unrelated to retention"
         assert_absent "$CASE_HOME/cleanup-called" "refused teardown invoked backend cleanup"
         assert_present "$CASE_WT/.claude/settings.local.json" "refused teardown removed the injected hook"
         assert_present "$CASE_HOME/state/$id.meta" "refused teardown removed task metadata"
@@ -620,6 +757,10 @@ sha256_file() {
   fi
 }
 
+test_unfinished_logic_cancellation_requires_force
+test_forced_teardown_preserves_recorded_artifacts
+test_retention_verification_recovers_missing_worktree
+test_retention_recovery_requires_absent_worktree_and_project
 test_logic_completion_retains_artifact_without_promotion
 test_teardown_refuses_changed_retained_refs
 test_logic_completion_requires_clean_artifact

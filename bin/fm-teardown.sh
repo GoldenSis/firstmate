@@ -1097,8 +1097,10 @@ fi
 # Keep the recorded logic-state artifact; all other task branches remain disposable.
 RETAINED_PROTOTYPE_BRANCH=
 if [ -e "$DATA/$ID/prototype.json" ] || [ -L "$DATA/$ID/prototype.json" ]; then
+  RETAINED_PROTOTYPE_ARGS=("$ID" "$WT" "$PROJ")
+  [ "$FORCE" != "--force" ] || RETAINED_PROTOTYPE_ARGS+=(--allow-unrecorded)
   if ! RETAINED_PROTOTYPE_BRANCH=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" \
-      "$SCRIPT_DIR/fm-prototype.sh" retained-branch "$ID" "$WT"); then
+      "$SCRIPT_DIR/fm-prototype.sh" retained-branch "${RETAINED_PROTOTYPE_ARGS[@]}"); then
     echo "REFUSED: prototype $ID has no verified retained artifact; preserving task and worktree." >&2
     exit 1
   fi

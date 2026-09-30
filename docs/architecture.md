@@ -132,6 +132,8 @@ The [`prototype-lifecycle` skill](../.agents/skills/prototype-lifecycle/SKILL.md
 
 The captain's 2026-09-30 decision (Wayfinder review, section 7 Question 3, option 3; roadmap row 19) retains decision-bearing logic-state artifacts as primary evidence while UI prototypes continue to leave only their report.
 The prototype lifecycle skill owns that two-way policy; completion records the retained branch and commit independently of implementation authorization, evidence updates preserve that identity, promotion restores the registered clean baseline, and cleanup verifies the recorded reference before preserving it, including after promotion.
+The captain's cancellation decision preserves explicitly approved `fm-teardown.sh --force` disposal before an artifact identity is recorded; once recorded, the artifact must still be verified and retained during forced cleanup.
+When the disposable worktree is already absent, cleanup verifies the retained reference through the task's recorded project before clearing task metadata.
 
 ## Dispatch profiles
 

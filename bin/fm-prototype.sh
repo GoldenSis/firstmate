@@ -64,9 +64,11 @@
 # branch or detached at the baseline. Completion records its identity once and
 # rejects later changes. Preparation only verifies that recorded artifact.
 # `retained-branch` verifies the recorded branch still resolves to its commit in
-# the bound worktree and prints its name (nothing for UI). Teardown calls it for
-# scouts and promoted tasks before either cleanup path, refusing missing or moved
-# refs and preserving the branch. fm-promote.sh detaches at the recorded baseline
+# the bound worktree, or the supplied recorded project if that worktree is absent,
+# and prints its name (nothing for UI or --allow-unrecorded without an identity).
+# Teardown calls it for scouts and promoted tasks before either cleanup path,
+# refusing missing or moved refs and preserving the branch.
+# fm-promote.sh detaches at the recorded baseline
 # before making this a ship task.
 # Repeating preparation in the same clean state is idempotent. `promotion-verify`
 # repeats every check without mutation and is called by fm-promote.sh.
@@ -77,7 +79,7 @@
 #   fm-prototype.sh bind <task-id> <worktree>
 #   fm-prototype.sh complete <task-id>
 #   fm-prototype.sh verify <task-id>
-#   fm-prototype.sh retained-branch <task-id> <worktree>
+#   fm-prototype.sh retained-branch <task-id> <worktree> [<project> [--allow-unrecorded]]
 #   fm-prototype.sh prepare-promotion <task-id> <worktree>
 #   fm-prototype.sh promotion-verify <task-id> <worktree>
 #   fm-prototype.sh decision <task-id>
@@ -358,16 +360,25 @@ recorded_retained_artifact() {
 }
 
 verify_retained_artifact() {
-  local supplied=$1 bound artifact branch expected actual
+  local supplied=$1 project=${2:-} allow_unrecorded=${3:-} bound repository artifact branch expected actual
   [ "$(jq -r '.class' "$MANIFEST")" = logic-state ] || return 0
   artifact=$(recorded_retained_artifact)
-  [ "$artifact" != null ] || die "logic-state completion has no recorded retained artifact"
-  supplied=$(canonical_dir "$supplied") || die "retained artifact worktree does not exist: $1"
+  if [ "$artifact" = null ]; then
+    [ "$allow_unrecorded" = --allow-unrecorded ] && return 0
+    die "logic-state completion has no recorded retained artifact"
+  fi
   bound=$(jq -r '.binding.worktree // empty' "$MANIFEST")
-  [ "$supplied" = "$bound" ] || die "retained artifact worktree differs from the registered worktree"
+  if [ -n "$project" ] && [ ! -e "$supplied" ] && [ ! -L "$supplied" ]; then
+    [ -n "$bound" ] && [ ! -e "$bound" ] && [ ! -L "$bound" ] \
+      || die "registered retained artifact worktree is not absent: $bound"
+    repository=$(canonical_dir "$project") || die "retained artifact project does not exist: $project"
+  else
+    repository=$(canonical_dir "$supplied") || die "retained artifact worktree does not exist: $1"
+    [ "$repository" = "$bound" ] || die "retained artifact worktree differs from the registered worktree"
+  fi
   branch=$(printf '%s\n' "$artifact" | jq -r '.branch')
   expected=$(printf '%s\n' "$artifact" | jq -r '.commit')
-  actual=$(git -C "$supplied" rev-parse --verify "refs/heads/$branch^{commit}" 2>/dev/null) \
+  actual=$(git -C "$repository" rev-parse --verify "refs/heads/$branch^{commit}" 2>/dev/null) \
     || die "retained artifact branch is missing: $branch"
   [ "$actual" = "$expected" ] || die "retained artifact branch changed: $branch"
 }
@@ -618,10 +629,12 @@ case "${1:-}" in
     prepare_promotion_command "$3"
     ;;
   retained-branch)
-    [ "$#" -eq 3 ] || die "usage: fm-prototype.sh retained-branch <task-id> <worktree>"
+    [ "$#" -ge 3 ] && [ "$#" -le 5 ] \
+      || die "usage: fm-prototype.sh retained-branch <task-id> <worktree> [<project> [--allow-unrecorded]]"
+    [ "$#" -lt 5 ] || [ "$5" = --allow-unrecorded ] || die "unknown retained-branch option: $5"
     load_task "$2"
     validate_manifest
-    verify_retained_artifact "$3"
+    verify_retained_artifact "$3" "${4:-}" "${5:-}"
     recorded_retained_artifact | jq -r '.branch // empty'
     ;;
   promotion-verify)
