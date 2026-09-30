@@ -221,4 +221,4 @@ Default five-role vocabulary (`needs-triage` … `wontfix`). See `docs/agents/tr
 
 ### Domain docs
 
-Single-context: root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
+Single-context: root `GLOSSARY.md` + `docs/adr/`. See `docs/agents/domain.md`.
