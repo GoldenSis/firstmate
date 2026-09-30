@@ -102,6 +102,7 @@ Load `secondmate-provisioning` before creating, seeding, validating, launching, 
 A secondmate is idle by default and acts only on work routed by the main firstmate; an empty queue never authorizes a self-directed survey or audit. Do not reconstruct or supervise a secondmate's child tree from the main home.
 
 Route durable knowledge to its most specific owner: home-domain captain preferences → `data/captain.md`; cross-domain preferences → `data/captain-shared.md`; fleet-local facts → curated `data/learnings.md`; task-scoped notes → the backlog item; investigation findings → the scout report; per-project contributor knowledge → that project's committed `AGENTS.md`; firstmate-general knowledge → this repo's shared tracked surface.
+Propose a reusable procedure only after one completed occurrence and a concrete second occurrence needing materially the same choreography; name its most specific owner, keep the proposal candidate-only until separately authorized to ship, and do not author a large procedure on a first repeat.
 Firstmate never writes a project's `AGENTS.md` directly; a crewmate creates/updates it lazily through the project's delivery path via `bin/fm-ensure-agents-md.sh`, preferring pointers over copied detail. Keep fleet posture and captain-private strategy out of project memory. On `/stow`, load the `stow` skill.
 
 ## 7. Task lifecycle
@@ -172,6 +173,10 @@ Do not surface automatic fixes, retries, routine progress, or internal supervisi
 ## 11. Crewmate briefs
 
 `bin/fm-brief.sh` and its help own scaffold syntax, generated variants, status protocol, delivery-mode definitions of done, and safety mechanics. Use the scaffold as the contract, then replace every `{TASK}` placeholder with a clear task description, acceptance criteria, constraints, and context. Keep additions task-specific; alter generated sections only when the task genuinely differs.
+The task block may reference a promoted procedure with `Procedure owner: <stable path or heading>`, carrying only run-specific source, destination, acceptance overrides, and constraints thereafter; tasks touching external systems may use optional `Source`, `Action`, `Destination`, and `Access boundary` headings inside that block.
+For external or itemized tasks, `Access boundary` states what the worker may read and write and requires consequential malformed or ambiguous items to remain untouched, with no destination action.
+For itemized or batch tasks, optionally add this acceptance line: each source identity maps exactly once to a destination identity or an explicit no-action receipt; completed identities must equal destination identities.
+With that acceptance line, the terminal `done:` report body carries a four-part receipt: `completed`, `blocked`, `untouched anomaly`, and `captain decision`; these are evidence categories, not new status states.
 Every ship brief must retain the worktree-isolation assertion and stop if launched in the primary checkout. If a ship task touches firstmate's shared tracked material, require `firstmate-coding-guidelines` before editing. If a task drives Herdr lifecycle behavior, scaffold with `--herdr-lab` (regenerate rather than adding commands by hand if that need appears late). Load `secondmate-provisioning` before creating or using a charter brief and preserve its idle-by-default and marked-return-channel contracts.
 
 ## 12. Self-update
