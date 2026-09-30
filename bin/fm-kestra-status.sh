@@ -2,12 +2,12 @@
 # fm-kestra-status.sh - the read-only half of firstmate's Kestra seam.
 #
 # It returns five kinds of evidence and nothing else: execution state, task logs,
-# declared flow outputs, replay lineage, and artifacts a flow actually declared as
-# an output. Before any evidence is printed or any follow-up request is made, the
-# execution must resolve to the configured namespace and a tracked, unchanged flow.
-# Every request goes through the `read` role of fm-kestra-lib.sh's HTTP gate, which
-# allows only the exact execution, log, artifact, and recorded-flow-revision GET
-# shapes used here. Performing a replay is not offered by any subcommand and is
+# the outputs tasks declared, replay lineage, and artifacts a task actually
+# declared as an output. Before any evidence is printed or any follow-up request
+# is made, the execution must resolve to the configured namespace and a tracked,
+# unchanged flow. Every request goes through the `read` role of fm-kestra-lib.sh's
+# HTTP gate, which allows only the exact execution, log, artifact, and flow-revision
+# GET shapes used here. Performing a replay is not offered by any subcommand and is
 # refused by the gate.
 #
 # A state this prints is evidence that a task ran. It is never approval, never
@@ -17,19 +17,24 @@
 # Usage:
 #   fm-kestra-status.sh state    <execution-id>   state, history, per-task attempts,
 #                                                 and the tasks that never ran
-#   fm-kestra-status.sh logs     <execution-id>   per-task log lines
-#   fm-kestra-status.sh outputs  <execution-id>   the flow's declared outputs
+#   fm-kestra-status.sh logs     <execution-id>   per-task, per-attempt log lines
+#   fm-kestra-status.sh outputs  <execution-id>   every output a task declared,
+#                                                 as <task>.<key>=<value>
 #   fm-kestra-status.sh lineage  <execution-id>   this execution and its original
 #   fm-kestra-status.sh artifact <execution-id> <uri> [--out <file>]
-#                                                 one artifact the execution
-#                                                 declared as an output
+#                                                 one artifact a task declared as
+#                                                 an output
 #   fm-kestra-status.sh --help
 #
 # `state` reports `not-run:` for every task the execution's recorded flow revision
-# declares that the execution never produced. If that exact revision cannot be
-# resolved, the output says the suppression evidence is unavailable.
+# declares that the execution never produced. That is only evidence once the
+# execution is terminal and its task list is well-formed, and only when the exact
+# revision can be read back and parsed; otherwise the line says
+# `not-run: unavailable: <reason>` and the rest of the state is still printed. An
+# HTTP failure reading the revision (for example a 404) is an unavailable reason;
+# a transport failure is an error.
 #
-# `artifact` refuses any URI the execution did not declare in its own outputs, so
+# `artifact` refuses any URI no task of the execution declared as an output, so
 # this adapter cannot be used to walk Kestra's internal storage.
 #
 # Exit status: 0 on success, 2 on a refusal or usage error, 1 on a transport or
@@ -66,7 +71,7 @@ case "$SUBCOMMAND" in
     ;;
   artifact)
     URI=${1:-}
-    [ -n "$URI" ] || fm_kestra_die "artifact needs the URI the execution declared"
+    [ -n "$URI" ] || fm_kestra_die "artifact needs the URI a task declared"
     shift
     if [ "${1:-}" = "--out" ]; then
       [ "$#" -ge 2 ] || fm_kestra_die "--out needs a path"
@@ -81,7 +86,7 @@ esac
 command -v jq >/dev/null 2>&1 || fm_kestra_die "jq is required for the Kestra seam" 1
 fm_kestra_load_config
 
-# fm_kestra_read <path>: one gated GET, with refusals kept distinguishable from
+# kestra_get <path>: one gated GET, with refusals kept distinguishable from
 # transport failures.
 kestra_get() {
   local rc=0 body
@@ -119,53 +124,81 @@ FLOW=$(printf '%s' "$EXEC_JSON" | jq -er '.flowId | select(type == "string")') \
   || fm_kestra_die "refused: execution $EXECUTION belongs to namespace $NS, not allow-listed namespace $FM_KESTRA_NAMESPACE"
 FLOW_FILE=""
 fm_kestra_resolve_flow "$FLOW" FLOW_FILE
-FLOW_NS=$(fm_kestra_scalar "$FLOW_FILE" namespace)
+FLOW_NS=$(fm_kestra_flow_namespace "$FLOW_FILE")
 [ "$FLOW_NS" = "$FM_KESTRA_NAMESPACE" ] \
   || fm_kestra_die "refused: tracked flow $FLOW does not belong to allow-listed namespace $FM_KESTRA_NAMESPACE"
+
+# not_run_source <revision> <out-var>: stage the flow source at that revision, or
+# set NOT_RUN_UNAVAILABLE. Curl's exit 22 is an HTTP-level failure with the body
+# retained, which is an unavailable reason; anything else non-zero is transport.
+not_run_source() {
+  local revision=$1 out_var=$2 rc=0 body returned source staged
+  body=$(fm_kestra_request read GET "/flows/$NS/$FLOW?revision=$revision&source=true") || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    exit 2
+  elif [ "$rc" -eq 22 ]; then
+    NOT_RUN_UNAVAILABLE="flow revision $revision could not be read from Kestra"
+    return 0
+  elif [ "$rc" -ne 0 ]; then
+    [ -z "$body" ] || printf '%s\n' "$body" >&2
+    fm_kestra_die "read request failed: /flows/$NS/$FLOW?revision=$revision&source=true" 1
+  fi
+  returned=$(printf '%s' "$body" | jq -r '
+    .revision | select(type == "number" and . >= 1 and floor == .) | tostring
+  ' 2>/dev/null) || returned=""
+  source=$(printf '%s' "$body" | jq -er '.source | select(type == "string")' 2>/dev/null) || source=""
+  if [ "$returned" != "$revision" ] || [ -z "$source" ]; then
+    NOT_RUN_UNAVAILABLE="flow revision $revision could not be resolved"
+    return 0
+  fi
+  fm_kestra_tempfile revision staged || fm_kestra_die "could not stage flow revision $revision" 1
+  printf '%s\n' "$source" > "$staged"
+  if ! fm_kestra_check_flow "$staged" >/dev/null 2>&1 \
+    || [ "$(fm_kestra_flow_id "$staged")" != "$FLOW" ] \
+    || [ "$(fm_kestra_flow_namespace "$staged")" != "$NS" ]; then
+    NOT_RUN_UNAVAILABLE="flow revision $revision could not be parsed safely"
+    return 0
+  fi
+  printf -v "$out_var" '%s' "$staged"
+}
 
 case "$SUBCOMMAND" in
   state)
     NOT_RUN_SOURCE=""
     NOT_RUN_UNAVAILABLE=""
+    STATE=$(printf '%s' "$EXEC_JSON" | jq -r '.state.current // "unknown"')
     REVISION=$(printf '%s' "$EXEC_JSON" | jq -r '
       .flowRevision |
       select(type == "number" and . >= 1 and floor == .) |
       tostring
     ')
-    if [ -z "$REVISION" ]; then
+    case "$STATE" in
+      SUCCESS|WARNING|FAILED|KILLED|CANCELLED) : ;;
+      *) NOT_RUN_UNAVAILABLE="execution is not terminal ($STATE)" ;;
+    esac
+    if [ -z "$NOT_RUN_UNAVAILABLE" ] \
+      && ! printf '%s' "$EXEC_JSON" | jq -e '
+        (.taskRunList | type == "array") and all(.taskRunList[]; type == "object" and (.taskId | type == "string"))
+      ' >/dev/null 2>&1; then
+      NOT_RUN_UNAVAILABLE="execution has no well-formed task list"
+    fi
+    if [ -z "$NOT_RUN_UNAVAILABLE" ] && [ -z "$REVISION" ]; then
       NOT_RUN_UNAVAILABLE="execution has no valid flowRevision"
-    else
-      REVISION_JSON=$(kestra_get "/flows/$NS/$FLOW?revision=$REVISION&source=true")
-      RETURNED_REVISION=$(printf '%s' "$REVISION_JSON" | jq -r '
-        .revision |
-        select(type == "number" and . >= 1 and floor == .) |
-        tostring
-      ')
-      REVISION_SOURCE=$(printf '%s' "$REVISION_JSON" | jq -er '.source | select(type == "string")' 2>/dev/null) \
-        || REVISION_SOURCE=""
-      if [ "$RETURNED_REVISION" != "$REVISION" ] || [ -z "$REVISION_SOURCE" ]; then
-        NOT_RUN_UNAVAILABLE="flow revision $REVISION could not be resolved"
-      else
-        fm_kestra_tempfile revision NOT_RUN_SOURCE \
-          || fm_kestra_die "could not stage flow revision $REVISION" 1
-        printf '%s\n' "$REVISION_SOURCE" > "$NOT_RUN_SOURCE"
-        if ! fm_kestra_check_flow "$NOT_RUN_SOURCE" >/dev/null 2>&1 \
-          || [ "$(fm_kestra_scalar "$NOT_RUN_SOURCE" id)" != "$FLOW" ] \
-          || [ "$(fm_kestra_scalar "$NOT_RUN_SOURCE" namespace)" != "$NS" ]; then
-          NOT_RUN_UNAVAILABLE="flow revision $REVISION could not be parsed safely"
-        fi
-      fi
+    fi
+    if [ -z "$NOT_RUN_UNAVAILABLE" ]; then
+      not_run_source "$REVISION" NOT_RUN_SOURCE
     fi
 
-    printf 'execution: %s\n' "$(printf '%s' "$EXEC_JSON" | jq -r '.id // "unknown"')"
+    printf 'execution: %s\n' "$EXEC_ID"
     printf 'flow: %s/%s\n' "$NS" "$FLOW"
-    printf 'state: %s\n' "$(printf '%s' "$EXEC_JSON" | jq -r '.state.current // "unknown"')"
+    printf 'revision: %s\n' "${REVISION:-unknown}"
+    printf 'state: %s\n' "$STATE"
     # The full transition history is what makes a retry sequence observable rather
     # than a bare terminal state, so it is printed verbatim and in order.
     printf 'history: %s\n' \
       "$(printf '%s' "$EXEC_JSON" | jq -r '[.state.histories[]?.state] | join(" -> ")')"
     printf '%s' "$EXEC_JSON" | jq -r '
-      .taskRunList[]? |
+      .taskRunList[]? | select(type == "object") |
       "task: \(.taskId) state=\(.state.current) attempts=\(.attempts | length // 0) " +
       "history=\([.state.histories[]?.state] | join(","))"
     '
@@ -175,7 +208,7 @@ case "$SUBCOMMAND" in
       while IFS= read -r declared; do
         [ -n "$declared" ] || continue
         if ! printf '%s' "$EXEC_JSON" \
-          | jq -e --arg task "$declared" 'any(.taskRunList[]?; .taskId == $task)' >/dev/null; then
+          | jq -e --arg task "$declared" 'any(.taskRunList[]; .taskId == $task)' >/dev/null; then
           printf 'not-run: %s\n' "$declared"
         fi
       done <<< "$(fm_kestra_task_ids "$NOT_RUN_SOURCE")"
@@ -191,22 +224,28 @@ case "$SUBCOMMAND" in
     ;;
 
   outputs)
+    # Outputs are what tasks declared on their own task runs: a Return task's
+    # value, a Write task's uri. Static flows declare no flow-level outputs.
     printf '%s' "$EXEC_JSON" | jq -r '
-      (.outputs // {}) | to_entries[]? | "output: \(.key)=\(.value)"
+      .taskRunList[]? | select(type == "object") |
+      .taskId as $task | (.outputs // {}) | to_entries[]? |
+      "output: \($task).\(.key)=\(.value | tostring)"
     '
     ;;
 
   lineage)
-    printf 'execution: %s\n' "$(printf '%s' "$EXEC_JSON" | jq -r '.id // "unknown"')"
+    printf 'execution: %s\n' "$EXEC_ID"
     printf 'original: %s\n' "$(printf '%s' "$EXEC_JSON" | jq -r '.originalId // "none"')"
     ;;
 
   artifact)
-    # Approved means declared. An artifact URI the execution did not publish as one
-    # of its own outputs is refused, so this stays an evidence reader rather than a
-    # storage browser.
-    printf '%s' "$EXEC_JSON" | jq -e --arg uri "$URI" \
-      'any((.outputs // {}) | to_entries[]?; (.value | tostring) == $uri)' >/dev/null \
+    # Approved means declared. An artifact URI no task of this execution published
+    # as one of its outputs is refused, so this stays an evidence reader rather
+    # than a storage browser.
+    printf '%s' "$EXEC_JSON" | jq -e --arg uri "$URI" '
+      any(.taskRunList[]? | select(type == "object") | (.outputs // {}) | to_entries[]?;
+        (.value | tostring) == $uri)
+    ' >/dev/null \
       || fm_kestra_die "refused: $URI is not declared as an output of execution $EXECUTION"
     ENCODED=$(printf '%s' "$URI" | jq -sRr @uri)
     if [ -n "$OUT" ]; then

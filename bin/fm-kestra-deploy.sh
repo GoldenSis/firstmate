@@ -11,20 +11,28 @@
 #   - a flow whose namespace is not the one allow-listed namespace in local config;
 #   - a flow missing the `system.readOnly: "true"` label (without it, the Kestra UI
 #     editor can change a deployed flow and Git review becomes advisory);
-#   - a task type outside the exact M1-safe allow-list in fm-kestra-lib.sh;
-#   - a YAML shape, input schema, or validator regex this seam cannot represent
-#     and pre-check exactly;
-#   - any trigger, because executions may start only through fm-kestra-run.sh.
+#   - anything outside the M1 static-flow grammar fm-kestra-lib.sh owns: a task
+#     type outside the M1-safe allow-list, any Pebble templating, an input schema or
+#     validator regex the run adapter could not pre-check exactly, any trigger.
+#
+# What it records. After the namespace update, every flow is read back from Kestra
+# at the revision the update reported, and that revision's source must be the
+# reviewed HEAD bytes. Only then is the revision written to the deployed-revision
+# record (data/kestra/revisions in the operating home; fm-kestra-lib.sh owns its
+# format), which is what fm-kestra-run.sh binds each execution to. A read-back
+# that does not match leaves the record untouched and fails, so a run can never be
+# bound to a revision that was not verified.
 #
 # Usage:
 #   fm-kestra-deploy.sh --check    validate tracked flows only; no config, no network
-#   fm-kestra-deploy.sh            validate, then validate server-side, then update
-#                                  the allow-listed namespace with deletion disabled
+#   fm-kestra-deploy.sh            validate, validate server-side, update the
+#                                  allow-listed namespace with deletion disabled,
+#                                  verify each deployed revision, record it
 #   fm-kestra-deploy.sh --help     this text
 #
-# Endpoint and credential come from gitignored captain-private config; see the
-# shape in docs/kestra-seam.md. No captain-private data enters a flow payload, and
-# every tracked flow is synthetic.
+# Endpoint and credential come from gitignored captain-private config; see
+# docs/configuration.md and docs/examples/kestra-env. No captain-private data
+# enters a flow payload, and every tracked flow is synthetic.
 #
 # Exit status: 0 on success, 2 on a refusal or usage error, 1 on a transport or
 # server failure.
@@ -52,14 +60,20 @@ fm_kestra_snapshot_flow_files
 problems=0
 declared_ns=""
 flow_count=0
+FLOW_IDS=()
 index=0
 while [ "$index" -lt "${#FM_KESTRA_SNAPSHOT_FILES[@]}" ]; do
   file=${FM_KESTRA_SNAPSHOT_FILES[$index]}
   source=${FM_KESTRA_SNAPSHOT_SOURCES[$index]}
   index=$((index + 1))
   flow_count=$((flow_count + 1))
-  fm_kestra_check_flow "$file" "$source" || problems=1
-  ns=$(fm_kestra_scalar "$file" namespace)
+  if ! fm_kestra_check_flow "$file" "$source"; then
+    problems=1
+    FLOW_IDS+=("")
+    continue
+  fi
+  FLOW_IDS+=("$(fm_kestra_flow_id "$file")")
+  ns=$(fm_kestra_flow_namespace "$file")
   if [ -z "$declared_ns" ]; then
     declared_ns=$ns
   elif [ "$ns" != "$declared_ns" ]; then
@@ -73,10 +87,8 @@ done
 if [ "$MODE" = check ]; then
   index=0
   while [ "$index" -lt "${#FM_KESTRA_SNAPSHOT_FILES[@]}" ]; do
-    file=${FM_KESTRA_SNAPSHOT_FILES[$index]}
-    source=${FM_KESTRA_SNAPSHOT_SOURCES[$index]}
+    printf 'ok: %s (%s/%s)\n' "${FM_KESTRA_SNAPSHOT_SOURCES[$index]}" "$declared_ns" "${FLOW_IDS[$index]}"
     index=$((index + 1))
-    printf 'ok: %s (%s/%s)\n' "$source" "$declared_ns" "$(fm_kestra_scalar "$file" id)"
   done
   exit 0
 fi
@@ -88,20 +100,13 @@ command -v jq >/dev/null 2>&1 || fm_kestra_die "jq is required for the Kestra se
 [ "$declared_ns" = "$FM_KESTRA_NAMESPACE" ] || fm_kestra_die \
   "tracked flows declare namespace $declared_ns but only $FM_KESTRA_NAMESPACE is allow-listed"
 
-# One multi-document body, exactly the set of tracked flows.
-BODY=""
-fm_kestra_tempfile flows BODY || fm_kestra_die "could not create a staging file" 1
-first=1
-for file in "${FM_KESTRA_SNAPSHOT_FILES[@]}"; do
-  [ "$first" -eq 1 ] || printf -- '---\n' >> "$BODY"
-  first=0
-  cat -- "$file" >> "$BODY"
-  printf '\n' >> "$BODY"
-done
+# The body is the HEAD snapshot, staged once inside the gate so validation and the
+# update send the same bytes; this script hands the gate no body of its own.
+fm_kestra_stage_deploy_body
 
 # Server-side validation first: a rejected flow must never reach the update call.
 rc=0
-validation=$(fm_kestra_request deploy POST /flows/validate "$BODY") || rc=$?
+validation=$(fm_kestra_request deploy POST /flows/validate) || rc=$?
 if [ "$rc" -eq 2 ]; then
   exit 2
 elif [ "$rc" -ne 0 ]; then
@@ -120,8 +125,7 @@ fi
 # `delete=false` is not a default worth trusting to a caller: deletion stays off.
 rc=0
 update_response=$(fm_kestra_request deploy POST \
-  "/flows/bulk?delete=false&namespace=$FM_KESTRA_NAMESPACE" \
-  "$BODY") || rc=$?
+  "/flows/bulk?delete=false&namespace=$FM_KESTRA_NAMESPACE") || rc=$?
 if [ "$rc" -eq 2 ]; then
   exit 2
 elif [ "$rc" -ne 0 ]; then
@@ -129,6 +133,35 @@ elif [ "$rc" -ne 0 ]; then
   fm_kestra_die "namespace update failed" 1
 fi
 
-for file in "${FM_KESTRA_SNAPSHOT_FILES[@]}"; do
-  printf 'deployed: %s/%s\n' "$FM_KESTRA_NAMESPACE" "$(fm_kestra_scalar "$file" id)"
+# --- revision verification and record ---------------------------------------
+#
+# The update response names the revision each flow now has. Each one is read back
+# and must carry the reviewed bytes before anything is recorded, so the record
+# never describes a revision that was not verified.
+RECORD_LINES=()
+index=0
+while [ "$index" -lt "${#FM_KESTRA_SNAPSHOT_FILES[@]}" ]; do
+  file=${FM_KESTRA_SNAPSHOT_FILES[$index]}
+  flow_id=${FLOW_IDS[$index]}
+  blob=${FM_KESTRA_SNAPSHOT_BLOBS[$index]}
+  index=$((index + 1))
+  revision=$(printf '%s' "$update_response" | jq -r --arg id "$flow_id" --arg ns "$FM_KESTRA_NAMESPACE" '
+    select(type == "array") | .[] |
+    select(type == "object" and .id == $id and .namespace == $ns) |
+    .revision | select(type == "number" and . >= 1 and floor == .) | tostring
+  ' 2>/dev/null | head -n 1) || revision=""
+  if [ -z "$revision" ]; then
+    [ -z "$update_response" ] || printf '%s\n' "$update_response" >&2
+    fm_kestra_die "namespace update reported no revision for flow $FM_KESTRA_NAMESPACE/$flow_id; nothing recorded" 1
+  fi
+  fm_kestra_verify_revision_source "$flow_id" "$FM_KESTRA_NAMESPACE" "$revision" "$file"
+  RECORD_LINES+=("$(printf '%s\t%s\t%s\t%s\t%s' \
+    "$flow_id" "$FM_KESTRA_NAMESPACE" "$revision" "$blob" "$FM_KESTRA_SNAPSHOT_HEAD")")
+done
+
+fm_kestra_write_revision_record "${RECORD_LINES[@]}"
+
+for line in "${RECORD_LINES[@]}"; do
+  IFS=$'\t' read -r flow_id _ revision _ _ <<< "$line"
+  printf 'deployed: %s/%s revision %s\n' "$FM_KESTRA_NAMESPACE" "$flow_id" "$revision"
 done

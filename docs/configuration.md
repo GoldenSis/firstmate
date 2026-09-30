@@ -110,6 +110,7 @@ See [`wedge-alarm.md`](wedge-alarm.md) for the channel reference and macOS verif
 It is home-local and is never inherited or propagated to a secondmate home.
 No value is committed anywhere; [`examples/kestra-env`](examples/kestra-env) is the copyable shape and [`kestra-seam.md`](kestra-seam.md) owns the seam's rationale, boundaries, and deferred decisions.
 The seam is inert without that file: `bin/fm-kestra-deploy.sh --check` still validates the tracked flows offline, and every other entrypoint refuses until an endpoint and namespace are configured.
+`data/kestra/revisions` (local, gitignored with the rest of `data/`) is the deployed-revision record the deploy script writes and the run adapter binds to; `bin/fm-kestra-lib.sh` owns its format, and a run refuses when it is absent or stale.
 
 ## Gate defaults (.no-mistakes.yaml)
 
@@ -506,6 +507,7 @@ config/kestra.env   loopback Kestra endpoint, namespace, and Basic Auth identity
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
 data/                personal fleet records; LOCAL, gitignored as a whole
   backlog.md         task queue, dependencies, history
+  kestra/revisions   deployed Kestra flow revisions verified against reviewed HEAD blobs; written only by bin/fm-kestra-deploy.sh, read by bin/fm-kestra-run.sh; home-local
   captain.md         this home's domain-local captain preferences and working style; LOCAL, gitignored, canonical even if harness memory mirrors it, and updated with inspect-then-update
   captain-shared.md  main-authoritative shared captain preferences propagated read-only to secondmate homes; LOCAL, gitignored, owned by secondmate-provisioning
   learnings.md       fleet-local operational facts and gotchas; LOCAL, gitignored; dated, evidence-backed, curated, and updated with inspect-then-update - rewrite and prune rather than append forever, the same contract as captain.md; created lazily, absent until this home has a learning to store

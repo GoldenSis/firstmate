@@ -11,9 +11,9 @@ A `SUCCESS` state is evidence that a task ran; it is not approval, not authoriza
 ## Data flow
 
 ```text
-unchanged Git YAML -> authorized deployer -> immutable Kestra flow
-firstmate request   -> allow-list/input adapter -> Kestra execution ID
-allow-listed execution/revision/logs/outputs -> read-only adapter -> firstmate report
+unchanged Git YAML -> authorized deployer -> immutable Kestra flow -> verified revision record
+firstmate request  -> allow-list/input adapter -> execution bound to the recorded revision
+execution state/logs/task outputs at that revision -> read-only adapter -> firstmate report
 ```
 
 Four pieces implement it.
@@ -21,17 +21,34 @@ Four pieces implement it.
 | Piece | Owner |
 | --- | --- |
 | Flow sources | `kestra/flows/*.yaml` |
-| Deploy-after-merge | `bin/fm-kestra-deploy.sh` |
+| Deploy-after-merge and revision record | `bin/fm-kestra-deploy.sh` |
 | Run adapter | `bin/fm-kestra-run.sh` |
 | Read-only evidence | `bin/fm-kestra-status.sh` |
 
-Each script's header comment is the authoritative description of its behavior, flags, and refusals; `bin/fm-kestra-lib.sh` owns the shared configuration, parsing, and HTTP gate contracts.
+Each script's header comment is the authoritative description of its behavior, flags, and refusals; `bin/fm-kestra-lib.sh` owns the shared configuration, the static-flow grammar, the revision record format, and the HTTP gate.
 Read the header before first use rather than relying on this page.
+
+## Static flows only
+
+M1 permits only static tracked flows (captain decision, 2026-09-30).
+Every task field is literal text, no Pebble expression appears anywhere in a flow, and no script or shell task type is admitted.
+The seam therefore never has to reproduce Kestra's template semantics locally, and a permitted task cannot render an input, a secret, or any other server-side value.
+Four review rounds had kept finding new gaps between a local approximation of those semantics and Kestra's own; narrowing the grammar removed the surface instead of patching it again.
+
+The cost is visible in `kestra/flows/m1_shape.yaml`: its typed inputs are declared, validated on both sides, and recorded on the execution as evidence, but no task reads them, and its branch has a literal condition so one arm always runs and the other is always reported as never run.
+A data-driven branch would need an allow-listed expression grammar, which is a deferred decision below.
+
+## Revision binding
+
+Git review decides what a flow says; the revision record decides what runs.
+Deployment updates the namespace, reads every flow back at the revision Kestra reported, requires that revision's source to be the reviewed bytes, and only then records the revision against the flow's Git blob id.
+A run refuses when the flow has no record, when the tracked flow's blob no longer matches the recorded one, when Kestra cannot return the recorded revision with matching source, or when the created execution reports another revision.
+The thing reviewed in Git is therefore provably the thing that runs, and a flow edited on the server or redeployed outside this path cannot be executed through the seam.
 
 ## Boundary rationale and ownership
 
 Git review is the authority for which flow identities and source bytes are addressable.
-The deploy and run script headers own the exact source-resolution and validation rules, while `bin/fm-kestra-lib.sh` owns the supported YAML shape, task and input allow-lists, and request matrix.
+The deploy and run script headers own the exact source-resolution, verification, and refusal rules, while `bin/fm-kestra-lib.sh` owns the supported YAML shape, task and input allow-lists, validator regex subset, and request matrix.
 Unsupported source constructs fail closed because approximating Kestra's semantics locally would make the adapter a weaker validator.
 
 Kestra is never given permission to pull and reconcile Git itself, because upstream documents that Git-driven synchronization can delete objects depending on the source-of-truth setting.
@@ -48,14 +65,14 @@ M1 installs no plugins and does not adopt the official quickstart's privileged h
 
 ## Local configuration
 
-`docs/configuration.md` owns where `config/kestra.env` lives and whether it is inherited, and `docs/examples/kestra-env` is the copyable shape.
+`docs/configuration.md` owns where `config/kestra.env` and the revision record live and whether they are inherited, and `docs/examples/kestra-env` is the copyable shape.
 `bin/fm-kestra-lib.sh` owns the exact file validation and credential-handling mechanics.
 The broad Kestra OSS identity remains a disclosure risk even though the adapters expose only narrow operations.
 
 ## Synthetic data only
 
 No captain-private, financial, personal, or otherwise sensitive data goes through any M1 flow.
-Retention, redaction, and artifact-size limits are not designed yet, and Kestra persists inputs in logs, rendered templates, outputs, and artifacts.
+Retention, redaction, and artifact-size limits are not designed yet, and Kestra persists inputs in logs, outputs, and artifacts.
 Every M1 task is read-only or synthetic for a second reason as well: retries duplicate side effects, and no idempotency rules exist yet.
 
 ## Testing
@@ -71,10 +88,9 @@ The retry obligation is therefore split into three claims:
 2. the status adapter reports the attempts, the `FAILED -> RETRYING -> RUNNING` transitions, the per-attempt error logs, and revision-accurate suppressed tasks without losing or inventing any of them, asserted against recorded execution and flow-revision shapes;
 3. Kestra's engine actually performing three attempts, which the hermetic suite does not assert.
 
-Claim 3 is covered by the opt-in live section at the end of that file, which runs only when `FM_KESTRA_LIVE=1` is set and the pinned loopback runtime has the tracked flows deployed.
+Claim 3 is covered by the opt-in live section at the end of that file, which runs only when `FM_KESTRA_LIVE=1` is set and the pinned loopback runtime has the tracked flows deployed through the deploy script.
+The same live section is what confirms that Kestra returns a flow's submitted source unchanged at a recorded revision; the hermetic fake models that round trip, it does not prove it.
 Every test name says which claim it belongs to, so no assertion reads as stronger than it is.
-
-The live section confirms the server-dependent request shapes that the library's request matrix owns.
 
 ## Deferred decisions and where they attach
 
@@ -85,12 +101,15 @@ Role-based access control, service accounts and API tokens, single sign-on, immu
 Buying is the captain's call and is tracked separately.
 It attaches at `fm_kestra_load_config` and `fm_kestra_request` in `bin/fm-kestra-lib.sh`: an API token would replace the Basic Auth config file without touching any caller.
 
+**An expression grammar for data-driven flows.**
+If a later milestone needs a branch that reads an input, the allow-list belongs in the text-field rule of `fm_kestra_parse_flow`, as an exact grammar of permitted expressions rather than a deny-list of dangerous ones.
+
 **Who may deploy, execute, replay, restart, and read artifacts, as durable policy.**
-It attaches at the role argument of `fm_kestra_request`, which already partitions deploy, run, and read.
+It attaches at the role argument of `fm_kestra_request`, which already partitions deploy, run, and read, and at the revision record, which already separates the act of deploying from the act of running.
 
 **Idempotency and replay rules for future mutable tasks.**
 Nothing in M1 mutates anything outside Kestra's own storage.
-A mutable task would need an idempotency key or an explicit non-retry policy declared in the flow, and `fm_kestra_check_flow` is where that requirement would be enforced at deploy time.
+A mutable task would need an idempotency key or an explicit non-retry policy declared in the flow, and `fm_kestra_parse_flow` is where that requirement would be enforced at deploy time.
 
 **Retention, redaction, artifact limits, and network policy for non-synthetic data.**
 Artifact reads already pass through one function that refuses undeclared URIs, so a size or redaction rule has one place to live.

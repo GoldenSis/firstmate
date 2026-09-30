@@ -2,12 +2,20 @@
 #
 # Git review is the only way this file changes, and bin/fm-kestra-deploy.sh is the
 # only authorized path from this file into a Kestra namespace. The
-# `system.readOnly` label below is what stops the Kestra UI editor from changing
+# system.readOnly label below is what stops the Kestra UI editor from changing
 # the deployed copy out from under Git.
 #
+# M1 flows are STATIC: every task field is literal text and no Pebble expression
+# appears anywhere, so no task can render an input, a secret, or any other
+# server-side value (captain decision, 2026-09-30). The typed inputs below are
+# still declared, validated by the run adapter before any request, and validated
+# again by Kestra; they are recorded on the execution as evidence but no task
+# reads them. A data-driven branch would need an allow-listed expression grammar,
+# which is a deferred decision noted in docs/kestra-seam.md.
+#
 # The flow exercises the shapes the seam has to be able to observe: typed and
-# constrained inputs, a sequential group, a parallel group, a branch, a written
-# artifact, and a declared flow output.
+# constrained inputs, a sequential group, a parallel group, a branch whose else
+# arm never runs, a written artifact, and task outputs.
 id: m1_shape
 namespace: firstmate.m1
 
@@ -34,7 +42,7 @@ inputs:
 tasks:
   - id: begin
     type: io.kestra.plugin.core.log.Log
-    message: "begin {{ inputs.label }} units={{ inputs.units }}"
+    message: "begin static shape"
   - id: sequential
     type: io.kestra.plugin.core.flow.Sequential
     tasks:
@@ -43,7 +51,7 @@ tasks:
         message: "sequential first"
       - id: seq_second
         type: io.kestra.plugin.core.debug.Return
-        format: "sequential second for {{ inputs.units }} units"
+        format: "sequential second"
   - id: parallel
     type: io.kestra.plugin.core.flow.Parallel
     tasks:
@@ -55,7 +63,7 @@ tasks:
         message: "parallel right"
   - id: choose_route
     type: io.kestra.plugin.core.flow.If
-    condition: "{{ inputs.route == 'safe' }}"
+    condition: "true"
     then:
       - id: safe_branch
         type: io.kestra.plugin.core.debug.Return
@@ -68,17 +76,8 @@ tasks:
     type: io.kestra.plugin.core.storage.Write
     extension: .txt
     content: |
-      label={{ inputs.label }}
-      units={{ inputs.units }}
-      route={{ inputs.route }}
+      kind=synthetic
+      shape=m1
   - id: finish
     type: io.kestra.plugin.core.debug.Return
-    format: "finished {{ inputs.label }} via {{ inputs.route }}"
-
-outputs:
-  - id: summary
-    type: STRING
-    value: "{{ outputs.finish.value }}"
-  - id: artifact
-    type: FILE
-    value: "{{ outputs.artifact.uri }}"
+    format: "finished static shape"

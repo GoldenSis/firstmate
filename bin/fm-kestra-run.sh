@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
 # fm-kestra-run.sh - the run adapter for firstmate's Kestra seam. Not a Kestra client.
 #
-# It does exactly one thing: launch one execution of one allow-listed flow with
-# typed, locally pre-checked inputs, and print the opaque execution ID.
+# It does exactly one thing: launch one execution of one allow-listed flow, at the
+# one revision deployment verified, with typed, locally pre-checked inputs, and
+# print the opaque execution ID.
 #
 # The allow-list is one immutable snapshot of the tracked, unchanged HEAD blobs in
 # kestra/flows/. A flow identity absent from that snapshot is not addressable here,
 # and the same bytes are used for resolution, schema validation, and request gating.
 #
+# Revision binding. Before the execution is created, the flow must have an entry in
+# the deployed-revision record fm-kestra-deploy.sh wrote, that entry's blob id must
+# equal the current HEAD blob (otherwise the reviewed flow changed since it was
+# deployed), and Kestra must return that exact revision with source equal to the
+# reviewed bytes. The execution is then created with `?revision=<n>`, and the
+# response's flowRevision must be that number. Any of those failing is a refusal:
+# this adapter never runs whatever the server happens to consider latest.
+#
 # Denied, structurally rather than by omission:
 #   - replay, restart, resume, kill, and state override;
 #   - flow creation, update, and deletion;
 #   - secret access and namespace administration;
-#   - arbitrary task selection.
+#   - arbitrary task selection and unbound (latest-revision) execution.
 # Two independent things enforce that. This script accepts only `--flow` and
 # `--input` and refuses every other argument, and fm-kestra-lib.sh's HTTP gate
 # refuses any method or path outside the `run` role, so a bug here still cannot
@@ -36,7 +45,8 @@
 # designed yet.
 #
 # Exit status: 0 and the execution ID on stdout; 2 on a refusal or usage error;
-# 1 on a transport or server failure.
+# 1 on a transport or server failure, including an execution that was created but
+# reports a revision other than the bound one (its id is named in the diagnostic).
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,12 +84,13 @@ done
 [ -n "$FLOW" ] || fm_kestra_die "--flow is required"
 
 FLOW_FILE=""
-fm_kestra_resolve_flow "$FLOW" FLOW_FILE
+FLOW_BLOB=""
+fm_kestra_resolve_flow "$FLOW" FLOW_FILE FLOW_BLOB
 fm_kestra_check_flow "$FLOW_FILE" || fm_kestra_die "flow source failed validation: $FLOW_FILE"
 
 fm_kestra_load_config
 
-FLOW_NS=$(fm_kestra_scalar "$FLOW_FILE" namespace)
+FLOW_NS=$(fm_kestra_flow_namespace "$FLOW_FILE")
 [ "$FLOW_NS" = "$FM_KESTRA_NAMESPACE" ] || fm_kestra_die \
   "flow $FLOW declares namespace $FLOW_NS but only $FM_KESTRA_NAMESPACE is allow-listed"
 
@@ -94,8 +105,19 @@ done <<< "$ACCEPTED"
 
 command -v jq >/dev/null 2>&1 || fm_kestra_die "jq is required for the Kestra seam" 1
 
+# --- revision binding -------------------------------------------------------
+
+REVISION=""
+RECORDED_BLOB=""
+fm_kestra_recorded_revision "$FLOW" "$FM_KESTRA_NAMESPACE" REVISION RECORDED_BLOB
+[ "$RECORDED_BLOB" = "$FLOW_BLOB" ] || fm_kestra_die \
+  "refused: tracked flow $FLOW changed since its deployed revision $REVISION was recorded; run bin/fm-kestra-deploy.sh before running it"
+fm_kestra_verify_revision_source "$FLOW" "$FM_KESTRA_NAMESPACE" "$REVISION" "$FLOW_FILE"
+
+# --- the one execution ------------------------------------------------------
+
 RC=0
-RESPONSE=$(fm_kestra_request run POST "/executions/$FM_KESTRA_NAMESPACE/$FLOW" \
+RESPONSE=$(fm_kestra_request run POST "/executions/$FM_KESTRA_NAMESPACE/$FLOW?revision=$REVISION" \
   ${FORM+"${FORM[@]}"}) || RC=$?
 # A refusal from the HTTP gate already printed its own diagnostic and exits 2;
 # anything else is a transport or server failure.
@@ -108,5 +130,10 @@ fi
 
 EXECUTION_ID=$(printf '%s' "$RESPONSE" | jq -r '.id // empty' 2>/dev/null || true)
 [ -n "$EXECUTION_ID" ] || fm_kestra_die "no execution id in the response" 1
+EXECUTION_REVISION=$(printf '%s' "$RESPONSE" | jq -r '
+  .flowRevision | select(type == "number" and . >= 1 and floor == .) | tostring
+' 2>/dev/null || true)
+[ "$EXECUTION_REVISION" = "$REVISION" ] || fm_kestra_die \
+  "execution $EXECUTION_ID reports flow revision ${EXECUTION_REVISION:-unknown}, not the bound revision $REVISION; treat it as unverified evidence" 1
 
 printf '%s\n' "$EXECUTION_ID"

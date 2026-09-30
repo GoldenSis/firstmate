@@ -2,8 +2,10 @@
 #
 # This flow exists to keep two behaviours observable and regression-tested: a task
 # that exhausts its configured attempts and reaches a terminal failure, and the
-# task after it never running as a result. `maxAttempts: 3` is three total
-# attempts, not one attempt plus three retries.
+# task after it never running as a result. maxAttempts 3 is three total
+# attempts, not one attempt plus three retries. Each attempt is identified by the
+# attempt number Kestra records on its log lines, not by a rendered message: M1
+# flows are static and carry no Pebble expression.
 #
 # Git review is the only way this file changes; bin/fm-kestra-deploy.sh is the only
 # authorized path into a Kestra namespace.
@@ -19,7 +21,7 @@ tasks:
     message: "controlled failure begins"
   - id: always_fails
     type: io.kestra.plugin.core.execution.Fail
-    errorMessage: "synthetic controlled failure, attempt={{ taskrun.attemptsCount }}"
+    errorMessage: "synthetic controlled failure"
     retry:
       type: constant
       interval: PT0.5S
