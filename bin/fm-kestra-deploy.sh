@@ -100,9 +100,9 @@ command -v jq >/dev/null 2>&1 || fm_kestra_die "jq is required for the Kestra se
 [ "$declared_ns" = "$FM_KESTRA_NAMESPACE" ] || fm_kestra_die \
   "tracked flows declare namespace $declared_ns but only $FM_KESTRA_NAMESPACE is allow-listed"
 
-# The body is the HEAD snapshot, staged once inside the gate so validation and the
-# update send the same bytes; this script hands the gate no body of its own.
-fm_kestra_stage_deploy_body
+# The HEAD files are staged once inside the gate so validation and the update
+# upload the same bytes; this script hands the gate no body of its own.
+fm_kestra_stage_deploy_files
 
 # Server-side validation first: a rejected flow must never reach the update call.
 rc=0
@@ -125,7 +125,7 @@ fi
 # `delete=false` is not a default worth trusting to a caller: deletion stays off.
 rc=0
 update_response=$(fm_kestra_request deploy POST \
-  "/flows/bulk?delete=false&namespace=$FM_KESTRA_NAMESPACE") || rc=$?
+  "/flows/$FM_KESTRA_NAMESPACE?delete=false") || rc=$?
 if [ "$rc" -eq 2 ]; then
   exit 2
 elif [ "$rc" -ne 0 ]; then

@@ -169,10 +169,10 @@ fm_kestra_ensure_flow_snapshot() {
 #     `content: |` is the only block scalar; `then`, `else`, and `tasks` are the
 #     only containers; `retry` is the only nested mapping.
 #
-# Validator regex subset. A STRING validator is pre-checked locally with POSIX ERE
-# under LC_ALL=C before any execution is created, and Kestra evaluates the same
-# pattern with Java's Pattern.matches. Only a grammar both engines read identically
-# is accepted: `^` ... `$` anchors, literal [A-Za-z0-9_.-], bracket expressions of
+# Validator regex subset. A STRING validator is pre-checked locally with jq using
+# Unicode characters, full-string anchors, and Java-compatible dot semantics.
+# Kestra evaluates the same pattern with Java's Pattern.matches. The supported
+# grammar is `^` ... `$` anchors, literal [A-Za-z0-9_-], dot, bracket expressions of
 # [A-Za-z0-9_-] and their ranges, groups, alternation, and the quantifiers
 # `* + ? {n} {n,m}`. No backslash, so no escapes or classes, and no `(?` extensions.
 
@@ -715,8 +715,10 @@ fm_kestra_validate_inputs() {
         ;;
       STRING)
         if [ -n "$in_validator" ]; then
-          # LC_ALL=C makes bracket ranges codepoint ranges, which is what Java uses.
-          printf '%s' "$value" | LC_ALL=C grep -Eq -- "^($in_validator)$" \
+          jq -en --arg value "$value" --arg pattern "$in_validator" '
+            $value | test("\\A(" +
+              ($pattern | gsub("\\."; "[^\r\n\u0085\u2028\u2029]")) + ")\\z")
+          ' >/dev/null \
             || fm_kestra_die "input $in_id must match $in_validator, got: $value"
         fi
         ;;
@@ -825,7 +827,7 @@ fm_kestra_load_config() {
 # M1 binds Kestra's main and management servers to loopback, so a non-loopback URL
 # means the seam is pointed at something it was never authorized to reach.
 fm_kestra_assert_loopback() {
-  local url=$1 rest hostport host
+  local url=$1 rest hostport host port
   case "$url" in
     http://*) rest=${url#http://} ;;
     https://*) rest=${url#https://} ;;
@@ -833,6 +835,7 @@ fm_kestra_assert_loopback() {
   esac
   case "$rest" in
     *@*) fm_kestra_die "endpoint must not embed credentials" ;;
+    *'?'*|*'#'*) fm_kestra_die "endpoint must not contain a query or fragment" ;;
   esac
   hostport=${rest%%/*}
   host=${hostport%%:*}
@@ -842,6 +845,16 @@ fm_kestra_assert_loopback() {
   case "$host" in
     127.0.0.1|localhost|::1) : ;;
     *) fm_kestra_die "endpoint must be loopback (127.0.0.1, localhost, or [::1]): $host" ;;
+  esac
+  local endpoint_re='^https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*/?$'
+  [[ "$url" =~ $endpoint_re ]] || fm_kestra_die "endpoint has unsupported URL syntax"
+  port=${BASH_REMATCH[2]#:}
+  if [ -n "$port" ]; then
+    [ "$((10#$port))" -ge 1 ] && [ "$((10#$port))" -le 65535 ] \
+      || fm_kestra_die "endpoint port must be between 1 and 65535"
+  fi
+  case "$rest/" in
+    */./*|*/../*) fm_kestra_die "endpoint must not contain dot path segments" ;;
   esac
 }
 
@@ -899,13 +912,11 @@ fm_kestra_recorded_revision() {
   printf -v "$fkrr_blob_var" '%s' "$fkrr_blob"
 }
 
-# fm_kestra_normalize_source: stdin to stdout, trailing whitespace stripped from
-# every line and leading/trailing blank lines dropped. Kestra keeps a flow's
-# submitted source text, but the multi-document deploy body splits on `---`, so the
-# only differences a faithful round trip can introduce are blank-line padding.
+# fm_kestra_normalize_source: stdin to stdout, with leading/trailing empty lines
+# dropped and all whitespace within source lines preserved.
 fm_kestra_normalize_source() {
   awk '
-    { sub(/[ \t\r]+$/, ""); lines[NR] = $0; if ($0 != "") { last = NR; if (!first) first = NR } }
+    { lines[NR] = $0; if ($0 != "") { last = NR; if (!first) first = NR } }
     END { for (i = first; i <= last; i++) print lines[i] }
   '
 }
@@ -1017,11 +1028,10 @@ fm_kestra_path_allowed() {
   local ns=${FM_KESTRA_NAMESPACE:-} tail flow revision
   case "$role" in
     deploy)
-      # Exact matches, not prefixes: a trailing wildcard after `namespace=` would
-      # let an extra query parameter ride along on the update call.
+      # Exact matches, not prefixes: no extra query parameter is allowed.
       case "$method $path" in
         'POST /flows/validate') return 0 ;;
-        "POST /flows/bulk?delete=false&namespace=$ns") [ -n "$ns" ] && return 0 ;;
+        "POST /flows/$ns?delete=false") [ -n "$ns" ] && return 0 ;;
       esac
       ;;
     run)
@@ -1084,8 +1094,26 @@ fm_kestra_path_allowed() {
 }
 
 fm_kestra_curl_request() {
-  local method=$1 path=$2 output=$3 netrc="" rc
-  shift 3
+  local role=$1 method=$2 path=$3 output=$4 netrc="" rc url target prefix
+  shift 4
+  fm_kestra_assert_loopback "$FM_KESTRA_BASE_URL"
+  case "$FM_KESTRA_TENANT" in
+    ''|*[!a-zA-Z0-9_-]*) fm_kestra_die "FM_KESTRA_TENANT is not [A-Za-z0-9_-]+" ;;
+  esac
+  url="${FM_KESTRA_BASE_URL%/}/api/v1/$FM_KESTRA_TENANT$path"
+  local request_re='^https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)+(\?[A-Za-z0-9%._~=&-]+)?$'
+  [[ "$url" =~ $request_re ]] || fm_kestra_die "refused: unsupported request URL syntax"
+  target=${url#*://}
+  target=/${target#*/}
+  case "${target%%\?*}/" in
+    */./*|*/../*) fm_kestra_die "refused: request URL contains dot path segments" ;;
+  esac
+  prefix=${FM_KESTRA_BASE_URL%/}
+  prefix=${prefix#*://}
+  case "$prefix" in */*) prefix=/${prefix#*/} ;; *) prefix="" ;; esac
+  target=${target#"$prefix/api/v1/$FM_KESTRA_TENANT"}
+  fm_kestra_path_allowed "$role" "$method" "$target" \
+    || fm_kestra_die "refused: $role may not $method $target"
   local curl_args=()
   fm_kestra_tempfile auth netrc || return 1
   printf 'user = "%s:%s"\n' "$FM_KESTRA_USER" "$FM_KESTRA_PASSWORD" > "$netrc" || {
@@ -1098,7 +1126,7 @@ fm_kestra_curl_request() {
   if [ -n "$output" ]; then
     curl_args+=(--output "$output")
   fi
-  curl_args+=(--request "$method" "$FM_KESTRA_BASE_URL/api/v1/$FM_KESTRA_TENANT$path")
+  curl_args+=(--request "$method" "$url")
   curl "${curl_args[@]}"
   rc=$?
   rm -f -- "$netrc"
@@ -1112,40 +1140,34 @@ fm_kestra_request_to_file() {
     || fm_kestra_die "refused: read may not GET $path"
   [ -f "$output" ] && [ ! -L "$output" ] \
     || fm_kestra_die "refused: read output is not a regular staging file"
-  fm_kestra_curl_request GET "$path" "$output"
+  fm_kestra_curl_request read GET "$path" "$output"
 }
 
-# The deploy body is staged once per process from the HEAD snapshot, inside the
-# gate, so both the validate and the update call send the same bytes and no caller
-# can substitute a body of its own.
-FM_KESTRA_DEPLOY_BODY=""
+# The deploy files are staged once per process from the HEAD snapshot, inside the
+# gate, so validation and deployment upload the same files as separate form parts.
+FM_KESTRA_DEPLOY_FILES=()
 
-fm_kestra_stage_deploy_body() {
-  local file first=1
-  if [ -n "$FM_KESTRA_DEPLOY_BODY" ] && [ -f "$FM_KESTRA_DEPLOY_BODY" ]; then
+fm_kestra_stage_deploy_files() {
+  local file
+  if [ "${#FM_KESTRA_DEPLOY_FILES[@]}" -gt 0 ]; then
     return 0
   fi
   fm_kestra_ensure_flow_snapshot
   [ "${#FM_KESTRA_SNAPSHOT_FILES[@]}" -gt 0 ] \
     || fm_kestra_die "refused: no tracked flows to deploy"
   fm_kestra_assert_flows_unchanged "$FM_KESTRA_SNAPSHOT_HEAD"
-  fm_kestra_tempfile flows FM_KESTRA_DEPLOY_BODY \
-    || fm_kestra_die "could not create a deploy staging file" 1
   for file in "${FM_KESTRA_SNAPSHOT_FILES[@]}"; do
     fm_kestra_check_flow "$file" >/dev/null 2>&1 \
       || fm_kestra_die "refused: a snapshot flow failed validation and cannot be deployed"
-    [ "$first" -eq 1 ] || printf -- '---\n' >> "$FM_KESTRA_DEPLOY_BODY"
-    first=0
-    cat -- "$file" >> "$FM_KESTRA_DEPLOY_BODY"
-    printf '\n' >> "$FM_KESTRA_DEPLOY_BODY"
   done
+  FM_KESTRA_DEPLOY_FILES=("${FM_KESTRA_SNAPSHOT_FILES[@]}")
 }
 
 # fm_kestra_request <role> <method> <path> [structured payload...]
 #
 # Writes the response body to stdout and returns curl's status. The credential is
 # supplied through a mode-0600 config file removed on exit, never through argv.
-# Deploy takes no payload and sends the staged HEAD snapshot body, run accepts
+# Deploy takes no payload and uploads the staged HEAD snapshot files, run accepts
 # only literal name=value form fields, and read accepts no payload.
 fm_kestra_request() {
   local role=$1 method=$2 path=$3
@@ -1160,8 +1182,14 @@ fm_kestra_request() {
   case "$role" in
     deploy)
       [ "$#" -eq 0 ] || fm_kestra_die "refused: deploy requests take no payload; the HEAD snapshot is the body"
-      fm_kestra_stage_deploy_body
-      request_args=(-H 'Content-Type: application/x-yaml' --data-binary "@$FM_KESTRA_DEPLOY_BODY")
+      fm_kestra_stage_deploy_files
+      local file index=0
+      for file in "${FM_KESTRA_DEPLOY_FILES[@]}"; do
+        file=${file//\\/\\\\}
+        file=${file//\"/\\\"}
+        request_args+=(--form "flows=@\"$file\";filename=flow-$index.yaml;type=application/x-yaml")
+        index=$((index + 1))
+      done
       ;;
     run)
       for field in "$@"; do
@@ -1185,5 +1213,5 @@ fm_kestra_request() {
     *) fm_kestra_die "refused: unknown Kestra request role: $role" ;;
   esac
 
-  fm_kestra_curl_request "$method" "$path" "" ${request_args+"${request_args[@]}"}
+  fm_kestra_curl_request "$role" "$method" "$path" "" ${request_args+"${request_args[@]}"}
 }

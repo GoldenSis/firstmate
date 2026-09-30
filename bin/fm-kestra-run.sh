@@ -94,6 +94,8 @@ FLOW_NS=$(fm_kestra_flow_namespace "$FLOW_FILE")
 [ "$FLOW_NS" = "$FM_KESTRA_NAMESPACE" ] || fm_kestra_die \
   "flow $FLOW declares namespace $FLOW_NS but only $FM_KESTRA_NAMESPACE is allow-listed"
 
+command -v jq >/dev/null 2>&1 || fm_kestra_die "jq is required for the Kestra seam" 1
+
 # Typed validation happens here, before the first byte goes out.
 ACCEPTED=$(fm_kestra_validate_inputs "$FLOW_FILE" ${INPUTS+"${INPUTS[@]}"})
 
@@ -102,8 +104,6 @@ while IFS= read -r pair; do
   [ -n "$pair" ] || continue
   FORM+=("$pair")
 done <<< "$ACCEPTED"
-
-command -v jq >/dev/null 2>&1 || fm_kestra_die "jq is required for the Kestra seam" 1
 
 # --- revision binding -------------------------------------------------------
 

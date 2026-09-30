@@ -229,15 +229,18 @@ make_fake_curl() {
   fakebin=$(fm_fakebin "$dir")
   cat > "$fakebin/curl" <<'SH'
 #!/usr/bin/env bash
-method=GET url="" cfg="" formstrings="" output=""
+method=GET url="" cfg="" formstrings="" output="" body=""
+uploads=()
 argv=$*
 while [ $# -gt 0 ]; do
   case "$1" in
     -X|--request) method=$2; shift 2 ;;
     --config) cfg=$2; shift 2 ;;
     --form-string) formstrings="$formstrings $2"; shift 2 ;;
+    --form) uploads+=("$2"); shift 2 ;;
+    --data-binary) body=${2#@}; shift 2 ;;
     -o|--output) output=$2; shift 2 ;;
-    --max-time|--noproxy|-H|--data-binary|-F|-w|-m) shift 2 ;;
+    --max-time|--noproxy|-H|-F|-w|-m) shift 2 ;;
     -q|--fail-with-body|-sS|-s|-S) shift ;;
     http://*|https://*) url=$1; shift ;;
     *) shift ;;
@@ -256,6 +259,21 @@ done
 } >> "$FAKE_CURL_LOG"
 
 path=${url#*/api/v1/main}
+if [ "$method" = POST ] && [[ "$path" == /flows/* ]]; then
+  destination="$FAKE_FLOW_DIR/uploads/${path#/flows/}"
+  destination=${destination%%\?*}
+  mkdir -p "$destination"
+  [ -z "$body" ] || cp "$body" "$destination/body"
+  index=0
+  for upload in "${uploads[@]}"; do
+    file=${upload#flows=@}
+    file=${file%%;filename=*}
+    file=${file#\"}
+    file=${file%\"}
+    cp "$file" "$destination/$index.yaml" || exit 1
+    index=$((index + 1))
+  done
+fi
 emit() {
   if [ -n "$output" ]; then
     printf '%s' "$1" > "$output"
@@ -286,7 +304,7 @@ if [ -n "${FAKE_CURL_FAIL_MATCH:-}" ]; then
 fi
 case "$method $path" in
   'POST /flows/validate') emit "$FAKE_VALIDATE_RESPONSE" ;;
-  'POST /flows/bulk'*) emit "$FAKE_BULK_RESPONSE" ;;
+  'POST /flows/bulk'*|'POST /flows/firstmate.m1?delete=false') emit "$FAKE_BULK_RESPONSE" ;;
   'POST /executions/firstmate.m1/m1_shape?revision='*)
     rev=${path##*revision=}
     emit "{\"id\":\"EXECSUCCESS1\",\"flowRevision\":${FAKE_EXEC_REVISION_OVERRIDE:-$rev}}" ;;
@@ -974,6 +992,10 @@ test_the_http_gate_allows_only_exact_role_paths() {
         "GET /namespaces/firstmate.m1/secrets" \
         "POST /executions/EXECSUCCESS1/state" \
         "POST /apitokens" \
+        "POST /flows/bulk?delete=false&namespace=firstmate.m1" \
+        "POST /flows/firstmate.m1?delete=true" \
+        "POST /flows/firstmate.m1?delete=false&extra=1" \
+        "POST /flows/someone.else?delete=false" \
         "POST /flows/bulk?delete=true&namespace=firstmate.m1" \
         "POST /flows/bulk?delete=false&namespace=firstmate.m1&extra=1" \
         "POST /flows/bulk?delete=false&namespace=someone.else" \
@@ -1000,8 +1022,8 @@ test_the_http_gate_allows_only_exact_role_paths() {
     done
     # The legitimate shapes must still pass, or the gate is merely broken.
     fm_kestra_path_allowed deploy POST "/flows/validate" || printf "DENIED deploy validate\n"
-    fm_kestra_path_allowed deploy POST "/flows/bulk?delete=false&namespace=firstmate.m1" \
-      || printf "DENIED deploy bulk\n"
+    fm_kestra_path_allowed deploy POST "/flows/firstmate.m1?delete=false" \
+      || printf "DENIED deploy namespace\n"
     fm_kestra_path_allowed run POST "/executions/firstmate.m1/m1_shape?revision=1" \
       || printf "DENIED run execute at revision\n"
     fm_kestra_path_allowed read GET "/executions/EXECSUCCESS1" || printf "DENIED read execution\n"
@@ -1548,20 +1570,22 @@ test_deploy_refuses_a_namespace_outside_the_allow_list() {
 }
 
 test_deploy_never_enables_deletion_and_records_verified_revisions() {
-  local body_calls body_files d out rc record
+  local file d out rc record
   d=$(workdir deploy-run)
   rm -f "$d/home/data/kestra/revisions"
   rc=0
   out=$(seam "$d" "$DEPLOY" 2>&1) || rc=$?
   expect_code 0 "$rc" "deploying the tracked flows must succeed against the fake server: $out"
-  assert_grep "flows/bulk?delete=false&namespace=$NS" "$d/curl.log" \
+  assert_grep "flows/$NS?delete=false" "$d/curl.log" \
     "the namespace update must disable deletion"
   assert_grep "POST http://127.0.0.1:18080/api/v1/main/flows/validate" "$d/curl.log" \
     "flows must be validated server-side before the update"
-  body_calls=$(sed -n 's/^ARGV .*--data-binary @\([^ ]*\).*/\1/p' "$d/curl.log" | wc -l | tr -d ' ')
-  body_files=$(sed -n 's/^ARGV .*--data-binary @\([^ ]*\).*/\1/p' "$d/curl.log" | sort -u | wc -l | tr -d ' ')
-  [ "$body_calls" -eq 2 ] && [ "$body_files" -eq 1 ] \
-    || fail "server validation and deployment must send the same staged HEAD body"
+  for file in 0 1; do
+    cmp -s "$d/fake-flows/uploads/validate/$file.yaml" "$d/fake-flows/uploads/$NS/$file.yaml" \
+      || fail "server validation and deployment must send the same separate HEAD files"
+  done
+  assert_absent "$d/fake-flows/uploads/$NS/body" "deployment must not concatenate flow sources"
+  assert_absent "$d/fake-flows/uploads/$NS/2.yaml" "deployment must upload exactly the tracked files"
   assert_no_grep "delete=true" "$d/curl.log" "deletion must never be enabled"
   # Kestra must never be handed Git reconciliation; the seam pushes instead.
   assert_no_grep "/git" "$d/curl.log" "the deployer must never ask Kestra to reconcile Git"
@@ -1612,7 +1636,7 @@ test_deploy_requires_every_server_validation_result_to_pass() {
     seam "$d" "$DEPLOY" 2>&1) || rc=$?
   expect_code 1 "$rc" "one valid response object must not mask a rejected flow"
   assert_contains "$out" "invalid flow" "the rejected validation response must remain visible"
-  assert_no_grep "/flows/bulk?" "$d/curl.log" \
+  assert_no_grep "/flows/$NS?delete=false" "$d/curl.log" \
     "the deployer must not update the namespace after any validation rejection"
   pass "server validation succeeds only when every expected flow result passes"
 }
@@ -1621,7 +1645,7 @@ test_http_failures_are_failures_and_keep_the_response_diagnostic() {
   local d out rc
   d=$(workdir deploy-http-failure)
   rc=0
-  out=$(SEAM_FAIL_MATCH='/flows/bulk' SEAM_FAIL_BODY='bulk update rejected' \
+  out=$(SEAM_FAIL_MATCH="/flows/$NS?delete=false" SEAM_FAIL_BODY='bulk update rejected' \
     seam "$d" "$DEPLOY" 2>&1) || rc=$?
   expect_code 1 "$rc" "an HTTP failure from the namespace update must fail deployment"
   assert_contains "$out" "bulk update rejected" "the server response body must remain diagnostic evidence"
@@ -1857,6 +1881,141 @@ test_live_engine_behaviour() {
   pass "live: Kestra made three attempts, showed the retry transitions, suppressed the following task, and returned the reviewed source at the bound revision"
 }
 
+test_deploy_preserves_literal_document_separators() {
+  local d out rc=0
+  d=$(workdir literal-separators)
+  fixture_flow "$d" literal 'id: m1_shape
+namespace: firstmate.m1
+labels:
+  system.readOnly: "true"
+tasks:
+  - id: artifact
+    type: io.kestra.plugin.core.storage.Write
+    extension: .txt
+    content: |
+      literal---text
+      ---
+      id: injected
+      namespace: firstmate.m1
+      tasks:
+        - id: forbidden
+          type: io.kestra.plugin.scripts.shell.Commands
+          commands:
+            - echo unsafe'
+  check_fixture "$d" >/dev/null || fail "document separators inside literal content must remain supported"
+  cp "$d/literal.yaml" "$d/fake-flows/m1_shape@1.yaml"
+  out=$(SEAM_VALIDATE_RESPONSE='[{"constraints":null}]' seam "$d" "$d/repo/bin/fm-kestra-deploy.sh" 2>&1) || rc=$?
+  expect_code 0 "$rc" "literal separators must deploy as one flow: $out"
+  cmp -s "$d/literal.yaml" "$d/fake-flows/uploads/validate/0.yaml" \
+    || fail "validation must receive the original flow as a separate uploaded file"
+  cmp -s "$d/literal.yaml" "$d/fake-flows/uploads/firstmate.m1/0.yaml" \
+    || fail "deployment must receive the same separate file, including literal separators"
+  assert_absent "$d/fake-flows/uploads/firstmate.m1/1.yaml" "literal YAML must not become another uploaded flow"
+  assert_no_grep '/flows/bulk' "$d/curl.log" "deployment must not use the delimiter-splitting endpoint"
+  pass "literal document separators remain artifact content in validation and deployment"
+}
+
+test_request_urls_cannot_escape_the_role_path() {
+  local d suffix out rc
+  d=$(workdir unsafe-base-url)
+  for suffix in '/api/v1/main/flows/bulk?delete=true&namespace=firstmate.m1#' \
+    '/?delete=true' '/#fragment' '/%2e%2e' '/..' '/.' '/prefix/../other' '/{one,two}' '/bad path' '/bad\path'; do
+    rc=0
+    out=$(SEAM_BASE_URL="http://127.0.0.1:18080$suffix" seam "$d" "$DEPLOY" 2>&1) || rc=$?
+    expect_code 2 "$rc" "unsafe base URL $suffix must be refused: $out"
+    [ ! -s "$d/curl.log" ] || fail "unsafe base URLs must be refused before curl"
+  done
+  for suffix in 'http://127.0.0.1:18080' 'https://localhost:443/prefix' 'http://[::1]:18080'; do
+    seam "$d" bash -c ". \"\$1\"; fm_kestra_assert_loopback \"\$2\"" _ "$ROOT/bin/fm-kestra-lib.sh" "$suffix" \
+      || fail "a valid loopback base must remain supported: $suffix"
+  done
+  rc=0
+  out=$(seam "$d" bash -c "
+    . \"\$1\"
+    fm_kestra_load_config
+    FM_KESTRA_BASE_URL='http://127.0.0.1:18080/api/v1/main/flows/bulk?delete=true#'
+    fm_kestra_request read GET /executions/EXECSUCCESS1
+  " _ "$ROOT/bin/fm-kestra-lib.sh" 2>&1) || rc=$?
+  expect_code 2 "$rc" "the transport must revalidate the configured URL before sending: $out"
+  [ ! -s "$d/curl.log" ] || fail "a changed unsafe base URL must never reach curl"
+  rc=0
+  out=$(seam "$d" bash -c "
+    . \"\$1\"
+    fm_kestra_load_config
+    FM_KESTRA_NAMESPACE=..
+    fm_kestra_request read GET '/flows/../m1_shape?revision=1&source=true'
+  " _ "$ROOT/bin/fm-kestra-lib.sh" 2>&1) || rc=$?
+  expect_code 2 "$rc" "dot segments in the assembled request path must be refused: $out"
+  [ ! -s "$d/curl.log" ] || fail "a request whose assembled path changes meaning must never reach curl"
+  pass "base URLs and assembled request paths cannot override the allowed HTTP operation"
+}
+
+test_revision_verification_preserves_literal_whitespace() {
+  local d out rc mutation
+  for mutation in trailing-space blank-indent; do
+    d=$(workdir "literal-whitespace-$mutation")
+    awk -v mutation="$mutation" '
+      /kind=synthetic/ {
+        if (mutation == "trailing-space") { print $0 " "; next }
+        print; print "       "; next
+      }
+      { print }
+    ' "$d/fake-flows/m1_shape@1.yaml" > "$d/changed.yaml"
+    mv "$d/changed.yaml" "$d/fake-flows/m1_shape@1.yaml"
+    rc=0
+    out=$(run_shape "$d" 2>&1) || rc=$?
+    expect_code 2 "$rc" "artifact whitespace drift must refuse execution: $out"
+    assert_contains "$out" 'does not carry the reviewed source' "whitespace drift must be a source mismatch"
+    assert_no_grep 'POST ' "$d/curl.log" "whitespace drift must not create an execution"
+    rm -f "$d/home/data/kestra/revisions"
+    rc=0
+    out=$(seam "$d" "$DEPLOY" 2>&1) || rc=$?
+    expect_code 2 "$rc" "artifact whitespace drift must refuse deployment verification: $out"
+    assert_absent "$d/home/data/kestra/revisions" "whitespace drift must not record a verified revision"
+  done
+  d=$(workdir source-padding)
+  { printf '\n'; cat "$d/fake-flows/m1_shape@1.yaml"; printf '\n'; } > "$d/padded.yaml"
+  mv "$d/padded.yaml" "$d/fake-flows/m1_shape@1.yaml"
+  run_shape "$d" >/dev/null || fail "empty transport padding outside content must remain harmless"
+  pass "revision verification preserves literal whitespace while allowing empty transport padding"
+}
+
+test_string_validators_use_character_semantics() {
+  local d example pattern value expected out rc
+  d=$(workdir unicode-validator)
+  for example in accent-one accent-two emoji-one emoji-two mixed ascii-range unicode-range nel ls ps empty; do
+    case "$example" in
+      accent-one) pattern='^.$'; value='é'; expected=0 ;;
+      accent-two) pattern='^..$'; value='é'; expected=2 ;;
+      emoji-one) pattern='^.$'; value='😀'; expected=0 ;;
+      emoji-two) pattern='^..$'; value='😀'; expected=2 ;;
+      mixed) pattern='^a.b$'; value='aéb'; expected=0 ;;
+      ascii-range) pattern='^[A-Z][a-z]+$'; value='Abc'; expected=0 ;;
+      unicode-range) pattern='^[A-Z][a-z]+$'; value='Abé'; expected=2 ;;
+      nel) pattern='^.*$'; value=$(printf '\302\205'); expected=2 ;;
+      ls) pattern='^.*$'; value=$(printf '\342\200\250'); expected=2 ;;
+      ps) pattern='^.*$'; value=$(printf '\342\200\251'); expected=2 ;;
+      empty) pattern='^.*$'; value=''; expected=0 ;;
+    esac
+    fixture_flow "$d" unicode "id: unicode
+namespace: firstmate.m1
+inputs:
+  - id: text
+    type: STRING
+    validator: $pattern
+$MINIMAL_HEAD"
+    rc=0
+    out=$(bash -c '. "$1"; fm_kestra_check_flow "$2" && fm_kestra_validate_inputs "$2" "$3"' \
+      _ "$ROOT/bin/fm-kestra-lib.sh" "$d/unicode.yaml" "text=$value" 2>&1) || rc=$?
+    expect_code "$expected" "$rc" "STRING validator $example must follow character semantics: $out"
+  done
+  pass "STRING validators count Unicode characters and exclude Java line terminators"
+}
+
+test_deploy_preserves_literal_document_separators
+test_request_urls_cannot_escape_the_role_path
+test_revision_verification_preserves_literal_whitespace
+test_string_validators_use_character_semantics
 test_typed_input_rejection_happens_before_any_request
 test_undeclared_input_is_refused
 test_missing_required_input_is_refused
