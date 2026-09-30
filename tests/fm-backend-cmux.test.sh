@@ -465,10 +465,10 @@ test_smoke_requires_explicit_opt_in() {
     dir="$TMP_ROOT/smoke-opt-in-$opt_in"; mkdir -p "$dir/responses"
     fb=$(make_cmux_fakebin "$dir")
     out=$(
-      export PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses"
       unset FM_CMUX_LIVE
       [ "$opt_in" = unset ] || export FM_CMUX_LIVE="$opt_in"
-      bash "$ROOT/tests/fm-backend-cmux-smoke.test.sh" 2>&1
+      PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+        bash "$ROOT/tests/fm-backend-cmux-smoke.test.sh" 2>&1
     )
     status=$?
     expect_code 0 "$status" "live smoke should skip without explicit opt-in ($opt_in)"
