@@ -55,7 +55,7 @@ A cmux spawn refuses loudly, with an actionable message pointing back to this do
 
 No first-run provisioning beyond the socket-access setup above and having `jq` installed; firstmate creates the workspace it needs on first spawn, launching the app itself (`open -a cmux`) if it is not already running.
 
-Watching and attaching: firstmate uses one workspace per task in whatever cmux window is currently open.
+Watching and attaching: firstmate uses one workspace per task in the window selected by [the creation rules below](#workspace-titles-can-settle-after-creation).
 Task selectors resolve through the shared contract owned by [`docs/configuration.md`](configuration.md) ("Runtime backend"), while the actual cmux workspace title is home-scoped as `fm-<home-label>-<id>`, for example `fm-firstmate-<8hex>-cmux-e2e-t1` in the primary home or `fm-2ndmate-<secondmate-id>-<8hex>-cmux-e2e-t1` in a secondmate home.
 You do not need to bring the window forward for routine supervision: from an active firstmate session, `bin/fm-peek.sh <id>` reads a task's surface without focusing it, and `FM_HOME=<this-firstmate-home> bin/fm-send.sh <id> "<text>"` steers it unless `FM_HOME` is already set to the active firstmate home - workspace/surface/pane creation all default `focus` to `false`, so an unattended spawn never steals your view.
 
@@ -170,9 +170,9 @@ No session field is needed - unlike herdr/zellij there is no session layer to re
 |---|---|---|
 | Version gate | `cmux version` -> `"cmux 0.64.17 (97) [9ed29d81a]"` | Works with NO socket connection at all - a pure client-version check, verified even while the socket was still rejecting connections. |
 | Reachability/auth gate | `cmux ping` -> `"PONG"` or a typed error | Classified into `ok`\|`denied`\|`unauth`\|`down`\|`error` from the error text (`fm_backend_cmux_ping_state`); `fm_backend_cmux_ensure_running` launches the app (`open -a cmux`) only for `down`, and fails fast with an actionable message for `denied`/`unauth` since relaunching cannot fix a configuration problem. |
-| Duplicate task check | `cmux workspace list --json --id-format uuids`, match by home-scoped `.title` | cmux enforces NO title uniqueness for workspaces OR surfaces/tabs - verified live: two workspaces, and two surfaces within one workspace, all created successfully sharing one title. The adapter's own duplicate check is required, mirroring herdr/zellij, and it checks the scoped title such as `fm-firstmate-<8hex>-<id>`. |
-| Create task workspace | `cmux new-workspace --name <scoped-title> --cwd <dir> --focus false --id-format uuids` | Creates a workspace with exactly one default surface. `--focus` verified to already default to `false` for workspace/surface/pane creation - no focus-restore dance needed, unlike zellij. The caller passes `fm-<id>`, but the adapter creates `fm-<home-label>-<id>`. |
-| Workspace/surface id resolution | `cmux workspace list --json --id-format uuids` (find by home-scoped title), then `cmux list-panes --workspace <id> --json --id-format uuids` (`.panes[0].selected_surface_id`) | A freshly created workspace already has exactly one surface, so no separate `new-surface` call is needed. `--id-format uuids` (or `both`) is required to get a bare `id` field in JSON; the default JSON shape returns only short `ref` strings like `"workspace:2"`. |
+| Duplicate task check | `cmux workspace list --json --id-format uuids --window <win>`, match by home-scoped `.title` | cmux enforces NO title uniqueness for workspaces OR surfaces/tabs - verified live: two workspaces, and two surfaces within one workspace, all created successfully sharing one title. The adapter checks the scoped title such as `fm-firstmate-<8hex>-<id>` in the [pinned creation window](#workspace-titles-can-settle-after-creation). |
+| Create task workspace | `cmux new-workspace --name <scoped-title> --cwd <dir> --focus false --id-format uuids --window <win>` | Creates a workspace with exactly one default surface in the pinned window. `--focus` verified to already default to `false` for workspace/surface/pane creation - no focus-restore dance needed, unlike zellij. The caller passes `fm-<id>`, but the adapter creates `fm-<home-label>-<id>`. |
+| Post-create workspace/surface id resolution | `cmux workspace list --json --id-format uuids --window <win>` (poll by home-scoped title), then `cmux list-panes --workspace <id> --json --id-format uuids` (`.panes[0].selected_surface_id`) | [Title publication can lag creation](#workspace-titles-can-settle-after-creation). A freshly created workspace already has exactly one surface, so no separate `new-surface` call is needed. `--id-format uuids` (or `both`) is required to get a bare `id` field in JSON; the default JSON shape returns only short `ref` strings like `"workspace:2"`. |
 | Liveness / target readiness | `cmux list-panes --workspace <id> --json --id-format uuids`, checking the surface id appears in `.panes[].surface_ids` | Structural existence check, NOT a content read - see "read-screen fails on a genuinely fresh surface" below for why `read-screen` cannot be used here. Verified reliable on a completely untouched fresh surface, unlike `read-screen`. |
 | Send literal (unsubmitted) | `cmux send --workspace <id> --surface <id> -- <text>` | Verified live: does NOT auto-submit - text sits at the prompt, unexecuted, until a separate Enter. Matches every other backend's "literal-then-separate-Enter" contract. The `--` separator keeps option-shaped text such as `--help` literal. |
 | Send key | `cmux send-key --workspace <id> --surface <id> <key>` | Verified names: `enter`, `escape`, `ctrl-c` all work directly (lowercase, hyphenated). Escape is natively supported (unlike Orca); Ctrl-C correctly interrupted a running `sleep 100` in a live test. cmux's own key vocabulary is richer still (`ctrl-d`/`ctrl-z`/`ctrl-\\`, semantic aliases `sigint`/`sigtstp`/`sigquit`), but firstmate's shared vocabulary only needs these three today. |
@@ -299,9 +299,68 @@ The helper and both branches are pinned in `tests/fm-backend-cmux.test.sh` by `t
 The live `window_of_workspace` window/count detection is pinned in `tests/fm-backend-cmux-smoke.test.sh`.
 The last-in-window path is not driven end to end in the automated smoke suite because closing the last workspace inherently leaves a window cmux cannot close over the socket, so a live end-to-end run cannot self-clean; the manual run recorded above is its empirical proof instead.
 
-Related current-window scoping, observed during this work and left out of scope for this fix: `workspace list --json` WITHOUT `--window` is scoped to the CURRENT window only (verified live).
-`fm_backend_cmux_window_of_workspace` passes `--window` per window and is unaffected, but `fm_backend_cmux_workspace_id_for_label` and `fm_backend_cmux_list_live` see only the current window's workspaces, and `fm_backend_cmux_target_ready`'s label recovery inherits that scope.
-That is correct for the selected-workspace teardown case (a selected workspace is in the current window) but is a known limitation for a task workspace parked in a non-current window.
+Related window scoping: `workspace list --json` WITHOUT `--window` lists only one window, observed as the current window in the live verification above.
+The later [caller-context verification](#workspace-titles-can-settle-after-creation) establishes that inherited `CMUX_WORKSPACE_ID` can select a different window from the focused one.
+`fm_backend_cmux_window_of_workspace` passes `--window` per window and is unaffected, but `fm_backend_cmux_workspace_id_for_label` and `fm_backend_cmux_list_live` still see only the CLI-selected window's workspaces, and `fm_backend_cmux_target_ready`'s label recovery inherits that scope.
+Pinning the creation window does not extend those recovery paths to other windows; a task workspace outside the CLI-selected window remains a known blind spot.
+
+## Workspace titles can settle after creation
+
+Reported on 2026-09-30 with cmux 0.64.25 (106), macOS: `new-workspace --name <title> --cwd <git-repo> --focus false` followed immediately by `workspace list --json --id-format uuids` failed title resolution three consecutive times with `error: could not resolve a cmux workspace id for '<title>' after creation`, although `title` and `custom_title` appeared a second or two later; `/tmp` exposed the title immediately.
+The adapter resolves the window containing the inherited `CMUX_WORKSPACE_ID`, falling back to `current-window` only when that caller workspace context is absent, then pins the snapshot, duplicate check, creation, title polling and timeout diagnostics to that window with `--window`.
+It refuses creation if that window cannot be identified, including when inherited caller context no longer resolves.
+It also refuses before creation if the pre-create workspace list cannot be read or parsed as a workspace array, or if that snapshot already contains the requested home-scoped title.
+It waits for title publication and, on timeout, leaves every workspace untouched for manual inspection and cleanup.
+The timeout error includes the pinned window ID and candidate IDs from the final post-create list, restricted to the requested directory and excluding every ID present before creation.
+These candidates are diagnostic hints, never proof of ownership, even when only one remains; the owned workspace may have disappeared or changed directory while a concurrent workspace remains.
+An empty candidate list is printed as `[]`; an unreadable or malformed final list is reported as `unavailable`.
+`tests/fm-backend-cmux.test.sh` reproduces delayed publication and timeout diagnostics with a fake CLI; the `fm_backend_cmux_create_task` header in [`bin/backends/cmux.sh`](../bin/backends/cmux.sh) owns `FM_CMUX_TITLE_SETTLE_SECS`, its accepted values, default and polling budget.
+
+Fixture verification on 2026-09-30 covers the distinction between [cmux 0.64.25 caller-context routing](https://github.com/manaflow-ai/cmux/blob/v0.64.25/CLI/cmux.swift#L20658-L20672) and the [`current-window --json --id-format uuids` response's `window_id` field](https://github.com/manaflow-ai/cmux/blob/v0.64.25/CLI/cmux.swift#L6756-L6762).
+With the caller in window A and window B focused, `bash tests/fm-backend-cmux.test.sh` reproduced duplicate creation before the caller-window fix (`expected exit 1, got 0`); the fixtures now verify duplicate refusal, successful creation followed by task lookup, timeout diagnostics and refusal when caller context cannot be resolved.
+Earlier fixtures reproduced an attempted close of `other-window-existing` after a window switch, leading to window pinning.
+The 2026-09-30 ownership regression reproduced `close-workspace --workspace concurrent` after the owned workspace disappeared, demonstrating that a unique new directory match cannot justify automatic cleanup.
+Following the captain's `cmux-cleanup-identity` decision, the timeout fixtures now require zero close attempts for unique, multiple, absent, disappeared-owned, changed-directory and unreadable-list cases.
+Validation of this revision uses fixtures only and retains the completed live timing evidence below; no additional live cmux test or workspace mutation was performed.
+`bash tests/fm-backend-cmux.test.sh` prints:
+
+```text
+ok - fm_backend_cmux_create_task: timeout leaves every workspace untouched and reports diagnostic candidate IDs
+ok - fm_backend_cmux_create_task: window switching preserves all workspaces and pins title polling and timeout diagnostics
+ok - fm_backend_cmux_create_task: refuses creation without a valid original window UUID
+ok - fm_backend_cmux_create_task: caller window controls duplicate refusal, creation, task lookup and timeout diagnostics
+ok - fm_backend_cmux_create_task: unresolved caller context refuses creation without falling back to the focused window
+```
+
+Live verification on 2026-09-30 used the installed `cmux 0.64.25 (106) [b685a275c]`, one `fm-test-title-settle-0f866168` workspace, and a fresh git repository at `/private/tmp/fm-cmux-title-settle.ldU6nb`.
+With `FM_ROOT` and `FM_HOME` set to this test's source directory, no inherited `CMUX_WORKSPACE_ID`, and `FM_CMUX_TITLE_SETTLE_SECS` unset, the adapter used its default five-second window.
+Python's `time.monotonic()` timestamped Bash trace lines as they arrived: the first title lookup returned empty approximately 0.026 seconds after `new-workspace` returned, and the second found the workspace after one 250 ms sleep, approximately 0.422 seconds after creation returned.
+The complete `fm_backend_cmux_create_task` call took approximately 0.688 seconds; the 0.422-second observation includes lookup overhead and polling granularity, so it does not establish the exact instant the title became visible.
+The shell commands used for creation were:
+
+```bash
+export FM_ROOT="$PWD" FM_HOME="$PWD"
+unset FM_ROOT_OVERRIDE FM_CONFIG_OVERRIDE FM_CMUX_TITLE_SETTLE_SECS
+source bin/fm-backend.sh
+fm_backend_source cmux
+source tests/cmux-test-safety.sh
+fm_backend_cmux_version_check
+[ "$(fm_backend_cmux_ping_state)" = ok ]
+fm_backend_cmux_cli version
+REPO=$(mktemp -d /tmp/fm-cmux-title-settle.XXXXXX)
+REPO=$(cd "$REPO" && pwd -P)
+git -c init.templateDir= init -q "$REPO"
+LABEL=fm-test-title-settle-0f866168
+PS4='+ '
+set -x
+TASK_IDS=$(fm_backend_cmux_create_task "$LABEL" "$REPO")
+set +x
+```
+
+The adapter returned workspace `B7C38110-27B3-43C9-ADE1-D6364E8CB0F6` and surface `4DB2E3B5-38A1-4B76-A00E-1085034B1CAD`; a window-scoped `workspace list` confirmed the scoped title, and `fm_backend_cmux_surface_exists "$WSID" "$SFID"` succeeded.
+Cleanup ran `CMUX_WORKSPACE_ID="$WSID" cmux_safe_close_workspace "$WSID" "$LABEL"` exactly once through the loaded safety helper.
+The immediate removal assertion failed because the workspace was still listed, but a subsequent `fm_backend_cmux_cli workspace list --json --id-format uuids --window 13D7E12A-2E4C-42CD-AF9D-E731D31DF560` confirmed zero entries for that workspace and 38 total workspaces, matching the pre-test count, without another close call.
+The temporary repository was removed with `rm -rf -- "$REPO"` and its absence verified; no app quit, relaunch, or unrelated workspace close was performed.
 
 ## Workspace ids do not survive a relaunch (verified from source, not a live restart)
 
@@ -325,7 +384,7 @@ The app source (`Sources/App/CmuxCLIPathInstaller.swift`) reveals cmux ships an 
 
 Same as herdr's tabs and zellij's tabs, unlike tmux's own window-name uniqueness: cmux enforces no title uniqueness at all for workspaces or for surfaces/tabs within a workspace.
 Verified live: two workspaces created with the identical title `fm-test-dup` both succeeded and listed simultaneously with distinct ids; two surfaces within one workspace both renamed to the identical tab title also succeeded.
-`fm_backend_cmux_create_task`'s own title-based duplicate check is therefore required, mirroring both prior adapters' posture exactly.
+`fm_backend_cmux_create_task`'s own title-based duplicate check is therefore required; its window scope is defined by [the creation contract](#workspace-titles-can-settle-after-creation).
 
 ## Composer verification: structural border-row classification (adapted from herdr)
 
@@ -372,4 +431,5 @@ All three tasks' cmux workspaces and worktrees were confirmed fully cleaned up a
 - **`--secondmate` spawns are refused** (mirrors Orca's refusal) - no per-home container design (a herdr-style workspace-per-home split, or similar) has been designed or verified for cmux yet.
 - **The one-time socket-access setup is a real, undocumented-by-upstream onboarding step.** A captain who selects `backend=cmux` without first switching `automation.socketControlMode` away from its `cmuxOnly` default to a viable mode (Automation mode recommended; see "Setup") will see every spawn fail with an actionable error naming the viable modes and pointing back to this document, but there is no way for firstmate to complete that GUI-only setup step on the captain's behalf.
 - **A surface can still die in the brief window between `target_ready` succeeding and the operation's own call running.** That remaining race degrades to "the operation quietly did nothing" - the same class of gap firstmate already tolerates for an unverified send on any backend, caught downstream by `fm-spawn.sh`'s worktree-discovery poll timing out, `fm_backend_cmux_send_text_submit`'s retry loop (which reports `send-failed`/`pending`/`unknown` rather than a false "sent"), or the watcher's stale-pane detection.
-- **Windows cannot be closed over the control socket, and label lookup is current-window scoped** - both owned by "Closing the last workspace in a window" above. Teardown of a last-in-window task workspace therefore leaves that window a fresh default workspace rather than closing it, and `fm_backend_cmux_workspace_id_for_label`/`fm_backend_cmux_list_live` only see the current window, so a task workspace parked in a non-current window is a known blind spot for label-based recovery.
+- **Windows cannot be closed over the control socket, and label lookup is limited to the CLI-selected window** - both owned by "Closing the last workspace in a window" above.
+  Teardown of a last-in-window task workspace therefore leaves that window a fresh default workspace rather than closing it, and tasks outside the CLI-selected window remain a blind spot for label-based recovery.

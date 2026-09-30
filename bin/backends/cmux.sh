@@ -342,28 +342,69 @@ fm_backend_cmux_surface_id_for_workspace() {  # <workspace_id>
 }
 
 # fm_backend_cmux_create_task: create the task's workspace (one surface),
-# refusing an existing live <label> (finding #6: cmux enforces no uniqueness
-# itself). Resolves the fresh workspace's default surface via one list-panes
-# call (finding: a freshly created workspace already has exactly one surface,
-# so no separate new-surface call is needed). --focus false is passed for
-# defense in depth though verified to already be the default (finding:
-# workspace/surface/pane create all default focus to false) - no
-# focus-restore dance is needed, unlike zellij. Echoes "<workspace_id>
-# <surface_id>" on success.
+# refusing an existing home-scoped title in the chosen window (finding #6:
+# cmux enforces no uniqueness itself). Resolves the fresh workspace's default
+# surface via one list-panes call (finding: a freshly created workspace already
+# has exactly one surface, so no separate new-surface call is needed).
+# --focus false is passed for defense in depth though verified to already be
+# the default (finding: workspace/surface/pane create all default focus to
+# false) - no focus-restore dance is needed, unlike zellij. Echoes
+# "<workspace_id> <surface_id>" on success.
+# docs/cmux-backend.md "Workspace titles can settle after creation" owns
+# window selection, pre-create snapshot requirements and timeout diagnostics.
+# FM_CMUX_TITLE_SETTLE_SECS: non-negative whole seconds (unset/empty: 5).
+# One immediate title lookup plus up to 4 * FM_CMUX_TITLE_SETTLE_SECS retries,
+# separated by 250 ms sleeps; 0 disables retries. CLI runtime is additional,
+# so this is a sleep budget, not a wall-clock deadline. Nonempty invalid values
+# fail before any cmux call. A git cwd can delay title publication after creation.
 fm_backend_cmux_create_task() {  # <label> <cwd>
-  local label=$1 cwd=$2 title dup out wsid sfid
+  local label=$1 cwd=$2 title dup out wsid sfid before after candidates win
+  local settle=${FM_CMUX_TITLE_SETTLE_SECS:-5} attempts i
+  case "$settle" in
+    ''|*[!0-9]*) echo "error: FM_CMUX_TITLE_SETTLE_SECS must be non-negative whole seconds" >&2; return 1 ;;
+  esac
+  attempts=$(awk -v secs="$settle" 'BEGIN { printf "%.0f", secs * 4 }')
   title=$(fm_backend_cmux_scoped_title "$label")
-  dup=$(fm_backend_cmux_workspace_id_for_label "$title")
+  if [ -n "${CMUX_WORKSPACE_ID:-}" ]; then
+    win=$(fm_backend_cmux_window_of_workspace "$CMUX_WORKSPACE_ID")
+    win=${win%% *}
+  else
+    win=$(fm_backend_cmux_cli current-window --json --id-format uuids 2>/dev/null) || win=''
+    win=$(printf '%s' "$win" | jq -er '.window_id | select(type == "string")' 2>/dev/null) || win=''
+  fi
+  if ! [[ "$win" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]; then
+    echo "error: could not resolve the cmux window before creating '$title'" >&2
+    return 1
+  fi
+  if ! before=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$win" 2>/dev/null) ||
+    ! before=$(printf '%s' "$before" | jq -ce '.workspaces | select(type == "array")' 2>/dev/null); then
+    echo "error: could not snapshot cmux workspaces before creating '$title'" >&2
+    return 1
+  fi
+  dup=$(printf '%s' "$before" | jq -r --arg want "$title" '.[] | select(.title == $want) | .id' | head -1)
   if [ -n "$dup" ]; then
     echo "error: cmux workspace '$title' already exists" >&2
     return 1
   fi
-  out=$(fm_backend_cmux_cli new-workspace --name "$title" --cwd "$cwd" --focus false --id-format uuids 2>&1) || {
+  out=$(fm_backend_cmux_cli new-workspace --name "$title" --cwd "$cwd" --focus false --id-format uuids --window "$win" 2>&1) || {
     echo "error: cmux new-workspace failed for '$title': $out" >&2
     return 1
   }
-  wsid=$(fm_backend_cmux_workspace_id_for_label "$title")
-  [ -n "$wsid" ] || { echo "error: could not resolve a cmux workspace id for '$title' after creation" >&2; return 1; }
+  for ((i=0; i<=attempts; i++)); do
+    wsid=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$win" 2>/dev/null \
+      | jq -r --arg want "$title" '.workspaces[]? | select(.title == $want) | .id' 2>/dev/null | head -1)
+    [ -z "$wsid" ] || break
+    [ "$i" -ge "$attempts" ] || sleep 0.25
+  done
+  if [ -z "$wsid" ]; then
+    after=$(fm_backend_cmux_cli workspace list --json --id-format uuids --window "$win" 2>/dev/null) || after=''
+    candidates=$(printf '%s' "$after" | jq -ce --arg cwd "$cwd" --argjson before "$before" '
+      .workspaces | select(type == "array")
+      | map(select(.current_directory == $cwd)
+        | select(.id as $id | $before | map(.id) | index($id) | not) | .id)' 2>/dev/null) || candidates=unavailable
+    echo "error: could not resolve a cmux workspace id for '$title' after creation (${settle}s title settle window); all workspaces left untouched; candidate IDs in window $win (diagnostic hints only, not proof of ownership): $candidates; inspect manually before cleanup" >&2
+    return 1
+  fi
   sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")
   [ -n "$sfid" ] || { echo "error: could not resolve the default surface for cmux workspace '$title' ($wsid)" >&2; return 1; }
   printf '%s %s' "$wsid" "$sfid"
