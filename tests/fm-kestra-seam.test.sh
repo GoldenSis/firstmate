@@ -198,10 +198,9 @@ tasks:
       maxDuration: PT10S
       warningOnRetry: true'
 
-VALIDATION_OK_JSON='[
-  {"constraints": null},
-  {"constraints": null}
-]'
+# Captured from the pinned server: successful results omit constraints.
+VALIDATION_OK_JSON=$(cat "$ROOT/tests/fixtures/kestra/validation-success.json")
+VALIDATION_SHAPE_OK_JSON=$(printf '%s' "$VALIDATION_OK_JSON" | jq '[.[] | select(.flow == "m1_shape")]')
 
 BULK_OK_JSON='[
   {"id": "m1_controlled_failure", "namespace": "firstmate.m1", "revision": 2},
@@ -1638,15 +1637,47 @@ test_deploy_records_nothing_when_a_revision_cannot_be_verified() {
 }
 
 test_deploy_requires_every_server_validation_result_to_pass() {
-  local d out rc
+  local d out rc response filter record index=0
+  for filter in 'map(.constraints = null)' 'reverse'; do
+    d=$(workdir "deploy-valid-response-$index")
+    index=$((index + 1))
+    response=$(printf '%s' "$VALIDATION_OK_JSON" | jq "$filter")
+    rc=0
+    out=$(SEAM_VALIDATE_RESPONSE="$response" seam "$d" "$DEPLOY" 2>&1) || rc=$?
+    expect_code 0 "$rc" "valid results with $filter must deploy: $out"
+    assert_contains "$out" "deployed: $NS/m1_shape revision 1" "valid results must reach deployment"
+  done
+
   d=$(workdir deploy-mixed-validation)
+  response=$(printf '%s' "$VALIDATION_OK_JSON" | jq '.[1].constraints = "invalid flow"')
   rc=0
-  out=$(SEAM_VALIDATE_RESPONSE='[{"constraints":null},{"constraints":"invalid flow"}]' \
+  out=$(SEAM_VALIDATE_RESPONSE="$response" \
     seam "$d" "$DEPLOY" 2>&1) || rc=$?
   expect_code 1 "$rc" "one valid response object must not mask a rejected flow"
   assert_contains "$out" "invalid flow" "the rejected validation response must remain visible"
   assert_no_grep "/flows/$NS?delete=false" "$d/curl.log" \
     "the deployer must not update the namespace after any validation rejection"
+
+  for filter in \
+    '[]' '.[0]' '.[0:1]' '. + [.[0]]' '[{}, {}]' '[null, null]' \
+    '{"message":"validation failed"}' 'map({constraints:null})' \
+    '.[1] = .[0]' '.[1].flow = "unknown_flow"' '.[0].namespace = "other.namespace"' \
+    '.[0].constraints = false' '.[0].constraints = []' '.[0].constraints = {}'
+  do
+    d=$(workdir "deploy-invalid-response-$index")
+    index=$((index + 1))
+    record=$(cat "$d/home/data/kestra/revisions")
+    response=$(printf '%s' "$VALIDATION_OK_JSON" | jq "$filter")
+    rc=0
+    out=$(SEAM_VALIDATE_RESPONSE="$response" seam "$d" "$DEPLOY" 2>&1) || rc=$?
+    expect_code 1 "$rc" "malformed or rejected validation result ($filter) must fail"
+    assert_contains "$out" "server rejected a tracked flow or returned an incomplete validation result" \
+      "the validation refusal must explain the failure"
+    assert_no_grep "/flows/$NS?delete=false" "$d/curl.log" \
+      "malformed or rejected validation results must never update the namespace"
+    [ "$(cat "$d/home/data/kestra/revisions")" = "$record" ] \
+      || fail "validation failure must preserve the recorded revisions"
+  done
   pass "server validation succeeds only when every expected flow result passes"
 }
 
@@ -1913,7 +1944,7 @@ tasks:
             - echo unsafe'
   check_fixture "$d" >/dev/null || fail "document separators inside literal content must remain supported"
   cp "$d/literal.yaml" "$d/fake-flows/m1_shape@1.yaml"
-  out=$(SEAM_VALIDATE_RESPONSE='[{"constraints":null}]' seam "$d" "$d/repo/bin/fm-kestra-deploy.sh" 2>&1) || rc=$?
+  out=$(SEAM_VALIDATE_RESPONSE="$VALIDATION_SHAPE_OK_JSON" seam "$d" "$d/repo/bin/fm-kestra-deploy.sh" 2>&1) || rc=$?
   expect_code 0 "$rc" "literal separators must deploy as one flow: $out"
   { cat "$d/literal.yaml"; printf '# firstmate-source-end'; } > "$d/expected"
   cmp -s "$d/expected" "$d/fake-flows/uploads/validate/0.yaml" \
@@ -2045,7 +2076,7 @@ tasks:
     cp "$ROOT/bin/fm-kestra-run.sh" "$d/repo/bin/"
     cp "$d/eof.yaml" "$d/fake-flows/m1_shape@1.yaml"
     rc=0
-    out=$(SEAM_VALIDATE_RESPONSE='[{"constraints":null}]' SEAM_ROUNDTRIP_UPLOADS=1 \
+    out=$(SEAM_VALIDATE_RESPONSE="$VALIDATION_SHAPE_OK_JSON" SEAM_ROUNDTRIP_UPLOADS=1 \
       seam "$d" "$d/repo/bin/fm-kestra-deploy.sh" 2>&1) || rc=$?
     expect_code 0 "$rc" "EOF bytes must survive the trimming upload endpoint: $ending: $out"
     cp "$d/eof.yaml" "$d/expected"
@@ -2070,11 +2101,11 @@ tasks:
       assert_no_grep '^POST ' "$d/curl.log" "EOF source drift must not create an execution"
       rm -f "$d/home/data/kestra/revisions"
       rc=0
-      out=$(SEAM_VALIDATE_RESPONSE='[{"constraints":null}]' \
+      out=$(SEAM_VALIDATE_RESPONSE="$VALIDATION_SHAPE_OK_JSON" \
         seam "$d" "$d/repo/bin/fm-kestra-deploy.sh" 2>&1) || rc=$?
       expect_code 2 "$rc" "EOF drift must refuse deployment verification: $ending $mutation: $out"
       assert_absent "$d/home/data/kestra/revisions" "EOF drift must not record a verified revision"
-      SEAM_VALIDATE_RESPONSE='[{"constraints":null}]' SEAM_ROUNDTRIP_UPLOADS=1 \
+      SEAM_VALIDATE_RESPONSE="$VALIDATION_SHAPE_OK_JSON" SEAM_ROUNDTRIP_UPLOADS=1 \
         seam "$d" "$d/repo/bin/fm-kestra-deploy.sh" >/dev/null || fail "restore verified revision"
     done
   done

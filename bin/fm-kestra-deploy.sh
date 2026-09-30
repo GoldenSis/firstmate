@@ -113,10 +113,15 @@ elif [ "$rc" -ne 0 ]; then
   [ -z "$validation" ] || printf '%s\n' "$validation" >&2
   fm_kestra_die "flow validation request failed" 1
 fi
-if ! printf '%s' "$validation" | jq -e --argjson expected "$flow_count" '
+# Kestra omits null constraints on success. Match the returned flow identities
+# so missing constraints cannot make an empty or unrelated object look valid.
+if ! printf '%s' "$validation" | jq -e --argjson expected "$flow_count" \
+  --arg ns "$FM_KESTRA_NAMESPACE" \
+  --argjson ids "$(printf '%s\n' "${FLOW_IDS[@]}" | jq -Rsc 'split("\n")[:-1]')" '
   type == "array" and
   length == $expected and
-  all(.[]; type == "object" and has("constraints") and .constraints == null)
+  all(.[]; type == "object" and .namespace == $ns and .constraints == null) and
+  ([.[].flow] | sort) == ($ids | sort)
 ' >/dev/null 2>&1; then
   [ -z "$validation" ] || printf '%s\n' "$validation" >&2
   fm_kestra_die "server rejected a tracked flow or returned an incomplete validation result" 1

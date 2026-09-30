@@ -1,0 +1,22 @@
+[
+  {
+    "index": 0,
+    "filename": "flow-0.yaml",
+    "namespace": "firstmate.m1",
+    "flow": "m1_controlled_failure",
+    "outdated": false,
+    "deprecationPaths": [],
+    "warnings": [],
+    "infos": []
+  },
+  {
+    "index": 1,
+    "filename": "flow-1.yaml",
+    "namespace": "firstmate.m1",
+    "flow": "m1_shape",
+    "outdated": false,
+    "deprecationPaths": [],
+    "warnings": [],
+    "infos": []
+  }
+]
