@@ -339,6 +339,7 @@ All implemented submit-verifying backends expose the identical caller-facing ver
 ## Test safety
 
 Unlike herdr/zellij, cmux has no isolated, throwaway SESSION a test can spin up and tear down on its own - there is just "the app", the same real running instance a captain uses day to day.
+Run the live smoke test explicitly with `FM_CMUX_LIVE=1 bash tests/fm-backend-cmux-smoke.test.sh`; without that opt-in it skips before contacting cmux, so portable test runs do not depend on or modify the shared desktop app.
 `tests/cmux-test-safety.sh`'s guard is adapted to this shape: `cmux_refuse_if_unsafe` requires a non-empty workspace id, a caller-facing label carrying the `fm-test-` prefix, and that the workspace is CURRENTLY LISTED with the scoped title derived from that label, before `cmux_safe_close_workspace` is allowed to close it.
 Every real-cmux test in this document and its accompanying test files creates only `fm-test-`-prefixed task labels, never enumerates-and-closes, and never quits or relaunches the app.
 

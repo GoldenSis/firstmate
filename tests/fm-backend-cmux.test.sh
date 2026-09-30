@@ -6,8 +6,8 @@
 # fakebin/command-log convention: a small, LOG-based, canned-response fake
 # `cmux` + real `jq` (jq is a real required tool for this backend, not
 # faked). The real-binary smoke test lives in
-# tests/fm-backend-cmux-smoke.test.sh, gated on the cmux binary actually
-# being installed and reachable.
+# tests/fm-backend-cmux-smoke.test.sh, gated on explicit live-test opt-in
+# plus the cmux binary being installed and reachable.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -455,6 +455,43 @@ SH
   assert_contains "$out" "Automation mode" "ensure_running's unauth error did not name the recommended no-password Automation mode"
   assert_contains "$out" "docs/cmux-backend.md" "ensure_running's unauth error did not point at the setup docs"
   pass "fm_backend_cmux_ensure_running: fails fast on an unauthenticated socket, naming the password config and the Automation mode alternative"
+}
+
+# --- live smoke test opt-in --------------------------------------------------
+
+test_smoke_requires_explicit_opt_in() {
+  local dir fb out status opt_in
+  for opt_in in unset '' 0 true; do
+    dir="$TMP_ROOT/smoke-opt-in-$opt_in"; mkdir -p "$dir/responses"
+    fb=$(make_cmux_fakebin "$dir")
+    out=$(
+      export PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses"
+      unset FM_CMUX_LIVE
+      [ "$opt_in" = unset ] || export FM_CMUX_LIVE="$opt_in"
+      bash "$ROOT/tests/fm-backend-cmux-smoke.test.sh" 2>&1
+    )
+    status=$?
+    expect_code 0 "$status" "live smoke should skip without explicit opt-in ($opt_in)"
+    assert_contains "$out" 'skip: set FM_CMUX_LIVE=1' "live smoke should explain its opt-in"
+    [ ! -e "$dir/log" ] || fail "live smoke contacted cmux without explicit opt-in ($opt_in)"
+  done
+  pass "real cmux smoke: requires explicit opt-in before contacting the shared app"
+}
+
+test_smoke_opt_in_preserves_failures() {
+  local dir fb out status
+  dir="$TMP_ROOT/smoke-enabled"; mkdir -p "$dir/responses"
+  fb=$(make_cmux_fakebin "$dir")
+  cmux_workspace_list_response "$dir" 1
+  cmux_workspace_list_response "$dir" 3
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" FM_CMUX_LIVE=1 \
+    bash "$ROOT/tests/fm-backend-cmux-smoke.test.sh" 2>&1 )
+  status=$?
+  expect_code 1 "$status" "opted-in smoke must fail when the created workspace cannot be resolved"
+  assert_contains "$out" 'could not resolve a cmux workspace id' "opted-in smoke did not exercise creation"
+  assert_contains "$out" 'not ok - create_task failed' "opted-in smoke swallowed an adapter failure"
+  assert_contains "$(cat "$dir/log")" $'\x1f''new-workspace' "opted-in smoke did not invoke creation"
+  pass "real cmux smoke: explicit opt-in exercises the adapter and preserves failures"
 }
 
 # --- create_task: duplicate refusal, id resolution ---------------------------
@@ -1006,6 +1043,8 @@ test_secondmate_spawn_refuses_cmux_backend() {
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
 
+test_smoke_requires_explicit_opt_in
+test_smoke_opt_in_preserves_failures
 test_version_check_accepts_current_version
 test_version_check_accepts_newer_version
 test_version_check_refuses_old_version
