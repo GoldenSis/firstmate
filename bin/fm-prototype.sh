@@ -12,6 +12,8 @@
 #   question: the explicit uncertainty
 #   safety.fixtures: "synthetic-or-minimized"
 #   safety.persistence: "none"
+#     Runtime experiment state is not persisted; retained source evidence below
+#     does not relax the safe envelope.
 #   safety.external_side_effects: "none"
 #   safety.sensitive_live_access: "forbidden"
 #   binding: null, or {worktree, baseline_head, ignored_snapshot[]}
@@ -19,8 +21,12 @@
 #       immediately before launch
 #   evidence: null, or {report_sha256, chosen_decision,
 #              regression_test_required, regression_test_reason}
+#   retained_artifact: optional {branch: "proto/<task-id>", commit}, logic-state only
+#     Completion records the full artifact HEAD independently of promotion.
 #   promotion: null, or {prepared_head, report_sha256, decision_sha256,
 #               regression_test_required}
+#     Legacy promotion.retained_artifact is read and preserved on evidence updates;
+#     conflicting artifact identities are invalid.
 # The safe values are immutable. There is deliberately no allow-sensitive,
 # force, assertion, or environment-variable bypass. Live NAS data, production
 # accounts/routes, tailnet or remote-access policy, DNS/MX/email control planes,
@@ -49,12 +55,31 @@
 # must be `required: <reason>` or `not-required: <reason>`; `required` is valid
 # only for logic-state. Repeating completion over identical report bytes is
 # idempotent. Changed evidence replaces the evidence digest and invalidates any
-# prior promotion preparation.
+# prior promotion preparation without changing the retained artifact identity.
 #
 # `verify` revalidates the evidence and its digest. Scout teardown calls it for
-# every marked prototype. `prepare-promotion` additionally requires the original
-# bound worktree, detached at its exact baseline HEAD, with no tracked or
-# untracked residue and the exact unchanged pre-launch ignored-file snapshot.
+# every marked prototype. Logic-state `complete` and all `prepare-promotion` calls
+# require the original bound worktree with no tracked or untracked residue and
+# the exact unchanged pre-launch ignored-file snapshot. UI preparation requires
+# detachment at the exact baseline. Logic-state completion requires the committed
+# artifact on proto/<task-id>, descended from the baseline; HEAD may be on that
+# branch or detached at the baseline. Completion records its identity once and
+# rejects later changes. Preparation only verifies that recorded artifact.
+# The worker creates and commits the artifact branch; these commands never create
+# or move it. UI completion validates the report without requiring scratch cleanup;
+# UI promotion preparation still requires the clean detached baseline.
+# `retained-branch` verifies the recorded branch still resolves to its commit in
+# the bound worktree, or the supplied recorded project if that worktree is absent,
+# and prints its name (nothing for UI or --allow-unrecorded without an identity).
+# The project fallback requires both the supplied and bound worktree paths to be
+# absent, not dangling symlinks; it never replaces a present but invalid worktree
+# or relaxes completion/promotion's original-worktree requirement.
+# --allow-unrecorded is used by explicitly approved teardown --force cancellation:
+# it permits no recorded identity, but never bypasses verification of one that exists.
+# Teardown calls it for scouts and promoted tasks before either cleanup path,
+# refusing missing or moved refs and preserving the branch.
+# fm-promote.sh detaches at the recorded baseline
+# before making this a ship task.
 # Repeating preparation in the same clean state is idempotent. `promotion-verify`
 # repeats every check without mutation and is called by fm-promote.sh.
 #
@@ -64,6 +89,7 @@
 #   fm-prototype.sh bind <task-id> <worktree>
 #   fm-prototype.sh complete <task-id>
 #   fm-prototype.sh verify <task-id>
+#   fm-prototype.sh retained-branch <task-id> <worktree> [<project> [--allow-unrecorded]]
 #   fm-prototype.sh prepare-promotion <task-id> <worktree>
 #   fm-prototype.sh promotion-verify <task-id> <worktree>
 #   fm-prototype.sh decision <task-id>
@@ -154,9 +180,13 @@ validate_manifest() {
   require_jq
   [ ! -L "$MANIFEST" ] || die "prototype manifest must not be a symlink: $MANIFEST"
   [ -f "$MANIFEST" ] || die "no registered prototype for task $ID at $MANIFEST"
-  jq -e '
+  jq -e --arg retained_branch "proto/$ID" '
+    def valid_artifact:
+      (keys | sort) == ["branch", "commit"]
+      and .branch == $retained_branch
+      and (.commit | test("^[0-9a-f]{40,64}$"));
     type == "object"
-    and (keys | sort) == [
+    and (del(.retained_artifact) | keys | sort) == [
       "binding",
       "class",
       "evidence",
@@ -202,8 +232,13 @@ validate_manifest() {
       and (.evidence.regression_test_required | type == "boolean")
       and (.evidence.regression_test_reason | type == "string" and length > 0)
     ))
+    and (.retained_artifact == null or (
+      .class == "logic-state" and (.retained_artifact | valid_artifact)
+    ))
+    and (.retained_artifact == null or .promotion.retained_artifact == null
+      or .retained_artifact == .promotion.retained_artifact)
     and (.promotion == null or (
-      (.promotion | keys | sort) == [
+      (.promotion | del(.retained_artifact) | keys | sort) == [
         "decision_sha256",
         "prepared_head",
         "regression_test_required",
@@ -213,6 +248,10 @@ validate_manifest() {
       and (.promotion.report_sha256 | test("^[0-9a-f]{64}$"))
       and (.promotion.decision_sha256 | test("^[0-9a-f]{64}$"))
       and (.promotion.regression_test_required | type == "boolean")
+      and ((.promotion | has("retained_artifact") | not) or (
+        .class == "logic-state"
+        and (.promotion.retained_artifact | valid_artifact)
+      ))
     ))
   ' "$MANIFEST" >/dev/null || die "invalid or unsafe prototype manifest: $MANIFEST"
 }
@@ -326,19 +365,67 @@ EOF
   '
 }
 
-assert_clean_baseline() {
-  local supplied=$1 bound baseline current branch residue expected_ignored actual_ignored
+recorded_retained_artifact() {
+  jq -cS '.retained_artifact // .promotion.retained_artifact // null' "$MANIFEST"
+}
+
+verify_retained_artifact() {
+  local supplied=$1 project=${2:-} allow_unrecorded=${3:-} bound repository artifact branch expected actual
+  [ "$(jq -r '.class' "$MANIFEST")" = logic-state ] || return 0
+  artifact=$(recorded_retained_artifact)
+  if [ "$artifact" = null ]; then
+    [ "$allow_unrecorded" = --allow-unrecorded ] && return 0
+    die "logic-state completion has no recorded retained artifact"
+  fi
+  bound=$(jq -r '.binding.worktree // empty' "$MANIFEST")
+  if [ -n "$project" ] && [ ! -e "$supplied" ] && [ ! -L "$supplied" ]; then
+    [ -n "$bound" ] && [ ! -e "$bound" ] && [ ! -L "$bound" ] \
+      || die "registered retained artifact worktree is not absent: $bound"
+    repository=$(canonical_dir "$project") || die "retained artifact project does not exist: $project"
+  else
+    repository=$(canonical_dir "$supplied") || die "retained artifact worktree does not exist: $1"
+    [ "$repository" = "$bound" ] || die "retained artifact worktree differs from the registered worktree"
+  fi
+  branch=$(printf '%s\n' "$artifact" | jq -r '.branch')
+  expected=$(printf '%s\n' "$artifact" | jq -r '.commit')
+  actual=$(git -C "$repository" rev-parse --verify "refs/heads/$branch^{commit}" 2>/dev/null) \
+    || die "retained artifact branch is missing: $branch"
+  [ "$actual" = "$expected" ] || die "retained artifact branch changed: $branch"
+}
+
+assert_clean_prototype_worktree() {
+  local supplied=$1 bound baseline current branch residue expected_ignored actual_ignored retained_commit recorded
   supplied=$(canonical_dir "$supplied") || die "worktree does not exist: $1"
   bound=$(jq -r '.binding.worktree // empty' "$MANIFEST")
   baseline=$(jq -r '.binding.baseline_head // empty' "$MANIFEST")
   [ -n "$bound" ] && [ -n "$baseline" ] || die "prototype has not been bound before worker launch"
-  [ "$supplied" = "$bound" ] || die "promotion worktree differs from the registered worktree"
+  [ "$supplied" = "$bound" ] || die "prototype worktree differs from the registered worktree"
   current=$(git -C "$supplied" rev-parse HEAD 2>/dev/null) \
     || die "cannot resolve prototype worktree HEAD"
-  [ "$current" = "$baseline" ] \
-    || die "prototype worktree is not at its registered baseline HEAD"
   branch=$(git -C "$supplied" symbolic-ref -q --short HEAD 2>/dev/null || true)
-  [ -z "$branch" ] || die "prototype worktree must be detached at baseline before promotion"
+  RETAINED_ARTIFACT=null
+  if [ "$(jq -r '.class' "$MANIFEST")" = logic-state ]; then
+    retained_commit=$(git -C "$supplied" rev-parse --verify "refs/heads/proto/$ID^{commit}" 2>/dev/null) \
+      || die "logic-state retained artifact must be committed on proto/$ID before completion"
+    git -C "$supplied" merge-base --is-ancestor "$baseline" "$retained_commit" \
+      || die "retained artifact does not descend from the registered baseline"
+    if [ "$branch" = "proto/$ID" ]; then
+      [ "$current" = "$retained_commit" ] || die "worktree differs from the retained artifact"
+    else
+      [ -z "$branch" ] && [ "$current" = "$baseline" ] \
+        || die "logic-state worktree must be on proto/$ID or detached at baseline"
+    fi
+    # shellcheck disable=SC2016  # jq variables are expanded by jq, not the shell.
+    RETAINED_ARTIFACT=$(jq -cnS --arg branch "proto/$ID" --arg commit "$retained_commit" \
+      '{branch: $branch, commit: $commit}')
+    recorded=$(recorded_retained_artifact)
+    [ "$recorded" = null ] || [ "$recorded" = "$RETAINED_ARTIFACT" ] \
+      || die "retained artifact branch changed: proto/$ID"
+  else
+    [ "$current" = "$baseline" ] \
+      || die "prototype worktree is not at its registered baseline HEAD"
+    [ -z "$branch" ] || die "prototype worktree must be detached at baseline before promotion"
+  fi
   residue=$(worktree_residue "$supplied")
   [ -z "$residue" ] || die "prototype worktree still contains experiment residue: $residue"
   expected_ignored=$(jq -c '.binding.ignored_snapshot' "$MANIFEST")
@@ -426,17 +513,24 @@ complete_command() {
   [ "$(jq -r '.binding != null' "$MANIFEST")" = true ] \
     || die "prototype must be bound before evidence completion"
   validate_evidence
+  RETAINED_ARTIFACT=null
+  if [ "$(jq -r '.class' "$MANIFEST")" = logic-state ]; then
+    assert_clean_prototype_worktree "$(jq -r '.binding.worktree' "$MANIFEST")"
+  fi
   report_digest=$(sha256_file "$REPORT")
   # shellcheck disable=SC2016  # jq variables are expanded by jq, not the shell.
   json_replace '
-    .evidence = {
+    {
       report_sha256: $report_digest,
       chosen_decision: $chosen_decision,
       regression_test_required: $regression_required,
       regression_test_reason: $regression_reason
-    }
-    | .promotion = null
+    } as $evidence
+    | if .evidence != $evidence then .promotion = null else . end
+    | .evidence = $evidence
+    | if $retained_artifact != null then .retained_artifact = $retained_artifact else . end
   ' \
+    --argjson retained_artifact "$RETAINED_ARTIFACT" \
     --arg report_digest "$report_digest" \
     --arg chosen_decision "$CHOSEN_DECISION" \
     --argjson regression_required "$REGRESSION_REQUIRED" \
@@ -465,19 +559,22 @@ verify_command() {
 prepare_promotion_command() {
   local worktree=$1 report_digest decision_digest baseline
   verify_command
-  assert_clean_baseline "$worktree"
+  verify_retained_artifact "$worktree"
+  assert_clean_prototype_worktree "$worktree"
   report_digest=$(jq -r '.evidence.report_sha256' "$MANIFEST")
   decision_digest=$(sha256_text "$(jq -r '.evidence.chosen_decision' "$MANIFEST")")
   baseline=$(jq -r '.binding.baseline_head' "$MANIFEST")
   # shellcheck disable=SC2016  # jq variables are expanded by jq, not the shell.
   json_replace '
-    .promotion = {
+    if $retained_artifact != null then .retained_artifact = $retained_artifact else . end
+    | .promotion = {
       prepared_head: $baseline,
       report_sha256: $report_digest,
       decision_sha256: $decision_digest,
       regression_test_required: .evidence.regression_test_required
     }
   ' \
+    --argjson retained_artifact "$RETAINED_ARTIFACT" \
     --arg baseline "$baseline" \
     --arg report_digest "$report_digest" \
     --arg decision_digest "$decision_digest"
@@ -489,7 +586,8 @@ promotion_verify_command() {
   verify_command
   [ "$(jq -r '.promotion != null' "$MANIFEST")" = true ] \
     || die "prototype promotion has not been prepared"
-  assert_clean_baseline "$worktree"
+  verify_retained_artifact "$worktree"
+  assert_clean_prototype_worktree "$worktree"
   expected_report=$(jq -r '.evidence.report_sha256' "$MANIFEST")
   [ "$expected_report" = "$(jq -r '.promotion.report_sha256' "$MANIFEST")" ] \
     || die "promotion preparation carries stale report evidence"
@@ -539,6 +637,15 @@ case "${1:-}" in
     [ "$#" -eq 3 ] || die "usage: fm-prototype.sh prepare-promotion <task-id> <worktree>"
     load_task "$2"
     prepare_promotion_command "$3"
+    ;;
+  retained-branch)
+    [ "$#" -ge 3 ] && [ "$#" -le 5 ] \
+      || die "usage: fm-prototype.sh retained-branch <task-id> <worktree> [<project> [--allow-unrecorded]]"
+    [ "$#" -lt 5 ] || [ "$5" = --allow-unrecorded ] || die "unknown retained-branch option: $5"
+    load_task "$2"
+    validate_manifest
+    verify_retained_artifact "$3" "${4:-}" "${5:-}"
+    recorded_retained_artifact | jq -r '.branch // empty'
     ;;
   promotion-verify)
     [ "$#" -eq 3 ] || die "usage: fm-prototype.sh promotion-verify <task-id> <worktree>"

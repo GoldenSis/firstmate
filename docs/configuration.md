@@ -12,7 +12,7 @@ This section is the single owner of the top-level operational-home layout; produ
 The tracked code root contains the shared instruction, skill, documentation, workflow, and `bin/` surfaces, while each effective `FM_HOME` contains private operational directories.
 `data/` holds durable private fleet records such as the project and secondmate registries, captain preferences, optional shared captain preferences, learnings, backlog, briefs, scout reports, question-first prototype manifests, and model-fusion synthesis markers and sealed gates.
 `bin/fm-brief.sh` writes the `data/<id>/fusion-synthesis` promotion marker, and `bin/fm-fusion-gate.sh` owns the exact `data/<id>/fusion-gate/` sealed-package mechanics.
-`bin/fm-brief.sh --scout --prototype` registers the `data/<id>/prototype.json` manifest through `bin/fm-prototype.sh`, whose header owns the exact `fm-prototype.v1` schema, safe-envelope values, worktree binding, evidence headings, and promotion checks.
+`bin/fm-brief.sh --scout --prototype` registers the `data/<id>/prototype.json` manifest through `bin/fm-prototype.sh`, whose header owns the exact `fm-prototype.v1` schema, safe-envelope values, worktree binding, evidence headings, retained artifact identity, and promotion and cleanup checks.
 `state/` holds volatile runtime records such as task metadata, append-only status events, endpoint signals, watcher and wake-queue coordination, away-mode state, and generated X-mode artifacts.
 `config/` holds local gitignored operating choices, and `projects/` holds the local project clones that Firstmate reads but changes only through the guarded exceptions in `AGENTS.md`.
 
@@ -523,6 +523,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   secondmates.md      secondmate routing table; firstmate-private, maintained by fm-home-seed.sh (section 6)
   <id>/brief.md      per-task crewmate brief, or per-secondmate charter brief when kind=secondmate
   <id>/report.md     scout task deliverable, written by the crewmate; survives teardown
+  <id>/prototype.json  question-first prototype registration, evidence, retention, and promotion record; survives teardown; schema owned by bin/fm-prototype.sh
   buzz-keypair.public  this home's loopback Buzz publishing PUBLIC key; LOCAL, gitignored; written by fm-buzz-keypair.sh, which never records the private half here (docs/buzz-loopback-adapter.md)
   buzz-keypair.public-history  public keys this home still trusts for pre-rotation event attribution; LOCAL, gitignored; exact lifecycle owned by fm-buzz-keypair.sh --help
   buzz-publisher-targets.jsonl  used relay/channel/publisher tuples that protect private-channel membership during rotation; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs

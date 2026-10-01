@@ -12,7 +12,8 @@
 # Usage: fm-brief.sh <task-id> <repo-name> [--scout] [--prototype <ui|logic-state> --question <question>] [--fusion-synthesis] [--herdr-lab]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
-#   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
+#   data/<task-id>/report.md (no push or PR) and the worktree is scratch, subject
+#   to prototype-lifecycle's artifact-retention policy for registered prototypes.
 #   --prototype <ui|logic-state> is a scout-only question-first prototype variant.
 #   It requires --question with one explicit uncertainty, registers the immutable
 #   safe envelope in data/<task-id>/prototype.json through fm-prototype.sh, and
@@ -323,8 +324,9 @@ $FUSION_SECTION$PROTOTYPE_SECTION$HERDR_SECTION
 # Setup
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
 This is a SCOUT task: the deliverable is a written report, not a PR.
-The worktree is your laboratory - install, run, edit, and make scratch commits freely; all of it is discarded at teardown.
-The report is the only thing that survives, so anything worth keeping must be in it.
+The worktree is your laboratory - install, run, edit, and make scratch commits within the task's safety constraints.
+Scratch is discarded at teardown except for artifacts retained under the registered prototype lifecycle above.
+Keep all findings and decisions in the durable report; prototype artifact retention follows that lifecycle's policy.
 
 # Rules
 1. Never push to any remote and never open a PR.

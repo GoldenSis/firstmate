@@ -31,6 +31,10 @@
 # unresolved-decision completion gate verifies its captain-held inventory.
 # A scout marked by data/<task-id>/prototype.json must also pass the prototype
 # evidence and digest verification owned by fm-prototype.sh before teardown.
+# Marked tasks, including promoted ships, must pass its retained-branch check
+# before cleanup; a missing, renamed, or moved logic-state artifact ref refuses
+# teardown. The verified artifact branch and durable prototype record survive
+# both cleanup paths; fm-prototype.sh owns verification and absent-worktree recovery.
 # Before destructive cleanup, teardown validates task check artifacts and any
 # matching quarantine entries as ordinary single-link files on the state
 # device. It refuses and preserves task state when that proof fails; otherwise
@@ -50,6 +54,8 @@
 #   --force skips ordinary-task dirty and landed-work checks, skips scout report
 #   checks, and discards secondmate child work for kind=secondmate. Only use it
 #   when the captain has explicitly said to discard the work.
+#   For registered prototypes it permits unfinished cancellation without a recorded
+#   artifact, but still verifies and preserves any recorded logic-state artifact.
 #
 # Transient / stale worktree git lock recovery (teardown-lock-race): a crew process
 # killed mid-git-operation can leave a .git/worktrees/<wt>/index.lock (or, for a
@@ -1092,6 +1098,18 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
+# Keep the recorded logic-state artifact; all other task branches remain disposable.
+RETAINED_PROTOTYPE_BRANCH=
+if [ -e "$DATA/$ID/prototype.json" ] || [ -L "$DATA/$ID/prototype.json" ]; then
+  RETAINED_PROTOTYPE_ARGS=("$ID" "$WT" "$PROJ")
+  [ "$FORCE" != "--force" ] || RETAINED_PROTOTYPE_ARGS+=(--allow-unrecorded)
+  if ! RETAINED_PROTOTYPE_BRANCH=$(FM_HOME="$FM_HOME" FM_DATA_OVERRIDE="$DATA" \
+      "$SCRIPT_DIR/fm-prototype.sh" retained-branch "${RETAINED_PROTOTYPE_ARGS[@]}"); then
+    echo "REFUSED: prototype $ID has no verified retained artifact; preserving task and worktree." >&2
+    exit 1
+  fi
+fi
+
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then
@@ -1102,7 +1120,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
     if [ "$branch" != "HEAD" ]; then
       if git -C "$WT" checkout --detach -q 2>/dev/null; then
-        git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
+        [ "$branch" = "$RETAINED_PROTOTYPE_BRANCH" ] || git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
       fi
     fi
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
@@ -1113,7 +1131,7 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
   if [ "$branch" != "HEAD" ]; then
     if git -C "$WT" checkout --detach -q 2>/dev/null; then
-      git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
+      [ "$branch" = "$RETAINED_PROTOTYPE_BRANCH" ] || git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
     fi
   fi
   # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.

@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 # Promote a scout task to a ship task in place: the crewmate keeps its window,
-# worktree, and loaded context; only the contract changes. Flips kind= to ship in
+# worktree, and loaded context. Flips kind= to ship in
 # state/<task-id>.meta so fm-teardown.sh applies the full ship-task teardown protection
-# again. After promoting, send the crewmate its ship instructions via fm-send.sh
-# (inventory scratch state, reset to a clean default-branch base, carry over only
-# intended fix changes, create branch fm/<task-id>, implement, then report done
-# according to the project's delivery mode).
+# again. After promoting, send the crewmate the emitted ship instructions via
+# fm-send.sh, following the project's delivery mode and the applicable lifecycle.
 # A scout carrying data/<task-id>/fusion-synthesis is refused until
 # fm-fusion-gate.sh verify confirms its validator-authored baseline-red seal.
 # The emitted fusion instructions run that same sealed gate red before production
 # edits and green before the selected delivery path begins.
 # A scout carrying data/<task-id>/prototype.json is refused until
 # fm-prototype.sh promotion-verify confirms completed evidence, the validated
-# decision, its regression-test obligation, and a residue-free detached worktree
-# at the exact pre-experiment baseline. The emitted ship instructions implement
+# decision, its regression-test obligation, and the class-specific retention
+# checks. Promotion detaches at the exact pre-experiment baseline before changing
+# kind, leaving any retained logic-state branch intact. Ship instructions implement
 # that decision afresh and continue through the existing delivery path.
 # --expect red is the required pre-edit observation.
 # --expect green is the required pre-delivery observation.
@@ -54,6 +53,12 @@ if [ -e "$DATA/$ID/prototype.json" ] || [ -L "$DATA/$ID/prototype.json" ]; then
     echo "error: prototype $ID has no valid clean promotion preparation; promotion refused" >&2
     exit 1
   fi
+  # Never let retained prototype commits become the ship branch's starting point.
+  BASELINE=$(jq -r '.binding.baseline_head' "$DATA/$ID/prototype.json")
+  git -C "$WT" checkout --detach -q "$BASELINE" || {
+    echo "error: could not restore the prototype baseline; promotion refused" >&2
+    exit 1
+  }
 fi
 
 TMP="$META.tmp"

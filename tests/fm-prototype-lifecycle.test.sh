@@ -17,6 +17,7 @@ PROMOTE="$ROOT/bin/fm-promote.sh"
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 TMP_ROOT=$(fm_test_tmproot fm-prototype)
+trap 'rm -rf "$TMP_ROOT"' EXIT
 
 setup_case() {
   local id=$1 class=$2 question=$3 injected_hook=${4:-}
@@ -77,7 +78,7 @@ Choose alternative A because the observed transition remained deterministic.
 
 ### Expiry or disposal
 
-Discard all experiment state at promotion or scout teardown.
+Dispose of UI scratch at promotion; retain decision-bearing logic-state evidence until the decision expires.
 
 ### Regression-test obligation
 
@@ -85,9 +86,362 @@ $obligation
 EOF
 }
 
+commit_logic_artifact() {
+  local id=$1
+  git -C "$CASE_WT" checkout -qb "proto/$id"
+  printf 'queued -> retry -> completed\n' > "$CASE_WT/reducer.txt"
+  git -C "$CASE_WT" add reducer.txt
+  git -C "$CASE_WT" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm 'Prototype reducer'
+}
+
+setup_teardown() {
+  local id=$1 backend=$2 kind=${3:-scout}
+  CASE_FAKEBIN=$(fm_fakebin "$CASE_HOME")
+  fm_fake_exit0 "$CASE_FAKEBIN" tmux
+  mkdir -p "$CASE_HOME/config"
+  printf 'manual\n' > "$CASE_HOME/config/backlog-backend"
+  cat > "$CASE_FAKEBIN/treehouse" <<'SH'
+#!/usr/bin/env bash
+touch "$PROTOTYPE_TEST_CLEANUP"
+git -C "$PROTOTYPE_TEST_REPO" worktree remove --force "$PROTOTYPE_TEST_WT"
+SH
+  cat > "$CASE_FAKEBIN/orca" <<'SH'
+#!/usr/bin/env bash
+case "$1 $2" in
+  'worktree show') jq -n --arg path "$PROTOTYPE_TEST_WT" '{result: {path: $path}}' ;;
+  'worktree rm')
+    touch "$PROTOTYPE_TEST_CLEANUP"
+    if [ -d "$PROTOTYPE_TEST_WT" ]; then
+      git -C "$PROTOTYPE_TEST_REPO" worktree remove --force "$PROTOTYPE_TEST_WT" || exit 1
+    fi
+    printf '{"ok":true}\n'
+    ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$CASE_FAKEBIN/treehouse" "$CASE_FAKEBIN/orca"
+  touch "$CASE_HOME/state/.last-watcher-beat"
+  fm_write_meta "$CASE_HOME/state/$id.meta" \
+    "window=w:$id" "worktree=$CASE_WT" "project=$CASE_REPO" \
+    "kind=$kind" "backend=$backend" "orca_worktree_id=fixture" \
+    'mode=local-only' 'decisions_reviewed=1' 'decision_keys='
+}
+
+run_teardown() {
+  PATH="$CASE_FAKEBIN:$PATH" PROTOTYPE_TEST_WT="$CASE_WT" \
+    PROTOTYPE_TEST_REPO="$CASE_REPO" PROTOTYPE_TEST_CLEANUP="$CASE_HOME/cleanup-called" \
+    FM_HOME="$CASE_HOME" FM_ROOT_OVERRIDE="$ROOT" "$TEARDOWN" "$@"
+}
+
+test_unfinished_logic_cancellation_requires_force() {
+  local backend id before rc out
+  for backend in tmux orca; do
+    id="cancel-$backend"
+    setup_case "$id" logic-state 'Does cancellation preserve state?'
+    commit_logic_artifact "$id"
+    printf 'unfinished experiment\n' >> "$CASE_WT/reducer.txt"
+    setup_teardown "$id" "$backend"
+    before=$(sha256_file "$CASE_HOME/data/$id/prototype.json")
+    out=$(run_teardown "$id" 2>&1); rc=$?
+    [ "$rc" -ne 0 ] || fail "$backend allowed unfinished cancellation without approval"
+    assert_contains "$out" 'has no report' "unfinished cancellation failed for an unrelated reason"
+    assert_present "$CASE_WT" "unapproved cancellation discarded unfinished work"
+    assert_absent "$CASE_HOME/cleanup-called" "unapproved cancellation invoked backend cleanup"
+    run_teardown "$id" --force >/dev/null || fail "$backend refused approved unfinished cancellation"
+    assert_absent "$CASE_WT" "approved cancellation kept the disposable worktree"
+    assert_absent "$CASE_HOME/state/$id.meta" "approved cancellation kept task metadata"
+    if git -C "$CASE_REPO" show-ref --verify --quiet "refs/heads/proto/$id"; then
+      fail "approved cancellation retained an unrecorded scratch branch"
+    fi
+    [ "$before" = "$(sha256_file "$CASE_HOME/data/$id/prototype.json")" ] \
+      || fail "approved cancellation changed the prototype record"
+  done
+  pass "fm-teardown.sh: approved cancellation discards unfinished logic-state scratch without a retention record"
+}
+
+test_forced_teardown_preserves_recorded_artifacts() {
+  local backend stage id question='Does forced cleanup retain evidence?' artifact
+  for backend in tmux orca; do
+    for stage in completed legacy promoted; do
+      id="force-$backend-$stage"
+      setup_case "$id" logic-state "$question"
+      commit_logic_artifact "$id"
+      artifact=$(git -C "$CASE_WT" rev-parse HEAD)
+      write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
+      FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null || fail "completion failed"
+      setup_teardown "$id" "$backend"
+      if [ "$stage" != completed ]; then
+        FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null \
+          || fail "preparation failed"
+      fi
+      if [ "$stage" = legacy ]; then
+        jq '.promotion.retained_artifact = .retained_artifact | del(.retained_artifact)' \
+          "$CASE_HOME/data/$id/prototype.json" > "$CASE_HOME/data/$id/prototype.json.tmp"
+        mv "$CASE_HOME/data/$id/prototype.json.tmp" "$CASE_HOME/data/$id/prototype.json"
+      elif [ "$stage" = promoted ]; then
+        FM_HOME="$CASE_HOME" FM_ROOT_OVERRIDE="$ROOT" "$PROMOTE" "$id" >/dev/null \
+          || fail "promotion failed"
+        git -C "$CASE_WT" checkout -qb "fm/$id"
+      fi
+      printf 'discardable changes\n' >> "$CASE_WT/README.md"
+      printf 'unfinished experiment\n' > "$CASE_WT/debug.log"
+      rm "$CASE_HOME/data/$id/report.md"
+      run_teardown "$id" --force >/dev/null || fail "$backend $stage forced cleanup failed"
+      assert_absent "$CASE_WT" "forced cleanup kept the disposable worktree"
+      assert_absent "$CASE_HOME/state/$id.meta" "forced cleanup kept task metadata"
+      [ "$(git -C "$CASE_REPO" rev-parse --verify "refs/heads/proto/$id")" = "$artifact" ] \
+        || fail "$backend $stage forced cleanup lost recorded artifact evidence"
+    done
+  done
+  pass "fm-teardown.sh: forced cleanup preserves recorded artifacts before and after promotion"
+}
+
+test_retention_verification_recovers_missing_worktree() {
+  local backend damage id question='Does evidence outlive the disposable copy?' baseline artifact before out rc
+  for backend in tmux orca; do
+    for damage in intact missing renamed moved; do
+      id="absent-$backend-$damage"
+      setup_case "$id" logic-state "$question"
+      baseline=$(git -C "$CASE_WT" rev-parse HEAD)
+      commit_logic_artifact "$id"
+      artifact=$(git -C "$CASE_WT" rev-parse HEAD)
+      write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
+      FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null || fail "completion failed"
+      setup_teardown "$id" "$backend"
+      before=$(sha256_file "$CASE_HOME/data/$id/prototype.json")
+      git -C "$CASE_REPO" worktree remove --force "$CASE_WT"
+      if [ "$damage" != intact ]; then
+        case "$damage" in
+          missing) git -C "$CASE_REPO" branch -D "proto/$id" >/dev/null ;;
+          renamed) git -C "$CASE_REPO" branch -m "proto/$id" "renamed/$id" ;;
+          moved) git -C "$CASE_REPO" branch -f "proto/$id" "$baseline" >/dev/null ;;
+        esac
+        out=$(run_teardown "$id" 2>&1); rc=$?
+        [ "$rc" -ne 0 ] || fail "$backend missing-worktree cleanup accepted a $damage artifact"
+        assert_contains "$out" 'retained artifact branch' "cleanup did not verify the project's artifact ref"
+        assert_present "$CASE_HOME/state/$id.meta" "refused recovery removed task metadata"
+        assert_absent "$CASE_HOME/cleanup-called" "refused recovery invoked backend cleanup"
+        if [ "$damage" = renamed ]; then
+          git -C "$CASE_REPO" branch -m "renamed/$id" "proto/$id"
+        else
+          git -C "$CASE_REPO" branch -f "proto/$id" "$artifact" >/dev/null
+        fi
+      fi
+      run_teardown "$id" >/dev/null || fail "$backend missing-worktree recovery failed"
+      assert_absent "$CASE_HOME/state/$id.meta" "missing-worktree recovery kept task metadata"
+      assert_present "$CASE_HOME/data/$id/report.md" "missing-worktree recovery lost the report"
+      [ "$(git -C "$CASE_REPO" rev-parse --verify "refs/heads/proto/$id")" = "$artifact" ] \
+        || fail "missing-worktree recovery lost the retained branch"
+      [ "$before" = "$(sha256_file "$CASE_HOME/data/$id/prototype.json")" ] \
+        || fail "missing-worktree recovery changed the recorded identity"
+    done
+  done
+  pass "fm-teardown.sh: missing-worktree recovery verifies retained artifacts through the recorded project"
+}
+
+test_retention_recovery_requires_absent_worktree_and_project() {
+  local id=recovery-boundary question='Does recovery verify the durable evidence?' rc branch
+  setup_case "$id" logic-state "$question"
+  commit_logic_artifact "$id"
+  write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null || fail "completion failed"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" retained-branch "$id" "$CASE_WT-missing" "$CASE_REPO" \
+    >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "recovery ignored a still-present registered worktree"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" retained-branch "$id" "$CASE_REPO" "$CASE_REPO" \
+    >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "recovery accepted a different existing worktree"
+  git -C "$CASE_REPO" worktree remove --force "$CASE_WT"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" retained-branch "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "recovery guessed a repository without a recorded project"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" retained-branch "$id" "$CASE_WT" "$CASE_REPO-missing" \
+    >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "recovery accepted an absent recorded project"
+  branch=$(FM_HOME="$CASE_HOME" "$PROTOTYPE" retained-branch "$id" "$CASE_WT" "$CASE_REPO") \
+    || fail "recovery refused the recorded project"
+  [ "$branch" = "proto/$id" ] || fail "recovery returned the wrong retained branch"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "recovery bypassed promotion's original worktree requirement"
+  pass "fm-prototype.sh: recovery requires an absent bound worktree and an explicit accessible project"
+}
+
+test_logic_completion_retains_artifact_without_promotion() {
+  local backend id question='Does the reducer preserve retry order?' artifact
+  for backend in tmux orca; do
+    id="completion-$backend"
+    setup_case "$id" logic-state "$question"
+    commit_logic_artifact "$id"
+    artifact=$(git -C "$CASE_WT" rev-parse HEAD)
+    write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
+    FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null \
+      || fail "logic-state completion failed"
+    jq -e '.promotion == null' "$CASE_HOME/data/$id/prototype.json" >/dev/null \
+      || fail "report-only completion prepared implementation"
+    setup_teardown "$id" "$backend"
+    run_teardown "$id" >/dev/null || fail "$backend report-only teardown failed"
+    [ "$(git -C "$CASE_REPO" rev-parse --verify "refs/heads/proto/$id" 2>/dev/null)" = "$artifact" ] \
+      || fail "$backend report-only teardown lost the artifact branch"
+    assert_absent "$CASE_WT" "$backend teardown did not remove the fixture worktree"
+    assert_present "$CASE_HOME/data/$id/report.md" "$backend teardown removed the report"
+    jq -e --arg branch "proto/$id" --arg commit "$artifact" \
+      '.retained_artifact == {branch: $branch, commit: $commit}' \
+      "$CASE_HOME/data/$id/prototype.json" >/dev/null \
+      || fail "$backend completion did not preserve artifact identity"
+  done
+  pass "fm-prototype.sh: report-only completion retains artifact evidence across both cleanup paths"
+}
+
+test_teardown_refuses_changed_retained_refs() {
+  local backend stage damage id question='Does retry converge?' baseline artifact before rc out
+  for backend in tmux orca; do
+    for stage in completed prepared promoted; do
+      for damage in missing renamed moved; do
+        id="ref-$backend-$stage-$damage"
+        setup_case "$id" logic-state "$question" with-hook
+        baseline=$(git -C "$CASE_WT" rev-parse HEAD)
+        commit_logic_artifact "$id"
+        artifact=$(git -C "$CASE_WT" rev-parse HEAD)
+        write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
+        FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null || fail "completion failed"
+        setup_teardown "$id" "$backend"
+        if [ "$stage" != completed ]; then
+          FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null \
+            || fail "preparation failed"
+        fi
+        if [ "$stage" = promoted ]; then
+          FM_HOME="$CASE_HOME" FM_ROOT_OVERRIDE="$ROOT" "$PROMOTE" "$id" >/dev/null \
+            || fail "promotion failed"
+          git -C "$CASE_WT" checkout -qb "fm/$id"
+        fi
+        case "$damage" in
+          missing)
+            git -C "$CASE_WT" checkout --detach -q "$baseline"
+            git -C "$CASE_REPO" branch -D "proto/$id" >/dev/null
+            ;;
+          renamed) git -C "$CASE_REPO" branch -m "proto/$id" "renamed/$id" ;;
+          moved)
+            git -C "$CASE_WT" checkout --detach -q "$baseline"
+            git -C "$CASE_REPO" branch -f "proto/$id" "$baseline" >/dev/null
+            ;;
+        esac
+        before=$(sha256_file "$CASE_HOME/data/$id/prototype.json")
+        out=$(run_teardown "$id" 2>&1); rc=$?
+        [ "$rc" -ne 0 ] || fail "$backend $stage teardown accepted a $damage artifact ref"
+        assert_contains "$out" 'retained artifact' "teardown failed for a reason unrelated to retention"
+        out=$(run_teardown "$id" --force 2>&1); rc=$?
+        [ "$rc" -ne 0 ] || fail "$backend $stage forced teardown accepted a $damage artifact ref"
+        assert_contains "$out" 'retained artifact' "forced teardown failed for a reason unrelated to retention"
+        assert_absent "$CASE_HOME/cleanup-called" "refused teardown invoked backend cleanup"
+        assert_present "$CASE_WT/.claude/settings.local.json" "refused teardown removed the injected hook"
+        assert_present "$CASE_HOME/state/$id.meta" "refused teardown removed task metadata"
+        [ "$before" = "$(sha256_file "$CASE_HOME/data/$id/prototype.json")" ] \
+          || fail "refused teardown changed artifact identity"
+        if [ "$damage" = renamed ]; then
+          [ "$(git -C "$CASE_REPO" rev-parse "renamed/$id")" = "$artifact" ] \
+            || fail "refused teardown deleted the renamed artifact"
+          git -C "$CASE_REPO" branch -m "renamed/$id" "proto/$id"
+        else
+          git -C "$CASE_REPO" branch -f "proto/$id" "$artifact" >/dev/null
+        fi
+        run_teardown "$id" >/dev/null || fail "restoring the artifact ref did not unblock cleanup"
+        assert_absent "$CASE_WT" "successful teardown did not remove the fixture worktree"
+        [ "$(git -C "$CASE_REPO" rev-parse "proto/$id")" = "$artifact" ] \
+          || fail "successful teardown lost restored artifact evidence"
+      done
+    done
+  done
+  pass "fm-teardown.sh: both cleanup paths refuse missing, renamed, or moved artifacts before and after promotion"
+}
+
+test_logic_completion_requires_clean_artifact() {
+  local id=completion-hygiene question='Does replay preserve order?' manifest before rc residue
+  setup_case "$id" logic-state "$question" with-hook
+  write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
+  manifest="$CASE_HOME/data/$id/prototype.json"
+  before=$(sha256_file "$manifest")
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "logic-state completion accepted an absent artifact branch"
+  commit_logic_artifact "$id"
+  printf '.env\n' >> "$(git -C "$CASE_WT" rev-parse --git-path info/exclude)"
+  for residue in tracked untracked ignored hook; do
+    case "$residue" in
+      tracked) printf 'changed\n' >> "$CASE_WT/reducer.txt" ;;
+      untracked) printf 'debug\n' > "$CASE_WT/debug.log" ;;
+      ignored) printf 'synthetic secret\n' > "$CASE_WT/.env" ;;
+      hook) printf '{"changed":true}\n' > "$CASE_WT/.claude/settings.local.json" ;;
+    esac
+    FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null 2>&1; rc=$?
+    [ "$rc" -ne 0 ] || fail "logic-state completion accepted $residue residue"
+    [ "$before" = "$(sha256_file "$manifest")" ] || fail "refused completion changed the manifest"
+    git -C "$CASE_WT" restore reducer.txt
+    rm -f "$CASE_WT/debug.log" "$CASE_WT/.env"
+    printf '{}\n' > "$CASE_WT/.claude/settings.local.json"
+  done
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "preparation accepted an artifact before completion"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null || fail "clean artifact completion failed"
+  jq 'del(.retained_artifact)' "$manifest" > "$manifest.tmp"
+  mv "$manifest.tmp" "$manifest"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "preparation recorded an artifact missing from completed evidence"
+  pass "fm-prototype.sh: completion requires a clean retained artifact and preparation requires its recorded identity"
+}
+
+test_legacy_retention_survives_evidence_updates() {
+  local id=legacy question='Does retry preserve order?' manifest artifact before rc
+  setup_case "$id" logic-state "$question"
+  commit_logic_artifact "$id"
+  artifact=$(git -C "$CASE_WT" rev-parse HEAD)
+  write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null || fail "completion failed"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null || fail "preparation failed"
+  manifest="$CASE_HOME/data/$id/prototype.json"
+  jq '.promotion.retained_artifact = .retained_artifact | del(.retained_artifact)' "$manifest" > "$manifest.tmp"
+  mv "$manifest.tmp" "$manifest"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" promotion-verify "$id" "$CASE_WT" >/dev/null \
+    || fail "legacy artifact preparation was not verifiable"
+  printf '\nAdditional observation: repeated input converges.\n' >> "$CASE_HOME/data/$id/report.md"
+  git -C "$CASE_WT" branch -m "proto/$id" "renamed/$id"
+  before=$(sha256_file "$manifest")
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "evidence update accepted a renamed legacy artifact"
+  [ "$before" = "$(sha256_file "$manifest")" ] || fail "refused update lost legacy retention"
+  git -C "$CASE_WT" branch -m "renamed/$id" "proto/$id"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null || fail "legacy evidence update failed"
+  jq -e --arg branch "proto/$id" --arg commit "$artifact" \
+    '.promotion == null and .retained_artifact == {branch: $branch, commit: $commit}' "$manifest" >/dev/null \
+    || fail "legacy evidence update lost retained artifact identity"
+  setup_teardown "$id" tmux
+  run_teardown "$id" >/dev/null || fail "updated legacy artifact cleanup failed"
+  [ "$(git -C "$CASE_REPO" rev-parse "proto/$id")" = "$artifact" ] \
+    || fail "legacy artifact was lost during cleanup"
+  pass "fm-prototype.sh: legacy retention remains verified and survives evidence updates"
+}
+
+test_ui_completion_keeps_report_only() {
+  local id=ui-report question='Which layout exposes retries?'
+  setup_case "$id" ui "$question"
+  git -C "$CASE_WT" checkout -qb "proto/$id"
+  printf 'UI scratch\n' > "$CASE_WT/layout.txt"
+  write_report "$id" "$question" ui 'not-required: no failure was reproduced'
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null || fail "UI completion refused scratch"
+  setup_teardown "$id" tmux
+  run_teardown "$id" >/dev/null || fail "UI report-only cleanup failed"
+  if git -C "$CASE_REPO" show-ref --verify --quiet "refs/heads/proto/$id"; then
+    fail "UI cleanup retained an artifact branch"
+  fi
+  assert_absent "$CASE_WT" "UI cleanup retained scratch"
+  assert_present "$CASE_HOME/data/$id/report.md" "UI cleanup removed the report"
+  jq -e '.retained_artifact == null and .promotion == null' "$CASE_HOME/data/$id/prototype.json" >/dev/null \
+    || fail "UI completion recorded artifact retention"
+  pass "fm-prototype.sh: UI report-only completion still discards scratch"
+}
+
 test_positive_evidence_and_decision() {
   local id=positive question='Does retry preserve the queued transition?' decision
   setup_case "$id" logic-state "$question"
+  commit_logic_artifact "$id"
   write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
   FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null
   FM_HOME="$CASE_HOME" "$PROTOTYPE" verify "$id" >/dev/null
@@ -170,7 +524,7 @@ test_incomplete_or_changed_evidence_fails() {
 }
 
 test_registration_completion_and_preparation_are_idempotent() {
-  local id=idempotent question='Does the reducer converge after duplicate input?' before after
+  local id=idempotent question='Does the reducer converge after duplicate input?' before after artifact refs rc
   setup_case "$id" logic-state "$question"
   before=$(sha256_file "$CASE_HOME/data/$id/prototype.json")
   FM_HOME="$CASE_HOME" "$PROTOTYPE" register "$id" logic-state "$question" >/dev/null
@@ -178,6 +532,9 @@ test_registration_completion_and_preparation_are_idempotent() {
   after=$(sha256_file "$CASE_HOME/data/$id/prototype.json")
   [ "$before" = "$after" ] || fail "identical registration and binding retries changed manifest bytes"
 
+  commit_logic_artifact "$id"
+  artifact=$(git -C "$CASE_WT" rev-parse HEAD)
+  refs=$(git -C "$CASE_REPO" for-each-ref --format='%(refname) %(objectname)' refs/heads)
   write_report "$id" "$question" logic-state 'not-required: duplicate input did not reproduce a failure'
   FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null
   before=$(sha256_file "$CASE_HOME/data/$id/prototype.json")
@@ -190,6 +547,31 @@ test_registration_completion_and_preparation_are_idempotent() {
   FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null
   after=$(sha256_file "$CASE_HOME/data/$id/prototype.json")
   [ "$before" = "$after" ] || fail "identical promotion preparation retry changed manifest bytes"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null || fail "completion retry failed after preparation"
+  [ "$before" = "$(sha256_file "$CASE_HOME/data/$id/prototype.json")" ] \
+    || fail "identical completion retry invalidated preparation or retention"
+
+  printf '\nAdditional observation: retries remain deterministic.\n' >> "$CASE_HOME/data/$id/report.md"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null || fail "evidence update failed"
+  jq -e --arg branch "proto/$id" --arg commit "$artifact" \
+    '.promotion == null and .retained_artifact == {branch: $branch, commit: $commit}' \
+    "$CASE_HOME/data/$id/prototype.json" >/dev/null \
+    || fail "evidence update did not preserve retention independently of preparation"
+  [ "$refs" = "$(git -C "$CASE_REPO" for-each-ref --format='%(refname) %(objectname)' refs/heads)" ] \
+    || fail "completion or preparation created or changed an artifact branch"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null
+  before=$(sha256_file "$CASE_HOME/data/$id/prototype.json")
+  git -C "$CASE_WT" checkout --detach -q "$(jq -r '.binding.baseline_head' "$CASE_HOME/data/$id/prototype.json")"
+  git -C "$CASE_REPO" branch -f "proto/$id" HEAD >/dev/null
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "completion retry accepted a moved artifact"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "preparation retry accepted a moved artifact"
+  [ "$before" = "$(sha256_file "$CASE_HOME/data/$id/prototype.json")" ] \
+    || fail "refused retry rewrote the retained identity"
+  git -C "$CASE_REPO" branch -f "proto/$id" "$artifact" >/dev/null
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null \
+    || fail "completion retry refused detached baseline with the retained branch"
   pass "fm-prototype.sh: registration, completion, and preparation retries are idempotent"
 }
 
@@ -217,10 +599,10 @@ test_sensitive_defaults_have_no_worker_bypass() {
   pass "fm-prototype.sh: sensitive boundaries are immutable and expose no worker bypass"
 }
 
-test_promotion_rejects_scratch_and_ignored_residue() {
-  local id=hygiene question='Which state representation survives retries?' rc baseline exclude
-  setup_case "$id" logic-state "$question" with-hook
-  write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
+test_ui_promotion_rejects_scratch_and_ignored_residue() {
+  local id=hygiene question='Which layout exposes retries?' rc baseline exclude
+  setup_case "$id" ui "$question" with-hook
+  write_report "$id" "$question" ui 'not-required: no failure was reproduced'
   FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null
 
   printf 'debug\n' > "$CASE_WT/debug.log"
@@ -241,22 +623,82 @@ test_promotion_rejects_scratch_and_ignored_residue() {
   printf '{}\n' > "$CASE_WT/.claude/settings.local.json"
 
   baseline=$(git -C "$CASE_WT" rev-parse HEAD)
+  git -C "$CASE_WT" checkout -qb "proto/$id"
   printf '# scratch\n' >> "$CASE_WT/README.md"
   git -C "$CASE_WT" add README.md
   git -C "$CASE_WT" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
     commit -qm scratch
   FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
-  [ "$rc" -ne 0 ] || fail "promotion preparation accepted a scratch commit"
+  [ "$rc" -ne 0 ] || fail "UI preparation accepted a scratch commit on a prototype branch"
+  touch "$CASE_HOME/state/.last-watcher-beat"
+  fm_write_meta "$CASE_HOME/state/$id.meta" \
+    "window=w:$id" "worktree=$CASE_WT" "project=$CASE_REPO" "kind=scout"
+  FM_HOME="$CASE_HOME" FM_ROOT_OVERRIDE="$ROOT" "$PROMOTE" "$id" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "UI promotion accepted retained scratch"
+  assert_grep 'kind=scout' "$CASE_HOME/state/$id.meta" "refused UI promotion changed task kind"
   git -C "$CASE_WT" checkout --detach -q "$baseline"
 
   FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null
   FM_HOME="$CASE_HOME" "$PROTOTYPE" promotion-verify "$id" "$CASE_WT" >/dev/null
-  pass "fm-prototype.sh: promotion rejects scratch state while allowing only the known injected hook"
+  pass "fm-prototype.sh: UI promotion rejects scratch state while allowing only the known injected hook"
+}
+
+test_logic_promotion_retains_artifact_off_ship_branch() {
+  local id=retained question='Does the reducer preserve retry order?' baseline artifact manifest before rc
+  setup_case "$id" logic-state "$question" with-hook
+  baseline=$(git -C "$CASE_WT" rev-parse HEAD)
+  commit_logic_artifact "$id"
+  artifact=$(git -C "$CASE_WT" rev-parse HEAD)
+  write_report "$id" "$question" logic-state 'not-required: no failure was reproduced'
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null \
+    || fail "logic-state preparation refused the clean retained artifact"
+  manifest="$CASE_HOME/data/$id/prototype.json"
+  jq -e --arg branch "proto/$id" --arg commit "$artifact" \
+    '.retained_artifact == {branch: $branch, commit: $commit}' "$manifest" >/dev/null \
+    || fail "promotion did not preserve the completed artifact branch and commit"
+  before=$(sha256_file "$manifest")
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" prepare-promotion "$id" "$CASE_WT" >/dev/null
+  [ "$before" = "$(sha256_file "$manifest")" ] || fail "retention preparation was not idempotent"
+
+  printf 'debug\n' > "$CASE_WT/debug.log"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" promotion-verify "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "retention accepted untracked scratch"
+  rm "$CASE_WT/debug.log"
+  printf '{"changed":true}\n' > "$CASE_WT/.claude/settings.local.json"
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" promotion-verify "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "retention accepted modified ignored residue"
+  printf '{}\n' > "$CASE_WT/.claude/settings.local.json"
+
+  git -C "$CASE_WT" checkout --detach -q "$baseline"
+  git -C "$CASE_WT" branch -f "proto/$id" "$baseline" >/dev/null
+  FM_HOME="$CASE_HOME" "$PROTOTYPE" promotion-verify "$id" "$CASE_WT" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "retention accepted a moved artifact branch"
+  git -C "$CASE_WT" branch -f "proto/$id" "$artifact" >/dev/null
+  git -C "$CASE_WT" checkout -q "proto/$id"
+
+  touch "$CASE_HOME/state/.last-watcher-beat"
+  fm_write_meta "$CASE_HOME/state/$id.meta" \
+    "window=w:$id" "worktree=$CASE_WT" "project=$CASE_REPO" \
+    "harness=echo" "kind=scout" "mode=no-mistakes" "yolo=off"
+  FM_HOME="$CASE_HOME" FM_ROOT_OVERRIDE="$ROOT" "$PROMOTE" "$id" >/dev/null \
+    || fail "logic-state promotion failed"
+  [ "$(git -C "$CASE_WT" rev-parse HEAD)" = "$baseline" ] \
+    || fail "ship task did not start at the clean baseline"
+  assert_absent "$CASE_WT/reducer.txt" "retained scratch reached the promoted worktree"
+  git -C "$CASE_WT" checkout -qb "fm/$id"
+  if git -C "$CASE_WT" merge-base --is-ancestor "$artifact" HEAD; then
+    fail "retained prototype commit reached the ship branch"
+  fi
+  [ "$(git -C "$CASE_REPO" rev-parse "proto/$id")" = "$artifact" ] \
+    || fail "promotion lost the retained prototype branch"
+  pass "fm-prototype.sh: logic-state artifact survives promotion outside the ship branch"
 }
 
 test_logic_failure_carries_regression_test_obligation() {
   local id=regression question='Does replay duplicate a completed transition?' obligation out
   setup_case "$id" logic-state "$question"
+  commit_logic_artifact "$id"
   write_report "$id" "$question" logic-state \
     'required: replay duplicated the completed transition'
   FM_HOME="$CASE_HOME" "$PROTOTYPE" complete "$id" >/dev/null
@@ -315,11 +757,21 @@ sha256_file() {
   fi
 }
 
+test_unfinished_logic_cancellation_requires_force
+test_forced_teardown_preserves_recorded_artifacts
+test_retention_verification_recovers_missing_worktree
+test_retention_recovery_requires_absent_worktree_and_project
+test_logic_completion_retains_artifact_without_promotion
+test_teardown_refuses_changed_retained_refs
+test_logic_completion_requires_clean_artifact
+test_legacy_retention_survives_evidence_updates
+test_ui_completion_keeps_report_only
 test_positive_evidence_and_decision
 test_brief_requires_question_and_exact_class
 test_incomplete_or_changed_evidence_fails
+test_logic_promotion_retains_artifact_off_ship_branch
 test_registration_completion_and_preparation_are_idempotent
 test_sensitive_defaults_have_no_worker_bypass
-test_promotion_rejects_scratch_and_ignored_residue
+test_ui_promotion_rejects_scratch_and_ignored_residue
 test_logic_failure_carries_regression_test_obligation
 test_tool_neutral_lifecycle_boundaries_are_central
