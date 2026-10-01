@@ -87,18 +87,42 @@ fm_watcher_healthy() {
   return 0
 }
 
-# Lock reclamation publishes a fully prepared, nonempty owner with one rename.
+# Portable lock contract (the lock's parent directory must already exist):
+# fm_lock_try_acquire <lock> returns 0 on acquisition, 1 otherwise; callers own
+# any retry deadline. fm_lock_acquire_wait <lock> retries every 0.1s indefinitely.
+# fm_lock_release <lock> removes only a lock whose PID matches ${BASHPID:-$$}.
+# Each acquisition resets FM_LOCK_OWNER_DIR and FM_LOCK_HELD_PID; success sets
+# FM_LOCK_OWNER_DIR to the acquired directory. FM_LOCK_HELD_PID reports an
+# observed PID on contention, which may be empty, malformed, or dead.
+# New locks link to a sibling <lock>.owner.XXXXXX directory; legacy directory
+# locks remain supported. The <lock>.steal guard serializes primary reclamation
+# and uses the same atomic replacement when its own owner is stale.
+#
+# Before publication, fm_lock_prepare_owner writes pid (${BASHPID:-$$}), created
+# (Unix epoch seconds), and owner-token (the original preparation path).
+# owner-token is an immutable generation identity, not a current directory path
+# after reclamation. Caller-owned pid-identity is separate; generic acquisition
+# checks PID liveness with kill -0 and does not require ps.
+# Missing or nonnumeric PIDs keep max(FM_LOCK_STALE_AFTER, 2) seconds of grace
+# based on the public lock path's mtime, not created; the default is 2 seconds.
+# A dead numeric PID is reclaimable immediately; a live PID is never aged out.
+#
+# Reclamation publishes a fully prepared, nonempty owner with one rename.
 # Owner links remain fixed while the referenced directory generation changes.
-# owner-token identifies that generation; watcher pid-identity is caller-owned.
 # A reclaimer pins the stale directory as its working directory before checking
 # and clearing it, so delayed cleanup can never resolve through a replacement.
-# The candidate has the destination basename and lives on the same filesystem;
+# The candidate is prepared under .fm-lock-prepare.XXXXXX in the target's parent,
+# with the destination basename, so it lives on the same filesystem;
 # mv into the destination parent performs rename(2), not a move into the owner.
 # A nonempty winner cannot be replaced by rename on macOS or Linux.
-# Losers discard only their private candidates and retry; they never remove,
+# Losers discard only their private candidates and return failure; they never remove,
 # rename, or restore the shared lock path or a replacement owner's directory.
+# Cleanup removes only known metadata and nested <lock>.owner.XXXXXX symlinks
+# pointing to the matching sibling owner path; unknown entries prevent takeover.
 # Death before publication leaves only private scratch or an empty stale owner,
 # which becomes reclaimable after the normal mid-acquire grace period.
+# Interrupted preparation directories are not swept by later acquisitions.
+# Owner disposal and legacy release also pin the directory before cleanup.
 
 fm_lock_clean_known_files() {
   local lockdir=$1

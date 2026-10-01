@@ -266,6 +266,9 @@ Use `/stow` before an intentional reset when the conversation may hold durable k
 The current watcher reliability work combines always-on bash triage with a durable queue for actionable wakes, a race-proof singleton lock, duplicate self-eviction, drain-time liveness assertion, and a self-verifying tracked-child arm wrapper.
 The presence-gated sub-supervisor (`bin/fm-supervise-daemon.sh`) provides walk-away supervision via the `/afk` skill while reusing the same shared wake classifier as the always-on watcher.
 
+The watcher, wake queue, sub-supervisor, and Buzz publisher share the portable lock contract in [`bin/fm-wake-lib.sh`](../bin/fm-wake-lib.sh), including atomic stale-owner replacement that keeps delayed contenders from changing a live replacement.
+That contract owns acquisition outputs, generation metadata, ageing, and interrupted-preparation recovery; [`tests/fm-watcher-lock.test.sh`](../tests/fm-watcher-lock.test.sh) covers bounded contention, delayed cleanup and release, live-PID refusal, and crash recovery, while [`tests/fm-buzz-publish.test.sh`](../tests/fm-buzz-publish.test.sh) covers publisher recovery of both a stale lock and its stale reclamation guard.
+
 
 ## Internal→plain translation table (relocated from AGENTS.md §9, 2026-07-29 org trim)
 
