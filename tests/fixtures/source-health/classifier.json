@@ -4,10 +4,16 @@
     { "target": 0, "stdout": " \n\t", "exitCode": 0, "expected": "empty-output" }
   ],
   "429-empty": [
-    { "target": 0, "stdout": "", "exitCode": 0, "httpStatus": 429, "expected": "rate-limit" },
-    { "target": 0, "stdout": "", "exitCode": 22, "httpStatus": 429, "expected": "rate-limit" },
-    { "target": 0, "stdout": "", "exitCode": 1, "httpStatus": 401, "expected": "authentication-required" },
-    { "target": 0, "stdout": "Example Domain\nThis domain is for use in documentation examples. rate limit authentication required", "exitCode": 0, "httpStatus": 200, "expected": null }
+    { "target": 0, "stdout": "", "exitCode": 0, "headers": "HTTP/2 429\r\n\r\n", "expected": "rate-limit" },
+    { "target": 0, "stdout": "", "exitCode": 22, "headers": "HTTP/2 429\r\n\r\n", "expected": "rate-limit" },
+    { "target": 0, "stdout": "", "exitCode": 1, "headers": "HTTP/2 401\r\n\r\n", "expected": "authentication-required" },
+    { "target": 0, "stdout": "", "exitCode": 1, "headers": "HTTP/2 429\r\n\r\nHTTP/2 200\r\n\r\n", "expected": "rate-limit" },
+    { "target": 3, "stdout": "", "exitCode": 22, "headers": "HTTP/1.1 200 Connection established\r\n\r\nHTTP/2 429\r\n\r\n", "githubTransport": true, "expected": "rate-limit" },
+    { "target": 5, "stdout": "", "exitCode": 1, "stderr": "WARNING: HTTP Error 403: Forbidden\nERROR: HTTP Error 429: Too Many Requests", "expected": "rate-limit" },
+    { "target": 5, "stdout": "", "exitCode": 1, "stderr": "WARNING: HTTP Error 429: Too Many Requests\nERROR: HTTP Error 403: Forbidden", "expected": "rate-limit" },
+    { "target": 5, "stdout": "", "exitCode": 1, "stderr": "WARNING: HTTP Error 401: Unauthorized\nERROR: HTTP Error 429: Too Many Requests", "expected": "rate-limit" },
+    { "target": 5, "stdout": "", "exitCode": 1, "stderr": "HTTP 429 mentioned in page text; HTTP Error without a status", "expected": "empty-output" },
+    { "target": 0, "stdout": "Example Domain\nThis domain is for use in documentation examples. HTTP Error 429: rate limit authentication required", "exitCode": 0, "headers": "HTTP/2 200\r\n\r\n", "expected": null }
   ],
   "title-only-in-head": [
     { "target": 0, "stdout": "This domain is for use in documentation examples without needing permission. Avoid use in operations.\nLearn more", "exitCode": 0, "expected": "malformed-output" },
@@ -16,8 +22,8 @@
     { "target": 1, "stdout": "Navigation\nContents\nSearch\nPrompt injection\nPrompt injection is a cybersecurity exploit.", "exitCode": 0, "expected": null }
   ],
   "malformed-toon": [
-    { "target": 3, "stdout": "name: Hello-World\nfull_name: octocat/Hello-World\nprivate: false\ndescription: My first repository on GitHub!\nowner:\n  login: octocat\ntopics: []", "exitCode": 0, "expected": null },
-    { "target": 3, "stdout": "{\"name\":\"Hello-World\",\"full_name\":\"octocat/Hello-World\",\"private\":false,\"description\":\"Example\"}", "exitCode": 0, "expected": "malformed-output" },
+    { "target": 3, "stdout": "name: Hello-World\nfull_name: octocat/Hello-World\nprivate: false\ndescription: My first repository on GitHub!\nowner:\n  login: octocat\ntopics: []", "exitCode": 0, "githubTransport": true, "expected": null },
+    { "target": 3, "stdout": "{\"name\":\"Hello-World\",\"full_name\":\"octocat/Hello-World\",\"private\":false,\"description\":\"Example\"}", "exitCode": 0, "githubTransport": true, "expected": "malformed-output" },
     { "target": 3, "stdout": "name: Hello-World\nfull_name: octocat/Hello-World\nprivate: \"false\"\ndescription: Example", "exitCode": 0, "expected": "malformed-output" },
     { "target": 3, "stdout": "name: Hello-World\nfull_name: octocat/Hello-World\nprivate: false\ndescription: \"unterminated", "exitCode": 0, "expected": "malformed-output" },
     { "target": 3, "stdout": "name: Hello-World\nfull_name: octocat/Hello-World\nprivate: false\ndescription: Example\nthis is not TOON", "exitCode": 0, "expected": "malformed-output" },

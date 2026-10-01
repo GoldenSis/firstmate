@@ -122,14 +122,15 @@ export function shapeMatches(target, text) {
 }
 
 export function classify(target, observation) {
+  const statuses = observation.httpStatuses ?? [];
   let failure = null;
   if (observation.timedOut) failure = 'timeout';
   else if (observation.unavailable) failure = 'unavailable';
-  else if (observation.httpStatus === 429) failure = 'rate-limit';
-  else if (observation.httpStatus === 401) failure = 'authentication-required';
+  else if (statuses.includes(429)) failure = 'rate-limit';
+  else if (statuses.includes(401)) failure = 'authentication-required';
   else if (!observation.stdout?.trim()) failure = 'empty-output';
   else if (observation.exitCode !== 0 || observation.overflow
-    || (observation.httpStatus >= 400) || !shapeMatches(target, observation.stdout)) failure = 'malformed-output';
+    || statuses.some(status => status >= 400) || !shapeMatches(target, observation.stdout)) failure = 'malformed-output';
   return {
     source: target.source,
     access_tier: 'public-read',
@@ -152,9 +153,9 @@ function executable(name) {
   return null;
 }
 
-async function run(command, args, env) {
+async function run(command, args, env, cwd) {
   return new Promise(resolveResult => {
-    const child = spawn(command, args, { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { env, cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     const result = { stdout: '', stderr: '', exitCode: null };
     const kill = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already exited */ } };
     const timer = setTimeout(() => { result.timedOut = true; kill(); }, TIMEOUT_MS);
@@ -176,36 +177,37 @@ async function run(command, args, env) {
 // converts errors into prose, while passing the unmodified JSON body to axi.
 // argv originates in the fixed gh-axi call, never in fetched content.
 function ghTransport() {
-  const response = spawnSync(process.env.FM_SOURCE_GH, [...process.argv.slice(3), '--include'], {
+  const expected = ['api', '/repos/octocat/Hello-World', '--method', 'GET', '--header', 'Authorization:'];
+  if (JSON.stringify(process.argv.slice(3)) !== JSON.stringify(expected)) throw Error('Unsupported GitHub request');
+  const response = spawnSync(process.env.FM_SOURCE_CURL, [
+    '--disable', '--silent', '--show-error', '--fail', '--retry', '0', '--max-time', '20',
+    '--proto', '=https', '--header', 'Authorization:', '--header', 'Accept: application/vnd.github+json',
+    '--user-agent', 'fm-source-health', '--dump-header', process.env.FM_SOURCE_STATUS,
+    'https://api.github.com/repos/octocat/Hello-World',
+  ], {
     encoding: 'utf8', maxBuffer: MAX_BYTES, timeout: TIMEOUT_MS,
   });
-  let body = response.stdout || '';
-  let status = null;
-  while (/^HTTP\/\S+ \d{3}[^\r\n]*\r?\n/.test(body)) {
-    const end = /\r?\n\r?\n/.exec(body);
-    if (!end) break;
-    status = Number(/^HTTP\/\S+ (\d{3})/.exec(body)[1]);
-    body = body.slice(end.index + end[0].length);
-  }
-  writeFileSync(process.env.FM_SOURCE_STATUS, JSON.stringify(status));
-  process.stdout.write(body);
+  process.stdout.write(response.stdout || '');
   process.stderr.write(response.stderr || '');
   process.exitCode = response.status ?? 1;
 }
 
-async function probe(target) {
+export function transportStatuses(target, headers = '', stderr = '') {
+  return target.tool === 'yt-dlp'
+    ? [...stderr.matchAll(/\bHTTP Error (\d{3}):/g)].map(match => Number(match[1]))
+    : [...headers.matchAll(/^HTTP\/\S+ (\d{3})\b/gm)].map(match => Number(match[1]));
+}
+
+export async function probe(target) {
   if (target.shape === 'snapshot-title-and-body') return classify(target, { unavailable: true });
   const tool = executable(target.tool.split(' ')[0]);
-  const transport = target.tool === 'webget' ? executable('curl') : target.shape === 'toon-object' ? executable('gh') : null;
+  const transport = target.tool === 'yt-dlp' ? null : executable('curl');
   if (!tool || (target.tool !== 'yt-dlp' && !transport)) return classify(target, { unavailable: true });
   const scratch = mkdtempSync(join(tmpdir(), 'fm-source-health-'));
   try {
     const statusFile = join(scratch, 'status');
-    const env = { ...process.env, PATH: `${scratch}${delimiter}${process.env.PATH}`, TMPDIR: scratch,
-      GH_HOST: 'github.com', GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' };
-    // gh-axi turns GH_REPO into --repo, which gh api does not accept.
-    // The API endpoint already supplies the fixed repository identity.
-    delete env.GH_REPO;
+    const env = { ...(target.shape === 'toon-object' ? {} : process.env),
+      PATH: `${scratch}${delimiter}${process.env.PATH}`, TMPDIR: scratch };
     let args;
     if (target.tool === 'webget') {
       // --disable MUST be first: ignore ambient curl cookies, retries and config.
@@ -213,12 +215,12 @@ async function probe(target) {
       env.FM_SOURCE_CURL = transport;
       args = [target.source, 'en'];
     } else if (target.shape === 'toon-object') {
+      Object.assign(env, { HOME: scratch, XDG_CONFIG_HOME: scratch, XDG_CACHE_HOME: scratch,
+        GH_CONFIG_DIR: scratch, GIT_DIR: scratch, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' });
       writeFileSync(join(scratch, 'gh'), '#!/bin/sh\nexec "$FM_SOURCE_NODE" "$FM_SOURCE_CHECKER" --gh-transport "$@"\n', { mode: 0o700 });
       env.FM_SOURCE_NODE = process.execPath;
       env.FM_SOURCE_CHECKER = fileURLToPath(import.meta.url);
-      env.FM_SOURCE_GH = transport;
-      // Explicit empty Authorization makes this public GET anonymous even when
-      // the local gh installation has a signed-in account.
+      env.FM_SOURCE_CURL = transport;
       args = ['api', 'GET', '/repos/octocat/Hello-World', '--header', 'Authorization:'];
     } else {
       args = ['--ignore-config', '--no-cache-dir', '--skip-download', '--no-playlist', '--dump-single-json',
@@ -226,24 +228,18 @@ async function probe(target) {
         '--extractor-args', 'youtube:player_client=tv,web_safari,android', target.source];
     }
     env.FM_SOURCE_STATUS = statusFile;
-    const observation = await run(tool, args, env);
+    const observation = await run(tool, args, env, target.shape === 'toon-object' ? scratch : undefined);
+    let headers = '';
     try {
-      const statusText = readFileSync(statusFile, 'utf8');
-      observation.httpStatus = target.tool === 'webget'
-        ? Number([...statusText.matchAll(/^HTTP\/\S+ (\d{3})\b/gm)].at(-1)?.[1])
-        : JSON.parse(statusText);
+      headers = readFileSync(statusFile, 'utf8');
     } catch { /* Transport did not reach response headers. */ }
-    if (target.tool === 'yt-dlp') {
-      // Only yt-dlp's transport diagnostic, not stdout/page text or vague prose.
-      const status = /\bHTTP Error (\d{3}):/.exec(observation.stderr);
-      if (status) observation.httpStatus = Number(status[1]);
-    }
+    observation.httpStatuses = transportStatuses(target, headers, observation.stderr);
     return classify(target, observation);
   } finally { rmSync(scratch, { recursive: true, force: true }); }
 }
 
 async function main() {
-  if (process.argv[2] === '--gh-transport' && process.env.FM_SOURCE_GH && process.env.FM_SOURCE_STATUS) return ghTransport();
+  if (process.argv[2] === '--gh-transport' && process.env.FM_SOURCE_CURL && process.env.FM_SOURCE_STATUS) return ghTransport();
   if (process.argv.length === 3 && process.argv[2] === '--help') {
     console.log('Usage: node bin/fm-source-health.mjs\nExplicit public-read diagnostics: six JSONL receipts, 20s per target, no retries.\nExit 0: all substantive-ok; 1: failures recorded; 2: setup/usage error.\nThe header owns the ten-field contract. Browser is unavailable; shared bridge refused.');
     return;
