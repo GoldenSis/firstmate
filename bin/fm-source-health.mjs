@@ -1,31 +1,50 @@
 #!/usr/bin/env node
 // Bootstrap capability diagnostics: explicit, public-read source-health receipts.
 // Usage: node bin/fm-source-health.mjs [--help]
-// Prints six JSONL records to stdout, also usable verbatim as scout receipts.
+// Prints six JSONL records to stdout in TARGETS order, usable verbatim as scout
+// receipts; local setup errors report to stderr and may leave partial output.
 // Exit 0: all substantive-ok; 1: at least one failed; 2: invocation/setup error.
 // This is opt-in, not a session-start network dependency. No installs or repairs.
-// One tool invocation per fixed target, at most 20 seconds each, no retries.
+// Requires Node; probes resolve webget, gh-axi and yt-dlp from PATH, plus curl
+// for webget and GitHub. Missing tools/transport yield unavailable receipts.
+// One tool invocation per available fixed target, at most 20 seconds each, no
+// retries; subprocesses are killed above 2 MiB of combined stdout and stderr.
 // A tool may use multiple protocol requests (notably YouTube extraction).
 // Browser is deliberately unavailable: the supported axi client owns a shared
 // bridge.pid; no safe isolated browser adapter is implemented here.
+// Thus a complete run currently exits 1 even if the other five receipts succeed.
 //
 // Record contract (exactly these ten fields):
 // source: fixed public URL; access_tier: public-read;
-// candidate_paths: tool names listed by TARGETS; active_path: attempted tool or
-// null when unavailable; last_checked_at: UTC ISO-8601 completion time;
+// candidate_paths: one-element array containing TARGETS' tool name;
+// active_path: attempted tool name or null when unavailable;
+// last_checked_at: UTC ISO-8601 completion time;
 // result: substantive-ok | failed; evidence_shape: TARGETS' required shape;
 // failure_class: null | unavailable | timeout | rate-limit |
 // authentication-required | malformed-output | empty-output;
 // external_content_trust: untrusted-data; repair_hint: null on success, otherwise
-// static advice only. A successful record is written only after shape validation;
-// failures still get receipts, with the required (not observed) evidence_shape.
+// static advice only. Failures still get receipts, with the required (not
+// observed) evidence_shape. Failure precedence: timeout, unavailable, HTTP 429
+// (rate-limit), HTTP 401 (authentication-required), blank stdout (empty-output),
+// then nonzero exit, overflow, any other HTTP >= 400, or a shape mismatch
+// (malformed-output). Success requires passing every check, not just exit zero.
 // Shapes: webget title-and-body requires the target's standalone title line AND
 // body marker in the stripped text (a title only in HTML head does not count);
-// gh-axi toon-object requires typed top-level name/full_name/private/description;
-// browser snapshot-title-and-body requires root title and joined body text;
-// yt-dlp json-metadata requires id/title/duration/webpage_url/channel.
-// No bodies are stored. Fetched bytes never supply commands, paths, or advice.
-// HTTP status is captured from transport headers, never inferred from page prose.
+// gh-axi toon-object requires top-level name=Hello-World,
+// full_name=octocat/Hello-World, private=false (boolean), and a nonblank string
+// description; JSON, malformed TOON and duplicate keys are rejected;
+// browser snapshot-title-and-body denotes root title and joined body text, but
+// no browser output is accepted until an isolated transport is implemented;
+// yt-dlp json-metadata requires id=jNQXAC9IVRw, nonblank title/channel strings,
+// finite positive numeric duration, and webpage_url equal to the fixed source.
+// Receipts contain no bodies. Fetched bytes never supply commands, paths, or advice.
+// HTTP statuses come from curl headers or yt-dlp's HTTP Error NNN: diagnostics,
+// never page prose; any recorded 429 takes precedence over 401 or empty output.
+// GitHub uses gh-axi api GET with an empty Authorization header, a clean
+// environment and scratch config/home/cwd; a local gh shim supplies curl's JSON
+// to gh-axi for TOON conversion without using ambient GitHub credentials.
+// Curl config is disabled; yt-dlp ignores config, disables cache and downloads
+// metadata only. Temporary transport files are removed after each probe.
 // Node handles subprocess isolation and the JSON/TOON receipt protocol; no npm
 // dependency is installed. The TOON predicate accepts the conservative mapping,
 // scalar and empty-array subset returned by this fixed repository endpoint.
