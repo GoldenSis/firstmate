@@ -21,11 +21,12 @@
 // KNOWN LIMITATION - NOT CONSTANT TIME
 // JavaScript BigInt operations are not constant time, so this signer leaks timing
 // information about the private key in principle. That is acceptable for exactly
-// the key this PoC uses and no other: a loopback-only fleet-reporting key that
-// signs nothing of value, holds no funds, grants no authority (merge authority
-// stays in bin/fm-pr-merge.sh per AGENTS.md section 7). Do not reuse this module
-// for a key that guards anything, and do not promote it to a networked or shared
-// relay without replacing it with an audited binding. bin/fm-buzz-keypair.sh
+// the key this single-user PoC uses and no other: a loopback-only fleet-reporting
+// key that signs projections and channel membership grants, holds no funds, and
+// grants no Firstmate authority (merge authority stays in bin/fm-pr-merge.sh per
+// AGENTS.md section 7). Do not reuse this module for other privileged keys, and
+// do not promote it to a networked or shared relay without replacing it with an
+// audited binding. bin/fm-buzz-keypair.sh
 // --help owns the rotation, retention, membership, and recovery procedure.
 //
 // The exported surface is deliberately small: schnorrSign, schnorrVerify,

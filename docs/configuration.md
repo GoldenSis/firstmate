@@ -431,7 +431,7 @@ FM_SEND_SETTLE=1        # seconds fm-send waits after a successful text submit; 
 BUZZ_IMAGE=ghcr.io/block/buzz:main  # Compose-only relay image override; pin an immutable compatible digest when reproducible infrastructure matters
 BUZZ_LOOPBACK_PORT=3000             # Compose-only host loopback port; when changed, set FM_BUZZ_RELAY=ws://localhost:<port> so publishing, inspection, and rotation address the same relay
 FM_BUZZ_RELAY=ws://localhost:3000   # credential-free ws/wss loopback relay URL; only 127.0.0.1, localhost, and [::1] hosts are accepted, and the `localhost` spelling is load-bearing for the bundled relay's HTTP Host routing
-FM_BUZZ_TIMEOUT_MS=15000            # positive integer through 2147483647; relay budget for each publish connection and rotation membership query; `fm-buzz-publish.sh --timeout` overrides it for publishing, while refresh lowers it when the total refresh deadline has less time remaining
+FM_BUZZ_TIMEOUT_MS=15000            # positive integer through 2147483647; budget per relay connection, including each rotation membership/role query and grant publication, not the whole rotation; `fm-buzz-publish.sh --timeout` overrides it for publishing, while refresh lowers it when the total refresh deadline has less time remaining
 FM_BUZZ_REFRESH_TIMEOUT_S=30        # positive integer without a leading zero; total budget for the entire `fm-buzz-refresh.sh` run, including snapshot and projection work, fleet and live-lane publication, and cached-queue replay
 FM_BUZZ_MAX_CACHE=100               # positive-integer best-effort total per relay/channel partition enforced by pruning current-publisher events; retained foreign-author and unreadable evidence may keep it above the limit
 FM_BUZZ_STDIN_TIMEOUT_S=30          # positive integer through 2147483647; deadline for reading the projection on stdin; an expired read is discarded rather than published
@@ -442,7 +442,7 @@ FM_BUZZ_CREW_STATUS_BYTES=16384     # positive integer without a leading zero; b
 FM_BUZZ_CREW_STATUS_LINE_CHARS=200  # positive integer without a leading zero; characters kept per status event in a crew lane; disclosed when it bites
 FM_BUZZ_CREW_INPUT_BYTES=1048576    # positive integer without a leading zero; projection input cap for `fm-buzz-crew-lanes.sh`; oversized input is refused rather than truncated
 FM_BUZZ_FORCE_FILE_STORE=           # set to 1 to select the 0600 fallback for normal loads and stores; rotation still inspects and clears every store per `fm-buzz-keypair.sh --help`
-FM_BUZZ_REQUIRE_PINNED_RELAY_AUTHORITY=0 # set to 1 to refuse rotation membership checks until the relay/channel signer is already pinned
+FM_BUZZ_REQUIRE_PINNED_RELAY_AUTHORITY=0 # 0 lets initial rotation membership checks pin a verified signer; 1 requires an existing pin; role and transfer checks always require the pin per bin/fm-buzz-targets.mjs
 # sub-supervisor (bin/fm-supervise-daemon.sh); presence-gated via /afk
 FM_SUPERVISOR_BACKEND=             # optional supervisor pane backend override; tmux/herdr only, otherwise detects $TMUX_PANE then HERDR_ENV/HERDR_PANE_ID before tmux fallback
 FM_SUPERVISOR_TARGET=              # optional supervisor pane target override; tmux target or herdr <session>:<pane-id>, otherwise auto-detected
@@ -526,8 +526,8 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   <id>/prototype.json  question-first prototype registration, evidence, retention, and promotion record; survives teardown; schema owned by bin/fm-prototype.sh
   buzz-keypair.public  this home's loopback Buzz publishing PUBLIC key; LOCAL, gitignored; written by fm-buzz-keypair.sh, which never records the private half here (docs/buzz-loopback-adapter.md)
   buzz-keypair.public-history  public keys this home still trusts for pre-rotation event attribution; LOCAL, gitignored; exact lifecycle owned by fm-buzz-keypair.sh --help
-  buzz-publisher-targets.jsonl  used relay/channel/publisher tuples that protect private-channel membership during rotation; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs
-  buzz-relay-authorities.jsonl  pinned kind-39002 membership signers by relay/channel pair; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs
+  buzz-publisher-targets.jsonl  used relay/channel/publisher tuples, including confirmed rotation replacements, that protect private-channel membership during rotation; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs
+  buzz-relay-authorities.jsonl  pinned relay signers for membership and role state by relay/channel pair; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs
   buzz-compromised-unverifiable-pairs.jsonl  tracked memberships that compromised recovery could not authenticate; LOCAL, gitignored; exact schema and lifecycle owned by bin/fm-buzz-targets.mjs
   .buzz-keypair.rotation-stage  a rotation's verified replacement key, transaction phase, and ordinary-or-compromised intent, held only until the replacement is stored and recorded; LOCAL, gitignored; custody and lifecycle owned by bin/fm-buzz-key-lib.sh
 projects/            cloned repos; gitignored; READ-ONLY for you

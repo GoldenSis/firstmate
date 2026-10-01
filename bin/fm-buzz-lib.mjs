@@ -3,7 +3,7 @@
 //
 // Layered on bin/fm-buzz-crypto.mjs (BIP-340 signing) and consumed by publishing,
 // inspection, and key rotation. This module owns the wire format, relay
-// conversation, loopback-only relay policy, and authoritative membership query
+// conversation, loopback-only relay policy, and membership/role queries and transfer
 // shared by those entry points. The fire-and-forget contract, replay cache, and
 // snapshot plumbing live in the publisher.
 //
@@ -14,18 +14,18 @@
 // content signed in the same second a distinct id. Buzz's relay dedupes on that
 // id (`INSERT ... ON CONFLICT DO NOTHING`), which makes resubmitting one cached,
 // byte-identical signed event perfectly idempotent. Rebuilding a cached logical
-// projection as a fresh event would instead create a second projection. Everything
-// downstream of signEvent must therefore move signed bytes around, not rebuild
-// events. The publisher's replay cache stores exact bytes for this reason.
+// projection as a fresh event would instead create a second projection. Cached
+// publication must therefore move signed bytes around, not rebuild events.
+// Membership-transfer retries instead follow current relay state, as documented
+// at transferChannelMembership below.
 //
-// Scope note: this speaks only the subset of the protocol the adapter needs - create a
-// private channel idempotently, publish append-only channel messages, read events
-// for human verification, and query authoritative membership state for safe key
-// rotation and transfer membership with NIP-29 PUT_USER. No canvas kind is
+// Scope note: this speaks only the subset of the protocol the adapter needs -
+// create a private channel idempotently, publish append-only channel messages,
+// read events for human verification, and query membership and role state for
+// safe key rotation and transfer with NIP-29 PUT_USER. No canvas kind is
 // implemented, by invariant: Buzz canvases are a single mutable TEXT column
-// overwritten with no compare-and-set, so publishing
-// state into one would silently clobber concurrent captain edits. Append-only
-// messages only.
+// overwritten with no compare-and-set, so publishing state into one would
+// silently clobber concurrent captain edits. Projections use append-only messages.
 
 import { randomBytes } from "node:crypto";
 
@@ -262,6 +262,12 @@ export function buildBearingsEvent(channelId, content, privateKeyHex, extraTags 
   );
 }
 
+// Require exactly one signed snapshot for this channel with unique public keys.
+// Membership accepts ["p", pubkey] or ["p", pubkey, "", role], with role one of
+// owner/admin/member/guest/bot; the owner/admin roster accepts ["p", pubkey, role].
+// An empty owner/admin roster is valid, but an empty membership roster is not.
+// Signature validation does not establish relay trust: callers must check the
+// returned signerPubkey against their authority registry before using the state.
 async function queryChannelRoster(relay, privateKeyHex, channelId, timeoutMs, kind) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) {
     throw new Error(`invalid relay timeout ${JSON.stringify(timeoutMs)}: expected an integer from 1 to 2147483647`);
@@ -318,6 +324,8 @@ export async function queryCurrentChannelMembership(relay, privateKeyHex, channe
   };
 }
 
+// Return this identity's owner/admin role, or null when it is not in that roster.
+// A null role is not proof of membership; use queryCurrentChannelMembership.
 export async function queryCurrentChannelRole(relay, privateKeyHex, channelId, timeoutMs) {
   const roster = await queryChannelRoster(relay, privateKeyHex, channelId, timeoutMs, KIND_NIP29_GROUP_ADMINS);
   const publisher = publicKeyFromPrivate(privateKeyHex);
@@ -331,7 +339,11 @@ export async function queryCurrentChannelRole(relay, privateKeyHex, channelId, t
 // outgoing key on every error. Reread relay state on retry rather than trusting
 // an OK or a local progress bit: Buzz stores admin events before applying their
 // side effects. Preserve owner/admin authority so the next rotation is possible.
-// verifyAuthority checks every signed roster against the caller's durable pin.
+// verifyAuthority(signerPubkey) must synchronously throw on a missing/mismatched
+// durable pin. A missing grant is re-signed with a fresh nonce so a stored event
+// whose side effects failed cannot suppress the retry as a duplicate.
+// Resolves without a value only after replacement membership and role confirm;
+// otherwise rejects. The caller records the confirmed target before retiring keys.
 export async function transferChannelMembership(
   relay, outgoingKey, replacementKey, channelId, timeoutMs, verifyAuthority,
 ) {

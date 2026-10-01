@@ -15,7 +15,7 @@
 #   fm-buzz-keypair.sh                       ensure a keypair exists; print the public key
 #   fm-buzz-keypair.sh --public              print the stored identity without changing records
 #   fm-buzz-keypair.sh --rotate              retire this home's key and mint a new one
-#   fm-buzz-keypair.sh --rotate --compromised  as above, but do not keep the retired key
+#   fm-buzz-keypair.sh --rotate --compromised  recover without membership grants or retired-key retention
 #   fm-buzz-keypair.sh --rotate --discard-pending-cache  quarantine outgoing pending events first
 #   fm-buzz-keypair.sh --forget-key <hex>    withdraw one already-retired public key
 #   fm-buzz-keypair.sh --forget-target <hex> attest one retired relay/channel target
@@ -36,16 +36,22 @@
 # adapter's. It clears BOTH private stores - the keychain entry and the 0600
 # fallback file - while preserving data/buzz-keypair.public as recovery evidence
 # until the fresh private key is stored and that public record is atomically
-# replaced. Ordinary rotation first adds the staged identity to every tracked
-# private channel using the outgoing owner/admin, preserving its role with a
-# NIP-29 kind-9000 event. Signed kind-39002 membership and kind-39001 role state
-# must confirm the replacement through its own authenticated connection before
-# any outgoing key is cleared. Each confirmed replacement target is recorded for
-# future rotations. Retries reuse the staged key and recheck relay state, so a
-# partial transfer never retires the still-usable outgoing key.
+# replaced. Ordinary rotation first checks every target tracked for the outgoing
+# identity and adds the staged identity wherever the outgoing key is still an
+# owner/admin, preserving its role with a NIP-29 kind-9000 PUT_USER event.
+# Signed kind-39002 membership and kind-39001 role state must confirm the
+# replacement through its own authenticated connection before any outgoing key
+# is cleared. An OK acknowledgement alone is insufficient. Each confirmed
+# replacement target is recorded for future rotations. A partial transfer leaves
+# completed grants in place and both keys stored; retry with --rotate to reuse
+# the staged key and recheck relay state before sending any missing grants.
+# Retirement clears local private stores; it does not revoke the outgoing
+# identity's relay membership or role.
 # Compromised rotation never authorizes membership changes with the outgoing
-# key, and ordinary rotation refuses members lacking owner/admin authority.
-# bin/fm-buzz-lib.mjs owns authoritative membership queries, and
+# key and refuses while it confirms any outgoing tracked membership; ordinary
+# rotation refuses members lacking owner/admin authority. Missing, malformed,
+# ambiguous, or untrusted relay state also stops rotation before key retirement.
+# bin/fm-buzz-lib.mjs owns membership and role queries and the transfer protocol;
 # bin/fm-buzz-targets.mjs owns tracked targets and relay-authority trust records.
 # Relay-supplied membership diagnostics render C0 and C1 terminal controls as
 # visible `\uXXXX` escapes before they reach stderr.
@@ -65,8 +71,8 @@
 # next run re-prints the SAME public key. A rotation that silently does not rotate
 # is worse than no rotation procedure at all.
 #
-# Historical events stay signed by the retired key, which grants no authority and
-# so needs no revocation. It is still evidence, though: it is a key only this home
+# Historical events stay signed by the retired key; retaining its public half
+# grants no Firstmate authority. It is still evidence: it is a key only this home
 # ever held, and bin/fm-buzz-inspect.sh --anonymous decides whether a served event
 # is this home's own content by its author. So rotation retains the retired PUBLIC
 # key in data/buzz-keypair.public-history rather than dropping it - a relay that
@@ -1070,7 +1076,7 @@ EOF
   # if it cannot be settled: after fm_buzz_key_forget there is no second chance to
   # learn what this home was publishing under, so a failure here would silently
   # and permanently cost the probe its attribution. A rotation that stops now is
-  # simply retryable - nothing has changed yet.
+  # retryable: membership grants may exist, but the outgoing key is still stored.
   if [ "$COMPROMISED" -eq 1 ]; then
     purge_public_set ${rotation_publics[@]+"${rotation_publics[@]}"} || {
       printf 'fm-buzz-keypair.sh: could not drop the compromised public keys from %s; nothing was rotated\n' "$HISTORY_FILE" >&2

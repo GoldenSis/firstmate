@@ -43,9 +43,10 @@
 # never echoed, logged, put in a command line, or captured into a variable that
 # later gets printed. bin/fm-buzz-keypair.sh deliberately exposes no flag that
 # prints it. The publishing key is low-value by construction - it signs
-# fleet-status projections on a loopback relay and grants no authority, since
-# merge authority stays in bin/fm-pr-merge.sh per AGENTS.md section 7 - but low
-# value is not no value, and leaking it into a log would be a real defect.
+# fleet-status projections and authorizes rotation membership grants on a loopback
+# relay, but grants no Firstmate merge authority, which stays in bin/fm-pr-merge.sh
+# per AGENTS.md section 7. Low value is not no value, and leaking it into a log
+# would be a real defect.
 
 FM_BUZZ_KEYCHAIN_SERVICE=firstmate-buzz
 
@@ -379,9 +380,10 @@ fm_buzz_key_store() {
 # a forget afterwards would take the new key with it. That leaves a window with no
 # key at all, and a keychain that refuses the write inside it strands the home with
 # a public record and nothing to derive it from - orphan recovery, from a routine
-# rotation. So the replacement is written here first, verified, and only then is
-# the outgoing key cleared: a failure at any later point leaves a stage file the
-# next run finishes, rather than a home with no key.
+# rotation. So the replacement is written here first, verified, and retained
+# through membership transfer and key replacement: failures leave the same
+# staged identity available for the retry procedure owned by
+# bin/fm-buzz-keypair.sh --help, rather than a home with no recoverable key.
 #
 # It lives beside the record it replaces, in the gitignored per-home data/, at the
 # same 0600 as the fallback store and by the same mktemp-then-tighten route, and
