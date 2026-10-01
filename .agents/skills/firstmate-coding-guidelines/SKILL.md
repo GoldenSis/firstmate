@@ -68,6 +68,7 @@ Firstmate adds this skill's load instruction to firstmate-repo briefs by hand in
 
 ## Skill-admission rubric
 
+Reusable-procedure proposals first follow [`AGENTS.md` section 6](../../../AGENTS.md#6-project-and-knowledge-management); the skill-admission gates below apply in addition.
 Skill creation is fail-closed: the default answer is "not a skill" until every admission gate passes.
 Apply all six gates before creating a new skill directory, and again before materially expanding an existing skill's scope.
 Routine edits inside a skill's already-admitted scope - a correction, a clarification, a structural fix - do not reopen admission.

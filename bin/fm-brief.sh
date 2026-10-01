@@ -6,6 +6,9 @@
 # description, acceptance criteria, and context, and may adjust other sections
 # when the task genuinely deviates (e.g. working an existing external PR instead
 # of shipping a new one).
+# For task-block procedure references, external-system access boundaries, and
+# itemized/batch acceptance and receipts, follow AGENTS.md section 11 when
+# replacing {TASK}.
 # Usage: fm-brief.sh <task-id> <repo-name> [--scout] [--prototype <ui|logic-state> --question <question>] [--fusion-synthesis] [--herdr-lab]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at

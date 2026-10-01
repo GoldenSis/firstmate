@@ -120,6 +120,7 @@ The helper's header owns the exact signal detection, relocated-home limitation, 
 ## Two task shapes
 
 Ship tasks change projects and ship by project mode (`no-mistakes`, `direct-PR`, or `local-only`); scout tasks investigate, plan, reproduce bugs, or audit, then leave a report at `data/<id>/report.md` and never push.
+For task-block procedure references, external-system access boundaries, and itemized/batch acceptance and receipts, follow [`AGENTS.md` section 11](../AGENTS.md#11-crewmate-briefs) when filling `{TASK}` in generated briefs.
 
 Model fusion composes ordinary scouts for independent explicit-model opinions, structured synthesis, and a validator-authored pre-builder gate before normal promotion.
 The [`model-fusion` skill](../.agents/skills/model-fusion/SKILL.md) owns the semantic overlay, while `bin/fm-fusion-gate.sh` owns only deterministic gate mechanics and never becomes a delivery reviewer.
@@ -229,7 +230,7 @@ Home-domain captain preferences go to `data/captain.md`, cross-domain shared cap
 Memory writes use inspect-then-update: read the current destination first, then rewrite or prune matching bullets or notes in place instead of appending by default.
 Task-scoped notes use `tasks-axi show <id> --full` followed by `tasks-axi update <id> --body-file <path>`, adding `--archive-body` when the prior body should remain recoverable.
 Generalizable firstmate knowledge goes to shared tracked docs through the normal PR pipeline; the firstmate-internal `/stow` deliberately never stores findings in either skill directory.
-A recurring pattern that looks skill-shaped becomes a `skillify-candidate` backlog note for a separate ship task, and the fail-closed admission rubric in the [`firstmate-coding-guidelines` skill](../.agents/skills/firstmate-coding-guidelines/SKILL.md) decides there whether it ever becomes a skill.
+A skill-shaped pattern eligible under [`AGENTS.md` section 6](../AGENTS.md#6-project-and-knowledge-management) may become a `skillify-candidate` backlog note for a separate ship task, and the fail-closed admission rubric in the [`firstmate-coding-guidelines` skill](../.agents/skills/firstmate-coding-guidelines/SKILL.md) decides there whether it ever becomes a skill.
 
 ## Local clones stay fresh
 

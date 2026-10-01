@@ -24,8 +24,8 @@ The goal is a session that is safe to reset or destroy because everything durabl
    - Undone next steps: anything left open that has not yet been filed as backlog work.
 
 2. **Route each finding using AGENTS.md's knowledge-routing rule.**
-   AGENTS.md section 6 ("Project and knowledge management") is the single source of truth for where each kind of knowledge belongs.
-   Read its "Route durable knowledge to its most specific owner" list and route each finding there instead of re-deriving the mapping here.
+   [`AGENTS.md` section 6](../../../AGENTS.md#6-project-and-knowledge-management) is the single source of truth for knowledge routing and reusable-procedure proposals.
+   Apply those rules before filing each finding.
 
 3. **Write within firstmate's existing write boundaries.**
    This skill does not grant any new write permission; it only prompts firstmate to use the boundaries that already exist (AGENTS.md section 1):
