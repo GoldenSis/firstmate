@@ -87,6 +87,19 @@ fm_watcher_healthy() {
   return 0
 }
 
+# Lock reclamation publishes a fully prepared, nonempty owner with one rename.
+# Owner links remain fixed while the referenced directory generation changes.
+# owner-token identifies that generation; watcher pid-identity is caller-owned.
+# A reclaimer pins the stale directory as its working directory before checking
+# and clearing it, so delayed cleanup can never resolve through a replacement.
+# The candidate has the destination basename and lives on the same filesystem;
+# mv into the destination parent performs rename(2), not a move into the owner.
+# A nonempty winner cannot be replaced by rename on macOS or Linux.
+# Losers discard only their private candidates and retry; they never remove,
+# rename, or restore the shared lock path or a replacement owner's directory.
+# Death before publication leaves only private scratch or an empty stale owner,
+# which becomes reclaimable after the normal mid-acquire grace period.
+
 fm_lock_clean_known_files() {
   local lockdir=$1
   rm -f \
@@ -94,6 +107,8 @@ fm_lock_clean_known_files() {
     "$lockdir/fm-home" \
     "$lockdir/pid-identity" \
     "$lockdir/watcher-path" \
+    "$lockdir/created" \
+    "$lockdir/owner-token" \
     2>/dev/null || true
 }
 
@@ -112,11 +127,11 @@ fm_lock_owner_dir() {
 }
 
 fm_lock_prepare_owner() {
-  local ownerdir=$1 mypid back
+  local ownerdir=$1 mypid
   mypid=${BASHPID:-$$}
   printf '%s\n' "$mypid" > "$ownerdir/pid" 2>/dev/null || return 1
-  back=$(cat "$ownerdir/pid" 2>/dev/null || true)
-  [ "$back" = "$mypid" ]
+  printf '%s\n' "$ownerdir" > "$ownerdir/owner-token" 2>/dev/null || return 1
+  date +%s > "$ownerdir/created" 2>/dev/null
 }
 
 fm_lock_link_owner() {
@@ -131,6 +146,9 @@ fm_lock_link_owner() {
 
 fm_lock_points_to_owner() {
   local lockdir=$1 ownerdir=$2 actual
+  if [ "$lockdir" = "$ownerdir" ] && [ -d "$lockdir" ] && [ ! -L "$lockdir" ]; then
+    return 0
+  fi
   actual=$(readlink "$lockdir" 2>/dev/null) || return 1
   [ "$actual" = "$ownerdir" ]
 }
@@ -138,7 +156,7 @@ fm_lock_points_to_owner() {
 fm_lock_discard_owner() {
   local ownerdir=$1
   [ -n "$ownerdir" ] || return 0
-  fm_lock_clean_known_files "$ownerdir"
+  ( cd "$ownerdir" 2>/dev/null && fm_lock_clean_known_files . ) || true
   rmdir "$ownerdir" 2>/dev/null || true
 }
 
@@ -163,19 +181,12 @@ fm_lock_claim_blocked_by_steal() {
 fm_lock_claim() {
   local lockdir=$1 ownerdir=$2 allowed_steal_owner=${3:-} mypid back
   mypid=${BASHPID:-$$}
-  if ! { printf '%s\n' "$mypid" > "$ownerdir/pid"; } 2>/dev/null; then
-    fm_lock_discard_owner "$ownerdir"
-    return 1
-  fi
+  # Publication already includes the PID; a late claimant must never write
+  # through an owner path that reclamation may have replaced in the meantime.
   back=$(cat "$ownerdir/pid" 2>/dev/null || true)
-  if [ "$back" != "$mypid" ]; then
-    fm_lock_discard_owner "$ownerdir"
-    return 1
-  fi
-  if ! fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
-    fm_lock_discard_owner "$ownerdir"
-    return 1
-  fi
+  [ "$back" = "$mypid" ] || return 1
+  [ "$(cat "$ownerdir/owner-token" 2>/dev/null || true)" = "$ownerdir" ] || return 1
+  fm_lock_points_to_owner "$lockdir" "$ownerdir" || return 1
   if fm_lock_claim_blocked_by_steal "$lockdir" "$allowed_steal_owner"; then
     if fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
       rm -f "$lockdir" 2>/dev/null || true
@@ -239,7 +250,7 @@ fm_lock_mid_acquire_is_fresh() {
 }
 
 fm_lock_recheck_stale_owner() {
-  local lockdir=$1 expected_owner=$2 expected_pid=$3 actual_pid
+  local lockdir=$1 expected_owner=$2 expected_pid=$3 age_path=${4:-$1} actual_pid
   if [ -n "$expected_owner" ]; then
     fm_lock_points_to_owner "$lockdir" "$expected_owner" || return 1
   elif [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
@@ -250,35 +261,50 @@ fm_lock_recheck_stale_owner() {
   if fm_pid_alive "$actual_pid"; then
     return 1
   fi
-  if fm_lock_mid_acquire_is_fresh "$lockdir" "$actual_pid"; then
+  if fm_lock_mid_acquire_is_fresh "$age_path" "$actual_pid"; then
     return 1
   fi
   return 0
 }
 
 fm_lock_reclaim_stale_owner() {
-  local lockdir=$1 expected_owner=$2 expected_pid=$3 expected_identity claimed_identity claim
-  fm_lock_recheck_stale_owner "$lockdir" "$expected_owner" "$expected_pid" || return 1
-  if [ -n "$expected_owner" ]; then
-    expected_identity=$(fm_path_identity "$lockdir") || return 1
-    fm_lock_clean_known_files "$expected_owner"
-    rmdir "$expected_owner" 2>/dev/null || return 1
-    claim="${expected_owner}.reclaimed-link"
-    [ ! -e "$claim" ] && [ ! -L "$claim" ] || return 1
-    mv "$lockdir" "$claim" 2>/dev/null || return 1
-    claimed_identity=$(fm_path_identity "$claim" 2>/dev/null || true)
-    if [ "$claimed_identity" != "$expected_identity" ] \
-      || ! fm_lock_points_to_owner "$claim" "$expected_owner"; then
-      if [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ]; then
-        mv "$claim" "$lockdir" 2>/dev/null || true
-      fi
-      return 1
-    fi
-    rm -f "$claim" 2>/dev/null
-    return $?
+  local lockdir=$1 expected_owner=$2 expected_pid=$3 target parent stage candidate rc
+  lockdir=$(fm_lock_abs_path "$lockdir") || return 1
+  target=${expected_owner:-$lockdir}
+  target=$(fm_lock_abs_path "$target") || return 1
+  parent=$(dirname "$target")
+  stage=$(mktemp -d "$parent/.fm-lock-prepare.XXXXXX") || return 1
+  candidate="$stage/$(basename "$target")"
+  if ! mkdir -m 700 "$candidate" || ! fm_lock_prepare_owner "$candidate"; then
+    fm_lock_discard_owner "$candidate"
+    rmdir "$stage" 2>/dev/null || true
+    return 1
   fi
-  fm_lock_clean_known_files "$lockdir"
-  rmdir "$lockdir" 2>/dev/null
+  rc=1
+  if (
+    # Keep all stale cleanup relative to this inode, even if another contender
+    # replaces target while we are suspended between the check and cleanup.
+    # Old versions could die after removing an owner but before its link.
+    # Recreate only that missing target; mkdir cannot replace an existing owner.
+    if [ -n "$expected_owner" ]; then mkdir -m 700 "$target" 2>/dev/null || true; fi
+    cd "$target" 2>/dev/null || exit 1
+    fm_lock_recheck_stale_owner . "" "$expected_pid" "$lockdir" || exit 1
+    fm_lock_clean_known_files .
+    mv "$candidate" "$parent/" 2>/dev/null
+  ); then
+    if { [ -n "$expected_owner" ] && fm_lock_points_to_owner "$lockdir" "$expected_owner"; } \
+      || { [ -z "$expected_owner" ] && [ -d "$lockdir" ] && [ ! -L "$lockdir" ]; }; then
+      FM_LOCK_OWNER_DIR=${expected_owner:-$target}
+      rc=0
+    else
+      # The public link disappeared independently; this unpublished candidate
+      # still names our live PID and no contender can reclaim it.
+      fm_lock_discard_owner "$target"
+    fi
+  fi
+  fm_lock_discard_owner "$candidate"
+  rmdir "$stage" 2>/dev/null || true
+  return "$rc"
 }
 
 fm_lock_acquire_preflight() {
@@ -298,6 +324,9 @@ fm_lock_acquire_preflight() {
 
 fm_lock_try_acquire_guard() {
   local lockdir=$1 pid owner preflight_status
+  FM_LOCK_HELD_PID=
+  FM_LOCK_OWNER_DIR=
+  lockdir=$(fm_lock_abs_path "$lockdir") || return 1
   if fm_lock_acquire_preflight "$lockdir"; then
     return 0
   else
@@ -311,12 +340,14 @@ fm_lock_try_acquire_guard() {
   if [ -L "$lockdir" ]; then
     owner=$(fm_lock_link_owner "$lockdir" 2>/dev/null || true)
   fi
-  fm_lock_reclaim_stale_owner "$lockdir" "$owner" "$pid" || return 1
-  fm_lock_try_create "$lockdir"
+  fm_lock_reclaim_stale_owner "$lockdir" "$owner" "$pid"
 }
 
 fm_lock_try_acquire() {
   local lockdir=$1 pid steal cur rc steal_owner primary_owner preflight_status
+  FM_LOCK_HELD_PID=
+  FM_LOCK_OWNER_DIR=
+  lockdir=$(fm_lock_abs_path "$lockdir") || return 1
   if fm_lock_acquire_preflight "$lockdir"; then
     return 0
   else
@@ -367,9 +398,8 @@ fm_lock_try_acquire() {
     return 1
   fi
 
-  fm_lock_remove_path "$lockdir" || true
   rc=1
-  if fm_lock_try_create "$lockdir" "$steal_owner"; then
+  if fm_lock_reclaim_stale_owner "$lockdir" "$primary_owner" "$cur"; then
     rc=0
   fi
   if [ "$rc" -ne 0 ]; then
@@ -403,7 +433,7 @@ fm_lock_release() {
   fi
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
   [ "$pid" = "$current" ] || return 0
-  fm_lock_clean_known_files "$lockdir"
+  ( cd "$lockdir" 2>/dev/null && fm_lock_clean_known_files . ) || true
   rmdir "$lockdir" 2>/dev/null || true
 }
 
