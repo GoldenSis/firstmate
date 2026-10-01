@@ -361,6 +361,161 @@ test_rotation_refuses_or_quarantines_outgoing_pending_events() {
   pass "rotation refuses or explicitly quarantines outgoing pending replay entries"
 }
 
+# Exercise the actual publisher/keypair commands against an authenticated relay
+# that enforces private membership and owner/admin grants.
+assert_rotation_memberships() {  # <home> <relay> <expected-count>
+  local home=$1 relay=$2 expected=$3 private=${4:-}
+  [ -n "$private" ] || private=$(jq -r .private_key "$(key_file "$home" "$home/xdg")")
+  printf '%s' "$private" | node --input-type=module -e '
+    const { readStdin, queryCurrentChannelMembership } = await import(process.argv[1]);
+    const { readPublisherTargets } = await import(process.argv[2]);
+    const { publicKeyFromPrivate } = await import(process.argv[3]);
+    const key = (await readStdin()).trim();
+    const targets = readPublisherTargets(process.argv[4]).filter(t => t.publisher_pubkey === publicKeyFromPrivate(key));
+    if (targets.length !== Number(process.argv[6])) throw new Error("replacement target count differs");
+    for (const target of targets) {
+      const state = await queryCurrentChannelMembership(process.argv[5], key, target.channel_id, 8000);
+      if (!state.member) throw new Error("replacement is not a confirmed member");
+    }
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$ROOT/bin/fm-buzz-targets.mjs" \
+    "$ROOT/bin/fm-buzz-crypto.mjs" "$home/data/buzz-publisher-targets.jsonl" "$relay" "$expected" \
+    || fail "replacement memberships were not all confirmed"
+}
+
+test_rotation_transfers_all_private_channels() {
+  local home relay old replacement output label keyfile private_before
+  home=$(make_home rotation-transfer)
+  old=$(run_keypair "$home" 2>/dev/null) || fail "transfer key setup failed"
+  keyfile=$(key_file "$home" "$home/xdg")
+  private_before=$(cat "$keyfile")
+  read -r STUB_PID relay <<EOF
+$(start_stub --enforce-membership)
+EOF
+  for label in transfer-a transfer-b; do
+    test_projection "before-$label" | run_publish "$home" "$relay" --channel-label "$label" >/dev/null 2>&1
+  done
+  output=$(run_keypair "$home" --rotate 2>&1)
+  expect_code 0 "$?" "routine rotation of two private channels: $output"
+  replacement=$(run_keypair "$home" --public 2>/dev/null)
+  [ "$replacement" != "$old" ] || fail "routine transfer kept the old identity"
+  [ "$(cat "$keyfile")" != "$private_before" ] || fail "transfer did not retire the old key"
+  assert_absent "$(rotation_stage_file "$home")" "completed transfer left a staged key"
+  assert_contains "$(cat "$home/data/buzz-keypair.public-history")" "$old" "transfer lost attribution"
+  assert_rotation_memberships "$home" "$relay" 2
+  for label in transfer-a transfer-b; do
+    test_projection "after-$label" | run_publish "$home" "$relay" --channel-label "$label" >/dev/null 2>&1
+    assert_contains "$(run_inspect "$home" "$relay" --channel-label "$label" 2>&1)" "after-$label" \
+      "replacement could not publish into its existing private channel"
+  done
+  # Transfer must preserve the authority needed for the next routine rotation.
+  output=$(run_keypair "$home" --rotate 2>&1)
+  expect_code 0 "$?" "second routine rotation: $output"
+  assert_rotation_memberships "$home" "$relay" 2
+  stop_stub "$STUB_PID"
+  pass "routine rotation transfers every tracked private channel and preserves future rotation authority"
+}
+
+test_rotation_resumes_partial_membership_transfer() {
+  local action home relay old output stage replacement fault channel label
+  for action in reject ack-only drop-after-add; do
+    home=$(make_home "partial-transfer-$action")
+    old=$(run_keypair "$home" 2>/dev/null) || fail "partial transfer key setup failed"
+    fault="$home/fault.json"
+    read -r STUB_PID relay <<EOF
+$(start_stub --enforce-membership --transfer-fault-file "$fault")
+EOF
+    for label in partial-a partial-b; do
+      test_projection "before-$label" | run_publish "$home" "$relay" --channel-label "$label" >/dev/null 2>&1
+    done
+    # Registry order is canonical; fail the second transfer after the first lands.
+    channel=$(node "$ROOT/bin/fm-buzz-targets.mjs" list-with-ids "$home/data/buzz-publisher-targets.jsonl" | tail -1 | cut -f4)
+    jq -cn --arg channel "$channel" --arg action "$action" '{channel:$channel,action:$action}' > "$fault"
+    output=$(FM_BUZZ_TIMEOUT_MS=2500 run_keypair "$home" --rotate 2>&1)
+    expect_code 1 "$?" "partial transfer must retain the old key on $action"
+    assert_contains "$output" "$channel" "partial transfer error omitted its channel"
+    [ "$(run_keypair "$home" --public 2>/dev/null)" = "$old" ] || fail "failed transfer retired the old key"
+    stage=$(rotation_stage_file "$home")
+    assert_present "$stage" "partial transfer lost its replacement key"
+    replacement=$(jq -r .public_key "$stage")
+    [ "$(jq -r .phase "$stage")" = prepared ] || fail "unconfirmed transfer became committable"
+    # Old identity remains usable after every partial failure.
+    test_projection "old-still-publishes" | run_publish "$home" "$relay" --channel-label partial-a >/dev/null 2>&1
+    assert_contains "$(run_inspect "$home" "$relay" --channel-label partial-a 2>&1)" "old-still-publishes" \
+      "partial transfer stranded the outgoing identity"
+    rm "$fault"
+    output=$(run_keypair "$home" --rotate 2>&1)
+    expect_code 0 "$?" "retry after $action: $output"
+    [ "$(run_keypair "$home" --public 2>/dev/null)" = "$replacement" ] || fail "retry minted another replacement"
+    assert_rotation_memberships "$home" "$relay" 2
+    stop_stub "$STUB_PID"
+  done
+  pass "partial transfers resume after rejection, unconfirmed OK, and lost acknowledgement"
+}
+
+test_rotation_resumes_after_transfer_persistence_failures() {
+  local point home relay old output stage replacement hook tools real_rm keyfile
+  for point in registry history commit delete install public clear; do
+    home=$(make_home "transfer-persistence-$point")
+    old=$(run_keypair "$home" 2>/dev/null) || fail "persistence key setup failed"
+    keyfile=$(key_file "$home" "$home/xdg")
+    hook="$home/fail-write.cjs"
+    tools="$home/tools"
+    mkdir "$tools"
+    real_rm=$(command -v rm)
+    cat > "$hook" <<'JS'
+const fs = require("node:fs");
+const original = fs.renameSync;
+fs.renameSync = function(source, target) {
+  const point = process.env.BUZZ_TEST_FAILURE;
+  if ((point === "registry" && target.endsWith("/buzz-publisher-targets.jsonl")) ||
+      (point === "history" && target.endsWith("/buzz-keypair.public-history")) ||
+      (point === "commit" && target.endsWith("/.buzz-keypair.rotation-stage") &&
+        JSON.parse(fs.readFileSync(source, "utf8")).phase === "committable") ||
+      (point === "install" && target === process.env.BUZZ_TEST_KEYFILE) ||
+      (point === "public" && target.endsWith("/buzz-keypair.public"))) {
+    // Abrupt death also leaves transaction locks behind; retry must reclaim
+    // them without losing the staged key before or after old-key removal.
+    if (point === "commit" || point === "install") process.kill(process.ppid, "SIGKILL");
+    process.exit(77);
+  }
+  return original.apply(this, arguments);
+};
+JS
+    cat > "$tools/rm" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  if { [ "\${BUZZ_TEST_FAILURE:-}" = clear ] && [ "\$arg" = "$home/data/.buzz-keypair.rotation-stage" ]; } ||
+     { [ "\${BUZZ_TEST_FAILURE:-}" = delete ] && [ "\$arg" = "$keyfile" ]; }; then exit 77; fi
+done
+exec "$real_rm" "\$@"
+EOF
+    chmod +x "$tools/rm"
+    read -r STUB_PID relay <<EOF
+$(start_stub --enforce-membership)
+EOF
+    test_projection before | run_publish "$home" "$relay" >/dev/null 2>&1
+    if output=$(BUZZ_TEST_FAILURE="$point" BUZZ_TEST_KEYFILE="$keyfile" NODE_OPTIONS="--require=$hook" \
+      PATH="$tools:$PATH" run_keypair "$home" --rotate 2>&1); then
+      fail "rotation unexpectedly completed despite persistence failure at $point"
+    fi
+    stage=$(rotation_stage_file "$home")
+    assert_present "$stage" "failure at $point lost the staged key"
+    replacement=$(jq -r .public_key "$stage")
+    if [ "$(jq -r .phase "$stage")" = committable ]; then
+      assert_rotation_memberships "$home" "$relay" 1 "$(jq -r .private_key "$stage")"
+    else
+      [ "$(run_keypair "$home" --public 2>/dev/null)" = "$old" ] || fail "$point retired an unconfirmed key"
+    fi
+    output=$(run_keypair "$home" --rotate 2>&1)
+    expect_code 0 "$?" "resume persistence failure at $point: $output"
+    [ "$(run_keypair "$home" --public 2>/dev/null)" = "$replacement" ] || fail "$point resume changed replacement"
+    assert_rotation_memberships "$home" "$relay" 1
+    assert_absent "$stage" "$point resume left the stage behind"
+    stop_stub "$STUB_PID"
+  done
+  pass "transfer survives target/history/stage writes, old-key deletion, replacement installation, public recording, and cleanup failures"
+}
+
 test_rotation_refuses_an_existing_private_channel_before_mutation() {
   local home relay old channel resolved_home private_file private_before history_before output code readback
   home=$(make_home rotate-existing-private-channel)
@@ -369,7 +524,7 @@ test_rotation_refuses_an_existing_private_channel_before_mutation() {
   private_before=$(cat "$private_file")
   history_before=$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null || true)
   read -r STUB_PID relay <<EOF
-$(start_stub)
+$(start_stub --enforce-membership)
 EOF
   test_projection "membership-must-survive" \
     | run_publish "$home" "$relay" >/dev/null 2>&1
@@ -380,12 +535,12 @@ EOF
     });
   ' "$ROOT/bin/fm-buzz-lib.mjs" "$resolved_home") || fail "could not derive the rotation fixture channel"
 
-  output=$(FM_BUZZ_KEYPAIR_RELAY="$relay" run_keypair "$home" --rotate 2>&1)
+  output=$(FM_BUZZ_KEYPAIR_RELAY="$relay" run_keypair "$home" --rotate --compromised 2>&1)
   code=$?
   expect_code 1 "$code" "rotation of an identity owning an existing private channel"
   assert_contains "$output" "current membership on relay $relay, channel $channel" \
     "rotation refusal did not name the existing private-channel membership"
-  assert_contains "$output" "Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity." \
+  assert_contains "$output" "Compromised rotation refuses membership transfer: the outgoing key is not trusted to authorize membership changes." \
     "rotation refusal omitted the required membership explanation"
   assert_contains "$output" "https://github.com/block/buzz/blob/main/ARCHITECTURE.md" \
     "rotation refusal omitted the Buzz architecture reference"
@@ -398,10 +553,21 @@ EOF
   [ "$(cat "$home/data/buzz-keypair.public-history" 2>/dev/null || true)" = "$history_before" ] \
     || fail "rotation refusal changed public-key history"
   readback=$(run_inspect "$home" "$relay" 2>&1)
+  jq -r .private_key "$private_file" | node --input-type=module -e '
+    const { readStdin, withRelay } = await import(process.argv[1]);
+    const key = (await readStdin()).trim();
+    const result = await withRelay(process.argv[2], key, 8000, async api => {
+      await api.authenticateIfChallenged();
+      return api.query({kinds: [9000], "#h": [process.argv[3]]});
+    });
+    if (result.refusal || result.events.length !== 0) process.exit(1);
+  ' "$ROOT/bin/fm-buzz-lib.mjs" "$relay" "$channel" \
+    || fail "compromised rotation authorized a membership change"
+  assert_absent "$(rotation_stage_file "$home")" "compromised membership refusal staged a replacement"
   stop_stub "$STUB_PID"
   assert_contains "$readback" "membership-must-survive" \
     "rotation membership preflight changed the existing channel state"
-  pass "rotation refuses an existing private channel before key mutation"
+  pass "compromised rotation refuses private-channel transfer without authorizing a membership change"
 }
 
 test_rotation_reports_every_membership_blocker() {
@@ -579,7 +745,7 @@ test_publisher_target_overrides_are_recorded_and_guard_rotation() {
     });
   ' "$ROOT/bin/fm-buzz-lib.mjs" "$label") || fail "could not derive the tracked override channel"
   read -r STUB_PID relay <<EOF
-$(start_stub)
+$(start_stub --enforce-membership)
 EOF
   test_projection "tracked-override" \
     | run_publish "$home" "$relay" --channel-label "$label" >/dev/null 2>&1
@@ -596,7 +762,7 @@ EOF
     || fail "publish did not persist the normalized relay/channel/publisher tuple"
   targets_before=$(cat "$targets")
 
-  output=$(run_keypair "$home" --rotate 2>&1)
+  output=$(run_keypair "$home" --rotate --compromised 2>&1)
   code=$?
   stop_stub "$STUB_PID"
   expect_code 1 "$code" "rotation with a tracked non-default private channel"
@@ -604,8 +770,8 @@ EOF
     "rotation refusal did not name the tracked override channel"
   assert_contains "$output" "relay $normalized_relay" \
     "rotation refusal did not name the tracked override relay"
-  assert_contains "$output" "Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity." \
-    "tracked-target refusal omitted the M1 membership explanation"
+  assert_contains "$output" "Compromised rotation refuses membership transfer: the outgoing key is not trusted to authorize membership changes." \
+    "tracked-target refusal omitted the compromised membership explanation"
   [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
     || fail "tracked-target refusal changed the recorded public key"
   [ "$(cat "$keyfile")" = "$private_before" ] \
@@ -758,7 +924,7 @@ EOF
     | awk -F '\t' -v channel="$channel" '$4 == channel { print $1 }')
   [ "${#target_hex}" = 64 ] || fail "the tracked target has no canonical target hex"
 
-  output=$(run_keypair "$home" --rotate 2>&1)
+  output=$(run_keypair "$home" --rotate --compromised 2>&1)
   code=$?
   expect_code 1 "$code" "rotation before target retirement"
   assert_contains "$output" "target $target_hex" \
@@ -947,8 +1113,8 @@ EOF
     "current-membership refusal did not name the normalized relay"
   assert_contains "$output" "channel $channel" \
     "current-membership refusal did not name the channel"
-  assert_contains "$output" "Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity." \
-    "current-membership refusal omitted the required M1 explanation"
+  assert_contains "$output" "The outgoing identity lacks owner/admin authority to transfer membership on the channels listed above." \
+    "current-membership refusal omitted the authority explanation"
   [ "$(cat "$home/data/buzz-keypair.public")" = "$old" ] \
     || fail "current-membership refusal changed the recorded public key"
   [ "$(cat "$keyfile")" = "$private_before" ] \
@@ -2982,6 +3148,9 @@ test_two_homes_sharing_one_xdg_get_separate_keys
 test_rotation_replaces_the_key_in_whichever_store_holds_it
 test_a_compromised_rotation_does_not_keep_the_retired_key
 test_rotation_refuses_or_quarantines_outgoing_pending_events
+test_rotation_transfers_all_private_channels
+test_rotation_resumes_partial_membership_transfer
+test_rotation_resumes_after_transfer_persistence_failures
 test_rotation_refuses_an_existing_private_channel_before_mutation
 test_rotation_reports_every_membership_blocker
 test_rotation_query_errors_report_every_target_on_the_endpoint

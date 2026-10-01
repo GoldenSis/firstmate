@@ -2,7 +2,9 @@
 // Durable publisher-target and relay-authority registries for Buzz key rotation.
 //
 // data/buzz-publisher-targets.jsonl contains one canonical JSON object per used
-// relay/channel/publisher tuple. Each object has exactly relay, channel_id, and
+// relay/channel/publisher tuple, including confirmed rotation replacements even
+// before they publish. Rotation adds replacement tuples without removing the
+// outgoing tuples. Each object has exactly relay, channel_id, and
 // publisher_pubkey string fields. Relays use normalizeRelayEndpoint(), while
 // channel identities are lowercase canonical UUIDs and publisher identities are
 // lowercase 64-character hex values.
@@ -16,7 +18,10 @@
 // data/buzz-relay-authorities.jsonl contains one canonical JSON object per
 // relay/channel pair, with exactly relay, channel_id, and signer_pubkey fields.
 // The first verified kind-39002 snapshot records its signer unless strict mode
-// requires an existing pin, and every later snapshot must match that signer.
+// requires an existing pin; subsequent membership snapshots must match it.
+// Role checks and every transfer check require that same pin for both
+// kind-39002 membership and kind-39001 owner/admin snapshots;
+// neither accepts a new signer or bootstraps a missing pin.
 // Relay identity retirement normalizes one complete endpoint, refuses while any
 // publisher target still names it, and atomically removes every authority pin
 // for that endpoint while preserving pins for every other endpoint.

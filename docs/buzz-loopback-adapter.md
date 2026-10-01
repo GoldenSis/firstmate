@@ -33,17 +33,18 @@ Each one is the reason a specific failure mode cannot occur, and breaching any o
 
    Loopback is not the same boundary as single-user, and the difference is worth stating rather than blurring.
    The relay runs open - no auth token, no membership enforcement - so any local process on this host, running as any user, can reach `127.0.0.1:3000` and publish.
-   The channel id is not a secret either: `channelIdForLabel` hashes the UTF-8 string `firstmate-buzz-channel:<label>`, where the default label is the resolved `FM_HOME`, takes the first 16 bytes, and sets the UUID version and variant bits, derived on purpose so a lost keypair cannot orphan the channel.
+   The channel id is not a secret either: `channelIdForLabel` hashes the UTF-8 string `firstmate-buzz-channel:<label>`, where the default label is the resolved `FM_HOME`, takes the first 16 bytes, and sets the UUID version and variant bits, so the channel address is independent of the publishing keypair.
+   Recovering that address alone does not restore membership after key loss; `bin/fm-buzz-keypair.sh --help` owns identity recovery.
    A local process that created the group first would own it and could read the bearings projections published into it.
    That is an accepted risk for a proof of concept on a single-user laptop with a disposable stack; the boundary actually being relied on is "no other local user", not "no remote party".
-   Closing it means enforcing membership, which belongs to Milestone 2 along with the rest of channel membership management.
+   Closing it means enabling membership enforcement in the bundled deployment, which remains outside the shipped rotation transfer support.
 
    Disposable has to mean the exposure ends when the operator stops using the stack, so the relay carries `restart: "no"` and does not come back by itself after a reboot.
    The datastores do restart, because they only serve the internal compose network, and they self-resume across a host reboot still holding every published bearings projection.
    `docker compose -f docker-compose.buzz-loopback.yml down -v` is what ends the exposure for good, volumes included.
    On first startup, `relay-key-init` generates one valid secp256k1 relay signing key inside the compose-managed `buzz-relay-key` volume with mode 0400 and ownership restricted to the relay user.
    The relay reads that key into `BUZZ_RELAY_PRIVATE_KEY` at process start, and no host bind mount or tracked file holds it.
-   A relay container restart reuses the same volume and therefore the same kind-39002 signer, while `docker compose -f docker-compose.buzz-loopback.yml down -v` destroys the key with the other disposable data.
+   A relay container restart reuses the same volume and therefore the same membership and role-state signer, while `docker compose -f docker-compose.buzz-loopback.yml down -v` destroys the key with the other disposable data.
    The next `up -d` after that teardown creates a different relay signer and a clean trust boundary.
 3. **Publishing is fire-and-forget.**
    `bin/fm-buzz-publish.sh` converts runtime publication failures into logged exit-0 non-events.
@@ -262,11 +263,12 @@ The exit-gate runs used an isolated `FM_HOME` rather than the live one.
 
 The default automated lane runs against a stub relay (`tests/fm-buzz-stub-relay.mjs`) so it passes on a CI runner with no Docker.
 The stub verifies every event's id and Schnorr signature before accepting it, so "the relay accepted it" is a real assertion rather than a stub agreeing with whatever it is sent.
+`tests/fm-buzz-keypair.test.sh` covers rotation across multiple private channels with stub-enforced membership, repeat rotation, partial transfer failures, interrupted persistence and recovery, and compromised-key and insufficient-authority refusals.
 Setting `FM_BUZZ_DOCKER_INTEGRATION=1` enables the opt-in Compose relay signer-lifecycle regression on a Docker-capable host.
 
 ## Known limitations
 
-The purpose-limited Schnorr implementation is not constant time and must not protect an authoritative or privileged key.
+The purpose-limited Schnorr implementation is not constant time; its permitted scope remains this single-user, loopback proof of concept.
 The header of `bin/fm-buzz-crypto.mjs` owns its implementation limits, permitted scope, and vector-coverage contract.
 
 Buzz documents no key-rotation procedure, so this adapter supplies one to keep historical projections attributable without trusting compromised identities.
@@ -281,7 +283,8 @@ The relay stack is disposable by design, while durable adapter target records su
 ## Out of scope
 
 Per-task lanes shipped; see [Per-crew lanes](#per-crew-lanes) above.
-Artifact delivery and channel membership management are still Milestone 2.
+Routine identity rotation now transfers private-channel membership where the outgoing identity has owner/admin authority; `bin/fm-buzz-keypair.sh --help` owns the authorization and recovery procedure.
+Artifact delivery and other channel membership management remain Milestone 2.
 NIP-OA signed approval provenance is Milestone 3.
 Reading state back from Buzz, canvases, Buzz workflows, and any hosted account are out of scope permanently, or until the study that ruled them out is re-opened.
 

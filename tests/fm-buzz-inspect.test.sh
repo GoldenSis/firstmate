@@ -648,8 +648,8 @@ test_quarantine_lifecycle_has_one_pinned_cache_owner() {
   assert_grep "<replay-root>/<endpoint-digest>/<channel-id>/<created_at>-<event-id>.json" \
     "$ROOT/bin/fm-buzz-publish.mjs" \
     "the active-cache owner does not document its partition and entry layout"
-  assert_grep "query authoritative membership state for safe key" "$ROOT/bin/fm-buzz-lib.mjs" \
-    "the relay-client scope omits rotation membership queries"
+  assert_grep "query membership and role state" "$ROOT/bin/fm-buzz-lib.mjs" \
+    "the relay-client scope omits rotation membership and role queries"
   assert_grep 'FM_BUZZ_DOCKER_INTEGRATION=1` enables the opt-in Compose' "$ROOT/docs/buzz-loopback-adapter.md" \
     "the adapter guide does not distinguish the opt-in Docker lane"
   # shellcheck disable=SC2016

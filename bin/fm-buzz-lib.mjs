@@ -3,7 +3,7 @@
 //
 // Layered on bin/fm-buzz-crypto.mjs (BIP-340 signing) and consumed by publishing,
 // inspection, and key rotation. This module owns the wire format, relay
-// conversation, loopback-only relay policy, and authoritative membership query
+// conversation, loopback-only relay policy, and membership/role queries and transfer
 // shared by those entry points. The fire-and-forget contract, replay cache, and
 // snapshot plumbing live in the publisher.
 //
@@ -14,17 +14,20 @@
 // content signed in the same second a distinct id. Buzz's relay dedupes on that
 // id (`INSERT ... ON CONFLICT DO NOTHING`), which makes resubmitting one cached,
 // byte-identical signed event perfectly idempotent. Rebuilding a cached logical
-// projection as a fresh event would instead create a second projection. Everything
-// downstream of signEvent must therefore move signed bytes around, not rebuild
-// events. The publisher's replay cache stores exact bytes for this reason.
+// projection as a fresh event would instead create a second projection. Cached
+// publication must therefore move signed bytes around, not rebuild events.
+// Membership-transfer retries instead follow current relay state, as documented
+// at transferChannelMembership below.
 //
-// Scope note: this speaks only the subset of the protocol M1 needs - create a
-// private channel idempotently, publish append-only channel messages, read events
-// for human verification, and query authoritative membership state for safe key
-// rotation. No canvas kind is implemented, by invariant: Buzz canvases are a
-// single mutable TEXT column overwritten with no compare-and-set, so publishing
-// state into one would silently clobber concurrent captain edits. Append-only
-// messages only.
+// Scope note: this speaks only the subset of the protocol the adapter needs -
+// create a private channel idempotently, publish append-only channel messages,
+// read events for human verification, and query membership and role state for
+// safe key rotation and transfer with NIP-29 PUT_USER. No canvas kind is
+// implemented, by invariant: Buzz canvases are a single mutable TEXT column
+// overwritten with no compare-and-set, so publishing state into one would
+// silently clobber concurrent captain edits. Projections use append-only messages.
+
+import { randomBytes } from "node:crypto";
 
 import {
   schnorrSign,
@@ -80,6 +83,7 @@ export function relayCacheKey(relay) {
 export const KIND_STREAM_MESSAGE = 9; // NIP-29 channel chat message (append-only)
 export const KIND_NIP29_ADD_USER = 9000;
 export const KIND_NIP29_CREATE_GROUP = 9007; // creates a channel; creator becomes owner
+export const KIND_NIP29_GROUP_ADMINS = 39001;
 export const KIND_NIP29_GROUP_MEMBERS = 39002;
 export const KIND_NIP42_AUTH = 22242; // NIP-42 challenge response
 
@@ -258,15 +262,20 @@ export function buildBearingsEvent(channelId, content, privateKeyHex, extraTags 
   );
 }
 
-export async function queryCurrentChannelMembership(relay, privateKeyHex, channelId, timeoutMs) {
+// Require exactly one signed snapshot for this channel with unique public keys.
+// Membership accepts ["p", pubkey] or ["p", pubkey, "", role], with role one of
+// owner/admin/member/guest/bot; the owner/admin roster accepts ["p", pubkey, role].
+// An empty owner/admin roster is valid, but an empty membership roster is not.
+// Signature validation does not establish relay trust: callers must check the
+// returned signerPubkey against their authority registry before using the state.
+async function queryChannelRoster(relay, privateKeyHex, channelId, timeoutMs, kind) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) {
     throw new Error(`invalid relay timeout ${JSON.stringify(timeoutMs)}: expected an integer from 1 to 2147483647`);
   }
-  const publisher = publicKeyFromPrivate(privateKeyHex);
   const { events, refusal } = await withRelay(relay, privateKeyHex, timeoutMs, async (api) => {
     await api.authenticateIfChallenged();
     return api.query({
-      kinds: [KIND_NIP29_GROUP_MEMBERS],
+      kinds: [kind],
       "#d": [channelId],
       limit: 2,
     }, "fm-rotation-check");
@@ -284,21 +293,92 @@ export async function queryCurrentChannelMembership(relay, privateKeyHex, channe
     : [];
   const validMembership = validation.eventObject &&
     validation.validKind &&
-    event.kind === KIND_NIP29_GROUP_MEMBERS &&
+    event.kind === kind &&
     validation.idMatches &&
     validation.signatureValid &&
     validation.validTags &&
     channelTags.length === 1 &&
     channelTags[0].length === 2 &&
     channelTags[0][1] === channelId &&
-    memberTags.length > 0 &&
-    memberTags.every((tag) => tag.length === 2 && HEX_64.test(tag[1])) &&
+    (kind === KIND_NIP29_GROUP_ADMINS || memberTags.length > 0) &&
+    memberTags.every((tag) => HEX_64.test(tag[1]) && (
+      kind === KIND_NIP29_GROUP_ADMINS
+        ? tag.length === 3 && ["owner", "admin"].includes(tag[2])
+        : tag.length === 2 || (tag.length === 4 && tag[2] === "" &&
+          ["owner", "admin", "member", "guest", "bot"].includes(tag[3]))
+    )) &&
     new Set(memberTags.map((tag) => tag[1])).size === memberTags.length;
   if (!validMembership) throw new Error("relay returned malformed current membership state");
   return {
-    member: memberTags.some((tag) => tag[1] === publisher),
+    members: memberTags,
     signerPubkey: event.pubkey,
   };
+}
+
+export async function queryCurrentChannelMembership(relay, privateKeyHex, channelId, timeoutMs) {
+  const roster = await queryChannelRoster(relay, privateKeyHex, channelId, timeoutMs, KIND_NIP29_GROUP_MEMBERS);
+  const publisher = publicKeyFromPrivate(privateKeyHex);
+  return {
+    member: roster.members.some((tag) => tag[1] === publisher),
+    signerPubkey: roster.signerPubkey,
+  };
+}
+
+// Return this identity's owner/admin role, or null when it is not in that roster.
+// A null role is not proof of membership; use queryCurrentChannelMembership.
+export async function queryCurrentChannelRole(relay, privateKeyHex, channelId, timeoutMs) {
+  const roster = await queryChannelRoster(relay, privateKeyHex, channelId, timeoutMs, KIND_NIP29_GROUP_ADMINS);
+  const publisher = publicKeyFromPrivate(privateKeyHex);
+  return {
+    role: roster.members.find((tag) => tag[1] === publisher)?.[2] ?? null,
+    signerPubkey: roster.signerPubkey,
+  };
+}
+
+// The caller durably stages replacementKey before invoking this, and retains the
+// outgoing key on every error. Reread relay state on retry rather than trusting
+// an OK or a local progress bit: Buzz stores admin events before applying their
+// side effects. Preserve owner/admin authority so the next rotation is possible.
+// verifyAuthority(signerPubkey) must synchronously throw on a missing/mismatched
+// durable pin. A missing grant is re-signed with a fresh nonce so a stored event
+// whose side effects failed cannot suppress the retry as a duplicate.
+// Resolves without a value only after replacement membership and role confirm;
+// otherwise rejects. The caller records the confirmed target before retiring keys.
+export async function transferChannelMembership(
+  relay, outgoingKey, replacementKey, channelId, timeoutMs, verifyAuthority,
+) {
+  const replacement = publicKeyFromPrivate(replacementKey);
+  const admins = await queryChannelRoster(relay, outgoingKey, channelId, timeoutMs, KIND_NIP29_GROUP_ADMINS);
+  verifyAuthority(admins.signerPubkey);
+  const role = admins.members.find((tag) => tag[1] === publicKeyFromPrivate(outgoingKey))?.[2];
+  if (!role) throw new Error("outgoing identity lacks owner/admin authority to transfer membership");
+  const members = await queryChannelRoster(relay, outgoingKey, channelId, timeoutMs, KIND_NIP29_GROUP_MEMBERS);
+  verifyAuthority(members.signerPubkey);
+  if (!members.members.some((tag) => tag[1] === replacement) ||
+      !admins.members.some((tag) => tag[1] === replacement && tag[2] === role)) {
+    const event = signEvent({
+      created_at: nowSeconds(),
+      kind: KIND_NIP29_ADD_USER,
+      tags: [["h", channelId], ["p", replacement], ["role", role],
+        ["nonce", randomBytes(16).toString("hex")]],
+      content: "",
+    }, outgoingKey);
+    const response = await withRelay(relay, outgoingKey, timeoutMs, async (api) => {
+      await api.authenticateIfChallenged();
+      return api.publish(event);
+    });
+    if (response.accepted !== true) {
+      throw new Error(`relay refused membership transfer: ${response.message}`);
+    }
+  }
+  // Authenticate as the new identity as well: its own readable, signed roster
+  // must confirm both membership and the preserved role before key retirement.
+  const confirmed = await queryCurrentChannelMembership(relay, replacementKey, channelId, timeoutMs);
+  verifyAuthority(confirmed.signerPubkey);
+  if (!confirmed.member) throw new Error("relay has not confirmed replacement membership");
+  const confirmedRole = await queryCurrentChannelRole(relay, replacementKey, channelId, timeoutMs);
+  verifyAuthority(confirmedRole.signerPubkey);
+  if (confirmedRole.role !== role) throw new Error("relay has not confirmed replacement channel role");
 }
 
 // --- relay response classification ------------------------------------------
