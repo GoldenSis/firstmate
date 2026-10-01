@@ -228,6 +228,7 @@ docker run -i --rm -v /var/run/docker.sock:/var/run/docker.sock docker:cli \
 
 The header of `bin/fm-buzz-lib.mjs` owns the signed-event identity and byte-preserving replay contract.
 The header and implementation of `bin/fm-buzz-publish.mjs` own active-cache and quarantine layout, write and recovery ordering, validation, pruning, accounting, notices, and cleanup.
+Publisher lock reclamation uses the shared [portable lock contract](../bin/fm-wake-lib.sh), with regression coverage linked in the [architecture development notes](architecture.md#development-notes).
 The header and implementation of `bin/fm-buzz-lib.mjs` own relay acknowledgement classification and the late-authentication state machine.
 
 ## Verification evidence

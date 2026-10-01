@@ -1060,6 +1060,29 @@ EOF
 
 # --- (e) the replay cache is capped ----------------------------------------
 
+
+test_publish_reclaims_stale_lock_and_guard() {
+  local home lock path owner dead output
+  home=$(make_home stale-publish-guard)
+  run_keypair "$home" >/dev/null 2>&1 || fail "stale-lock keypair setup failed"
+  lock="$home/state/.buzz-replay-publish.lock"
+  dead=999999
+  while kill -0 "$dead" 2>/dev/null; do dead=$((dead + 1)); done
+  for path in "$lock" "$lock.steal"; do
+    owner="$path.owner.stale"
+    mkdir "$owner"
+    printf '%s\n' "$dead" > "$owner/pid"
+    ln -s "$owner" "$path"
+  done
+  output=$(test_projection "stale-lock" | FM_BUZZ_LOCK_TIMEOUT_S=3 run_publish "$home" "ws://127.0.0.1:1" 2>&1)
+  assert_not_contains "$output" "timed out" "stale lock or guard blocked Buzz publication"
+  [ "$(replay_count "$home")" = 1 ] || fail "reclaimed publisher did not enqueue exactly one event"
+  for path in "$lock" "$lock.steal"; do
+    [ ! -e "$path" ] && [ ! -L "$path" ] || fail "publisher did not release the reclaimed lock"
+  done
+  pass "Buzz publication reclaims both stale owner links and releases them"
+}
+
 test_publish_lock_acquisition_is_validated_bounded_and_interruptible() {
   local home lock projection out_file result invalid code pid waited ready holder tools real_mktemp mktemp_log
   home=$(make_home bounded-publish-lock)
@@ -1624,6 +1647,7 @@ test_permanent_rejection_is_not_replayed_forever
 test_retryable_rejection_is_kept
 test_relay_rejection_diagnostics_escape_terminal_controls
 test_truthy_non_boolean_ok_is_not_accepted
+test_publish_reclaims_stale_lock_and_guard
 test_publish_lock_acquisition_is_validated_bounded_and_interruptible
 test_a_writer_that_never_closes_does_not_hang_the_publish
 test_invalid_stdin_timeouts_are_rejected_before_reading

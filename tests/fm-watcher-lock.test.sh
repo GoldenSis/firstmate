@@ -289,13 +289,15 @@ test_lock_live_steal_mutex_is_not_reclaimed() {
 }
 
 test_stale_guard_reclamation_cannot_remove_a_live_replacement() {
-  local dir state fakebin guard stale_owner live_owner dead live started release result worker real_mv waited
-  dir=$(make_case lock-stale-guard-race)
+  local dir state fakebin guard stale_owner live_owner dead live started release result worker real_mv waited second_owner nested
+  dir=$(make_case lock-stale-guard-restore-race)
   state="$dir/state"
   fakebin="$dir/fakebin"
   guard="$state/.contend.lock.steal"
   stale_owner="$state/.stale-guard-owner"
   live_owner="$state/.live-guard-owner"
+  second_owner="$state/.second-live-guard-owner"
+  nested="$second_owner/$(basename "$stale_owner").reclaimed-link"
   started="$dir/remove-started"
   release="$dir/remove-release"
   result="$dir/result"
@@ -308,7 +310,17 @@ test_stale_guard_reclamation_cannot_remove_a_live_replacement() {
 #!/usr/bin/env bash
 if [ ! -e "$started" ]; then
   : > "$started"
-  while [ ! -e "$release" ]; do sleep 0.01; done
+  retries=0
+  while [ ! -e "$release" ] && [ "\$retries" -lt 500 ]; do
+    sleep 0.01
+    retries=\$((retries + 1))
+  done
+  [ -e "$release" ] || exit 124
+else
+  # Model the next contender publishing after the restore absence check.
+  mkdir "$second_owner" || exit 125
+  cat "$live_owner/pid" > "$second_owner/pid"
+  ln -s "$second_owner" "$guard" || exit 126
 fi
 exec "$real_mv" "\$@"
 EOF
@@ -339,18 +351,369 @@ EOF
   printf '%s\n' "$live" > "$live_owner/pid"
   ln -s "$live_owner" "$guard"
   : > "$release"
-  wait "$worker" || true
+  wait_for_exit "$worker" 100
+  waited=$?
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  [ "$waited" -ne 124 ] || fail "stale guard restore worker timed out"
 
   [ "$(cat "$result")" = "rc=1" ] \
     || fail "a stale guard reclaimer acquired after its inspected owner changed"
   [ "$(readlink "$guard" 2>/dev/null || true)" = "$live_owner" ] \
-    || fail "a stale guard reclaimer removed the replacement guard"
+    || fail "a stale guard restore replaced the second live guard"
   [ "$(cat "$guard/pid" 2>/dev/null || true)" = "$live" ] \
     || fail "a stale guard reclaimer changed the replacement owner"
-  kill "$live" 2>/dev/null || true
-  wait "$live" 2>/dev/null || true
-  pass "stale guard reclamation removes only the inspected owner identity"
+  [ ! -L "$nested" ] || fail "stale guard restore moved its claim into the second live owner directory"
+  pass "stale guard restore never mutates the second live owner directory"
 }
+
+# Keep every synthetic scheduling gate bounded, including the command shim.
+lock_wait_for_file() {
+  local path=$1 attempts=0
+  while [ ! -e "$path" ] && [ "$attempts" -lt 400 ]; do
+    sleep 0.02
+    attempts=$((attempts + 1))
+  done
+  [ -e "$path" ]
+}
+
+test_interrupted_nested_publication_recovers() (
+  local kind dir state lockdir owner nested worker='' winner='' real_ln status
+  trap 'kill "${worker:-}" "${winner:-}" 2>/dev/null || true; wait "${worker:-}" 2>/dev/null || true; wait "${winner:-}" 2>/dev/null || true' EXIT
+  real_ln=$(command -v ln)
+  for kind in primary guard; do
+    dir=$(make_case "nested-publication-$kind")
+    state=$(cd "$dir/state" && pwd -P)
+    lockdir="$state/.contend.lock"
+    [ "$kind" != guard ] || lockdir="$lockdir.steal"
+    cat > "$dir/fakebin/ln" <<EOF
+#!/usr/bin/env bash
+: > "$dir/publishing"
+attempts=0
+while [ ! -e "$dir/publish-go" ] && [ "\$attempts" -lt 400 ]; do
+  sleep 0.02; attempts=\$((attempts + 1))
+done
+[ -e "$dir/publish-go" ] || exit 124
+"$real_ln" "\$@" || exit 125
+printf '%s\n' "\$2" > "$dir/nested-owner"
+kill -KILL "\$PUBLISH_PID"
+EOF
+    chmod +x "$dir/fakebin/ln"
+    FM_STATE_OVERRIDE="$state" PATH="$dir/fakebin:$PATH" bash -c '
+      . "$1"
+      export PUBLISH_PID=${BASHPID:-$$}
+      fm_lock_try_create "$2"
+    ' _ "$LIB" "$lockdir" &
+    worker=$!
+    lock_wait_for_file "$dir/publishing" || fail "$kind: contender did not reach publication"
+    FM_STATE_OVERRIDE="$state" bash -c '
+      . "$1"
+      fm_lock_try_acquire_guard "$2" || exit 1
+      : > "$3/winner-ready"
+      attempts=0
+      while [ "$attempts" -lt 500 ]; do
+        sleep 0.02; attempts=$((attempts + 1))
+      done
+      exit 124
+    ' _ "$LIB" "$lockdir" "$dir" &
+    winner=$!
+    lock_wait_for_file "$dir/winner-ready" || fail "$kind: winner did not acquire"
+    owner=$(readlink "$lockdir")
+    : > "$dir/publish-go"
+    wait_for_exit "$worker" 100 >/dev/null 2>&1
+    status=$?
+    [ "$status" -eq 137 ] || fail "$kind: interrupted publisher did not die (status $status)"
+    worker=
+    nested=$(cat "$dir/nested-owner")
+    [ "$(readlink "$owner/$(basename "$nested")")" = "$nested" ] || fail "$kind: no nested publication to recover"
+    kill -KILL "$winner"
+    wait "$winner" 2>/dev/null || true
+    winner=
+    FM_STATE_OVERRIDE="$state" bash -c '
+      . "$1"
+      if [ "$3" = guard ]; then fm_lock_try_acquire_guard "$2"; else fm_lock_try_acquire "$2"; fi || exit 1
+      [ "$FM_LOCK_OWNER_DIR" = "$4" ] || exit 2
+      [ "$(cat "$2/pid")" = "${BASHPID:-$$}" ] || exit 3
+      [ -s "$2/owner-token" ] && [ -s "$2/created" ] || exit 4
+      [ ! -L "$2/$(basename "$5")" ] || exit 5
+      fm_lock_release "$2"
+      [ ! -e "$2" ] && [ ! -L "$2" ]
+    ' _ "$LIB" "$lockdir" "$kind" "$owner" "$nested" || fail "$kind: nested publication permanently blocked recovery"
+  done
+  pass "interrupted nested publications allow primary and guard recovery"
+)
+
+test_absent_primary_with_stale_guard() (
+  local layout dir state lockdir guard owner dead
+  dead=$(dead_pid)
+  for layout in directory link; do
+    dir=$(make_case "absent-primary-$layout")
+    state="$dir/state"
+    lockdir="$state/.contend.lock"
+    guard="$lockdir.steal"
+    owner=$guard
+    if [ "$layout" = link ]; then
+      owner="$state/stale-guard-owner"
+      ln -s "$owner" "$guard"
+    fi
+    mkdir "$owner"
+    printf '%s\n' "$dead" > "$owner/pid"
+    FM_STATE_OVERRIDE="$state" bash -c '
+      . "$1"
+      fm_lock_try_acquire "$2" || exit 1
+      [ "$(cat "$2/pid")" = "${BASHPID:-$$}" ] || exit 2
+      fm_lock_points_to_owner "$2" "$FM_LOCK_OWNER_DIR" || exit 3
+      [ -s "$2/owner-token" ] && [ -s "$2/created" ] || exit 4
+      [ ! -e "$2.steal" ] && [ ! -L "$2.steal" ] || exit 5
+      fm_lock_release "$2"
+      [ ! -e "$2" ] && [ ! -L "$2" ]
+    ' _ "$LIB" "$lockdir" || fail "$layout: absent primary was not acquired in one attempt"
+  done
+  pass "absent primary is acquired in one attempt after stale guard recovery"
+)
+
+test_reclaim_preserves_unrecognized_leftovers() (
+  local kind dir state lockdir leftover dead
+  dead=$(dead_pid)
+  for kind in file wrong-target wrong-name; do
+    dir=$(make_case "unrecognized-leftover-$kind")
+    state=$(cd "$dir/state" && pwd -P)
+    lockdir="$state/.contend.lock.steal"
+    mkdir "$lockdir"
+    printf '%s\n' "$dead" > "$lockdir/pid"
+    leftover="$lockdir/$(basename "$lockdir").owner.abc123"
+    case "$kind" in
+      file) printf 'preserve\n' > "$leftover" ;;
+      wrong-target) ln -s "$state/unrelated" "$leftover" ;;
+      wrong-name) leftover="$lockdir/unrelated"; ln -s "$state/unrelated" "$leftover" ;;
+    esac
+    FM_STATE_OVERRIDE="$state" bash -c '
+      . "$1"
+      ! fm_lock_try_acquire_guard "$2"
+    ' _ "$LIB" "$lockdir" || fail "$kind: reclamation discarded an unrecognized entry"
+    case "$kind" in
+      file) [ "$(cat "$leftover")" = preserve ] || fail "reclamation changed an unrelated file" ;;
+      *) [ "$(readlink "$leftover")" = "$state/unrelated" ] || fail "$kind: reclamation changed an unrelated link" ;;
+    esac
+  done
+  pass "reclamation removes only validated lock-owned symlinks"
+)
+
+test_watcher_starts_with_absent_primary_and_stale_guard() (
+  local dir state guard dead pid=''
+  trap 'kill "${pid:-}" 2>/dev/null || true; wait "${pid:-}" 2>/dev/null || true' EXIT
+  dir=$(make_case watcher-absent-primary)
+  state="$dir/state"
+  guard="$state/.watch.lock.steal"
+  dead=$(dead_pid)
+  mark_pr_check_migration_complete "$state"
+  mkdir "$guard"
+  printf '%s\n' "$dead" > "$guard/pid"
+  PATH="$dir/fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=0.1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$dir/watch.out" &
+  pid=$!
+  lock_wait_for_file "$state/.last-watcher-beat" || fail "watcher exited instead of acquiring the absent primary"
+  is_live_non_zombie "$pid" || fail "watcher did not stay alive after stale guard recovery"
+  [ "$(cat "$state/.watch.lock/pid")" = "$pid" ] || fail "watcher did not own the recovered lock"
+  [ -s "$state/.watch.lock/pid-identity" ] || fail "watcher did not finish lock initialization"
+  [ ! -e "$guard" ] && [ ! -L "$guard" ] || fail "watcher left its recovery guard behind"
+  ! grep -q 'already running' "$dir/watch.out" || fail "watcher reported a nonexistent singleton"
+  pass "one-shot watcher startup recovers an absent primary with a stale guard"
+)
+
+test_atomic_reclaim_single_winner() (
+  local phase dir state lockdir owner dead a='' b='' i winner_identity real_rm real_mv stale_identity nested pinned_owner
+  trap 'kill "${a:-}" "${b:-}" 2>/dev/null || true; wait "${a:-}" 2>/dev/null || true; wait "${b:-}" 2>/dev/null || true' EXIT
+  real_rm=$(command -v rm)
+  real_mv=$(command -v mv)
+  for phase in rm mv; do
+    dir=$(make_case "atomic-reclaim-$phase")
+    state="$dir/state"
+    lockdir="$state/.contend.lock.steal"
+    ln -s "$state" "$dir/state-alias"
+    owner="$dir/state-alias/stale-owner"
+    dead=$(dead_pid)
+    mkdir "$owner"
+    pinned_owner=$(cd "$owner" && pwd -P)
+    printf '%s\n' "$dead" > "$owner/pid"
+    ln -s "$owner" "$lockdir"
+    nested="$(cd "$state" && pwd -P)/$(basename "$lockdir").owner.abc123"
+    ln -s "$nested" "$owner/$(basename "$nested")"
+    touch -h -t 200001010000 "$lockdir"
+    stale_identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_path_identity "$2"' _ "$LIB" "$owner")
+    for i in rm mv; do
+      cat > "$dir/fakebin/$i" <<EOF
+#!/usr/bin/env bash
+if [ "$i" = "$phase" ] && [ "\$(pwd -P)" = "$pinned_owner" ] && { [ "$i" = mv ] || [ "\${2:-}" = ./pid ]; }; then
+  : > "$dir/\$CONTENDER.ready"
+  attempts=0
+  while [ ! -e "$dir/\$CONTENDER.go" ] && [ "\$attempts" -lt 400 ]; do
+    sleep 0.02
+    attempts=\$((attempts + 1))
+  done
+  [ -e "$dir/\$CONTENDER.go" ] || exit 124
+fi
+exec "$([ "$i" = rm ] && printf '%s' "$real_rm" || printf '%s' "$real_mv")" "\$@"
+EOF
+      chmod +x "$dir/fakebin/$i"
+    done
+    for i in a b; do
+      CONTENDER="$i" FM_STATE_OVERRIDE="$state" FM_LOCK_STALE_AFTER=0 PATH="$dir/fakebin:$PATH" bash -c '
+        . "$1"
+        eval "$(declare -f fm_lock_recheck_stale_owner | sed "1s/fm_lock_recheck_stale_owner/original_recheck/")"
+        fm_lock_recheck_stale_owner() {
+          original_recheck "$@" || return 1
+          [ "$1" != . ] || fm_path_identity . > "$checked"
+        }
+        checked="$3/$CONTENDER.checked"
+        if fm_lock_try_acquire_guard "$2"; then
+          fm_lock_points_to_owner "$2" "$FM_LOCK_OWNER_DIR" || exit 2
+          result=won
+        else
+          result=lost
+        fi
+        printf "%s\n" "$result" > "$3/$CONTENDER.result"
+        attempts=0
+        while [ ! -e "$3/finish" ] && [ "$attempts" -lt 500 ]; do
+          sleep 0.02; attempts=$((attempts + 1))
+        done
+        [ -e "$3/finish" ] || exit 124
+        [ "$result" != won ] || fm_lock_release "$2"
+      ' _ "$LIB" "$lockdir" "$dir" &
+      if [ "$i" = a ]; then a=$!; else b=$!; fi
+      lock_wait_for_file "$dir/$i.ready" || fail "$phase: contender $i missed scheduling gate"
+      [ "$(cat "$dir/$i.checked" 2>/dev/null)" = "$stale_identity" ] \
+        || fail "$phase: contender $i did not pass the check in the stale directory"
+    done
+    [ ! -e "$dir/a.result" ] && [ ! -e "$dir/b.result" ] || fail "$phase: a contender published before both checks"
+    : > "$dir/a.go"
+    lock_wait_for_file "$dir/a.result" || fail "$phase: first contender never returned"
+    [ "$(cat "$dir/a.result")" = won ] || fail "$phase: first contender did not win"
+    winner_identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_path_identity "$2"' _ "$LIB" "$owner")
+    ln -s "$nested" "$owner/$(basename "$nested")"
+    : > "$dir/b.go"
+    lock_wait_for_file "$dir/b.result" || fail "$phase: losing contender never returned"
+    [ "$(cat "$dir/b.result")" = lost ] || fail "$phase: two contenders acquired one stale lock"
+    [ "$(cat "$lockdir/pid")" = "$a" ] || fail "$phase: loser removed the winner PID"
+    [ -s "$lockdir/owner-token" ] && [ -s "$lockdir/created" ] || fail "$phase: winner metadata was removed"
+    [ "$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_path_identity "$2"' _ "$LIB" "$owner")" = "$winner_identity" ] \
+      || fail "$phase: loser renamed or replaced the winning directory"
+    [ "$(readlink "$lockdir")" = "$owner" ] || fail "$phase: owner link changed"
+    [ "$(readlink "$owner/$(basename "$nested")")" = "$nested" ] || fail "$phase: loser cleaned a replacement owner link"
+    rm -f "$owner/$(basename "$nested")"
+    : > "$dir/finish"
+    wait "$a" || fail "$phase: winner did not release"
+    wait "$b" || fail "$phase: loser failed"
+    a='' b=''
+    [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ] || fail "$phase: release left the lock behind"
+  done
+  pass "atomic reclamation rejects delayed cleanup and rename contenders without touching the winner"
+)
+
+
+test_legacy_release_cannot_clean_a_replacement() (
+  local dir state lockdir dead a='' b='' real_rm
+  trap 'kill "${a:-}" "${b:-}" 2>/dev/null || true; wait "${a:-}" 2>/dev/null || true; wait "${b:-}" 2>/dev/null || true' EXIT
+  dir=$(make_case legacy-release-race)
+  state="$dir/state"
+  lockdir="$(cd "$state" && pwd -P)/.contend.lock"
+  dead=$(dead_pid)
+  real_rm=$(command -v rm)
+  mkdir "$lockdir"
+  printf '%s\n' "$dead" > "$lockdir/pid"
+  cat > "$dir/fakebin/rm" <<EOF
+#!/usr/bin/env bash
+if [ "\${FM_TEST_RELEASING:-}" = 1 ] && { [ "\$PWD" = "$lockdir" ] || [ "\${2:-}" = "$lockdir/pid" ]; }; then
+  "$real_rm" -f "$lockdir/pid"
+  touch -t 200001010000 "$lockdir"
+  : > "$dir/releasing"
+  attempts=0
+  while [ ! -e "$dir/release-go" ] && [ "\$attempts" -lt 400 ]; do
+    sleep 0.02; attempts=\$((attempts + 1))
+  done
+  [ -e "$dir/release-go" ] || exit 124
+fi
+exec "$real_rm" "\$@"
+EOF
+  chmod +x "$dir/fakebin/rm"
+  FM_STATE_OVERRIDE="$state" PATH="$dir/fakebin:$PATH" bash -c '
+    . "$1"
+    fm_lock_try_acquire_guard "$2" || exit 1
+    export FM_TEST_RELEASING=1
+    fm_lock_release "$2"
+  ' _ "$LIB" "$lockdir" &
+  a=$!
+  lock_wait_for_file "$dir/releasing" || fail "legacy owner never reached release gate"
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire_guard "$2" || exit 1
+    : > "$3/acquired"
+    attempts=0
+    while [ ! -e "$3/finish" ] && [ "$attempts" -lt 400 ]; do
+      sleep 0.02; attempts=$((attempts + 1))
+    done
+    [ -e "$3/finish" ] || exit 124
+    fm_lock_release "$2"
+  ' _ "$LIB" "$lockdir" "$dir" &
+  b=$!
+  lock_wait_for_file "$dir/acquired" || fail "successor could not reclaim the incomplete release"
+  : > "$dir/release-go"
+  wait_for_exit "$a" 100 || fail "legacy release failed to finish"
+  a=
+  [ "$(cat "$lockdir/pid")" = "$b" ] || fail "old release removed the successor PID"
+  [ -s "$lockdir/owner-token" ] && [ -s "$lockdir/created" ] \
+    || fail "old release cleaned the successor metadata"
+  : > "$dir/finish"
+  wait "$b" || fail "successor could not release"
+  b=
+  pass "delayed legacy release cleans only its pinned directory"
+)
+
+test_reclaim_crash_before_rename_recovers() (
+  local dir state lockdir owner worker='' dead i status
+  trap 'kill "${worker:-}" 2>/dev/null || true; wait "${worker:-}" 2>/dev/null || true' EXIT
+  dir=$(make_case reclaim-crash)
+  state="$dir/state"
+  lockdir="$state/.contend.lock.steal"
+  owner="$state/stale-owner"
+  dead=$(dead_pid)
+  mkdir "$owner"
+  printf '%s\n' "$dead" > "$owner/pid"
+  ln -s "$owner" "$lockdir"
+  cat > "$dir/fakebin/mv" <<EOF
+#!/usr/bin/env bash
+[ -s "\$1/pid" ] && [ -s "\$1/owner-token" ] && [ -s "\$1/created" ] || exit 125
+: > "$dir/prepared"
+kill -KILL "\$RECLAIM_PID"
+exit 1
+EOF
+  chmod +x "$dir/fakebin/mv"
+  # Kill the actual acquirer after preparation and cleanup, before rename.
+  FM_STATE_OVERRIDE="$state" PATH="$dir/fakebin:$PATH" bash -c '
+    . "$1"
+    export RECLAIM_PID=${BASHPID:-$$}
+    fm_lock_try_acquire_guard "$2"
+  ' _ "$LIB" "$lockdir" &
+  worker=$!
+  lock_wait_for_file "$dir/prepared" || fail "crashing contender never prepared its replacement"
+  wait_for_exit "$worker" 100 >/dev/null 2>&1
+  status=$?
+  [ "$status" -eq 137 ] || fail "prepared acquirer did not exit through SIGKILL (status $status)"
+  worker=
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    attempts=0
+    while ! fm_lock_try_acquire_guard "$2" && [ "$attempts" -lt 50 ]; do
+      sleep 0.1; attempts=$((attempts + 1))
+    done
+    [ "$attempts" -lt 50 ] || exit 1
+    [ -s "$2/owner-token" ] && [ -s "$2/created" ] || exit 2
+    fm_lock_release "$2"
+  ' _ "$LIB" "$lockdir" || fail "crash before rename blocked recovery past the stale window"
+  for i in "$state"/.fm-lock-prepare.*; do
+    [ ! -d "$i" ] || rm -rf "$i"
+  done
+  pass "crash before atomic rename leaves no permanent half-lock"
+)
 
 test_lock_does_not_steal_live_lock() {
   local dir state lockdir live out lockpid
@@ -361,7 +724,8 @@ test_lock_does_not_steal_live_lock() {
   live=$!
   mkdir "$lockdir"
   printf '%s\n' "$live" > "$lockdir/pid"
-  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+  touch -t 200001010000 "$lockdir"
+  out=$(FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
     if fm_lock_try_acquire "$2"; then rc=0; else rc=1; fi
     printf "rc=%s held=%s\n" "$rc" "${FM_LOCK_HELD_PID:-}"
@@ -409,14 +773,15 @@ test_lock_late_claim_loses_after_recreate() {
   out=$(FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
     owner1=$(fm_lock_owner_dir "$2") || exit 20
+    identity1=$(fm_path_identity "$owner1") || exit 20
     ln -s "$owner1" "$2" || exit 21
     touch -h -t 200001010000 "$2" 2>/dev/null || sleep 2
     if ! fm_lock_try_acquire "$2"; then exit 22; fi
     before=$(cat "$2/pid" 2>/dev/null || true)
     if fm_lock_claim "$2" "$owner1"; then late=won; else late=lost; fi
     after=$(cat "$2/pid" 2>/dev/null || true)
-    current_owner=$(readlink "$2" 2>/dev/null || true)
-    printf "late=%s before=%s after=%s owner_changed=%s\n" "$late" "$before" "$after" "$([ "$current_owner" != "$owner1" ] && echo yes || echo no)"
+    current_owner=$(fm_path_identity "$owner1" 2>/dev/null || true)
+    printf "late=%s before=%s after=%s owner_changed=%s\n" "$late" "$before" "$after" "$([ "$current_owner" != "$identity1" ] && echo yes || echo no)"
   ' _ "$LIB" "$lockdir")
   case "$out" in
     *"late=lost"*) ;;
@@ -441,6 +806,7 @@ test_lock_paused_mid_acquire_claim_fails_during_steal() {
   out=$(FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
     owner=$(fm_lock_owner_dir "$2") || exit 20
+    fm_lock_prepare_owner "$owner" || exit 20
     ln -s "$owner" "$2" || exit 21
     fm_lock_try_acquire "$2.steal" || exit 22
     steal_owner=${FM_LOCK_OWNER_DIR:-}
@@ -813,6 +1179,13 @@ test_lock_steals_dead_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency
 test_lock_live_steal_mutex_is_not_reclaimed
 test_stale_guard_reclamation_cannot_remove_a_live_replacement
+test_interrupted_nested_publication_recovers || exit 1
+test_absent_primary_with_stale_guard || exit 1
+test_reclaim_preserves_unrecognized_leftovers || exit 1
+test_watcher_starts_with_absent_primary_and_stale_guard || exit 1
+test_atomic_reclaim_single_winner || exit 1
+test_legacy_release_cannot_clean_a_replacement || exit 1
+test_reclaim_crash_before_rename_recovers || exit 1
 test_lock_does_not_steal_live_lock
 test_lock_empty_pid_uses_minimum_grace
 test_lock_late_claim_loses_after_recreate
