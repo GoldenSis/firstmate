@@ -262,6 +262,7 @@ An absent or incompatible `tasks-axi` reports `MISSING: tasks-axi (install: npm 
 An absent `quota-axi` reports `MISSING: quota-axi (install: npm install -g quota-axi)`; `bin/fm-dispatch-select.sh` still degrades to the first profile at runtime when quota data is unavailable.
 Bootstrap also reports a `TANGLE:` line when `FM_ROOT` is on a named non-default branch; follow the printed checkout remediation rather than treating it as an installable tool problem.
 In a read-only session that did not get the fleet lock, the same line is advisory and omits the checkout command.
+For explicit public-source capability diagnostics and scout evidence receipts, [`bin/fm-source-health.mjs`](../bin/fm-source-health.mjs) owns the record contract, fixed probes, and invocation help; it is not run automatically at startup.
 The locked session-start bootstrap step also runs a best-effort project clone refresh through `fm-fleet-sync.sh`.
 It emits `FLEET_SYNC:` for skipped refreshes that may matter, recovered self-heals, and `STUCK:` alarms.
 Normal completed runs keep local-only and no-origin skips silent.
