@@ -168,6 +168,16 @@ fm_lock_remove_stray_owner_link() {
   fi
 }
 
+fm_lock_clean_stray_owner_links() {
+  local lockdir=$1 stray ownerdir
+  for stray in "./$(basename "$lockdir").owner."??????; do
+    [ -L "$stray" ] || continue
+    ownerdir="$(dirname "$lockdir")/${stray#./}"
+    [ "$(readlink "$stray" 2>/dev/null || true)" = "$ownerdir" ] || continue
+    rm -f "$stray" 2>/dev/null || true
+  done
+}
+
 fm_lock_claim_blocked_by_steal() {
   local lockdir=$1 allowed_steal_owner=${2:-} steal
   steal="$lockdir.steal"
@@ -290,6 +300,7 @@ fm_lock_reclaim_stale_owner() {
     cd "$target" 2>/dev/null || exit 1
     fm_lock_recheck_stale_owner . "" "$expected_pid" "$lockdir" || exit 1
     fm_lock_clean_known_files .
+    fm_lock_clean_stray_owner_links "$lockdir"
     mv "$candidate" "$parent/" 2>/dev/null
   ); then
     if { [ -n "$expected_owner" ] && fm_lock_points_to_owner "$lockdir" "$expected_owner"; } \
@@ -399,7 +410,8 @@ fm_lock_try_acquire() {
   fi
 
   rc=1
-  if fm_lock_reclaim_stale_owner "$lockdir" "$primary_owner" "$cur"; then
+  if fm_lock_try_create "$lockdir" "$steal_owner" \
+    || fm_lock_reclaim_stale_owner "$lockdir" "$primary_owner" "$cur"; then
     rc=0
   fi
   if [ "$rc" -ne 0 ]; then
