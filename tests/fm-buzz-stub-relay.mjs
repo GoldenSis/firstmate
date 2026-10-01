@@ -31,10 +31,12 @@
 //                                          [--ambiguous-membership]
 //                                          [--empty-membership]
 //                                          [--membership-private-key HEX]
+//                                          [--enforce-membership] [--transfer-fault-file PATH]
 // Prints "listening <port>" on stdout once ready, so a caller can use port 0 and
 // learn the ephemeral port.
 
 import { createServer } from "node:http";
+import { readFileSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import {
   computeEventId,
@@ -91,6 +93,8 @@ let refuseReq = null;
 let malformMembership = false;
 let ambiguousMembership = false;
 let emptyMembership = false;
+let enforceMembership = false;
+let transferFaultFile = "";
 let relayPrivateKey = "3".padStart(64, "0");
 for (let i = 0; i < argv.length; i += 1) {
   if (argv[i] === "--port") port = Number(argv[++i]);
@@ -108,6 +112,8 @@ for (let i = 0; i < argv.length; i += 1) {
   else if (argv[i] === "--malform-membership") malformMembership = true;
   else if (argv[i] === "--ambiguous-membership") ambiguousMembership = true;
   else if (argv[i] === "--empty-membership") emptyMembership = true;
+  else if (argv[i] === "--enforce-membership") { enforceMembership = true; challenge = true; }
+  else if (argv[i] === "--transfer-fault-file") transferFaultFile = argv[++i];
   else if (argv[i] === "--membership-private-key") relayPrivateKey = argv[++i] ?? "";
 }
 if (!/^[0-9a-f]{64}$/.test(relayPrivateKey)) {
@@ -118,6 +124,8 @@ if (!/^[0-9a-f]{64}$/.test(relayPrivateKey)) {
 // `ON CONFLICT DO NOTHING` semantics - a second insert of a known id is a no-op.
 const store = new Map();
 const channelMembers = new Map();
+const channelRoles = new Map();
+const KIND_NIP29_GROUP_ADMINS = 39001;
 const KIND_NIP29_ADD_USER = 9000;
 const KIND_NIP29_CREATE_GROUP = 9007;
 const KIND_NIP29_GROUP_MEMBERS = 39002;
@@ -130,7 +138,9 @@ function applyMembershipEvent(event) {
   const channel = eventTag(event, "h");
   if (!channel) return;
   if (event.kind === KIND_NIP29_CREATE_GROUP) {
+    if (channelMembers.has(channel)) return;
     channelMembers.set(channel, new Set([event.pubkey]));
+    channelRoles.set(channel, new Map([[event.pubkey, "owner"]]));
     return;
   }
   if (event.kind === KIND_NIP29_ADD_USER) {
@@ -138,22 +148,30 @@ function applyMembershipEvent(event) {
     if (!member) return;
     const members = channelMembers.get(channel) ?? new Set();
     members.add(member);
+    const roles = channelRoles.get(channel) ?? new Map();
+    roles.set(member, eventTag(event, "role") ?? roles.get(member) ?? "member");
+    channelRoles.set(channel, roles);
     channelMembers.set(channel, members);
   }
 }
 
 function currentMembershipEvents(filter) {
-  if (!Array.isArray(filter.kinds) || !filter.kinds.includes(KIND_NIP29_GROUP_MEMBERS)) return [];
+  const kind = filter.kinds?.find((value) => [KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_ADMINS].includes(value));
+  if (!kind) return [];
   const channels = Array.isArray(filter["#d"]) ? filter["#d"] : [];
   return channels.flatMap((channel) => {
     const members = channelMembers.get(channel);
     if (!members) return [];
     const event = signEvent({
       created_at: nowSeconds(),
-      kind: KIND_NIP29_GROUP_MEMBERS,
+      kind,
       tags: [
         ["d", channel],
-        ...(emptyMembership ? [] : [...members].sort().map((member) => ["p", member])),
+        ...(emptyMembership ? [] : [...members].sort().flatMap((member) => {
+          const role = channelRoles.get(channel)?.get(member) ?? "member";
+          if (kind === KIND_NIP29_GROUP_ADMINS) return ["owner", "admin"].includes(role) ? [["p", member, role]] : [];
+          return [enforceMembership ? ["p", member, "", role] : ["p", member]];
+        })),
       ],
       content: "",
     }, relayPrivateKey);
@@ -161,7 +179,7 @@ function currentMembershipEvents(filter) {
     if (ambiguousMembership) {
       return [event, signEvent({
         created_at: event.created_at + 1,
-        kind: KIND_NIP29_GROUP_MEMBERS,
+        kind,
         tags: event.tags,
         content: "",
       }, relayPrivateKey)];
@@ -268,6 +286,7 @@ server.on("upgrade", (req, socket) => {
   const challengeString = "0".repeat(64);
   let challengeIssued = false;
   let authenticated = false;
+  let authenticatedPubkey = null;
   if (challenge) {
     const issue = () => {
       challengeIssued = true;
@@ -309,7 +328,7 @@ server.on("upgrade", (req, socket) => {
           carries &&
           computeEventId(event) === event.id &&
           schnorrVerify(event.id, event.pubkey, event.sig);
-        if (valid) authenticated = true;
+        if (valid) { authenticated = true; authenticatedPubkey = event.pubkey; }
         send(["OK", event.id, valid, valid ? "" : "error: bad auth response"]);
         continue;
       }
@@ -343,6 +362,35 @@ server.on("upgrade", (req, socket) => {
           send(["OK", event.id, false, "invalid: bad signature"]);
           continue;
         }
+        const channel = eventTag(event, "h");
+        if (enforceMembership && event.kind === KIND_NIP29_CREATE_GROUP && channelMembers.has(channel)) {
+          send(["OK", event.id, false, "duplicate: channel already exists"]);
+          continue;
+        }
+        if (enforceMembership && (event.pubkey !== authenticatedPubkey ||
+          (event.kind === KIND_NIP29_ADD_USER && !["owner", "admin"].includes(channelRoles.get(channel)?.get(event.pubkey))) ||
+          (event.kind === 9 && !channelMembers.get(channel)?.has(event.pubkey)))) {
+          send(["OK", event.id, false, "restricted: actor not authorized"]);
+          continue;
+        }
+        const fault = transferFaultFile && existsSync(transferFaultFile)
+          ? JSON.parse(readFileSync(transferFaultFile, "utf8")) : {};
+        if (event.kind === KIND_NIP29_ADD_USER && fault.channel === channel) {
+          if (fault.action === "reject") {
+            send(["OK", event.id, false, "error: injected membership failure"]);
+            continue;
+          }
+          if (fault.action === "ack-only") {
+            send(["OK", event.id, true, ""]);
+            continue;
+          }
+          if (fault.action === "drop-after-add") {
+            store.set(event.id, event);
+            applyMembershipEvent(event);
+            socket.destroy();
+            return;
+          }
+        }
         if (store.has(event.id)) {
           if (duplicateRefused) {
             send(["OK", event.id, truthyOk ? "false" : false, "duplicate: event already stored"]);
@@ -358,6 +406,11 @@ server.on("upgrade", (req, socket) => {
           // CLOSED and deliberately no EOSE, matching a relay that rejects the
           // subscription outright rather than serving an empty result set.
           send(["CLOSED", subId, refuseReq]);
+          continue;
+        }
+        const requestedChannels = filter["#d"] ?? filter["#h"] ?? [];
+        if (enforceMembership && requestedChannels.some((id) => !channelMembers.get(id)?.has(authenticatedPubkey))) {
+          send(["CLOSED", subId, "restricted: not a channel member"]);
           continue;
         }
         const found = [...store.values(), ...currentMembershipEvents(filter)]

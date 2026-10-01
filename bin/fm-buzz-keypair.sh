@@ -36,8 +36,15 @@
 # adapter's. It clears BOTH private stores - the keychain entry and the 0600
 # fallback file - while preserving data/buzz-keypair.public as recovery evidence
 # until the fresh private key is stored and that public record is atomically
-# replaced. Before mutation it refuses identities whose tracked private-channel
-# memberships would be stranded because M1 has no membership-transfer operation.
+# replaced. Ordinary rotation first adds the staged identity to every tracked
+# private channel using the outgoing owner/admin, preserving its role with a
+# NIP-29 kind-9000 event. Signed kind-39002 membership and kind-39001 role state
+# must confirm the replacement through its own authenticated connection before
+# any outgoing key is cleared. Each confirmed replacement target is recorded for
+# future rotations. Retries reuse the staged key and recheck relay state, so a
+# partial transfer never retires the still-usable outgoing key.
+# Compromised rotation never authorizes membership changes with the outgoing
+# key, and ordinary rotation refuses members lacking owner/admin authority.
 # bin/fm-buzz-lib.mjs owns authoritative membership queries, and
 # bin/fm-buzz-targets.mjs owns tracked targets and relay-authority trust records.
 # Relay-supplied membership diagnostics render C0 and C1 terminal controls as
@@ -340,7 +347,7 @@ publisher_is_current_channel_member() {  # <keychain|file> <relay> <channel> <ti
       try {
         const buzz = await import(process.argv[1]);
         escapeTerminalControls = buzz.escapeTerminalControls;
-        const { queryCurrentChannelMembership } = buzz;
+        const { queryCurrentChannelMembership, queryCurrentChannelRole } = buzz;
         const { verifyOrRecordRelayAuthority } = await import(process.argv[2]);
         const privateKey = input.trim();
         if (!privateKey) throw new Error("stored publishing key is empty");
@@ -355,14 +362,24 @@ publisher_is_current_channel_member() {  # <keychain|file> <relay> <channel> <ti
           channel_id: process.argv[4],
           signer_pubkey: membership.signerPubkey,
         }, { strict: process.argv[7] === "1" });
-        process.stdout.write(membership.member ? "member\n" : "absent\n");
+        let result = membership.member ? "member" : "absent";
+        if (membership.member && process.argv[8] === "0") {
+          const authority = await queryCurrentChannelRole(
+            process.argv[3], privateKey, process.argv[4], Number(process.argv[5]),
+          );
+          verifyOrRecordRelayAuthority(process.argv[6], {
+            relay: process.argv[3], channel_id: process.argv[4], signer_pubkey: authority.signerPubkey,
+          }, { strict: true });
+          result = authority.role ?? "member";
+        }
+        process.stdout.write(result + "\n");
       } catch (error) {
         process.stderr.write(escapeTerminalControls(error.message) + "\n");
         process.exitCode = 1;
       }
     });
   ' "$SCRIPT_DIR/fm-buzz-lib.mjs" "$SCRIPT_DIR/fm-buzz-targets.mjs" \
-    "$relay" "$channel" "$timeout_ms" "$AUTHORITIES_FILE" "$STRICT_RELAY_AUTHORITY"
+    "$relay" "$channel" "$timeout_ms" "$AUTHORITIES_FILE" "$STRICT_RELAY_AUTHORITY" "$COMPROMISED"
 }
 
 check_rotation_target_membership() {  # <keychain|file> <public-key> <target-hex> <relay> <channel>
@@ -381,6 +398,11 @@ check_rotation_target_membership() {  # <keychain|file> <public-key> <target-hex
 }fm-buzz-keypair.sh: could not verify current membership for target $target_hex, relay $relay, channel $channel: $FM_BUZZ_CAPTURED_DIAGNOSTIC; nothing was rotated"
     rotation_membership_error_targets="${rotation_membership_error_targets:+$rotation_membership_error_targets
 }$target_hex"$'\t'"$relay"$'\t'"$channel"
+    return 0
+  fi
+  if [ "$check" = owner ] || [ "$check" = admin ]; then
+    rotation_membership_transfers="${rotation_membership_transfers:+$rotation_membership_transfers
+}$store"$'\t'"$target_hex"$'\t'"$relay"$'\t'"$channel"
     return 0
   fi
   [ "$check" = "member" ] || return 0
@@ -411,7 +433,13 @@ EOF
   done <<EOF
 $rotation_targets
 EOF
-  printf '%s\n' 'Rotating publisher identity for an existing private channel would strand membership; membership-transfer is not implemented in M1. To rotate, either publish membership transfer first (planned for M2) or destroy and recreate the channel with the new identity.' >&2
+  if [ -n "$rotation_membership_blockers" ]; then
+    if [ "$COMPROMISED" -eq 1 ]; then
+      printf '%s\n' 'Compromised rotation refuses membership transfer: the outgoing key is not trusted to authorize membership changes.' >&2
+    else
+      printf '%s\n' 'The outgoing identity lacks owner/admin authority to transfer membership on the channels listed above.' >&2
+    fi
+  fi
   printf '%s\n' 'If these relays or channels are truly retired, run this full recovery sequence:' >&2
   printf '%s\n' '  docker compose -f docker-compose.buzz-loopback.yml down -v' >&2
   while IFS= read -r target_hex; do
@@ -439,6 +467,50 @@ check_rotation_targets_for_store() {  # <keychain|file> <public-key>
       "$store" "$public" "$target_hex" "$target_relay" "$target_channel"
   done <<EOF
 $rotation_targets
+EOF
+}
+
+transfer_rotation_memberships() {
+  local store target_hex relay channel private
+  while IFS=$'\t' read -r store target_hex relay channel; do
+    [ -n "$store" ] || continue
+    case $store in
+      keychain) private=$(fm_buzz_key_load_keychain "$FM_HOME") || return 1 ;;
+      file) private=$(fm_buzz_key_load_file "$FM_HOME") || return 1 ;;
+      *) return 1 ;;
+    esac
+    # Both keys travel only over stdin, never argv or diagnostics.
+    # shellcheck disable=SC2016
+    printf '%s\n%s\n' "$private" "$ROTATION_STAGE_PRIVATE" | node -e '
+      let input = "";
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", (chunk) => { input += chunk; });
+      process.stdin.on("end", async () => {
+        const { transferChannelMembership, escapeTerminalControls } = await import(process.argv[1]);
+        try {
+          const { verifyOrRecordRelayAuthority, recordPublisherTarget } = await import(process.argv[2]);
+          const [outgoing, replacement] = input.trim().split("\n");
+          const [relay, channel, timeout, authorities, targets, publisher] = process.argv.slice(3);
+          await transferChannelMembership(relay, outgoing, replacement, channel, Number(timeout),
+            (signer) => verifyOrRecordRelayAuthority(authorities, {
+              relay, channel_id: channel, signer_pubkey: signer,
+            }, { strict: true }));
+          recordPublisherTarget(targets, { relay, channel_id: channel, publisher_pubkey: publisher });
+        } catch (error) {
+          process.stderr.write(escapeTerminalControls(error.message) + "\n");
+          process.exitCode = 1;
+        }
+      });
+    ' "$SCRIPT_DIR/fm-buzz-lib.mjs" "$SCRIPT_DIR/fm-buzz-targets.mjs" \
+      "$relay" "$channel" "$rotation_timeout" "$AUTHORITIES_FILE" "$TARGETS_FILE" "$ROTATION_STAGE_PUBLIC" || {
+        private=""
+        printf 'fm-buzz-keypair.sh: membership transfer incomplete for target %s, relay %s, channel %s; outgoing key and staged replacement retained; retry with --rotate\n' \
+          "$target_hex" "$relay" "$channel" >&2
+        return 1
+      }
+    private=""
+  done <<EOF
+$rotation_membership_transfers
 EOF
 }
 
@@ -888,6 +960,7 @@ run_rotate_operation() {
   rotation_membership_errors=""
   rotation_membership_error_targets=""
   rotation_membership_blockers=""
+  rotation_membership_transfers=""
   if [ -n "$keychain_public" ]; then
     check_rotation_targets_for_store keychain "$keychain_public"
   fi
@@ -952,6 +1025,10 @@ EOF
       exit 1
     fi
   done
+
+  if [ "$COMPROMISED" -eq 0 ]; then
+    transfer_rotation_memberships || exit 1
+  fi
 
   unverifiable_pairs=""
   unverifiable_publics=()

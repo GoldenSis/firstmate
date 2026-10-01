@@ -281,7 +281,8 @@ The relay stack is disposable by design, while durable adapter target records su
 ## Out of scope
 
 Per-task lanes shipped; see [Per-crew lanes](#per-crew-lanes) above.
-Artifact delivery and channel membership management are still Milestone 2.
+Routine identity rotation now transfers private-channel membership; `bin/fm-buzz-keypair.sh --help` owns the authorization and recovery procedure.
+Artifact delivery and other channel membership management remain Milestone 2.
 NIP-OA signed approval provenance is Milestone 3.
 Reading state back from Buzz, canvases, Buzz workflows, and any hosted account are out of scope permanently, or until the study that ruled them out is re-opened.
 
