@@ -25,19 +25,19 @@ The goal is a session that is safe to reset or destroy because everything durabl
 
 2. **Route each finding using AGENTS.md's knowledge-routing rule.**
    [`AGENTS.md` section 6](../../../AGENTS.md#6-project-and-knowledge-management) is the single source of truth for knowledge routing and reusable-procedure proposals.
-   Apply those rules before filing each finding.
+   For factual records, follow the history contract in that section before filing each finding.
 
 3. **Write within firstmate's existing write boundaries.**
    This skill does not grant any new write permission; it only prompts firstmate to use the boundaries that already exist (AGENTS.md section 1):
    - Captain preferences and fleet-local operational facts: hand-write directly to the destination selected by AGENTS.md's knowledge-routing rule, using inspect-then-update every time.
-     Before writing, inspect the destination, find the existing bullet or section the finding duplicates or supersedes, and rewrite it in place rather than adding a new trailing entry.
-     `data/learnings.md` may not exist yet; create it on first local learning, in the same dated, evidence-backed, curated style as the captain-preference files.
+     Before writing, inspect the destination and find the existing bullet or section the finding belongs to.
+     `data/learnings.md` may not exist yet; create it on first local learning.
    - Project-intrinsic knowledge: never hand-write a project's `AGENTS.md`.
      Route it through a normal ship task so a crewmate records it via `bin/fm-ensure-agents-md.sh` and commits it through that project's delivery pipeline, exactly as section 6 describes.
      If the fleet is live, delegate this to a crewmate rather than doing it inline.
    - Knowledge generalizable to every firstmate user: this repo's own `AGENTS.md` (or other shared, tracked material), shipped through the normal branch -> no-mistakes -> PR -> captain-merge pipeline for this repo (section 1), never hand-committed straight to `main`.
    - Task-scoped notes: inspect the relevant backlog item with `tasks-axi show <id> --full`, judge whether the new note is new, duplicate, superseding, or obsolete, then write a considered replacement body with `tasks-axi update <id> --body-file <path>`.
-     When the replacement intentionally supersedes prior state that should remain recoverable, add `--archive-body` to that update command so the prior body stays recoverable without copying it into the replacement.
+     When the replacement intentionally supersedes prior state that should remain recoverable, add `--archive-body` to that update command so the prior body stays recoverable.
      Never append.
      If hand-editing `data/backlog.md` per the active backend, make the same inspect-then-update edit in place.
    - Undone next steps: file each as a queued backlog item (section 10), with `blocked-by` recorded if it genuinely depends on something else.
@@ -46,9 +46,9 @@ The goal is a session that is safe to reset or destroy because everything durabl
    Every write starts by reading the current destination and deciding how the finding changes what is already there.
    Use this checklist before writing:
    - Which existing bullet, section, or task body does this supersede?
-   - Can this be a one-sentence rewrite instead of a new entry?
+   - Can this update stay within the existing entry?
    - Should an older bullet or note be deleted, retired, or archived because it is now obsolete?
-   When a finding overlaps or supersedes something already on disk, rewrite or prune the existing entry instead of piling on a new one.
+   When a finding overlaps something already on disk, curate the matching entry instead of piling on a new trailing entry.
    Graduation moves are limited to exactly three: promote a learning to the shared `AGENTS.md` via PR, fold it into the captain-preference destination selected by AGENTS.md, or delete a stale entry.
    Do not invent other graduation paths.
 

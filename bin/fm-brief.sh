@@ -353,6 +353,7 @@ Keep all findings and decisions in the durable report; prototype artifact retent
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
 The report must stand alone: what you did, what you found, the evidence (commands run, output, file:line references), and what you recommend.
+Follow the durable factual-record contract in \`$FM_ROOT/AGENTS.md\` section 6.
 $PROTOTYPE_DOD
 Before reporting done, read and follow \`$FM_ROOT/.agents/skills/decision-hold-lifecycle/SKILL.md\` and pass its shared completion gate for the report and any visual review.
 When the report is complete, append \`done: {one-line conclusion}\` to the status file and stop.
