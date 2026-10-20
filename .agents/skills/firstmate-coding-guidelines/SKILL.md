@@ -140,3 +140,4 @@ Keep instructions as the authority and discovery layer, but make repeated execut
 - A backend-verification doc (`docs/*-backend.md`) records empirical facts, not assumptions.
 - Include the date, version, exact commands run, and exact output.
 - Write incidents the same way, as evidence, not narrative alone.
+- For verification and incident records, follow the durable factual-record contract in [`AGENTS.md` section 6](../../../AGENTS.md#6-project-and-knowledge-management).

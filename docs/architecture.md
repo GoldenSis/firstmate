@@ -230,9 +230,10 @@ The full ownership rule - what is project-intrinsic versus fleet-private, and ho
 
 ## Operational memory routing
 
+[`AGENTS.md` section 6](../AGENTS.md#6-project-and-knowledge-management) owns the per-request improvement-candidate rule and the durable factual-record contract.
 `/stow` sweeps the current session for durable knowledge that only exists in conversation and routes each finding to the most specific disk home.
 Home-domain captain preferences go to `data/captain.md`, cross-domain shared captain preferences go to the primary home's `data/captain-shared.md`, fleet-local operational facts and gotchas go to home-local `data/learnings.md`, project-intrinsic knowledge goes through normal crewmate delivery into that project's committed `AGENTS.md`, and task-scoped notes or undone next steps go to the backlog.
-Memory writes use inspect-then-update: read the current destination first, then rewrite or prune matching bullets or notes in place instead of appending by default.
+Memory writes use inspect-then-update: read the current destination first, then curate the matching entry under that contract.
 Task-scoped notes use `tasks-axi show <id> --full` followed by `tasks-axi update <id> --body-file <path>`, adding `--archive-body` when the prior body should remain recoverable.
 Generalizable firstmate knowledge goes to shared tracked docs through the normal PR pipeline; the firstmate-internal `/stow` deliberately never stores findings in either skill directory.
 A skill-shaped pattern eligible under [`AGENTS.md` section 6](../AGENTS.md#6-project-and-knowledge-management) may become a `skillify-candidate` backlog note for a separate ship task, and the fail-closed admission rubric in the [`firstmate-coding-guidelines` skill](../.agents/skills/firstmate-coding-guidelines/SKILL.md) decides there whether it ever becomes a skill.

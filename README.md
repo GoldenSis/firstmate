@@ -53,6 +53,7 @@ Launching a supported harness inside it instantiates your first mate - and makes
 - **Optional Kestra execution seam** - deploy reviewed static flows, run a verified revision with checked inputs, and read execution evidence; [M1](docs/kestra-seam.md) is limited to synthetic data and keeps decisions outside Kestra.
 - **Guarded by construction** - the first mate is read-only over your projects outside guarded clone refreshes, safe branch pruning, and approved `local-only` fast-forward merges; crewmates make every project change behind the configured merge authority.
 - **Restart-proof** - all state lives on disk and in the active session backend (tmux by hard default, herdr or cmux when selected or auto-detected, zellij/orca when explicitly selected); kill the session anytime and the next one reconciles, including confirmed-dead secondmate agents, and carries on.
+- **Durable knowledge** - [operational memory routing](docs/architecture.md#operational-memory-routing) connects each request's improvement candidates and factual history to their existing owners.
 
 Full detail on every feature lives in [docs/architecture.md](docs/architecture.md).
 
