@@ -135,7 +135,7 @@ Shared captain preferences that apply across secondmate domains live only in the
 ## Operational learnings (data/learnings.md)
 
 Fleet-local operational facts and gotchas live locally in `data/learnings.md`; it is gitignored and printed after the captain-preference files in the session-start context digest.
-The file is created lazily on first learning and follows the same dated, evidence-backed, curated style as `data/captain.md`: inspect the current file first, then rewrite or prune stale entries instead of appending forever.
+The file is created lazily on first learning; before updating it, inspect the existing entries and follow the durable factual-record contract in [`AGENTS.md` section 6](../AGENTS.md#6-project-and-knowledge-management).
 There is no shared learnings file by captain decision.
 
 ## Secondmate routes (data/secondmates.md)
@@ -519,7 +519,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   kestra/revisions   deployed Kestra flow revisions verified against reviewed HEAD blobs; written only by bin/fm-kestra-deploy.sh, read by bin/fm-kestra-run.sh; home-local
   captain.md         this home's domain-local captain preferences and working style; LOCAL, gitignored, canonical even if harness memory mirrors it, and updated with inspect-then-update
   captain-shared.md  main-authoritative shared captain preferences propagated read-only to secondmate homes; LOCAL, gitignored, owned by secondmate-provisioning
-  learnings.md       fleet-local operational facts and gotchas; LOCAL, gitignored; dated, evidence-backed, curated, and updated with inspect-then-update - rewrite and prune rather than append forever, the same contract as captain.md; created lazily, absent until this home has a learning to store
+  learnings.md       fleet-local operational facts and gotchas; LOCAL, gitignored; see Operational learnings above
   projects.md        thin fleet navigation registry; firstmate-private, parsed by fm-project-mode.sh (section 6)
   secondmates.md      secondmate routing table; firstmate-private, maintained by fm-home-seed.sh (section 6)
   <id>/brief.md      per-task crewmate brief, or per-secondmate charter brief when kind=secondmate

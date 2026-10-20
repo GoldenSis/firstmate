@@ -292,4 +292,5 @@ Reading state back from Buzz, canvases, Buzz workflows, and any hosted account a
 
 Keep this file as the one place that states the adapter's invariants and its verification evidence.
 Mechanics belong in each script's header and `--help`, not here.
-When a fact here is superseded, rewrite it rather than appending a correction, and keep the evidence sections as evidence: exact commands, exact output, and the date they were run.
+For factual updates, follow the durable factual-record contract in [`AGENTS.md` section 6](../AGENTS.md#6-project-and-knowledge-management).
+Keep the evidence sections as evidence: exact commands, exact output, and the date they were run.
