@@ -59,6 +59,15 @@ FM_CLASSIFY_PAUSED_VERB_DEFAULT='paused'
 # shellcheck disable=SC2034 # Read by the watcher and daemon (fm-watch.sh, fm-supervise-daemon.sh), not this lib.
 FM_PAUSE_RESURFACE_SECS_DEFAULT=3600
 
+# Ceiling for the declared-pause recheck back-off. Each recheck that finds the
+# pause unchanged (same status-file mtime as the last recheck) doubles the next
+# wait, from FM_PAUSE_RESURFACE_SECS up to this ceiling: 1h, 2h, 4h, 8h. Any new
+# status line, or the pane going busy, resets it to FM_PAUSE_RESURFACE_SECS. A
+# long-parked pause otherwise woke the supervisor every hour with nothing new
+# (2026-10: 538 hourly rechecks in 19 days, about 470 of them no-ops).
+# shellcheck disable=SC2034 # Read by fm-watch.sh, not this lib.
+FM_PAUSE_RESURFACE_MAX_SECS_DEFAULT=28800
+
 # The resolution verb and durable-backlog-transfer verb that CLOSE a keyed
 # status decision opened by needs-decision or blocked. See status_open_decisions
 # below for the status-fold contract. The transfer verb is written only after
