@@ -140,6 +140,10 @@ STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provabl
 # it re-surfaces once for a recheck every PAUSE_RESURFACE_SECS - far longer than the
 # wedge threshold, but finite so a forgotten pause cannot rot invisibly.
 PAUSE_RESURFACE_SECS=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
+# Unchanged pauses back off: each recheck that finds the same status-file mtime
+# doubles the next wait, capped here (fm-classify-lib.sh owns the default).
+PAUSE_RESURFACE_MAX_SECS=${FM_PAUSE_RESURFACE_MAX_SECS:-$FM_PAUSE_RESURFACE_MAX_SECS_DEFAULT}
+[ "$PAUSE_RESURFACE_MAX_SECS" -ge "$PAUSE_RESURFACE_SECS" ] 2>/dev/null || PAUSE_RESURFACE_MAX_SECS=$PAUSE_RESURFACE_SECS
 TRIAGE_LOG="$STATE/.watch-triage.log"
 TRIAGE_LOG_MAX_BYTES=${FM_WATCH_TRIAGE_LOG_MAX_BYTES:-262144}
 # Consecutive event-path failures (fm_backend_wait_transition returning 2 -
@@ -311,10 +315,15 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
 # on the pause's own STATUS-FILE mtime, not a per-hash marker, so a churny idle pane
 # (a ticking clock, a token counter) cannot keep resetting the cadence the way a
 # hash-tied timer would. A .paused-resurfaced-<key> throttle marker records the last
-# re-surface epoch so, once past the window, it fires once per window rather than
-# every poll. Advances the stale suppressor to <hash> and flags the key paused.
+# re-surface (its mtime) so, once past the window, it fires once per window rather
+# than every poll. The marker body holds "<rechecks> <status-mtime>": while the
+# status file is unchanged since the last recheck, each window doubles up to
+# PAUSE_RESURFACE_MAX_SECS, so a long-parked pause stops waking the supervisor
+# every hour with nothing new. A new status line resets the window; a busy pane
+# clears the marker through clear_pause_state. Advances the stale suppressor to
+# <hash> and flags the key paused.
 handle_paused_stale() {  # <window> <task> <hash>
-  local win=$1 task=$2 h=$3 key statusf mtime age rf rf_age reason
+  local win=$1 task=$2 h=$3 key statusf mtime age rf rf_age reason n i prev_mtime window
   key=$(printf '%s' "$win" | tr ':/.' '___')
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
@@ -325,10 +334,20 @@ handle_paused_stale() {  # <window> <task> <hash>
   age=$(( $(date +%s) - mtime ))
   rf="$STATE/.paused-resurfaced-$key"
   rf_age=$(age_of "$rf")   # 999999 when no prior re-surface
-  if [ "$age" -ge "$PAUSE_RESURFACE_SECS" ] && [ "$rf_age" -ge "$PAUSE_RESURFACE_SECS" ]; then
+  n=0; prev_mtime=
+  [ -s "$rf" ] && read -r n prev_mtime < "$rf"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  [ "$prev_mtime" = "$mtime" ] || n=0
+  window=$PAUSE_RESURFACE_SECS
+  i=$n
+  while [ "$i" -gt 0 ] && [ "$window" -lt "$PAUSE_RESURFACE_MAX_SECS" ]; do
+    window=$(( window * 2 )); i=$(( i - 1 ))
+  done
+  [ "$window" -gt "$PAUSE_RESURFACE_MAX_SECS" ] && window=$PAUSE_RESURFACE_MAX_SECS
+  if [ "$age" -ge "$PAUSE_RESURFACE_SECS" ] && [ "$rf_age" -ge "$window" ]; then
     reason="stale: $win (paused ${age}s, awaiting external - declared pause, rechecked on a long cadence not a wedge; confirm the wait still holds)"
     fm_wake_append stale "$win" "$reason" || exit 1
-    date +%s > "$rf"
+    printf '%s %s\n' "$(( n + 1 ))" "$mtime" > "$rf"
     wake "$reason"
   fi
   triage_log "absorbed stale (paused, awaiting external, age ${age}s): $win"
